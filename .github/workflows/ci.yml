@@ -1,0 +1,145 @@
+# Continuous Integration — Lint + Test for both frontend and backend.
+#
+# Triggered on every pull request and on push to `main`. Two jobs run in
+# parallel; both must pass before a PR can be merged. The backend job spins
+# up a real Postgres service container so tests mirror production.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Backend — Ruff + mypy + pytest (against a service-container Postgres).
+  # ---------------------------------------------------------------------------
+  backend:
+    name: backend (lint + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: smart_order_test
+        ports:
+          - 5432:5432
+        # GitHub Actions waits for `options.health-cmd` to succeed before
+        # marking the service ready — prevents flaky "connection refused"
+        # at test startup.
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/smart_order_test
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET: ci-secret-not-for-prod
+      APP_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read .python-version
+        id: pyver
+        run: echo "version=$(cat ../.python-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.4"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ steps.pyver.outputs.version }}
+
+      - name: Install dependencies
+        run: uv sync --frozen || uv sync
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: mypy
+        run: uv run mypy app
+
+      - name: pytest
+        run: uv run pytest
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Frontend — ESLint + tsc --noEmit + Vitest.
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: frontend (lint + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read .nvmrc
+        id: node
+        run: echo "version=$(cat ../.nvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.3
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+          cache: "pnpm"
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: ESLint
+        run: pnpm lint
+
+      - name: Type-check
+        run: pnpm typecheck
+
+      - name: Vitest
+        run: pnpm test
+
+# ---------------------------------------------------------------------------
+# Local "review pipeline" snippet (NOT executed by Actions — kept here as a
+# reusable copy-paste recipe for engineers reviewing CI status from the CLI):
+#
+#   # Latest run for the current branch
+#   gh run list --workflow=ci.yml --branch=$(git rev-parse --abbrev-ref HEAD) \
+#     --limit 1 --json conclusion,status,headSha,url
+#
+#   # Watch the run in-place until it finishes
+#   gh run watch $(gh run list --workflow=ci.yml --limit 1 --json databaseId -q '.[0].databaseId')
+#
+#   # Re-run a failed job
+#   gh run rerun --failed
+# ---------------------------------------------------------------------------

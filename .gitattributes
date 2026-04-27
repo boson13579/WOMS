@@ -1,0 +1,14 @@
+# Force LF line endings everywhere — prevents Windows CRLF from breaking
+# Linux containers, shell scripts, and diff readability across platforms.
+* text=auto eol=lf
+
+# Binaries — keep as-is.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.pdf binary
+*.woff binary
+*.woff2 binary

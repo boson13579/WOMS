@@ -1,0 +1,67 @@
+# Pre-commit hooks — run automatically on `git commit`.
+#
+# First-time setup (per developer machine):
+#     uv tool install pre-commit
+#     pre-commit install
+#
+# Run manually against the whole repo:
+#     pre-commit run --all-files
+
+repos:
+  # --- Generic hygiene -------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  # --- Python (backend) ------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^backend/
+      - id: ruff-format
+        files: ^backend/
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        files: ^backend/app/
+        args: [--config-file=backend/pyproject.toml]
+        additional_dependencies:
+          - pydantic>=2.10.0
+          - pydantic-settings>=2.7.0
+          - sqlalchemy>=2.0.36
+          - structlog>=24.4.0
+          - types-passlib
+
+  # --- Frontend (TS/CSS/JSON/MD) --------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        types_or: [javascript, jsx, ts, tsx, css, json, markdown, yaml]
+        additional_dependencies:
+          - prettier@3.3.3
+
+  - repo: local
+    hooks:
+      - id: eslint
+        name: eslint
+        language: system
+        files: ^frontend/.*\.(ts|tsx)$
+        # Run via pnpm so the project's locked ESLint version + plugins are used.
+        entry: bash -c 'cd frontend && pnpm exec eslint --max-warnings=0'
+        pass_filenames: false

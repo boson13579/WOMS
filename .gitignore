@@ -1,0 +1,78 @@
+# =============================================================================
+# Secrets & local config — NEVER commit these.
+# =============================================================================
+.env
+.env.*
+!.env.example
+
+# =============================================================================
+# Python (backend)
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+dist/
+build/
+.eggs/
+
+# uv (lockfile `uv.lock` IS committed; only ignore caches)
+.uv-cache/
+
+# =============================================================================
+# Node / pnpm (frontend)
+# =============================================================================
+node_modules/
+pnpm-debug.log*
+yarn-error.log
+npm-debug.log*
+.pnpm-store/
+.vite/
+.turbo/
+*.tsbuildinfo
+frontend/dist/
+coverage/
+
+# =============================================================================
+# IDE / editor
+# =============================================================================
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# =============================================================================
+# Merge / patch artifacts
+# =============================================================================
+*.orig
+*.rej
+
+# =============================================================================
+# Claude Code project settings (may contain machine-local tokens / paths)
+# =============================================================================
+.claude/
+claude.local.md
+
+# =============================================================================
+# Docker / OS / misc
+# =============================================================================
+*.log
+*.pid
+docker-compose.override.yml
