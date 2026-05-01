@@ -71,6 +71,15 @@ Thumbs.db
 claude.local.md
 
 # =============================================================================
+# Personal scratchpad — never commit. Anything you write under notes/ stays
+# on your machine only. To share a note with the team, move it to docs/.
+# =============================================================================
+notes/
+NOTES.md
+TODO.local.md
+*.local.md
+
+# =============================================================================
 # Docker / OS / misc
 # =============================================================================
 *.log
