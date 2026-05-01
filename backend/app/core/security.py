@@ -38,7 +38,10 @@ def hash_password(plain: str) -> str:
 
 def verify_password(plain: str, hashed: str) -> bool:
     """Return True if *plain* matches the stored *hashed* password."""
-    return bool(bcrypt.checkpw(plain.encode(), hashed.encode()))
+    try:
+        return bool(bcrypt.checkpw(plain.encode(), hashed.encode()))
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
