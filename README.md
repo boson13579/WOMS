@@ -84,7 +84,8 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"  # JWT_SECRET
 ### 步驟 4：裝 backend + frontend 依賴
 
 ```bash
-# Backend：uv 會自動下載 Python 3.11.9（系統 Python 不會被動到）
+# Backend：uv 依 backend/.python-version（鎖在 3.11.9）自動下載對應直譯器
+# 系統 Python 不會被動到；如果你機器上沒有 3.11.x，uv 會自己抓一份到 ~/.local/share/uv
 cd backend && uv sync && cd ..
 
 # Frontend

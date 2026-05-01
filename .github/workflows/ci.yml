@@ -55,7 +55,8 @@ jobs:
 
       - name: Read .python-version
         id: pyver
-        run: echo "version=$(cat ../.python-version)" >> "$GITHUB_OUTPUT"
+        # Read backend/.python-version (same file uv consults locally).
+        run: echo "version=$(cat .python-version)" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
