@@ -149,9 +149,7 @@ def test_register_by_non_root_returns_403(
     assert res.json()["error"]["code"] == 403
 
 
-def test_register_duplicate_username_returns_409(
-    client: TestClient, db_session: Session
-) -> None:
+def test_register_duplicate_username_returns_409(client: TestClient, db_session: Session) -> None:
     _make_user(db_session, username="root2", password="rootpass2", role=UserRole.root)
     _make_user(db_session, username="existing", password="pass1234")
     token = _login(client, "root2", "rootpass2")
@@ -227,9 +225,7 @@ def test_me_with_malformed_sub_returns_401(client: TestClient) -> None:
     assert res.json()["error"]["code"] == 401
 
 
-def test_me_with_deactivated_user_returns_401(
-    client: TestClient, db_session: Session
-) -> None:
+def test_me_with_deactivated_user_returns_401(client: TestClient, db_session: Session) -> None:
     user = _make_user(db_session, username="deactivated", password="pass5678")
     token = _login(client, "deactivated", "pass5678")
 
