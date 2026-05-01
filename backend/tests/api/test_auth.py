@@ -1,8 +1,6 @@
-"""Auth API tests — covers login, register, and me endpoints.
+"""Auth API tests covering the login, register, and me endpoints.
 
-RED phase: all tests are written before the implementation exists.
-Run `pytest tests/api/test_auth.py -v` and confirm every test FAILS
-before proceeding to the GREEN phase.
+Run `pytest tests/api/test_auth.py -v` to execute this test module.
 """
 
 from __future__ import annotations
