@@ -14,7 +14,7 @@ from typing import Any
 import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -23,7 +23,8 @@ from app.models.user import User, UserRole
 from app.repositories import user as user_repo
 from app.schemas.user import TokenPayload
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+# auto_error=False so we can raise 401 (HTTPBearer default is 403 on missing token).
+http_bearer = HTTPBearer(auto_error=False)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +81,13 @@ def decode_access_token(token: str) -> TokenPayload:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials.",
         ) from exc
-    return TokenPayload(sub=raw["sub"], role=raw["role"], exp=raw["exp"])
+    try:
+        return TokenPayload(sub=raw["sub"], role=raw["role"], exp=raw["exp"])
+    except (KeyError, TypeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials.",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -88,29 +95,31 @@ def decode_access_token(token: str) -> TokenPayload:
 # ---------------------------------------------------------------------------
 
 
+_UNAUTHORIZED = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Could not validate credentials.",
+)
+
+
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(http_bearer),
     db: Session = Depends(get_db),
 ) -> User:
     """Validate the bearer token and return the corresponding active User.
 
     Raises HTTP 401 for any token problem or inactive account.
     """
-    payload = decode_access_token(token)
+    if credentials is None:
+        raise _UNAUTHORIZED
+    payload = decode_access_token(credentials.credentials)
     try:
         user_id = uuid.UUID(payload.sub)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials.",
-        ) from exc
+        raise _UNAUTHORIZED from exc
 
     user = user_repo.get_by_id(db, user_id)
     if user is None or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials.",
-        )
+        raise _UNAUTHORIZED
     return user
 
 

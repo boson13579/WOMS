@@ -234,3 +234,38 @@ def test_me_with_deactivated_user_returns_401(client: TestClient, db_session: Se
 
     assert res.status_code == 401
     assert res.json()["error"]["code"] == 401
+
+
+def test_login_with_corrupted_password_hash_returns_401(
+    client: TestClient, db_session: Session
+) -> None:
+    # Covers the except ValueError branch in verify_password():
+    # bcrypt.checkpw raises ValueError when the stored hash is not valid bcrypt.
+    user = _make_user(db_session, username="corrupted", password="goodpass1")
+    user.password_hash = "not-a-valid-hash"
+    db_session.commit()
+
+    res = client.post(
+        "/api/v1/auth/login",
+        json={"username": "corrupted", "password": "goodpass1"},
+    )
+
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+def test_me_with_missing_claims_token_returns_401(client: TestClient) -> None:
+    # Covers the except (KeyError, TypeError) branch in decode_access_token():
+    # JWT is structurally valid but payload is missing the required "sub" claim.
+    import jwt as pyjwt
+
+    token = pyjwt.encode(
+        {"role": "viewer", "exp": 9999999999},  # "sub" intentionally omitted
+        "test-secret-do-not-use-in-prod",
+        algorithm="HS256",
+    )
+
+    res = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
