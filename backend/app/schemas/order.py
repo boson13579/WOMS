@@ -15,9 +15,12 @@ __all__ = [
     "BatchUpdateRequest",
     "BatchUpdateResponse",
     "CreateOrderRequest",
+    "LockResponse",
     "OrderListResponse",
     "OrderResponse",
     "OrderStatus",
+    "SoftPinRequest",
+    "SoftPinResponse",
     "UpdateOrderRequest",
 ]
 
@@ -80,6 +83,11 @@ class OrderResponse(BaseModel):
     version_id: int
     created_at: datetime
     updated_at: datetime
+    # Lock fields (Task 3)
+    is_locked: bool
+    locked_by: uuid.UUID | None
+    locked_at: datetime | None
+    soft_pin_date: date | None
 
 
 class OrderListResponse(BaseModel):
@@ -111,3 +119,36 @@ class AuditLogResponse(BaseModel):
     old_value: dict[str, Any] | None
     new_value: dict[str, Any] | None
     created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Lock / Soft-pin schemas (Task 3)
+# ---------------------------------------------------------------------------
+
+
+class LockResponse(BaseModel):
+    """Response for POST/DELETE /orders/{order_id}/lock."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    is_locked: bool
+    locked_by: uuid.UUID | None
+    locked_at: datetime | None
+    version_id: int
+
+
+class SoftPinRequest(BaseModel):
+    """Payload for PATCH /orders/{order_id}/soft-pin."""
+
+    preferred_date: date
+
+
+class SoftPinResponse(BaseModel):
+    """Response for PATCH/DELETE /orders/{order_id}/soft-pin."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    soft_pin_date: date | None
+    version_id: int

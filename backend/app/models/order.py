@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 
 import sqlalchemy as sa
@@ -90,5 +90,25 @@ class Order(Base):
     )
     notes: Mapped[str | None] = mapped_column(
         sa.Text,
+        nullable=True,
+    )
+
+    # --- Locking fields (Task 3) ---
+    is_locked: Mapped[bool] = mapped_column(
+        sa.Boolean,
+        nullable=False,
+        server_default="false",
+    )
+    locked_by: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        sa.ForeignKey("users.id"),
+        nullable=True,
+    )
+    locked_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
+    )
+    soft_pin_date: Mapped[date | None] = mapped_column(
+        sa.Date,
         nullable=True,
     )

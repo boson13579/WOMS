@@ -33,6 +33,7 @@ dev = [
     "pytest-cov>=6.0.0",
     "testcontainers[postgres]>=4.9.0",
     "pre-commit>=4.0.0",
+    "fakeredis>=2.35.1",
 ]
 
 [build-system]

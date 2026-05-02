@@ -7,7 +7,7 @@ No business logic here — validation, status guards, and audit logging live in
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -20,6 +20,8 @@ __all__ = [
     "get_by_id_including_deleted",
     "get_many",
     "get_today_order_count",
+    "update_lock",
+    "update_soft_pin",
 ]
 
 
@@ -98,6 +100,36 @@ def create(
         notes=notes,
     )
     db.add(order)
+    db.flush()
+    db.refresh(order)
+    return order
+
+
+def update_lock(
+    db: Session,
+    order: Order,
+    *,
+    is_locked: bool,
+    locked_by: uuid.UUID | None,
+    locked_at: datetime | None,
+) -> Order:
+    """Update the hard-pin lock fields and return the refreshed entity."""
+    order.is_locked = is_locked
+    order.locked_by = locked_by
+    order.locked_at = locked_at
+    db.flush()
+    db.refresh(order)
+    return order
+
+
+def update_soft_pin(
+    db: Session,
+    order: Order,
+    *,
+    soft_pin_date: date | None,
+) -> Order:
+    """Update the soft-pin preferred date and return the refreshed entity."""
+    order.soft_pin_date = soft_pin_date
     db.flush()
     db.refresh(order)
     return order

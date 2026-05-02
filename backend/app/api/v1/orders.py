@@ -9,10 +9,13 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from redis.asyncio import Redis
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
+from app.core.redis import get_redis
+from app.core.scheduling_lock import is_scheduling_locked
 from app.core.security import require_roles
 from app.models.order import OrderStatus
 from app.models.user import User, UserRole
@@ -21,11 +24,15 @@ from app.schemas.order import (
     BatchUpdateRequest,
     BatchUpdateResponse,
     CreateOrderRequest,
+    LockResponse,
     OrderListResponse,
     OrderResponse,
+    SoftPinRequest,
+    SoftPinResponse,
     UpdateOrderRequest,
 )
 from app.services import order as order_service
+from app.services import order_lock as order_lock_service
 
 router = APIRouter()
 
@@ -33,6 +40,11 @@ router = APIRouter()
 _READ_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
 # Roles allowed to write orders (scheduler and above)
 _WRITE_ROLES = require_roles(UserRole.scheduler, UserRole.root)
+
+_SCHEDULING_LOCKED_ERROR = HTTPException(
+    status_code=423,
+    detail="Scheduling is in progress. Please try again later.",
+)
 
 
 @router.post("", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
@@ -110,10 +122,11 @@ def get_order(
 
 
 @router.patch("/{order_id}", response_model=OrderResponse)
-def update_order(
+async def update_order(
     order_id: uuid.UUID,
     request: UpdateOrderRequest,
     db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis),
     current_user: User = Depends(_WRITE_ROLES),
 ) -> OrderResponse:
     """Partially update an order (pending or scheduled only).
@@ -127,14 +140,18 @@ def update_order(
         404: order not found.
         409: version_id mismatch — another user modified the order.
         422: order is in an immutable status (in_production / completed / cancelled).
+        423: scheduling engine is running — retry later.
     """
+    if await is_scheduling_locked(redis):
+        raise _SCHEDULING_LOCKED_ERROR
     return order_service.update_order(db, order_id, request, current_user)
 
 
 @router.delete("/{order_id}", response_model=OrderResponse)
-def delete_order(
+async def delete_order(
     order_id: uuid.UUID,
     db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis),
     current_user: User = Depends(_WRITE_ROLES),
 ) -> OrderResponse:
     """Soft-delete an order: sets is_deleted=True and status=cancelled.
@@ -145,7 +162,10 @@ def delete_order(
 
     Errors:
         404: order not found.
+        423: scheduling engine is running — retry later.
     """
+    if await is_scheduling_locked(redis):
+        raise _SCHEDULING_LOCKED_ERROR
     return order_service.delete_order(db, order_id, current_user)
 
 
@@ -163,3 +183,88 @@ def get_audit_log(
         404: order not found.
     """
     return order_service.get_audit_log(db, order_id, current_user)
+
+
+@router.post("/{order_id}/lock", response_model=LockResponse)
+async def lock_order(
+    order_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current_user: User = Depends(_WRITE_ROLES),
+) -> LockResponse:
+    """Hard-pin an order: prevent the scheduling engine from moving it.
+
+    Idempotent — calling again on an already-locked order returns 200.
+
+    Permission: scheduler+.
+
+    Errors:
+        404: order not found.
+        423: scheduling engine is running — retry later.
+    """
+    if await is_scheduling_locked(redis):
+        raise _SCHEDULING_LOCKED_ERROR
+    return order_lock_service.lock_order(db, order_id, current_user)
+
+
+@router.delete("/{order_id}/lock", response_model=LockResponse)
+async def unlock_order(
+    order_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current_user: User = Depends(_WRITE_ROLES),
+) -> LockResponse:
+    """Remove the hard pin from an order.
+
+    Idempotent — calling again on an already-unlocked order returns 200.
+
+    Permission: scheduler+.
+
+    Errors:
+        404: order not found.
+    """
+    if await is_scheduling_locked(redis):
+        raise _SCHEDULING_LOCKED_ERROR
+    return order_lock_service.unlock_order(db, order_id, current_user)
+
+
+@router.patch("/{order_id}/soft-pin", response_model=SoftPinResponse)
+async def set_soft_pin(
+    order_id: uuid.UUID,
+    request: SoftPinRequest,
+    db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current_user: User = Depends(_WRITE_ROLES),
+) -> SoftPinResponse:
+    """Set a preferred production date (soft pin) for an order.
+
+    The scheduling engine will try to honour this date but may move the order
+    if capacity is insufficient.
+
+    Permission: scheduler+.
+
+    Errors:
+        404: order not found.
+    """
+    if await is_scheduling_locked(redis):
+        raise _SCHEDULING_LOCKED_ERROR
+    return order_lock_service.set_soft_pin(db, order_id, request.preferred_date, current_user)
+
+
+@router.delete("/{order_id}/soft-pin", response_model=SoftPinResponse)
+async def clear_soft_pin(
+    order_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current_user: User = Depends(_WRITE_ROLES),
+) -> SoftPinResponse:
+    """Clear the soft-pin preferred date from an order.
+
+    Permission: scheduler+.
+
+    Errors:
+        404: order not found.
+    """
+    if await is_scheduling_locked(redis):
+        raise _SCHEDULING_LOCKED_ERROR
+    return order_lock_service.clear_soft_pin(db, order_id, current_user)

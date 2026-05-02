@@ -19,10 +19,12 @@ Performance notes:
 from __future__ import annotations
 
 import os
-from collections.abc import Generator, Iterator
+from collections.abc import AsyncGenerator, Generator, Iterator
 
+import fakeredis.aioredis
 import pytest
 from fastapi.testclient import TestClient
+from redis.asyncio import Redis
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
@@ -109,23 +111,37 @@ def db_session(engine: Engine) -> Generator[Session, None, None]:
         connection.close()
 
 
-# --- 4. FastAPI TestClient with `get_db` overridden --------------------------
+# --- 4. FakeRedis (per-test, unlocked) ---------------------------------------
 
 
 @pytest.fixture
-def client(db_session: Session) -> Iterator[TestClient]:
-    """A `TestClient` whose `get_db` dependency yields the rolled-back session.
+def fake_redis() -> fakeredis.aioredis.FakeRedis:
+    """A fresh, unlocked FakeRedis instance for each test."""
+    return fakeredis.aioredis.FakeRedis()
 
-    This means request handlers run against the same isolated transaction the
-    test inspects directly — no flaky cross-fixture state.
+
+# --- 5. FastAPI TestClient with `get_db` and `get_redis` overridden ----------
+
+
+@pytest.fixture
+def client(db_session: Session, fake_redis: fakeredis.aioredis.FakeRedis) -> Iterator[TestClient]:
+    """A `TestClient` whose `get_db` and `get_redis` dependencies are overridden.
+
+    `get_db` yields the rolled-back session so DB state is isolated per test.
+    `get_redis` yields an empty FakeRedis so no real Redis is required.
     """
     from app.core.db import get_db
+    from app.core.redis import get_redis
     from app.main import app
 
     def _override_get_db() -> Generator[Session, None, None]:
         yield db_session
 
+    async def _override_get_redis() -> AsyncGenerator[Redis, None]:
+        yield fake_redis  # type: ignore[misc]
+
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_redis] = _override_get_redis
     try:
         with TestClient(app) as c:
             yield c
