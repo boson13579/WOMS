@@ -30,9 +30,7 @@ _order_status_enum = sa.Enum(
 )
 
 # Statuses that allow mutation via PATCH
-MUTABLE_STATUSES: frozenset[OrderStatus] = frozenset(
-    {OrderStatus.pending, OrderStatus.scheduled}
-)
+MUTABLE_STATUSES: frozenset[OrderStatus] = frozenset({OrderStatus.pending, OrderStatus.scheduled})
 
 
 class Order(Base):

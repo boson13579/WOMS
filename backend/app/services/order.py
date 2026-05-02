@@ -192,8 +192,12 @@ def update_order(
     }
 
     _write_audit(
-        db, action="order.updated", actor=actor, order=order,
-        old_value=old_val, new_value=new_val,
+        db,
+        action="order.updated",
+        actor=actor,
+        order=order,
+        old_value=old_val,
+        new_value=new_val,
     )
 
     try:
@@ -226,9 +230,7 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     return OrderResponse.model_validate(order)
 
 
-def batch_update_orders(
-    db: Session, req: BatchUpdateRequest, actor: User
-) -> BatchUpdateResponse:
+def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> BatchUpdateResponse:
     """Bulk-update delivery dates; silently skip immutable-status orders."""
     updated: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []
@@ -266,9 +268,7 @@ def batch_update_orders(
     )
 
 
-def get_audit_log(
-    db: Session, order_id: uuid.UUID, current_user: User
-) -> list[AuditLogResponse]:
+def get_audit_log(db: Session, order_id: uuid.UUID, current_user: User) -> list[AuditLogResponse]:
     """Return all audit-log entries for an order; raise 404 if not found."""
     order = order_repo.get_by_id(db, order_id)
     if order is None:

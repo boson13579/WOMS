@@ -269,9 +269,7 @@ def test_update_order_success(client: TestClient, db_session: Session) -> None:
     assert body["status"] == "pending"
 
 
-def test_update_order_version_conflict_returns_409(
-    client: TestClient, db_session: Session
-) -> None:
+def test_update_order_version_conflict_returns_409(client: TestClient, db_session: Session) -> None:
     user = _make_user(db_session, username="sched_conflict", role=UserRole.scheduler)
     token = _login(client, "sched_conflict")
     order = _make_order(db_session, created_by=user.id)
@@ -295,9 +293,7 @@ def test_update_order_version_conflict_returns_409(
     assert res.json()["error"]["code"] == 409
 
 
-def test_update_order_in_production_returns_422(
-    client: TestClient, db_session: Session
-) -> None:
+def test_update_order_in_production_returns_422(client: TestClient, db_session: Session) -> None:
     user = _make_user(db_session, username="sched_prod", role=UserRole.scheduler)
     token = _login(client, "sched_prod")
     order = _make_order(db_session, created_by=user.id, status=OrderStatus.in_production)
@@ -508,9 +504,7 @@ def test_audit_log_recorded_on_create(client: TestClient, db_session: Session) -
     assert res.status_code == 201
     order_id = uuid.UUID(res.json()["id"])
 
-    logs = db_session.scalars(
-        select(AuditLog).where(AuditLog.resource_id == order_id)
-    ).all()
+    logs = db_session.scalars(select(AuditLog).where(AuditLog.resource_id == order_id)).all()
     assert len(logs) >= 1
     assert any(log.action == "order.created" for log in logs)
 

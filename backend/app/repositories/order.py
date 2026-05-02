@@ -48,9 +48,7 @@ def get_many(
     total: int = db.scalars(count_stmt).one()
 
     rows = db.scalars(
-        base.order_by(Order.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
+        base.order_by(Order.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
     ).all()
 
     return list(rows), total
