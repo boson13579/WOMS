@@ -182,7 +182,7 @@ def update_order(
         order.wafer_quantity = req.wafer_quantity
     if req.requested_delivery_date is not None:
         order.requested_delivery_date = req.requested_delivery_date
-    if req.notes is not None:
+    if "notes" in req.model_fields_set:
         order.notes = req.notes
     order.status = OrderStatus.pending
 
