@@ -113,6 +113,8 @@ def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResp
         "wafer_quantity": order.wafer_quantity,
         "requested_delivery_date": str(order.requested_delivery_date),
         "status": order.status.value,
+        "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        "notes": order.notes,
     }
     _write_audit(db, action="order.created", actor=actor, order=order, new_value=new_val)
     db.commit()
