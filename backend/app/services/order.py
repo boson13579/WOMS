@@ -306,8 +306,12 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
 
 
 def get_audit_log(db: Session, order_id: uuid.UUID, current_user: User) -> list[AuditLogResponse]:
-    """Return all audit-log entries for an order; raise 404 if not found."""
-    order = order_repo.get_by_id(db, order_id)
+    """Return all audit-log entries for an order; raise 404 if not found.
+
+    Uses get_by_id_including_deleted so cancelled orders remain queryable —
+    their audit trail must always be accessible after soft-delete.
+    """
+    order = order_repo.get_by_id_including_deleted(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 

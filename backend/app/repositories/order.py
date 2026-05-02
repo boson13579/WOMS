@@ -17,6 +17,7 @@ from app.models.order import Order, OrderStatus
 __all__ = [
     "create",
     "get_by_id",
+    "get_by_id_including_deleted",
     "get_many",
     "get_today_order_count",
 ]
@@ -25,6 +26,15 @@ __all__ = [
 def get_by_id(db: Session, order_id: uuid.UUID) -> Order | None:
     """Return the order with *order_id*, or None if absent/soft-deleted."""
     stmt = select(Order).where(Order.id == order_id, Order.is_deleted.is_(False))
+    return db.scalars(stmt).first()
+
+
+def get_by_id_including_deleted(db: Session, order_id: uuid.UUID) -> Order | None:
+    """Return the order with *order_id* regardless of soft-delete status.
+
+    Used by audit-log queries so that cancelled orders remain queryable.
+    """
+    stmt = select(Order).where(Order.id == order_id)
     return db.scalars(stmt).first()
 
 

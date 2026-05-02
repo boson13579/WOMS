@@ -577,3 +577,40 @@ def test_get_audit_log_not_found_returns_404(client: TestClient, db_session: Ses
 
     assert res.status_code == 404
     assert res.json()["error"]["code"] == 404
+
+
+def test_get_audit_log_after_cancel_still_returns_logs(
+    client: TestClient, db_session: Session
+) -> None:
+    _make_user(db_session, username="sched_audit_cancel2", role=UserRole.scheduler)
+    _make_user(db_session, username="mgr_audit_cancel2", role=UserRole.order_manager)
+    sched_token = _login(client, "sched_audit_cancel2")
+    mgr_token = _login(client, "mgr_audit_cancel2")
+
+    # Create order via API (writes order.created audit log)
+    res = client.post(
+        "/api/v1/orders",
+        json={
+            "customer_name": "CancelCo",
+            "wafer_quantity": 50,
+            "requested_delivery_date": _DELIVERY,
+        },
+        headers=_auth(sched_token),
+    )
+    assert res.status_code == 201
+    order_id = res.json()["id"]
+
+    # Cancel the order (soft-delete, writes order.cancelled audit log)
+    res = client.delete(f"/api/v1/orders/{order_id}", headers=_auth(sched_token))
+    assert res.status_code == 200
+
+    # Audit log must still be queryable even though the order is soft-deleted
+    res = client.get(f"/api/v1/orders/{order_id}/audit-log", headers=_auth(mgr_token))
+
+    assert res.status_code == 200
+    logs = res.json()
+    assert isinstance(logs, list)
+    assert len(logs) >= 2
+    actions = [log["action"] for log in logs]
+    assert "order.created" in actions
+    assert "order.cancelled" in actions
