@@ -9,11 +9,9 @@ Layered architecture rule: entities know nothing about FastAPI, Celery, or
 HTTP. They are pure domain objects mapped to database tables.
 """
 
+from app.models.audit_log import AuditLog
 from app.models.base_class import Base
-
-# When new entities are added (e.g., `from app.models.order import Order`),
-# import them here so Alembic's autogenerate detects them. This file is the
-# single registration site referenced by `alembic/env.py`.
+from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
 
-__all__ = ["Base", "User", "UserRole"]
+__all__ = ["AuditLog", "Base", "Order", "OrderStatus", "User", "UserRole"]

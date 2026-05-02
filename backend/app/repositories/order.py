@@ -1,0 +1,95 @@
+"""Pure CRUD operations for the Order entity.
+
+No business logic here — validation, status guards, and audit logging live in
+`services/order.py`. Every query filters `is_deleted=False` automatically.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import date
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.models.order import Order, OrderStatus
+
+__all__ = [
+    "create",
+    "get_by_id",
+    "get_many",
+    "get_today_order_count",
+]
+
+
+def get_by_id(db: Session, order_id: uuid.UUID) -> Order | None:
+    """Return the order with *order_id*, or None if absent/soft-deleted."""
+    stmt = select(Order).where(Order.id == order_id, Order.is_deleted.is_(False))
+    return db.scalars(stmt).first()
+
+
+def get_many(
+    db: Session,
+    *,
+    status: list[OrderStatus] | None = None,
+    assigned_to: uuid.UUID | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[Order], int]:
+    """Return a paginated list of active orders plus the total count."""
+    base = select(Order).where(Order.is_deleted.is_(False))
+
+    if status:
+        base = base.where(Order.status.in_(status))
+    if assigned_to is not None:
+        base = base.where(Order.assigned_to == assigned_to)
+
+    count_stmt = select(func.count()).select_from(base.subquery())
+    total: int = db.scalars(count_stmt).one()
+
+    rows = db.scalars(
+        base.order_by(Order.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+
+    return list(rows), total
+
+
+def get_today_order_count(db: Session, today: date) -> int:
+    """Return the number of orders whose order_number starts with today's prefix.
+
+    Used to derive the daily sequence number for new order_numbers.
+    """
+    prefix = f"ORD-{today.strftime('%Y%m%d')}-"
+    stmt = select(func.count()).where(
+        Order.order_number.like(f"{prefix}%"),
+    )
+    return db.scalars(stmt).one()
+
+
+def create(
+    db: Session,
+    *,
+    order_number: str,
+    customer_name: str,
+    wafer_quantity: int,
+    requested_delivery_date: date,
+    created_by: uuid.UUID,
+    assigned_to: uuid.UUID | None = None,
+    notes: str | None = None,
+) -> Order:
+    """Insert a new Order row and return the refreshed entity."""
+    order = Order(
+        order_number=order_number,
+        customer_name=customer_name,
+        wafer_quantity=wafer_quantity,
+        requested_delivery_date=requested_delivery_date,
+        created_by=created_by,
+        assigned_to=assigned_to,
+        notes=notes,
+    )
+    db.add(order)
+    db.flush()
+    db.refresh(order)
+    return order
