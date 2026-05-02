@@ -226,8 +226,16 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     order.status = OrderStatus.cancelled
 
     _write_audit(db, action="order.cancelled", actor=actor, order=order, old_value=old_val)
-    db.commit()
-    db.refresh(order)
+    try:
+        db.commit()
+        db.refresh(order)
+    except StaleDataError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Order was modified by another user. Refresh and try again.",
+        ) from exc
+
     logger.info("order.cancelled", order_id=str(order_id), actor_id=str(actor.id))
     return OrderResponse.model_validate(order)
 
