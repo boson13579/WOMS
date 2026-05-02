@@ -14,5 +14,6 @@ from app.models.base_class import Base
 # When new entities are added (e.g., `from app.models.order import Order`),
 # import them here so Alembic's autogenerate detects them. This file is the
 # single registration site referenced by `alembic/env.py`.
+from app.models.user import User, UserRole
 
-__all__ = ["Base"]
+__all__ = ["Base", "User", "UserRole"]
