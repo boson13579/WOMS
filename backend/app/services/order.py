@@ -251,20 +251,47 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
             skipped.append(order_id)
             continue
 
-        old_date = str(order.requested_delivery_date)
-        order.requested_delivery_date = req.requested_delivery_date
-        order.status = OrderStatus.pending
-        _write_audit(
-            db,
-            action="order.updated",
-            actor=actor,
-            order=order,
-            old_value={"requested_delivery_date": old_date},
-            new_value={"requested_delivery_date": str(req.requested_delivery_date)},
-        )
-        updated.append(order_id)
+        savepoint = db.begin_nested()
+        try:
+            old_date = str(order.requested_delivery_date)
+            order.requested_delivery_date = req.requested_delivery_date
+            order.status = OrderStatus.pending
+            _write_audit(
+                db,
+                action="order.updated",
+                actor=actor,
+                order=order,
+                old_value={"requested_delivery_date": old_date},
+                new_value={"requested_delivery_date": str(req.requested_delivery_date)},
+            )
+            db.flush()
+            savepoint.commit()
+            updated.append(order_id)
+        except StaleDataError:
+            savepoint.rollback()
+            db.expire_all()
+            skipped.append(order_id)
+            logger.warning(
+                "order.batch_update_conflict",
+                order_id=str(order_id),
+                actor_id=str(actor.id),
+            )
 
-    db.commit()
+    try:
+        db.commit()
+    except StaleDataError as exc:
+        db.rollback()
+        logger.warning(
+            "order.batch_update_commit_conflict",
+            updated=len(updated),
+            skipped=len(skipped),
+            actor_id=str(actor.id),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="One or more orders were modified by another request. Please retry.",
+        ) from exc
+
     logger.info(
         "order.batch_updated",
         updated=len(updated),
