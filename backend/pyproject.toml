@@ -18,7 +18,7 @@ dependencies = [
     "structlog>=24.4.0",
     "celery[redis]>=5.4.0",
     "redis>=5.2.0",
-    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=4.0.0",
     "pyjwt>=2.10.0",
     "python-multipart>=0.0.20",
     "httpx>=0.28.0",
@@ -32,7 +32,6 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "testcontainers[postgres]>=4.9.0",
-    "types-passlib>=1.7.7",
     "pre-commit>=4.0.0",
 ]
 
@@ -74,11 +73,12 @@ ignore = [
     "D203", "D213",      # Conflicting docstring styles
     "PLR0913",           # Too many arguments — FastAPI handlers commonly need many
     "ANN401",            # Allow `Any` in **kwargs / pass-through helpers (audit_log, middleware)
+    "B008",              # FastAPI Depends() in argument defaults is intentional
 ]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests may use assert, skip docstrings, and lazy-import to defer env-var reads.
-"tests/**" = ["S101", "D", "ANN", "PLR2004", "PLC0415"]
+"tests/**" = ["S101", "S105", "S106", "S107", "D", "ANN", "PLR2004", "PLC0415"]
 # Alembic migrations are auto-generated — relax style rules.
 "alembic/**" = ["D", "ANN"]
 
