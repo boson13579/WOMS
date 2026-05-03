@@ -95,6 +95,20 @@ module.exports = {
      * Required when `@typescript-eslint/no-floating-promises` is on. */
     'no-void': ['error', { allowAsStatement: true }],
 
+    /* Numbers in template literals are universally understood and safe. */
+    '@typescript-eslint/restrict-template-expressions': [
+      'error',
+      { allowNumber: true, allowBoolean: true, allowNullish: false },
+    ],
+
+    /* Function declarations are hoisted — flagging "used before defined" for
+     * helpers placed below the main component is unhelpful noise. */
+    'no-use-before-define': 'off',
+    '@typescript-eslint/no-use-before-define': [
+      'error',
+      { functions: false, classes: false, variables: true, typedefs: false },
+    ],
+
     /* Test/config files may use devDependencies. */
     'import/no-extraneous-dependencies': [
       'error',
