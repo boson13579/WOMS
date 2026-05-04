@@ -1,14 +1,15 @@
 /**
- * Application shell — Phase 1 Auth.
+ * App-level providers.
  *
- * Renders the AuthPage which handles both login and registration.
- * Phase 2 will replace this with <RouterProvider router={router} /> from
- * react-router-dom for full client-side navigation.
+ * `main.tsx` mounts this; the router (and therefore route components) live
+ * inside `<RouterProvider>` so future code can read `useNavigate` etc.
  */
-import { AuthPage } from '@/features/auth/components/AuthPage';
+import { RouterProvider } from 'react-router-dom';
+
+import { router } from '@/routes/router';
 
 function App(): JSX.Element {
-  return <AuthPage />;
+  return <RouterProvider router={router} />;
 }
 
 export default App;

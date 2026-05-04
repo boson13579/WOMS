@@ -1,0 +1,78 @@
+"""Pydantic DTOs for the auth / user domain."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.user import UserRole
+
+__all__ = [
+    "LoginRequest",
+    "LoginResponse",
+    "RegisterRequest",
+    "TokenPayload",
+    "UserResponse",
+    "UserRole",
+]
+
+
+# ---------------------------------------------------------------------------
+# Request schemas
+# ---------------------------------------------------------------------------
+
+
+class LoginRequest(BaseModel):
+    """Credentials submitted to POST /auth/login."""
+
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+class RegisterRequest(BaseModel):
+    """Payload for POST /auth/register (root only)."""
+
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=8)
+    email: str | None = None
+    role: UserRole = UserRole.viewer
+
+
+# ---------------------------------------------------------------------------
+# Response schemas
+# ---------------------------------------------------------------------------
+
+
+class LoginResponse(BaseModel):
+    """Returned on successful login."""
+
+    access_token: str
+    token_type: str = "bearer"  # noqa: S105 — OAuth2 token_type, not a password
+
+
+class UserResponse(BaseModel):
+    """Public view of a user record."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    username: str
+    email: str | None
+    role: UserRole
+    is_active: bool
+    created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Internal / token schemas
+# ---------------------------------------------------------------------------
+
+
+class TokenPayload(BaseModel):
+    """Claims extracted from a decoded JWT."""
+
+    sub: str  # str(user_id)
+    role: str
+    exp: int
