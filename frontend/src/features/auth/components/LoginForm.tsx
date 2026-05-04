@@ -1,22 +1,31 @@
 /**
- * Login form skeleton — Phase 1.
+ * LoginForm — Phase 2-ready login form.
  *
- * Demonstrates the Bulletproof React feature pattern (component lives in
- * `features/<feature>/components/`, API client in `features/<feature>/api/`)
- * with React Hook Form + Zod for form state and React Query for the mutation.
- *
- * No real authentication occurs — `login()` is a mock that resolves to a
- * fake token. Phase 2 wires this to the FastAPI auth endpoint.
+ * Uses React Hook Form + Zod for validation, and the `useLogin` React Query
+ * mutation. On success, persists the token in the Zustand auth store and calls
+ * `onSuccess` so the parent (AuthPage) can switch view.
  */
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useMutation } from '@tanstack/react-query';
+import { Loader2, LogIn } from 'lucide-react';
 import { useForm } from 'react-hook-form';
 
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 
-import { login, loginRequestSchema, type LoginRequest } from '../api/login';
+import { loginRequestSchema, useLogin, type LoginRequest } from '../api/auth';
+import { useAuthStore } from '../stores/authStore';
 
-export function LoginForm(): JSX.Element {
+interface LoginFormProps {
+  /** Called when login succeeds — parent uses this to navigate. */
+  onSuccess?: () => void;
+  /** Called when user wants to switch to the register form. */
+  onSwitchToRegister?: () => void;
+}
+
+export function LoginForm({ onSuccess, onSwitchToRegister }: LoginFormProps): JSX.Element {
+  const setToken = useAuthStore((s) => s.setToken);
+
   const {
     register,
     handleSubmit,
@@ -26,17 +35,15 @@ export function LoginForm(): JSX.Element {
     defaultValues: { username: '', password: '' },
   });
 
-  const mutation = useMutation({
-    mutationFn: login,
-    // Phase 2: persist the token in a Zustand store and redirect to /orders.
-    onSuccess: (data) => {
-      // eslint-disable-next-line no-console
-      console.info('[Phase 1 mock] login succeeded', data);
-    },
-  });
+  const mutation = useLogin();
 
   const onSubmit = handleSubmit((values) => {
-    mutation.mutate(values);
+    mutation.mutate(values, {
+      onSuccess: (data) => {
+        setToken(data.access_token, values.username);
+        onSuccess?.();
+      },
+    });
   });
 
   return (
@@ -44,47 +51,76 @@ export function LoginForm(): JSX.Element {
       onSubmit={(event) => {
         void onSubmit(event);
       }}
-      className="space-y-4 rounded-lg border bg-card p-6 shadow-sm"
+      className="space-y-5"
       noValidate
     >
       <div className="space-y-2">
-        <label htmlFor="username" className="block text-sm font-medium">
-          Username
-          <input
-            id="username"
-            type="text"
-            autoComplete="username"
-            className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-normal focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            {...register('username')}
-          />
-        </label>
+        <Label htmlFor="login-username">Username</Label>
+        <Input
+          id="login-username"
+          type="text"
+          autoComplete="username"
+          placeholder="your_username"
+          aria-invalid={errors.username !== undefined}
+          aria-describedby={errors.username ? 'login-username-error' : undefined}
+          {...register('username')}
+        />
         {errors.username ? (
-          <p className="text-xs text-destructive">{errors.username.message}</p>
+          <p id="login-username-error" className="text-xs text-destructive" role="alert">
+            {errors.username.message}
+          </p>
         ) : null}
       </div>
 
       <div className="space-y-2">
-        <label htmlFor="password" className="block text-sm font-medium">
-          Password
-          <input
-            id="password"
-            type="password"
-            autoComplete="current-password"
-            className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-normal focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            {...register('password')}
-          />
-        </label>
+        <Label htmlFor="login-password">Password</Label>
+        <Input
+          id="login-password"
+          type="password"
+          autoComplete="current-password"
+          placeholder="••••••••"
+          aria-invalid={errors.password !== undefined}
+          aria-describedby={errors.password ? 'login-password-error' : undefined}
+          {...register('password')}
+        />
         {errors.password ? (
-          <p className="text-xs text-destructive">{errors.password.message}</p>
+          <p id="login-password-error" className="text-xs text-destructive" role="alert">
+            {errors.password.message}
+          </p>
         ) : null}
       </div>
 
+      {mutation.isError ? (
+        <p className="text-xs text-destructive" role="alert">
+          Login failed. Please check your credentials and try again.
+        </p>
+      ) : null}
+
       <Button type="submit" disabled={mutation.isPending} className="w-full">
-        {mutation.isPending ? 'Signing in…' : 'Sign in'}
+        {mutation.isPending ? (
+          <>
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+            Signing in…
+          </>
+        ) : (
+          <>
+            <LogIn className="mr-2 h-4 w-4" aria-hidden="true" />
+            Sign in
+          </>
+        )}
       </Button>
 
-      {mutation.isError ? (
-        <p className="text-xs text-destructive">Login failed. Please try again.</p>
+      {onSwitchToRegister ? (
+        <p className="text-center text-sm text-muted-foreground">
+          Don&apos;t have an account?{' '}
+          <button
+            type="button"
+            onClick={onSwitchToRegister}
+            className="font-medium text-primary underline-offset-4 hover:underline"
+          >
+            Create one
+          </button>
+        </p>
       ) : null}
     </form>
   );

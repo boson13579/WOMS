@@ -1,26 +1,14 @@
 /**
- * Application shell.
+ * Application shell — Phase 1 Auth.
  *
- * Phase 1 placeholder: shows the auth feature's LoginForm so a fresh clone
- * can verify the entire toolchain (Vite + Tailwind + shadcn tokens + React
- * Query + Bulletproof folder structure) at a glance.
- *
- * Phase 2 will replace this with `<RouterProvider>` from react-router-dom.
+ * Renders the AuthPage which handles both login and registration.
+ * Phase 2 will replace this with <RouterProvider router={router} /> from
+ * react-router-dom for full client-side navigation.
  */
-import { LoginForm } from '@/features/auth/components/LoginForm';
+import { AuthPage } from '@/features/auth/components/AuthPage';
 
 function App(): JSX.Element {
-  return (
-    <main className="min-h-screen flex items-center justify-center bg-background p-4">
-      <div className="w-full max-w-md">
-        <header className="mb-6 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">Smart Order Management</h1>
-          <p className="text-sm text-muted-foreground">Phase 1 — scaffolding only</p>
-        </header>
-        <LoginForm />
-      </div>
-    </main>
-  );
+  return <AuthPage />;
 }
 
 export default App;
