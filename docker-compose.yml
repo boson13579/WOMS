@@ -28,7 +28,7 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-smart_order}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-smart_order}" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -36,13 +36,13 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command: [ "redis-server", "--appendonly", "yes" ]
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -66,7 +66,7 @@ services:
     ports:
       - "8000:8000"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8000/api/v1/health"]
+      test: [ "CMD", "curl", "--fail", "http://localhost:8000/api/v1/health" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -81,7 +81,7 @@ services:
     depends_on:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
-    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=INFO"]
+    command: [ "celery", "-A", "app.workers.celery_app", "worker", "--loglevel=INFO" ]
     environment:
       APP_ENV: ${APP_ENV:-dev}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-smart_order}
@@ -106,6 +106,14 @@ services:
       # to avoid Windows ↔ Linux symlink/permission churn.
       - ./frontend:/app
       - /app/node_modules
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      db: { condition: service_healthy }
 
 volumes:
   db_data:

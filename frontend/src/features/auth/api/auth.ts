@@ -22,7 +22,6 @@ export const loginRequestSchema = z.object({
 export const loginResponseSchema = z.object({
   access_token: z.string(),
   token_type: z.literal('bearer'),
-  expires_in: z.number().int().positive(),
 });
 
 export const registerRequestSchema = z
@@ -76,42 +75,44 @@ export type RegisterResponse = z.infer<typeof registerResponseSchema>;
 export async function login(payload: LoginRequest): Promise<LoginResponse> {
   loginRequestSchema.parse(payload);
 
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, 400);
+  const res = await fetch('/api/v1/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   });
-
-  return loginResponseSchema.parse({
-    access_token: 'mock-jwt-token-replace-in-phase-2',
-    token_type: 'bearer',
-    expires_in: 3600,
-  });
+  
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null);
+    throw new Error(errorData?.detail || 'Login failed');
+  }
+  
+  return loginResponseSchema.parse(await res.json());
 }
 
 /**
- * Phase 1 mock — simulates user registration.
- *
- * Phase 2 replacement:
- *   const res = await fetch('/api/v1/auth/register', {
- *     method: 'POST',
- *     headers: { 'Content-Type': 'application/json' },
- *     body: JSON.stringify(payload),
- *   });
- *   if (!res.ok) throw new Error('Registration failed');
- *   return registerResponseSchema.parse(await res.json());
+ * Phase 2 — registers user via backend.
  */
 export async function register(payload: RegisterRequest): Promise<RegisterResponse> {
   registerRequestSchema.parse(payload);
 
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, 600);
+  const res = await fetch('/api/v1/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: payload.username,
+      email: payload.email,
+      password: payload.password,
+      // Default to viewer role per backend schema if not provided
+      role: 'viewer'
+    }),
   });
 
-  return registerResponseSchema.parse({
-    id: '00000000-0000-0000-0000-000000000001',
-    username: payload.username,
-    email: payload.email,
-    created_at: new Date().toISOString(),
-  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null);
+    throw new Error(errorData?.detail || 'Registration failed');
+  }
+
+  return registerResponseSchema.parse(await res.json());
 }
 
 // ─── React Query hooks ───────────────────────────────────────────────────────

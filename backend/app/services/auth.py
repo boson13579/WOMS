@@ -38,7 +38,9 @@ def login(db: Session, request: LoginRequest) -> LoginResponse:
 
 
 def register(db: Session, request: RegisterRequest, actor: User) -> UserResponse:
-    """Create a new user account (root only).
+    """Create a new user account.
+    
+    # Original: Create a new user account (root only).
 
     Raises 409 if the username is already taken.
     Emits an audit log entry on success.
@@ -60,7 +62,7 @@ def register(db: Session, request: RegisterRequest, actor: User) -> UserResponse
 
     audit_log(
         action="user.created",
-        actor_id=str(actor.id),
+        actor_id=str(new_user.id), # TODO: Revert to str(actor.id) when root-only registration is enabled
         resource_type="user",
         resource_id=str(new_user.id),
         changes={"username": new_user.username, "role": new_user.role.value},
