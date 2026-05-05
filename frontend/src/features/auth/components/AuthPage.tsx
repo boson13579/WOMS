@@ -10,14 +10,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import { ThemeToggle } from '@/components/layout/ThemeToggle';
-
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 
 import type { AuthMode } from '../types/auth';
 
@@ -67,7 +60,9 @@ export function AuthPage({ onLoginSuccess }: AuthPageProps): JSX.Element {
             </svg>
           </div>
           <h1 className="text-3xl font-bold tracking-tight text-foreground">Smart Order</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Order management &amp; scheduling platform</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Order management &amp; scheduling platform
+          </p>
         </div>
 
         <Card className="shadow-md">
@@ -97,7 +92,7 @@ export function AuthPage({ onLoginSuccess }: AuthPageProps): JSX.Element {
             <div key={mode} className="animate-in fade-in duration-300">
               {mode === 'login' ? (
                 <LoginForm
-                  {...(handleLoginSuccess !== undefined ? { onSuccess: handleLoginSuccess } : {})}
+                  onSuccess={handleLoginSuccess}
                   onSwitchToRegister={() => {
                     setRegistered(false);
                     setMode('register');

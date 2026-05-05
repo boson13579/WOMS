@@ -9,7 +9,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
-import { RegisterForm } from '../components/RegisterForm';
+import { RegisterForm } from './RegisterForm';
 
 function renderWithClient(ui: React.ReactElement) {
   const client = new QueryClient({
@@ -53,7 +53,7 @@ describe('RegisterForm', () => {
     await userEvent.click(screen.getByRole('button', { name: /create account/i }));
     await waitFor(() => {
       const alerts = screen.getAllByRole('alert');
-      expect(alerts.some((el) => /uppercase letter/i.test(el.textContent ?? ''))).toBe(true);
+      expect(alerts.some((el) => /uppercase letter/i.test(el.textContent))).toBe(true);
     });
   });
 
@@ -64,7 +64,7 @@ describe('RegisterForm', () => {
     await userEvent.click(screen.getByRole('button', { name: /create account/i }));
     await waitFor(() => {
       const alerts = screen.getAllByRole('alert');
-      expect(alerts.some((el) => /at least one number/i.test(el.textContent ?? ''))).toBe(true);
+      expect(alerts.some((el) => /at least one number/i.test(el.textContent))).toBe(true);
     });
   });
 

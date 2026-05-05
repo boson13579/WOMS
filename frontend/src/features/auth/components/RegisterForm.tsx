@@ -119,17 +119,11 @@ export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps):
           autoComplete="new-password"
           placeholder="••••••••"
           aria-invalid={errors.confirmPassword !== undefined}
-          aria-describedby={
-            errors.confirmPassword ? 'register-confirm-password-error' : undefined
-          }
+          aria-describedby={errors.confirmPassword ? 'register-confirm-password-error' : undefined}
           {...register('confirmPassword')}
         />
         {errors.confirmPassword ? (
-          <p
-            id="register-confirm-password-error"
-            className="text-xs text-destructive"
-            role="alert"
-          >
+          <p id="register-confirm-password-error" className="text-xs text-destructive" role="alert">
             {errors.confirmPassword.message}
           </p>
         ) : null}

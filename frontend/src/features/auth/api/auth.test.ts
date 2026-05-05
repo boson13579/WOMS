@@ -11,7 +11,7 @@ import {
   loginResponseSchema,
   registerRequestSchema,
   registerResponseSchema,
-} from '../api/auth';
+} from './auth';
 
 describe('loginRequestSchema', () => {
   it('accepts valid credentials', () => {

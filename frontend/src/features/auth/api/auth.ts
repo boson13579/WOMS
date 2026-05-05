@@ -80,12 +80,12 @@ export async function login(payload: LoginRequest): Promise<LoginResponse> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  
+
   if (!res.ok) {
-    const errorData = await res.json().catch(() => null);
-    throw new Error(errorData?.detail || 'Login failed');
+    const errorData = (await res.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(errorData?.detail ?? 'Login failed');
   }
-  
+
   return loginResponseSchema.parse(await res.json());
 }
 
@@ -103,13 +103,13 @@ export async function register(payload: RegisterRequest): Promise<RegisterRespon
       email: payload.email,
       password: payload.password,
       // Default to viewer role per backend schema if not provided
-      role: 'viewer'
+      role: 'viewer',
     }),
   });
 
   if (!res.ok) {
-    const errorData = await res.json().catch(() => null);
-    throw new Error(errorData?.detail || 'Registration failed');
+    const errorData = (await res.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(errorData?.detail ?? 'Registration failed');
   }
 
   return registerResponseSchema.parse(await res.json());

@@ -8,7 +8,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
-import { LoginForm } from '../components/LoginForm';
+import { LoginForm } from './LoginForm';
 
 function renderWithClient(ui: React.ReactElement) {
   const client = new QueryClient({
