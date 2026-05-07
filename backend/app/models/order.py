@@ -93,7 +93,7 @@ class Order(Base):
         nullable=True,
     )
 
-    # --- Locking fields (Task 3) ---
+    # --- Locking fields ---
     is_locked: Mapped[bool] = mapped_column(
         sa.Boolean,
         nullable=False,

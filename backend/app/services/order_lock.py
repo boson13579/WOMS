@@ -118,15 +118,15 @@ def unlock_order(
         locked_by=None,
         locked_at=None,
     )
-    old_val2: dict[str, Any] = {"is_locked": True}
-    new_val2: dict[str, Any] = {"is_locked": False}
+    old_val: dict[str, Any] = {"is_locked": True}
+    new_val: dict[str, Any] = {"is_locked": False}
     _write_lock_audit(
         db,
         action="order.unlocked",
         actor=actor,
         order_id=order.id,
-        old_value=old_val2,
-        new_value=new_val2,
+        old_value=old_val,
+        new_value=new_val,
     )
     db.commit()
     db.refresh(order)
@@ -135,7 +135,7 @@ def unlock_order(
         actor_id=str(actor.id),
         resource_type="order",
         resource_id=str(order.id),
-        changes={"old": old_val2, "new": new_val2},
+        changes={"old": old_val, "new": new_val},
     )
     logger.info("order.unlocked", order_id=str(order.id), actor_id=str(actor.id))
     return LockResponse.model_validate(order)
@@ -154,15 +154,15 @@ def set_soft_pin(
 
     old_date = order.soft_pin_date
     order = order_repo.update_soft_pin(db, order, soft_pin_date=preferred_date)
-    old_val3: dict[str, Any] = {"soft_pin_date": str(old_date) if old_date else None}
-    new_val3: dict[str, Any] = {"soft_pin_date": str(preferred_date)}
+    old_val: dict[str, Any] = {"soft_pin_date": str(old_date) if old_date else None}
+    new_val: dict[str, Any] = {"soft_pin_date": str(preferred_date)}
     _write_lock_audit(
         db,
         action="order.soft_pinned",
         actor=actor,
         order_id=order.id,
-        old_value=old_val3,
-        new_value=new_val3,
+        old_value=old_val,
+        new_value=new_val,
     )
     db.commit()
     db.refresh(order)
@@ -171,7 +171,7 @@ def set_soft_pin(
         actor_id=str(actor.id),
         resource_type="order",
         resource_id=str(order.id),
-        changes={"old": old_val3, "new": new_val3},
+        changes={"old": old_val, "new": new_val},
     )
     logger.info("order.soft_pinned", order_id=str(order.id), actor_id=str(actor.id))
     return SoftPinResponse.model_validate(order)
@@ -192,15 +192,15 @@ def clear_soft_pin(
 
     old_date = order.soft_pin_date
     order = order_repo.update_soft_pin(db, order, soft_pin_date=None)
-    old_val4: dict[str, Any] = {"soft_pin_date": str(old_date)}
-    new_val4: dict[str, Any] = {"soft_pin_date": None}
+    old_val: dict[str, Any] = {"soft_pin_date": str(old_date)}
+    new_val: dict[str, Any] = {"soft_pin_date": None}
     _write_lock_audit(
         db,
         action="order.soft_pin_cleared",
         actor=actor,
         order_id=order.id,
-        old_value=old_val4,
-        new_value=new_val4,
+        old_value=old_val,
+        new_value=new_val,
     )
     db.commit()
     db.refresh(order)
@@ -209,7 +209,7 @@ def clear_soft_pin(
         actor_id=str(actor.id),
         resource_type="order",
         resource_id=str(order.id),
-        changes={"old": old_val4, "new": new_val4},
+        changes={"old": old_val, "new": new_val},
     )
     logger.info("order.soft_pin_cleared", order_id=str(order.id), actor_id=str(actor.id))
     return SoftPinResponse.model_validate(order)

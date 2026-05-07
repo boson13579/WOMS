@@ -83,7 +83,7 @@ class OrderResponse(BaseModel):
     version_id: int
     created_at: datetime
     updated_at: datetime
-    # Lock fields (Task 3)
+    # Lock fields
     is_locked: bool
     locked_by: uuid.UUID | None
     locked_at: datetime | None
