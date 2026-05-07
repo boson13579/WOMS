@@ -55,6 +55,8 @@ def get_many(
     if assigned_to is not None:
         base = base.where(Order.assigned_to == assigned_to)
     if search:
+        search = search.strip()
+    if search:
         pattern = f"%{search}%"
         base = base.where(
             or_(

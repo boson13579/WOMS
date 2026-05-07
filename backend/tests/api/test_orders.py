@@ -688,3 +688,40 @@ def test_list_orders_search_combined_with_status_filter(
     assert "ORD-MATCH-PENDING" in order_numbers
     assert "ORD-MATCH-COMPLETED" not in order_numbers
     assert "ORD-OTHER-PENDING" not in order_numbers
+
+
+def test_list_orders_search_and_status_combined(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="mgr_search_combo", role=UserRole.order_manager)
+    token = _login(client, "mgr_search_combo")
+    # Matches search but wrong status — excluded
+    _make_order(
+        db_session,
+        created_by=user.id,
+        customer_name="Target Corp",
+        status=OrderStatus.completed,
+    )
+    # Matches both search and status — included
+    _make_order(
+        db_session,
+        created_by=user.id,
+        customer_name="Target Corp",
+        status=OrderStatus.pending,
+    )
+    # Wrong customer, right status — excluded
+    _make_order(
+        db_session,
+        created_by=user.id,
+        customer_name="Other Inc",
+        status=OrderStatus.pending,
+    )
+
+    res = client.get(
+        "/api/v1/orders?search=Target&status=pending",
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 1
+    assert body["items"][0]["customer_name"] == "Target Corp"
+    assert body["items"][0]["status"] == "pending"
