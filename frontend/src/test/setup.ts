@@ -14,6 +14,16 @@ import * as React from 'react';
 import type * as recharts from 'recharts';
 import { vi } from 'vitest';
 
+// jsdom does not implement HTMLDialogElement.showModal / close.
+// Polyfill so any component using native <dialog> can be tested.
+HTMLDialogElement.prototype.showModal = vi.fn(function (this: HTMLDialogElement) {
+  this.setAttribute('open', '');
+});
+HTMLDialogElement.prototype.close = vi.fn(function (this: HTMLDialogElement) {
+  this.removeAttribute('open');
+  this.dispatchEvent(new Event('close'));
+});
+
 vi.mock('recharts', async (importOriginal) => {
   const actual = await importOriginal<typeof recharts>();
   return {
