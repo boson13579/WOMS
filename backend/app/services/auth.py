@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.logger import audit_log
 from app.core.security import create_access_token, hash_password, verify_password
+from app.models.user import UserRole
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import user as user_repo
 from app.schemas.user import LoginRequest, LoginResponse, RegisterRequest, UserResponse
@@ -54,11 +55,9 @@ def register(db: Session, request: RegisterRequest) -> UserResponse:
         db,
         username=request.username,
         password_hash=hash_password(request.password),
-        role=request.role,
+        role=UserRole.viewer,
         email=request.email,
     )
-    db.commit()
-
     audit_log_repo.create(
         db,
         action="user.created",
@@ -68,6 +67,8 @@ def register(db: Session, request: RegisterRequest) -> UserResponse:
         old_value=None,
         new_value={"username": new_user.username, "role": new_user.role.value},
     )
+    db.commit()
+
     audit_log(
         action="user.created",
         actor_id=str(new_user.id),

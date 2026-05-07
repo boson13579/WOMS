@@ -105,6 +105,21 @@ def update_user(
             role=request.role,
             is_active=request.is_active,
         )
+        new_val = {
+            "username": user.username,
+            "email": user.email,
+            "role": user.role.value,
+            "is_active": user.is_active,
+        }
+        audit_log_repo.create(
+            db,
+            action="user.updated",
+            user_id=actor.id,
+            resource_type="user",
+            resource_id=user.id,
+            old_value=old_val,
+            new_value=new_val,
+        )
         db.commit()
     except StaleDataError as exc:
         db.rollback()
@@ -113,22 +128,6 @@ def update_user(
             detail="User was modified by another request. Refresh and try again.",
         ) from exc
 
-    new_val = {
-        "username": user.username,
-        "email": user.email,
-        "role": user.role.value,
-        "is_active": user.is_active,
-    }
-
-    audit_log_repo.create(
-        db,
-        action="user.updated",
-        user_id=actor.id,
-        resource_type="user",
-        resource_id=user.id,
-        old_value=old_val,
-        new_value=new_val,
-    )
     audit_log(
         action="user.updated",
         actor_id=str(actor.id),
@@ -153,6 +152,15 @@ def deactivate_user(db: Session, user_id: uuid.UUID, actor: User) -> UserRespons
 
     try:
         user_repo.deactivate(db, user)
+        audit_log_repo.create(
+            db,
+            action="user.deactivated",
+            user_id=actor.id,
+            resource_type="user",
+            resource_id=user.id,
+            old_value={"is_active": True},
+            new_value={"is_active": False},
+        )
         db.commit()
     except StaleDataError:
         db.rollback()
@@ -161,15 +169,6 @@ def deactivate_user(db: Session, user_id: uuid.UUID, actor: User) -> UserRespons
             detail="User was modified concurrently. Please retry.",
         ) from None
 
-    audit_log_repo.create(
-        db,
-        action="user.deactivated",
-        user_id=actor.id,
-        resource_type="user",
-        resource_id=user.id,
-        old_value={"is_active": True},
-        new_value={"is_active": False},
-    )
     audit_log(
         action="user.deactivated",
         actor_id=str(actor.id),
