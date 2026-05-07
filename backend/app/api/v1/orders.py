@@ -59,6 +59,7 @@ def list_orders(
     current_user: User = Depends(_READ_ROLES),
     status_filter: Annotated[list[OrderStatus] | None, Query(alias="status")] = None,
     assigned_to: uuid.UUID | None = None,
+    search: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> OrderListResponse:
@@ -70,6 +71,7 @@ def list_orders(
         db,
         status=status_filter,
         assigned_to=assigned_to,
+        search=search,
         page=page,
         page_size=page_size,
     )

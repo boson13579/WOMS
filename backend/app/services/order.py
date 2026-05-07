@@ -128,12 +128,13 @@ def list_orders(
     *,
     status: list[OrderStatus] | None = None,
     assigned_to: uuid.UUID | None = None,
+    search: str | None = None,
     page: int = 1,
     page_size: int = 20,
 ) -> OrderListResponse:
     """Return a paginated list of active orders with optional filters."""
     items, total = order_repo.get_many(
-        db, status=status, assigned_to=assigned_to, page=page, page_size=page_size
+        db, status=status, assigned_to=assigned_to, search=search, page=page, page_size=page_size
     )
     return OrderListResponse(
         items=[OrderResponse.model_validate(o) for o in items],

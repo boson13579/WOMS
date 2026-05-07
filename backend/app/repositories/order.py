@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.order import Order, OrderStatus
@@ -43,6 +43,7 @@ def get_many(
     *,
     status: list[OrderStatus] | None = None,
     assigned_to: uuid.UUID | None = None,
+    search: str | None = None,
     page: int = 1,
     page_size: int = 20,
 ) -> tuple[list[Order], int]:
@@ -53,6 +54,14 @@ def get_many(
         base = base.where(Order.status.in_(status))
     if assigned_to is not None:
         base = base.where(Order.assigned_to == assigned_to)
+    if search:
+        pattern = f"%{search}%"
+        base = base.where(
+            or_(
+                Order.order_number.ilike(pattern),
+                Order.customer_name.ilike(pattern),
+            )
+        )
 
     count_stmt = select(func.count()).select_from(base.subquery())
     total: int = db.scalars(count_stmt).one()

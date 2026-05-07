@@ -617,3 +617,38 @@ def test_get_audit_log_after_cancel_still_returns_logs(
     actions = [log["action"] for log in logs]
     assert "order.created" in actions
     assert "order.cancelled" in actions
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+
+def test_list_orders_search_by_order_number(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="mgr_search_num", role=UserRole.order_manager)
+    token = _login(client, "mgr_search_num")
+    _make_order(db_session, created_by=user.id, order_number="ORD-MATCH-0001")
+    _make_order(db_session, created_by=user.id, order_number="ORD-OTHER-0002")
+
+    res = client.get("/api/v1/orders?search=MATCH", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    order_numbers = [o["order_number"] for o in body["items"]]
+    assert "ORD-MATCH-0001" in order_numbers
+    assert "ORD-OTHER-0002" not in order_numbers
+
+
+def test_list_orders_search_by_customer_name(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="mgr_search_cust", role=UserRole.order_manager)
+    token = _login(client, "mgr_search_cust")
+    _make_order(db_session, created_by=user.id, customer_name="Searchable Corp")
+    _make_order(db_session, created_by=user.id, customer_name="Other Company")
+
+    res = client.get("/api/v1/orders?search=Searchable", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    customer_names = [o["customer_name"] for o in body["items"]]
+    assert "Searchable Corp" in customer_names
+    assert "Other Company" not in customer_names
