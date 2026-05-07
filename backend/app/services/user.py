@@ -96,16 +96,15 @@ def update_user(
         "is_active": user.is_active,
     }
 
-    user_repo.update(
-        db,
-        user,
-        username=request.username,
-        email=request.email,
-        role=request.role,
-        is_active=request.is_active,
-    )
-
     try:
+        user_repo.update(
+            db,
+            user,
+            username=request.username,
+            email=request.email,
+            role=request.role,
+            is_active=request.is_active,
+        )
         db.commit()
     except StaleDataError as exc:
         db.rollback()
