@@ -79,7 +79,7 @@ class UserResponse(BaseModel):
 
 
 class UserListResponse(BaseModel):
-    """Paginated list of users."""
+    """List of users with the total number of matching records."""
 
     users: list[UserResponse]
     total: int
