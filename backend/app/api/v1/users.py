@@ -32,9 +32,7 @@ def list_users(
         401: missing or invalid bearer token.
         403: authenticated user does not have the root role.
     """
-    if search:
-        return user_service.search_users(db, search)
-    return user_service.list_users(db)
+    return user_service.list_users(db, search=search)
 
 
 @router.get("/{user_id}", response_model=UserResponse)

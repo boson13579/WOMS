@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -82,7 +81,6 @@ def update(
     email: str | None = None,
     role: UserRole | None = None,
     is_active: bool | None = None,
-    **_extra: Any,
 ) -> User:
     """Apply partial updates to *user* and flush.  Caller must commit."""
     if username is not None:

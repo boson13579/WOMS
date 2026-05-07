@@ -147,6 +147,16 @@ def test_register_invalid_role_returns_422(client: TestClient) -> None:
     assert res.json()["error"]["code"] == 422
 
 
+def test_register_with_root_role_is_forced_to_viewer(client: TestClient) -> None:
+    res = client.post(
+        "/api/v1/auth/register",
+        json={"username": "tricky", "password": "password1", "role": "root"},
+    )
+
+    assert res.status_code == 201
+    assert res.json()["role"] == "viewer"
+
+
 # ---------------------------------------------------------------------------
 # Me tests
 # ---------------------------------------------------------------------------

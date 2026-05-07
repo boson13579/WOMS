@@ -36,17 +36,8 @@ def _guard_last_root(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_LAST_ROOT_MSG)
 
 
-def list_users(db: Session) -> UserListResponse:
-    """Return all non-deleted users."""
-    users = user_repo.list_users(db)
-    return UserListResponse(
-        users=[UserResponse.model_validate(u) for u in users],
-        total=len(users),
-    )
-
-
-def search_users(db: Session, search: str) -> UserListResponse:
-    """Return users whose username or email matches *search*."""
+def list_users(db: Session, search: str | None = None) -> UserListResponse:
+    """Return all non-deleted users, optionally filtered by *search*."""
     users = user_repo.list_users(db, search=search)
     return UserListResponse(
         users=[UserResponse.model_validate(u) for u in users],
@@ -95,6 +86,7 @@ def update_user(
         "role": user.role.value,
         "is_active": user.is_active,
     }
+    new_val: dict[str, object] = {}
 
     try:
         user_repo.update(
@@ -162,12 +154,12 @@ def deactivate_user(db: Session, user_id: uuid.UUID, actor: User) -> UserRespons
             new_value={"is_active": False},
         )
         db.commit()
-    except StaleDataError:
+    except StaleDataError as exc:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User was modified concurrently. Please retry.",
-        ) from None
+        ) from exc
 
     audit_log(
         action="user.deactivated",
