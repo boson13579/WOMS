@@ -652,3 +652,39 @@ def test_list_orders_search_by_customer_name(client: TestClient, db_session: Ses
     customer_names = [o["customer_name"] for o in body["items"]]
     assert "Searchable Corp" in customer_names
     assert "Other Company" not in customer_names
+
+
+def test_list_orders_search_combined_with_status_filter(
+    client: TestClient, db_session: Session
+) -> None:
+    user = _make_user(
+        db_session, username="mgr_search_status", role=UserRole.order_manager
+    )
+    token = _login(client, "mgr_search_status")
+    _make_order(
+        db_session,
+        created_by=user.id,
+        order_number="ORD-MATCH-PENDING",
+        status=OrderStatus.pending,
+    )
+    _make_order(
+        db_session,
+        created_by=user.id,
+        order_number="ORD-MATCH-COMPLETED",
+        status=OrderStatus.completed,
+    )
+    _make_order(
+        db_session,
+        created_by=user.id,
+        order_number="ORD-OTHER-PENDING",
+        status=OrderStatus.pending,
+    )
+
+    res = client.get("/api/v1/orders?status=pending&search=MATCH", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    order_numbers = [o["order_number"] for o in body["items"]]
+    assert "ORD-MATCH-PENDING" in order_numbers
+    assert "ORD-MATCH-COMPLETED" not in order_numbers
+    assert "ORD-OTHER-PENDING" not in order_numbers
