@@ -657,9 +657,7 @@ def test_list_orders_search_by_customer_name(client: TestClient, db_session: Ses
 def test_list_orders_search_combined_with_status_filter(
     client: TestClient, db_session: Session
 ) -> None:
-    user = _make_user(
-        db_session, username="mgr_search_status", role=UserRole.order_manager
-    )
+    user = _make_user(db_session, username="mgr_search_status", role=UserRole.order_manager)
     token = _login(client, "mgr_search_status")
     _make_order(
         db_session,
