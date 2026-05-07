@@ -654,7 +654,7 @@ def test_list_orders_search_by_customer_name(client: TestClient, db_session: Ses
     assert "Other Company" not in customer_names
 
 
-def test_list_orders_search_combined_with_status_filter(
+def test_list_orders_search_by_order_number_and_status(
     client: TestClient, db_session: Session
 ) -> None:
     user = _make_user(db_session, username="mgr_search_status", role=UserRole.order_manager)
@@ -682,13 +682,16 @@ def test_list_orders_search_combined_with_status_filter(
 
     assert res.status_code == 200
     body = res.json()
+    assert body["total"] == 1
     order_numbers = [o["order_number"] for o in body["items"]]
     assert "ORD-MATCH-PENDING" in order_numbers
     assert "ORD-MATCH-COMPLETED" not in order_numbers
     assert "ORD-OTHER-PENDING" not in order_numbers
 
 
-def test_list_orders_search_and_status_combined(client: TestClient, db_session: Session) -> None:
+def test_list_orders_search_by_customer_name_and_status(
+    client: TestClient, db_session: Session
+) -> None:
     user = _make_user(db_session, username="mgr_search_combo", role=UserRole.order_manager)
     token = _login(client, "mgr_search_combo")
     # Matches search but wrong status — excluded

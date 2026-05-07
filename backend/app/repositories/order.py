@@ -55,15 +55,16 @@ def get_many(
     if assigned_to is not None:
         base = base.where(Order.assigned_to == assigned_to)
     if search:
-        search = search.strip()
-    if search:
-        pattern = f"%{search}%"
-        base = base.where(
-            or_(
-                Order.order_number.ilike(pattern),
-                Order.customer_name.ilike(pattern),
+        trimmed = search.strip()
+        if trimmed:
+            escaped = trimmed.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            base = base.where(
+                or_(
+                    Order.order_number.ilike(pattern, escape="\\"),
+                    Order.customer_name.ilike(pattern, escape="\\"),
+                )
             )
-        )
 
     count_stmt = select(func.count()).select_from(base.subquery())
     total: int = db.scalars(count_stmt).one()
