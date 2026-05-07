@@ -26,6 +26,8 @@ def _guard_last_root(
     """Raise 409 if the operation would leave no active root user."""
     if user.role != UserRole.root:
         return
+    if not user.is_active:
+        return
     will_demote = new_role is not None and new_role != UserRole.root
     will_deactivate = new_is_active is False
     if not will_demote and not will_deactivate:
