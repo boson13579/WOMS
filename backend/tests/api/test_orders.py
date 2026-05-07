@@ -407,6 +407,10 @@ def test_delete_order_sets_cancelled_and_soft_deleted(
     assert order.is_deleted is True
     assert order.status == OrderStatus.cancelled
 
+    # Soft-deleted order is invisible via the normal GET endpoint
+    get_res = client.get(f"/api/v1/orders/{order.id}", headers=_auth(token))
+    assert get_res.status_code == 404
+
 
 def test_delete_nonexistent_order_returns_404(client: TestClient, db_session: Session) -> None:
     _make_user(db_session, username="sched_del_404", role=UserRole.scheduler)

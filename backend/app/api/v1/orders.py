@@ -41,10 +41,12 @@ _READ_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole
 # Roles allowed to write orders (scheduler and above)
 _WRITE_ROLES = require_roles(UserRole.scheduler, UserRole.root)
 
-_SCHEDULING_LOCKED_ERROR = HTTPException(
-    status_code=423,
-    detail="Scheduling is in progress. Please try again later.",
-)
+
+def _scheduling_locked() -> HTTPException:
+    return HTTPException(
+        status_code=423,
+        detail="Scheduling is in progress. Please try again later.",
+    )
 
 
 @router.post("", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
@@ -143,7 +145,7 @@ async def update_order(
         423: scheduling engine is running — retry later.
     """
     if await is_scheduling_locked(redis):
-        raise _SCHEDULING_LOCKED_ERROR
+        raise _scheduling_locked()
     return order_service.update_order(db, order_id, request, current_user)
 
 
@@ -165,7 +167,7 @@ async def delete_order(
         423: scheduling engine is running — retry later.
     """
     if await is_scheduling_locked(redis):
-        raise _SCHEDULING_LOCKED_ERROR
+        raise _scheduling_locked()
     return order_service.delete_order(db, order_id, current_user)
 
 
@@ -203,7 +205,7 @@ async def lock_order(
         423: scheduling engine is running — retry later.
     """
     if await is_scheduling_locked(redis):
-        raise _SCHEDULING_LOCKED_ERROR
+        raise _scheduling_locked()
     return order_lock_service.lock_order(db, order_id, current_user)
 
 
@@ -224,7 +226,7 @@ async def unlock_order(
         404: order not found.
     """
     if await is_scheduling_locked(redis):
-        raise _SCHEDULING_LOCKED_ERROR
+        raise _scheduling_locked()
     return order_lock_service.unlock_order(db, order_id, current_user)
 
 
@@ -247,7 +249,7 @@ async def set_soft_pin(
         404: order not found.
     """
     if await is_scheduling_locked(redis):
-        raise _SCHEDULING_LOCKED_ERROR
+        raise _scheduling_locked()
     return order_lock_service.set_soft_pin(db, order_id, request.preferred_date, current_user)
 
 
@@ -266,5 +268,5 @@ async def clear_soft_pin(
         404: order not found.
     """
     if await is_scheduling_locked(redis):
-        raise _SCHEDULING_LOCKED_ERROR
+        raise _scheduling_locked()
     return order_lock_service.clear_soft_pin(db, order_id, current_user)

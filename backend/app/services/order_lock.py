@@ -37,7 +37,7 @@ def _write_lock_audit(
     old_value: dict[str, Any],
     new_value: dict[str, Any],
 ) -> None:
-    """Persist an audit row and emit an ECS stdout record for lock events."""
+    """Persist an audit row to DB. Must be called within the open transaction (before commit)."""
     audit_log_repo.create(
         db,
         action=action,
@@ -46,13 +46,6 @@ def _write_lock_audit(
         resource_id=order_id,
         old_value=old_value,
         new_value=new_value,
-    )
-    emit_audit_log(
-        action=action,
-        actor_id=str(actor.id),
-        resource_type="order",
-        resource_id=str(order_id),
-        changes={"old": old_value, "new": new_value},
     )
 
 
@@ -79,17 +72,25 @@ def lock_order(
         locked_by=actor.id,
         locked_at=datetime.now(UTC),
     )
+    old_val: dict[str, Any] = {"is_locked": False}
+    new_val: dict[str, Any] = {"is_locked": True, "locked_by": str(actor.id)}
     _write_lock_audit(
         db,
         action="order.locked",
         actor=actor,
         order_id=order.id,
-        old_value={"is_locked": False},
-        new_value={"is_locked": True, "locked_by": str(actor.id)},
+        old_value=old_val,
+        new_value=new_val,
     )
     db.commit()
     db.refresh(order)
-
+    emit_audit_log(
+        action="order.locked",
+        actor_id=str(actor.id),
+        resource_type="order",
+        resource_id=str(order.id),
+        changes={"old": old_val, "new": new_val},
+    )
     logger.info("order.locked", order_id=str(order.id), actor_id=str(actor.id))
     return LockResponse.model_validate(order)
 
@@ -117,17 +118,25 @@ def unlock_order(
         locked_by=None,
         locked_at=None,
     )
+    old_val2: dict[str, Any] = {"is_locked": True}
+    new_val2: dict[str, Any] = {"is_locked": False}
     _write_lock_audit(
         db,
         action="order.unlocked",
         actor=actor,
         order_id=order.id,
-        old_value={"is_locked": True},
-        new_value={"is_locked": False},
+        old_value=old_val2,
+        new_value=new_val2,
     )
     db.commit()
     db.refresh(order)
-
+    emit_audit_log(
+        action="order.unlocked",
+        actor_id=str(actor.id),
+        resource_type="order",
+        resource_id=str(order.id),
+        changes={"old": old_val2, "new": new_val2},
+    )
     logger.info("order.unlocked", order_id=str(order.id), actor_id=str(actor.id))
     return LockResponse.model_validate(order)
 
@@ -145,17 +154,25 @@ def set_soft_pin(
 
     old_date = order.soft_pin_date
     order = order_repo.update_soft_pin(db, order, soft_pin_date=preferred_date)
+    old_val3: dict[str, Any] = {"soft_pin_date": str(old_date) if old_date else None}
+    new_val3: dict[str, Any] = {"soft_pin_date": str(preferred_date)}
     _write_lock_audit(
         db,
         action="order.soft_pinned",
         actor=actor,
         order_id=order.id,
-        old_value={"soft_pin_date": str(old_date) if old_date else None},
-        new_value={"soft_pin_date": str(preferred_date)},
+        old_value=old_val3,
+        new_value=new_val3,
     )
     db.commit()
     db.refresh(order)
-
+    emit_audit_log(
+        action="order.soft_pinned",
+        actor_id=str(actor.id),
+        resource_type="order",
+        resource_id=str(order.id),
+        changes={"old": old_val3, "new": new_val3},
+    )
     logger.info("order.soft_pinned", order_id=str(order.id), actor_id=str(actor.id))
     return SoftPinResponse.model_validate(order)
 
@@ -170,18 +187,29 @@ def clear_soft_pin(
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
+    if order.soft_pin_date is None:
+        return SoftPinResponse.model_validate(order)
+
     old_date = order.soft_pin_date
     order = order_repo.update_soft_pin(db, order, soft_pin_date=None)
+    old_val4: dict[str, Any] = {"soft_pin_date": str(old_date)}
+    new_val4: dict[str, Any] = {"soft_pin_date": None}
     _write_lock_audit(
         db,
         action="order.soft_pin_cleared",
         actor=actor,
         order_id=order.id,
-        old_value={"soft_pin_date": str(old_date) if old_date else None},
-        new_value={"soft_pin_date": None},
+        old_value=old_val4,
+        new_value=new_val4,
     )
     db.commit()
     db.refresh(order)
-
+    emit_audit_log(
+        action="order.soft_pin_cleared",
+        actor_id=str(actor.id),
+        resource_type="order",
+        resource_id=str(order.id),
+        changes={"old": old_val4, "new": new_val4},
+    )
     logger.info("order.soft_pin_cleared", order_id=str(order.id), actor_id=str(actor.id))
     return SoftPinResponse.model_validate(order)
