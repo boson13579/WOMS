@@ -108,6 +108,7 @@ def update_user(
     try:
         db.commit()
     except StaleDataError as exc:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User was modified by another request. Refresh and try again.",
