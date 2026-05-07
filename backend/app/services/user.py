@@ -151,8 +151,15 @@ def deactivate_user(db: Session, user_id: uuid.UUID, actor: User) -> UserRespons
 
     _guard_last_root(db, user, None, False)
 
-    user_repo.deactivate(db, user)
-    db.commit()
+    try:
+        user_repo.deactivate(db, user)
+        db.commit()
+    except StaleDataError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User was modified concurrently. Please retry.",
+        ) from None
 
     audit_log_repo.create(
         db,
