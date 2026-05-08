@@ -1,0 +1,560 @@
+"""Tests for the ``/api/v1/schedule/*`` HTTP router.
+
+Uses the project's `client` fixture (real Postgres via testcontainers) for
+auth + DB, but mocks Redis and the Celery ``.delay()`` so no broker is
+needed.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import date, timedelta
+from unittest.mock import MagicMock
+
+import bcrypt
+from app.models.order import Order, OrderStatus
+from app.models.user import User, UserRole
+from app.services.scheduling import SchedulerState, SchedulingOrder
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+# ---------------------------------------------------------------------------
+# Helpers (module-level per CLAUDE.md test convention)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRedis:
+    """Minimal in-memory stand-in for the keys the router touches.
+
+    The router writes pending ops to a sorted set (``ZADD`` keyed by
+    ``score_for_op``) and reads ``schedule:state`` / ``schedule:status``
+    via plain string ops.
+    """
+
+    def __init__(self) -> None:
+        self._strings: dict[str, str] = {}
+        self._zsets: dict[str, list[tuple[float, str]]] = {}
+
+    # ----- String ops --------------------------------------------------------
+    def get(self, key: str) -> str | None:
+        return self._strings.get(key)
+
+    def set(self, key: str, value: str, ex: int | None = None) -> None:
+        # ``ex`` (TTL) accepted for API compat; tests don't actually expire.
+        self._strings[key] = value
+
+    def incr(self, key: str) -> int:
+        cur = int(self._strings.get(key, "0")) + 1
+        self._strings[key] = str(cur)
+        return cur
+
+    def delete(self, *keys: str) -> int:
+        n = 0
+        for key in keys:
+            if self._strings.pop(key, None) is not None:
+                n += 1
+            if self._zsets.pop(key, None) is not None:
+                n += 1
+        return n
+
+    # ----- Sorted-set ops ----------------------------------------------------
+    def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        bucket = self._zsets.setdefault(key, [])
+        added = 0
+        for member, score in mapping.items():
+            existing = next((i for i, (_, m) in enumerate(bucket) if m == member), None)
+            if existing is not None:
+                bucket.pop(existing)
+            else:
+                added += 1
+            insert_at = next(
+                (i for i, (s, m) in enumerate(bucket) if (s, m) > (score, member)),
+                len(bucket),
+            )
+            bucket.insert(insert_at, (score, member))
+        return added
+
+    def zcard(self, key: str) -> int:
+        return len(self._zsets.get(key, []))
+
+
+def _make_user(
+    db: Session,
+    *,
+    username: str,
+    password: str = "password123",
+    role: UserRole = UserRole.viewer,
+) -> User:
+    user = User(
+        username=username,
+        password_hash=bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
+        role=role,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _login(client: TestClient, username: str, password: str = "password123") -> str:
+    res = client.post(
+        "/api/v1/auth/login",
+        json={"username": username, "password": password},
+    )
+    assert res.status_code == 200
+    return res.json()["access_token"]
+
+
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _make_order(
+    db: Session,
+    *,
+    created_by: uuid.UUID,
+    status: OrderStatus = OrderStatus.pending,
+    scheduled_production_date: date | None = None,
+    expected_delivery_date: date | None = None,
+    customer_name: str = "Test Customer",
+    wafer_quantity: int = 100,
+    requested_delivery_date: date = date(2026, 8, 1),
+) -> Order:
+    order = Order(
+        order_number=f"ORD-TEST-{uuid.uuid4().hex[:6].upper()}",
+        customer_name=customer_name,
+        wafer_quantity=wafer_quantity,
+        requested_delivery_date=requested_delivery_date,
+        scheduled_production_date=scheduled_production_date,
+        expected_delivery_date=expected_delivery_date,
+        status=status,
+        created_by=created_by,
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def _patch_redis_and_delay(monkeypatch, fake_redis: _FakeRedis) -> MagicMock:
+    """Swap the API module's Redis and Celery .delay; return the delay mock."""
+    monkeypatch.setattr("app.api.v1.schedule._redis", lambda: fake_redis)
+    delay_mock = MagicMock(return_value=MagicMock(id="task-mock"))
+    monkeypatch.setattr("app.api.v1.schedule.run_scheduling_task.delay", delay_mock)
+    return delay_mock
+
+
+_VALID_OP_PAYLOAD = {
+    "op": "add",
+    "order_id": str(uuid.uuid4()),
+    "order_number": "ORD-OP-PAYLOAD",
+    "wafer_quantity": 100,
+    "deadline": "2026-08-01",
+    "requested_by": str(uuid.uuid4()),
+}
+
+
+# ---------------------------------------------------------------------------
+# POST /trigger
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_success_returns_202(client: TestClient, db_session: Session, monkeypatch) -> None:
+    fake_redis = _FakeRedis()
+    delay_mock = _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="sched_trig_ok", role=UserRole.scheduler)
+    token = _login(client, "sched_trig_ok")
+
+    res = client.post("/api/v1/schedule/trigger", headers=_auth(token))
+
+    assert res.status_code == 202
+    body = res.json()
+    assert body["task_id"] == "task-mock"
+    assert body["message"] == "Scheduling started"
+    assert delay_mock.called
+
+
+def test_trigger_returns_409_when_already_running(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    fake_redis.set("schedule:status", json.dumps({"state": "running"}))
+    delay_mock = _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="sched_trig_dup", role=UserRole.scheduler)
+    token = _login(client, "sched_trig_dup")
+
+    res = client.post("/api/v1/schedule/trigger", headers=_auth(token))
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+    assert not delay_mock.called
+
+
+def test_trigger_by_viewer_returns_403(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="viewer_trig", role=UserRole.viewer)
+    token = _login(client, "viewer_trig")
+
+    res = client.post("/api/v1/schedule/trigger", headers=_auth(token))
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_trigger_without_token_returns_401(client: TestClient) -> None:
+    res = client.post("/api/v1/schedule/trigger")
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /operations
+# ---------------------------------------------------------------------------
+
+
+def test_operations_enqueues_and_triggers_when_idle(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    delay_mock = _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="sched_op_idle", role=UserRole.scheduler)
+    token = _login(client, "sched_op_idle")
+
+    res = client.post(
+        "/api/v1/schedule/operations",
+        headers=_auth(token),
+        json=_VALID_OP_PAYLOAD,
+    )
+
+    assert res.status_code == 202
+    assert res.json()["message"] == "Operation queued"
+    # Op was pushed onto the pending queue.
+    assert fake_redis.zcard("schedule:pending_ops") == 1
+    # And a run was kicked off.
+    assert delay_mock.called
+
+
+def test_operations_skips_trigger_while_running(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    fake_redis.set("schedule:status", json.dumps({"state": "running"}))
+    delay_mock = _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="sched_op_run", role=UserRole.scheduler)
+    token = _login(client, "sched_op_run")
+
+    res = client.post(
+        "/api/v1/schedule/operations",
+        headers=_auth(token),
+        json=_VALID_OP_PAYLOAD,
+    )
+
+    assert res.status_code == 202
+    # Op enqueued — the in-flight task picks it up at the end of its cycle.
+    assert fake_redis.zcard("schedule:pending_ops") == 1
+    # No fresh trigger.
+    assert not delay_mock.called
+
+
+def test_operations_by_viewer_returns_403(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="viewer_ops", role=UserRole.viewer)
+    token = _login(client, "viewer_ops")
+
+    res = client.post(
+        "/api/v1/schedule/operations",
+        headers=_auth(token),
+        json=_VALID_OP_PAYLOAD,
+    )
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_operations_without_token_returns_401(client: TestClient) -> None:
+    res = client.post("/api/v1/schedule/operations", json=_VALID_OP_PAYLOAD)
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /status
+# ---------------------------------------------------------------------------
+
+
+def test_status_returns_redis_doc_when_present(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    fake_redis.set(
+        "schedule:status",
+        json.dumps(
+            {
+                "state": "running",
+                "started_at": "2026-05-05T00:00:00+00:00",
+                "finished_at": None,
+                "task_id": "task-running",
+                "error": None,
+            }
+        ),
+    )
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="mgr_status_data", role=UserRole.order_manager)
+    token = _login(client, "mgr_status_data")
+
+    res = client.get("/api/v1/schedule/status", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["state"] == "running"
+    assert body["task_id"] == "task-running"
+    assert body["started_at"] == "2026-05-05T00:00:00+00:00"
+
+
+def test_status_returns_idle_default_when_empty(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="mgr_status_empty", role=UserRole.order_manager)
+    token = _login(client, "mgr_status_empty")
+
+    res = client.get("/api/v1/schedule/status", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["state"] == "idle"
+    assert body["message"] == "No scheduling has been run yet"
+
+
+def test_status_by_viewer_returns_403(client: TestClient, db_session: Session, monkeypatch) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="viewer_status", role=UserRole.viewer)
+    token = _login(client, "viewer_status")
+
+    res = client.get("/api/v1/schedule/status", headers=_auth(token))
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_status_without_token_returns_401(client: TestClient) -> None:
+    res = client.get("/api/v1/schedule/status")
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /result
+# ---------------------------------------------------------------------------
+
+
+def test_result_returns_scheduled_orders_sorted_by_production_date(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    user = _make_user(db_session, username="mgr_result_ok", role=UserRole.order_manager)
+    token = _login(client, "mgr_result_ok")
+
+    later = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=date(2026, 6, 10),
+        expected_delivery_date=date(2026, 6, 12),
+    )
+    earlier = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=date(2026, 5, 20),
+        expected_delivery_date=date(2026, 5, 22),
+    )
+    # Excluded: not in scheduled status.
+    _make_order(db_session, created_by=user.id, status=OrderStatus.pending)
+
+    res = client.get("/api/v1/schedule/result", headers=_auth(token))
+
+    assert res.status_code == 200
+    items = res.json()
+    ids = [item["id"] for item in items]
+    assert ids == [str(earlier.id), str(later.id)]
+    # Each item carries the schedule-relevant fields.
+    assert items[0]["scheduled_production_date"] == "2026-05-20"
+    assert items[0]["expected_delivery_date"] == "2026-05-22"
+    assert items[0]["status"] == "scheduled"
+    # No scheduler state in Redis ⇒ daily_breakdown falls back to empty list.
+    assert items[0]["daily_breakdown"] == []
+    assert items[1]["daily_breakdown"] == []
+
+
+def test_result_includes_daily_breakdown_from_redis_state(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """When SchedulerState is present in Redis, GET /result attaches a
+    per-day breakdown derived from compute_schedule(state)."""
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+
+    user = _make_user(db_session, username="mgr_breakdown", role=UserRole.order_manager)
+    token = _login(client, "mgr_breakdown")
+
+    base = date(2026, 5, 6)
+    next_day = base + timedelta(days=1)
+    order = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=base,
+        expected_delivery_date=next_day,
+    )
+
+    # Construct a state where the same order spans two days. compute_schedule
+    # forward-fills: day 1 takes the full 10,000 cap, day 2 takes the rest.
+    state = SchedulerState.initial(base)
+    state.priority_queue.append(
+        SchedulingOrder(
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=15_000,
+            deadline=next_day,
+        )
+    )
+    fake_redis.set("schedule:state", state.to_json())
+
+    res = client.get("/api/v1/schedule/result", headers=_auth(token))
+
+    assert res.status_code == 200
+    items = res.json()
+    assert len(items) == 1
+    assert items[0]["daily_breakdown"] == [
+        {"date": base.isoformat(), "quantity": 10_000},
+        {"date": next_day.isoformat(), "quantity": 5_000},
+    ]
+
+
+def test_result_excludes_soft_deleted_orders(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    user = _make_user(db_session, username="mgr_result_del", role=UserRole.order_manager)
+    token = _login(client, "mgr_result_del")
+
+    deleted = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=date(2026, 5, 20),
+    )
+    deleted.is_deleted = True
+    db_session.commit()
+
+    res = client.get("/api/v1/schedule/result", headers=_auth(token))
+
+    assert res.status_code == 200
+    assert res.json() == []
+
+
+def test_result_by_viewer_returns_403(client: TestClient, db_session: Session, monkeypatch) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="viewer_result", role=UserRole.viewer)
+    token = _login(client, "viewer_result")
+
+    res = client.get("/api/v1/schedule/result", headers=_auth(token))
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_result_without_token_returns_401(client: TestClient) -> None:
+    res = client.get("/api/v1/schedule/result")
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /rebuild
+# ---------------------------------------------------------------------------
+
+
+def _patch_rebuild_delay(monkeypatch) -> MagicMock:
+    """Patch ``rebuild_schedule_task.delay`` so the API doesn't enqueue a
+    real Celery task. Returns the mock for assertions."""
+    rebuild_delay_mock = MagicMock(return_value=MagicMock(id="rebuild-task-mock"))
+    monkeypatch.setattr("app.api.v1.schedule.rebuild_schedule_task.delay", rebuild_delay_mock)
+    return rebuild_delay_mock
+
+
+def test_rebuild_returns_202_and_dispatches_task(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """Happy path: rebuild dispatches ``rebuild_schedule_task`` and returns
+    202 with the new task id. The actual rebuild work happens inside the
+    task body (covered in ``tests/workers/test_scheduling_task.py``)."""
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    rebuild_delay_mock = _patch_rebuild_delay(monkeypatch)
+
+    _make_user(db_session, username="sched_rebuild_ok", role=UserRole.scheduler)
+    token = _login(client, "sched_rebuild_ok")
+
+    res = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+
+    assert res.status_code == 202
+    body = res.json()
+    assert body["task_id"] == "rebuild-task-mock"
+    assert "queued" in body["message"].lower()
+    rebuild_delay_mock.assert_called_once()
+
+
+def test_rebuild_dispatches_even_when_run_scheduling_is_running(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """Rebuild no longer 409s when a scheduling run is in progress — instead
+    the task is queued and serializes itself by polling status. This test
+    verifies the API layer dispatches unconditionally; the wait-for-idle
+    logic is in the task body and tested in the worker suite."""
+    fake_redis = _FakeRedis()
+    fake_redis.set("schedule:status", json.dumps({"state": "running"}))
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    rebuild_delay_mock = _patch_rebuild_delay(monkeypatch)
+
+    _make_user(db_session, username="sched_rebuild_busy", role=UserRole.scheduler)
+    token = _login(client, "sched_rebuild_busy")
+
+    res = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+
+    assert res.status_code == 202
+    rebuild_delay_mock.assert_called_once()
+
+
+def test_rebuild_by_viewer_returns_403(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="viewer_rebuild", role=UserRole.viewer)
+    token = _login(client, "viewer_rebuild")
+
+    res = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_rebuild_without_token_returns_401(client: TestClient) -> None:
+    res = client.post("/api/v1/schedule/rebuild")
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
