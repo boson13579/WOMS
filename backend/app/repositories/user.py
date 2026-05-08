@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models.user import User, UserRole
@@ -39,17 +39,6 @@ def list_users(db: Session, *, search: str | None = None) -> list[User]:
         )
     stmt = stmt.order_by(User.created_at.desc())
     return list(db.scalars(stmt).all())
-
-
-def count_active_roots_excluding(db: Session, exclude_id: uuid.UUID) -> int:
-    """Count active root users, excluding the given user_id."""
-    stmt = select(func.count()).where(
-        User.role == UserRole.root,
-        User.is_active.is_(True),
-        User.is_deleted.is_(False),
-        User.id != exclude_id,
-    )
-    return db.scalar(stmt) or 0
 
 
 def lock_and_count_other_active_roots(db: Session, exclude_id: uuid.UUID) -> int:

@@ -6,8 +6,8 @@ import uuid
 
 import structlog
 from fastapi import HTTPException, status
-from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.logger import audit_log
 from app.models.user import User, UserRole
