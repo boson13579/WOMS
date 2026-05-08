@@ -77,19 +77,20 @@ def update(
     db: Session,
     user: User,
     *,
+    fields_set: set[str],
     username: str | None = None,
     email: str | None = None,
     role: UserRole | None = None,
     is_active: bool | None = None,
 ) -> User:
     """Apply partial updates to *user* and flush.  Caller must commit."""
-    if username is not None:
+    if "username" in fields_set and username is not None:
         user.username = username
-    if email is not None:
+    if "email" in fields_set:
         user.email = email
-    if role is not None:
+    if "role" in fields_set and role is not None:
         user.role = role
-    if is_active is not None:
+    if "is_active" in fields_set and is_active is not None:
         user.is_active = is_active
     db.flush()
     db.refresh(user)

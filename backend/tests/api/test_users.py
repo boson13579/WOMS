@@ -320,6 +320,34 @@ def test_delete_user_without_token_returns_401(client: TestClient, db_session: S
 # ---------------------------------------------------------------------------
 
 
+def test_patch_user_clear_email_with_null_succeeds(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+    target = _make_user(db_session, username="sam", email="sam@example.com")
+
+    res = client.patch(
+        f"/api/v1/users/{target.id}",
+        json={"email": None, "version_id": target.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["email"] is None
+
+
+def test_patch_user_omit_email_leaves_it_unchanged(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+    target = _make_user(db_session, username="tina", email="tina@example.com")
+
+    res = client.patch(
+        f"/api/v1/users/{target.id}",
+        json={"role": "scheduler", "version_id": target.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["email"] == "tina@example.com"
+
+
 def test_patch_user_demote_last_root_returns_409(client: TestClient, db_session: Session) -> None:
     root = _make_user(db_session, username="only_root", role=UserRole.root)
     token = _login(client, "only_root", "pass1234")

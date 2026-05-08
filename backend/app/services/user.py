@@ -92,6 +92,7 @@ def update_user(
         user_repo.update(
             db,
             user,
+            fields_set=request.model_fields_set,
             username=request.username,
             email=request.email,
             role=request.role,
