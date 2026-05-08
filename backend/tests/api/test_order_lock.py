@@ -359,7 +359,8 @@ async def test_release_lock_succeeds() -> None:
         return 0
 
     fake.eval = AsyncMock(side_effect=_eval)  # type: ignore[method-assign]
-    await release_scheduling_lock(fake, token)  # type: ignore[arg-type]
+    assert token is not None
+    await release_scheduling_lock(fake, token)
     locked = await is_scheduling_locked(fake)
     assert locked is False
 
