@@ -9,6 +9,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncGenerator, Generator
 from datetime import date
+from unittest.mock import AsyncMock
 
 import bcrypt
 import fakeredis.aioredis
@@ -329,29 +330,49 @@ def test_lock_order_during_scheduling_returns_423(
 
 @pytest.mark.asyncio
 async def test_acquire_lock_succeeds_when_free() -> None:
-    """acquire_scheduling_lock returns True when no lock is held."""
+    """acquire_scheduling_lock returns a token string when no lock is held."""
     redis = fakeredis.aioredis.FakeRedis()
     result = await acquire_scheduling_lock(redis)
-    assert result is True
+    assert result is not None
 
 
 @pytest.mark.asyncio
 async def test_acquire_lock_fails_when_held() -> None:
-    """acquire_scheduling_lock returns False when lock already exists."""
+    """acquire_scheduling_lock returns None when lock already exists."""
     redis = fakeredis.aioredis.FakeRedis()
     await acquire_scheduling_lock(redis)
     result = await acquire_scheduling_lock(redis)
-    assert result is False
+    assert result is None
 
 
 @pytest.mark.asyncio
 async def test_release_lock_succeeds() -> None:
     """release_scheduling_lock deletes the key; is_scheduling_locked returns False."""
-    redis = fakeredis.aioredis.FakeRedis()
-    await acquire_scheduling_lock(redis)
-    await release_scheduling_lock(redis)
-    locked = await is_scheduling_locked(redis)
+    fake = fakeredis.aioredis.FakeRedis()
+    token = await acquire_scheduling_lock(fake)
+
+    async def _eval(script: str, numkeys: int, key: str, tok: str) -> int:
+        stored = await fake.get(key)
+        if stored is not None and stored.decode() == tok:
+            await fake.delete(key)
+            return 1
+        return 0
+
+    fake.eval = AsyncMock(side_effect=_eval)  # type: ignore[method-assign]
+    await release_scheduling_lock(fake, token)  # type: ignore[arg-type]
+    locked = await is_scheduling_locked(fake)
     assert locked is False
+
+
+@pytest.mark.asyncio
+async def test_release_lock_wrong_token() -> None:
+    """release_scheduling_lock returns False and leaves the key when token does not match."""
+    fake = fakeredis.aioredis.FakeRedis()
+    await acquire_scheduling_lock(fake)
+    fake.eval = AsyncMock(return_value=0)  # type: ignore[method-assign]
+    released = await release_scheduling_lock(fake, str(uuid.uuid4()))
+    assert released is False
+    assert await is_scheduling_locked(fake) is True
 
 
 @pytest.mark.asyncio
@@ -366,12 +387,21 @@ async def test_lock_expires_after_ttl() -> None:
 @pytest.mark.asyncio
 async def test_scheduling_lock_context_acquires_and_releases() -> None:
     """scheduling_lock_context holds the lock inside the block and releases on exit."""
-    redis = fakeredis.aioredis.FakeRedis()
+    fake = fakeredis.aioredis.FakeRedis()
 
-    async with scheduling_lock_context(redis):
-        assert await is_scheduling_locked(redis) is True
+    async def _eval(script: str, numkeys: int, key: str, tok: str) -> int:
+        stored = await fake.get(key)
+        if stored is not None and stored.decode() == tok:
+            await fake.delete(key)
+            return 1
+        return 0
 
-    assert await is_scheduling_locked(redis) is False
+    fake.eval = AsyncMock(side_effect=_eval)  # type: ignore[method-assign]
+
+    async with scheduling_lock_context(fake):
+        assert await is_scheduling_locked(fake) is True
+
+    assert await is_scheduling_locked(fake) is False
 
 
 @pytest.mark.asyncio
