@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import structlog
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.logger import audit_log
@@ -51,13 +52,20 @@ def register(db: Session, request: RegisterRequest) -> UserResponse:
             detail=f"Username '{request.username}' is already taken.",
         )
 
-    new_user = user_repo.create(
-        db,
-        username=request.username,
-        password_hash=hash_password(request.password),
-        role=UserRole.viewer,
-        email=request.email,
-    )
+    try:
+        new_user = user_repo.create(
+            db,
+            username=request.username,
+            password_hash=hash_password(request.password),
+            role=UserRole.viewer,
+            email=request.email,
+        )
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{request.username}' is already taken.",
+        ) from None
     audit_log_repo.create(
         db,
         action="user.created",

@@ -115,7 +115,7 @@ def test_login_missing_fields_returns_422(client: TestClient) -> None:
 def test_register_without_token_succeeds(client: TestClient) -> None:
     res = client.post(
         "/api/v1/auth/register",
-        json={"username": "newuser", "password": "newpassword1", "role": "viewer"},
+        json={"username": "newuser", "password": "newpassword1"},
     )
 
     assert res.status_code == 201
@@ -130,14 +130,14 @@ def test_register_duplicate_username_returns_409(client: TestClient, db_session:
 
     res = client.post(
         "/api/v1/auth/register",
-        json={"username": "existing", "password": "newpassword1", "role": "viewer"},
+        json={"username": "existing", "password": "newpassword1"},
     )
 
     assert res.status_code == 409
     assert res.json()["error"]["code"] == 409
 
 
-def test_register_with_root_role_is_forced_to_viewer(client: TestClient) -> None:
+def test_register_always_assigns_viewer_role(client: TestClient) -> None:
     res = client.post(
         "/api/v1/auth/register",
         json={"username": "tricky", "password": "password1", "role": "root"},
@@ -145,6 +145,28 @@ def test_register_with_root_role_is_forced_to_viewer(client: TestClient) -> None
 
     assert res.status_code == 201
     assert res.json()["role"] == "viewer"
+
+
+def test_register_concurrent_duplicate_username_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    """DB-level IntegrityError (race window) is converted to 409."""
+    from unittest.mock import patch
+
+    import app.repositories.user as _user_repo
+
+    _make_user(db_session, username="race_victim", password="pass1234")
+
+    # Simulate race window: Python-level check returns None even though
+    # the username already exists in DB (concurrent insert snuck in first).
+    with patch.object(_user_repo, "get_by_username", return_value=None):
+        res = client.post(
+            "/api/v1/auth/register",
+            json={"username": "race_victim", "password": "password1"},
+        )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
 
 
 # ---------------------------------------------------------------------------

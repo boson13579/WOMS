@@ -52,6 +52,27 @@ def count_active_roots_excluding(db: Session, exclude_id: uuid.UUID) -> int:
     return db.scalar(stmt) or 0
 
 
+def lock_and_count_other_active_roots(db: Session, exclude_id: uuid.UUID) -> int:
+    """Lock all active root rows then return the count excluding *exclude_id*.
+
+    SELECT ... FOR UPDATE serialises concurrent last-root checks: the second
+    transaction blocks until the first commits, then re-counts under the lock
+    and sees the updated state — preventing two simultaneous demote/deactivate
+    operations from both believing another root exists.
+    """
+    stmt = (
+        select(User.id)
+        .where(
+            User.role == UserRole.root,
+            User.is_active.is_(True),
+            User.is_deleted.is_(False),
+        )
+        .with_for_update()
+    )
+    root_ids = list(db.scalars(stmt).all())
+    return sum(1 for rid in root_ids if rid != exclude_id)
+
+
 def create(
     db: Session,
     *,

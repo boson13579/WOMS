@@ -6,8 +6,8 @@ import uuid
 
 import structlog
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
+from sqlalchemy.orm import Session
 
 from app.core.logger import audit_log
 from app.models.user import User, UserRole
@@ -32,7 +32,7 @@ def _guard_last_root(
     will_deactivate = new_is_active is False
     if not will_demote and not will_deactivate:
         return
-    if user_repo.count_active_roots_excluding(db, user.id) == 0:
+    if user_repo.lock_and_count_other_active_roots(db, user.id) == 0:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_LAST_ROOT_MSG)
 
 
