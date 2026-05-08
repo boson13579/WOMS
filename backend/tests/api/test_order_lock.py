@@ -207,6 +207,16 @@ def test_lock_order_not_found_returns_404(client: TestClient, db_session: Sessio
     assert resp.status_code == 404
 
 
+def test_unlock_order_not_found_returns_404(client: TestClient, db_session: Session) -> None:
+    """DELETE lock for non-existent order → 404."""
+    _make_user(db_session, username="unlk404_sched")
+    token = _login(client, "unlk404_sched")
+    fake_id = str(uuid.uuid4())
+
+    resp = client.delete(f"{_BASE}/{fake_id}/lock", headers=_auth(token))
+    assert resp.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Soft Pin tests
 # ---------------------------------------------------------------------------
@@ -272,6 +282,41 @@ def test_soft_pin_invalid_date_returns_422(client: TestClient, db_session: Sessi
     assert resp.status_code == 422
 
 
+def test_soft_pin_set_not_found_returns_404(client: TestClient, db_session: Session) -> None:
+    """PATCH soft-pin for non-existent order → 404."""
+    _make_user(db_session, username="sp_set404_sched")
+    token = _login(client, "sp_set404_sched")
+    fake_id = str(uuid.uuid4())
+
+    resp = client.patch(
+        f"{_BASE}/{fake_id}/soft-pin",
+        json={"preferred_date": "2026-09-10"},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 404
+
+
+def test_soft_pin_clear_not_found_returns_404(client: TestClient, db_session: Session) -> None:
+    """DELETE soft-pin for non-existent order → 404."""
+    _make_user(db_session, username="sp_clr404_sched")
+    token = _login(client, "sp_clr404_sched")
+    fake_id = str(uuid.uuid4())
+
+    resp = client.delete(f"{_BASE}/{fake_id}/soft-pin", headers=_auth(token))
+    assert resp.status_code == 404
+
+
+def test_soft_pin_clear_idempotent(client: TestClient, db_session: Session) -> None:
+    """DELETE soft-pin when soft_pin_date is already None → 200, soft_pin_date=None."""
+    user = _make_user(db_session, username="sp_clr_idemp_sched")
+    token = _login(client, "sp_clr_idemp_sched")
+    order = _make_order(db_session, created_by=user.id)
+
+    resp = client.delete(f"{_BASE}/{order.id}/soft-pin", headers=_auth(token))
+    assert resp.status_code == 200
+    assert resp.json()["soft_pin_date"] is None
+
+
 # ---------------------------------------------------------------------------
 # Scheduling Lock — router integration tests
 # ---------------------------------------------------------------------------
@@ -317,6 +362,49 @@ def test_lock_order_during_scheduling_returns_423(
     order = _make_order(db_session, created_by=user.id)
 
     resp = locked_client.post(f"{_BASE}/{order.id}/lock", headers=_auth(token))
+    assert resp.status_code == 423
+    assert resp.json()["error"]["code"] == 423
+
+
+def test_delete_lock_during_scheduling_returns_423(
+    locked_client: TestClient, db_session: Session
+) -> None:
+    """DELETE /orders/{id}/lock while scheduling lock is held → 423."""
+    user = _make_user(db_session, username="sl_unlk_sched")
+    token = _login(locked_client, "sl_unlk_sched")
+    order = _make_order(db_session, created_by=user.id)
+
+    resp = locked_client.delete(f"{_BASE}/{order.id}/lock", headers=_auth(token))
+    assert resp.status_code == 423
+    assert resp.json()["error"]["code"] == 423
+
+
+def test_soft_pin_set_during_scheduling_returns_423(
+    locked_client: TestClient, db_session: Session
+) -> None:
+    """PATCH /orders/{id}/soft-pin while scheduling lock is held → 423."""
+    user = _make_user(db_session, username="sl_sp_set_sched")
+    token = _login(locked_client, "sl_sp_set_sched")
+    order = _make_order(db_session, created_by=user.id)
+
+    resp = locked_client.patch(
+        f"{_BASE}/{order.id}/soft-pin",
+        json={"preferred_date": "2026-09-10"},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 423
+    assert resp.json()["error"]["code"] == 423
+
+
+def test_soft_pin_clear_during_scheduling_returns_423(
+    locked_client: TestClient, db_session: Session
+) -> None:
+    """DELETE /orders/{id}/soft-pin while scheduling lock is held → 423."""
+    user = _make_user(db_session, username="sl_sp_clr_sched")
+    token = _login(locked_client, "sl_sp_clr_sched")
+    order = _make_order(db_session, created_by=user.id)
+
+    resp = locked_client.delete(f"{_BASE}/{order.id}/soft-pin", headers=_auth(token))
     assert resp.status_code == 423
     assert resp.json()["error"]["code"] == 423
 

@@ -10,7 +10,10 @@ import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+import structlog
 from redis.asyncio import Redis
+
+logger = structlog.get_logger(__name__)
 
 SCHEDULING_LOCK_KEY = "scheduling:lock"
 SCHEDULING_LOCK_TTL_SECONDS = 300  # 5 minutes — prevents deadlock on engine crash
@@ -64,4 +67,9 @@ async def scheduling_lock_context(redis: Redis) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
-        await release_scheduling_lock(redis, token)
+        try:
+            released = await release_scheduling_lock(redis, token)
+            if not released:
+                logger.warning("scheduling_lock.release_mismatch", key=SCHEDULING_LOCK_KEY)
+        except Exception:
+            logger.error("scheduling_lock.release_failed", key=SCHEDULING_LOCK_KEY, exc_info=True)
