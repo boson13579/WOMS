@@ -9,8 +9,8 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from app.models.order import Order, OrderStatus
 
@@ -23,6 +23,15 @@ __all__ = [
     "update_lock",
     "update_soft_pin",
 ]
+
+SORTABLE_FIELDS: dict[str, InstrumentedAttribute[object]] = {
+    "order_number": Order.order_number,
+    "customer_name": Order.customer_name,
+    "wafer_quantity": Order.wafer_quantity,
+    "requested_delivery_date": Order.requested_delivery_date,
+}
+DEFAULT_SORT_BY = "requested_delivery_date"
+DEFAULT_SORT_ORDER = "asc"
 
 
 def get_by_id(db: Session, order_id: uuid.UUID) -> Order | None:
@@ -45,8 +54,11 @@ def get_many(
     *,
     status: list[OrderStatus] | None = None,
     assigned_to: uuid.UUID | None = None,
+    search: str | None = None,
     page: int = 1,
     page_size: int = 20,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
 ) -> tuple[list[Order], int]:
     """Return a paginated list of active orders plus the total count."""
     base = select(Order).where(Order.is_deleted.is_(False))
@@ -55,12 +67,25 @@ def get_many(
         base = base.where(Order.status.in_(status))
     if assigned_to is not None:
         base = base.where(Order.assigned_to == assigned_to)
+    if search:
+        trimmed = search.strip()
+        if trimmed:
+            escaped = trimmed.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            base = base.where(
+                or_(
+                    Order.order_number.ilike(pattern, escape="\\"),
+                    Order.customer_name.ilike(pattern, escape="\\"),
+                )
+            )
 
     count_stmt = select(func.count()).select_from(base.subquery())
     total: int = db.scalars(count_stmt).one()
 
+    field = SORTABLE_FIELDS.get(sort_by or DEFAULT_SORT_BY, SORTABLE_FIELDS[DEFAULT_SORT_BY])
+    order_clause = field.asc() if (sort_order or DEFAULT_SORT_ORDER) == "asc" else field.desc()
     rows = db.scalars(
-        base.order_by(Order.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+        base.order_by(order_clause, Order.id.asc()).offset((page - 1) * page_size).limit(page_size)
     ).all()
 
     return list(rows), total

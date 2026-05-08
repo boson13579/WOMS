@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import structlog
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.logger import audit_log
 from app.core.security import create_access_token, hash_password, verify_password
-from app.models.user import User
+from app.models.user import UserRole
+from app.repositories import audit_log as audit_log_repo
 from app.repositories import user as user_repo
 from app.schemas.user import LoginRequest, LoginResponse, RegisterRequest, UserResponse
 
@@ -37,11 +39,12 @@ def login(db: Session, request: LoginRequest) -> LoginResponse:
     return LoginResponse(access_token=token)
 
 
-def register(db: Session, request: RegisterRequest, actor: User) -> UserResponse:
-    """Create a new user account (root only).
+def register(db: Session, request: RegisterRequest) -> UserResponse:
+    """Create a new user account (public endpoint).
 
     Raises 409 if the username is already taken.
-    Emits an audit log entry on success.
+    Emits an audit log entry (DB + stdout) on success.
+    Actor is the newly created user itself (self-registration).
     """
     if user_repo.get_by_username(db, request.username) is not None:
         raise HTTPException(
@@ -49,18 +52,34 @@ def register(db: Session, request: RegisterRequest, actor: User) -> UserResponse
             detail=f"Username '{request.username}' is already taken.",
         )
 
-    new_user = user_repo.create(
+    try:
+        new_user = user_repo.create(
+            db,
+            username=request.username,
+            password_hash=hash_password(request.password),
+            role=UserRole.viewer,
+            email=request.email,
+        )
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{request.username}' is already taken.",
+        ) from None
+    audit_log_repo.create(
         db,
-        username=request.username,
-        password_hash=hash_password(request.password),
-        role=request.role,
-        email=request.email,
+        action="user.created",
+        user_id=new_user.id,
+        resource_type="user",
+        resource_id=new_user.id,
+        old_value=None,
+        new_value={"username": new_user.username, "role": new_user.role.value},
     )
     db.commit()
 
     audit_log(
         action="user.created",
-        actor_id=str(actor.id),
+        actor_id=str(new_user.id),
         resource_type="user",
         resource_id=str(new_user.id),
         changes={"username": new_user.username, "role": new_user.role.value},

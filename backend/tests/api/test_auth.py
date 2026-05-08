@@ -6,7 +6,6 @@ Run `pytest tests/api/test_auth.py -v` to execute this test module.
 from __future__ import annotations
 
 import bcrypt
-import pytest
 from app.models.user import User, UserRole
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -113,14 +112,10 @@ def test_login_missing_fields_returns_422(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_register_by_root_succeeds(client: TestClient, db_session: Session) -> None:
-    _make_user(db_session, username="root_user", password="rootpass1", role=UserRole.root)
-    token = _login(client, "root_user", "rootpass1")
-
+def test_register_without_token_succeeds(client: TestClient) -> None:
     res = client.post(
         "/api/v1/auth/register",
-        json={"username": "newuser", "password": "newpassword1", "role": "viewer"},
-        headers={"Authorization": f"Bearer {token}"},
+        json={"username": "newuser", "password": "newpassword1"},
     )
 
     assert res.status_code == 201
@@ -130,46 +125,48 @@ def test_register_by_root_succeeds(client: TestClient, db_session: Session) -> N
     assert "password_hash" not in body
 
 
-@pytest.mark.parametrize("role", ["scheduler", "order_manager", "viewer"])
-def test_register_by_non_root_returns_403(
-    client: TestClient, db_session: Session, role: str
-) -> None:
-    _make_user(db_session, username=f"user_{role}", password="pass1234", role=UserRole(role))
-    token = _login(client, f"user_{role}", "pass1234")
-
-    res = client.post(
-        "/api/v1/auth/register",
-        json={"username": "hacker", "password": "evilpass1", "role": "viewer"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-
-    assert res.status_code == 403
-    assert res.json()["error"]["code"] == 403
-
-
 def test_register_duplicate_username_returns_409(client: TestClient, db_session: Session) -> None:
-    _make_user(db_session, username="root2", password="rootpass2", role=UserRole.root)
     _make_user(db_session, username="existing", password="pass1234")
-    token = _login(client, "root2", "rootpass2")
 
     res = client.post(
         "/api/v1/auth/register",
-        json={"username": "existing", "password": "newpassword1", "role": "viewer"},
-        headers={"Authorization": f"Bearer {token}"},
+        json={"username": "existing", "password": "newpassword1"},
     )
 
     assert res.status_code == 409
     assert res.json()["error"]["code"] == 409
 
 
-def test_register_without_token_returns_401(client: TestClient) -> None:
+def test_register_always_assigns_viewer_role(client: TestClient) -> None:
     res = client.post(
         "/api/v1/auth/register",
-        json={"username": "ghost", "password": "ghostpass1", "role": "viewer"},
+        json={"username": "tricky", "password": "password1", "role": "root"},
     )
 
-    assert res.status_code == 401
-    assert res.json()["error"]["code"] == 401
+    assert res.status_code == 201
+    assert res.json()["role"] == "viewer"
+
+
+def test_register_concurrent_duplicate_username_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    """DB-level IntegrityError (race window) is converted to 409."""
+    from unittest.mock import patch
+
+    import app.repositories.user as _user_repo
+
+    _make_user(db_session, username="race_victim", password="pass1234")
+
+    # Simulate race window: Python-level check returns None even though
+    # the username already exists in DB (concurrent insert snuck in first).
+    with patch.object(_user_repo, "get_by_username", return_value=None):
+        res = client.post(
+            "/api/v1/auth/register",
+            json={"username": "race_victim", "password": "password1"},
+        )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
 
 
 # ---------------------------------------------------------------------------
