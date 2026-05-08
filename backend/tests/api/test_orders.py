@@ -870,3 +870,15 @@ def test_list_orders_search_and_sort_combined(client: TestClient, db_session: Se
     assert all("Alpha" in item["customer_name"] for item in items)
     qtys = [item["wafer_quantity"] for item in items]
     assert qtys == sorted(qtys)
+
+
+# ---------------------------------------------------------------------------
+# Constants sync
+# ---------------------------------------------------------------------------
+
+
+def test_valid_sort_fields_matches_sortable_fields() -> None:
+    from app.api.v1.orders import VALID_SORT_FIELDS
+    from app.repositories.order import SORTABLE_FIELDS
+
+    assert set(SORTABLE_FIELDS.keys()) == VALID_SORT_FIELDS
