@@ -39,7 +39,6 @@ class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=64)
     password: str = Field(..., min_length=8)
     email: str | None = None
-    role: UserRole = UserRole.viewer
 
 
 class UserUpdateRequest(BaseModel):

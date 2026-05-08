@@ -137,16 +137,6 @@ def test_register_duplicate_username_returns_409(client: TestClient, db_session:
     assert res.json()["error"]["code"] == 409
 
 
-def test_register_invalid_role_returns_422(client: TestClient) -> None:
-    res = client.post(
-        "/api/v1/auth/register",
-        json={"username": "baduser", "password": "password1", "role": "superadmin"},
-    )
-
-    assert res.status_code == 422
-    assert res.json()["error"]["code"] == 422
-
-
 def test_register_with_root_role_is_forced_to_viewer(client: TestClient) -> None:
     res = client.post(
         "/api/v1/auth/register",
