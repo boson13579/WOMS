@@ -726,3 +726,147 @@ def test_list_orders_search_by_customer_name_and_status(
     assert body["total"] == 1
     assert body["items"][0]["customer_name"] == "Target Corp"
     assert body["items"][0]["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Sort
+# ---------------------------------------------------------------------------
+
+
+def test_list_orders_default_sort_is_requested_delivery_date_asc(
+    client: TestClient, db_session: Session
+) -> None:
+    user = _make_user(db_session, username="mgr_sort_default", role=UserRole.order_manager)
+    token = _login(client, "mgr_sort_default")
+    _make_order(db_session, created_by=user.id, requested_delivery_date=date(2026, 9, 1))
+    _make_order(db_session, created_by=user.id, requested_delivery_date=date(2026, 7, 1))
+    _make_order(db_session, created_by=user.id, requested_delivery_date=date(2026, 8, 1))
+
+    res = client.get("/api/v1/orders", headers=_auth(token))
+
+    assert res.status_code == 200
+    dates = [item["requested_delivery_date"] for item in res.json()["items"]]
+    assert dates == sorted(dates)
+
+
+def test_list_orders_sort_by_order_number_asc(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="mgr_sort_num_asc", role=UserRole.order_manager)
+    token = _login(client, "mgr_sort_num_asc")
+    _make_order(db_session, created_by=user.id, order_number="ORD-SORT-C")
+    _make_order(db_session, created_by=user.id, order_number="ORD-SORT-A")
+    _make_order(db_session, created_by=user.id, order_number="ORD-SORT-B")
+
+    res = client.get("/api/v1/orders?sort_by=order_number&sort_order=asc", headers=_auth(token))
+
+    assert res.status_code == 200
+    nums = [item["order_number"] for item in res.json()["items"]]
+    sort_nums = [n for n in nums if n.startswith("ORD-SORT-")]
+    assert sort_nums == sorted(sort_nums)
+
+
+def test_list_orders_sort_by_order_number_desc(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="mgr_sort_num_desc", role=UserRole.order_manager)
+    token = _login(client, "mgr_sort_num_desc")
+    _make_order(db_session, created_by=user.id, order_number="ORD-SORTD-C")
+    _make_order(db_session, created_by=user.id, order_number="ORD-SORTD-A")
+    _make_order(db_session, created_by=user.id, order_number="ORD-SORTD-B")
+
+    res = client.get("/api/v1/orders?sort_by=order_number&sort_order=desc", headers=_auth(token))
+
+    assert res.status_code == 200
+    nums = [item["order_number"] for item in res.json()["items"]]
+    sort_nums = [n for n in nums if n.startswith("ORD-SORTD-")]
+    assert sort_nums == sorted(sort_nums, reverse=True)
+
+
+def test_list_orders_sort_by_requested_delivery_date_asc(
+    client: TestClient, db_session: Session
+) -> None:
+    user = _make_user(db_session, username="mgr_sort_date_asc", role=UserRole.order_manager)
+    token = _login(client, "mgr_sort_date_asc")
+    _make_order(db_session, created_by=user.id, requested_delivery_date=date(2026, 12, 1))
+    _make_order(db_session, created_by=user.id, requested_delivery_date=date(2026, 10, 1))
+    _make_order(db_session, created_by=user.id, requested_delivery_date=date(2026, 11, 1))
+
+    res = client.get(
+        "/api/v1/orders?sort_by=requested_delivery_date&sort_order=asc", headers=_auth(token)
+    )
+
+    assert res.status_code == 200
+    dates = [item["requested_delivery_date"] for item in res.json()["items"]]
+    assert dates == sorted(dates)
+
+
+def test_list_orders_sort_by_wafer_quantity_desc(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="mgr_sort_qty_desc", role=UserRole.order_manager)
+    token = _login(client, "mgr_sort_qty_desc")
+    _make_order(db_session, created_by=user.id, wafer_quantity=300)
+    _make_order(db_session, created_by=user.id, wafer_quantity=100)
+    _make_order(db_session, created_by=user.id, wafer_quantity=200)
+
+    res = client.get("/api/v1/orders?sort_by=wafer_quantity&sort_order=desc", headers=_auth(token))
+
+    assert res.status_code == 200
+    qtys = [item["wafer_quantity"] for item in res.json()["items"]]
+    assert qtys == sorted(qtys, reverse=True)
+
+
+def test_list_orders_invalid_sort_by_returns_422(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="mgr_sort_invalid", role=UserRole.order_manager)
+    token = _login(client, "mgr_sort_invalid")
+
+    res = client.get("/api/v1/orders?sort_by=invalid_field", headers=_auth(token))
+
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
+
+
+def test_list_orders_invalid_sort_order_returns_422(
+    client: TestClient, db_session: Session
+) -> None:
+    _make_user(db_session, username="mgr_sort_order_invalid", role=UserRole.order_manager)
+    token = _login(client, "mgr_sort_order_invalid")
+
+    res = client.get("/api/v1/orders?sort_order=random", headers=_auth(token))
+
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
+
+
+def test_list_orders_search_and_sort_combined(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="mgr_sort_search", role=UserRole.order_manager)
+    token = _login(client, "mgr_sort_search")
+    _make_order(
+        db_session,
+        created_by=user.id,
+        customer_name="Alpha Corp",
+        order_number="ORD-COMBO-001",
+        wafer_quantity=300,
+    )
+    _make_order(
+        db_session,
+        created_by=user.id,
+        customer_name="Alpha Inc",
+        order_number="ORD-COMBO-002",
+        wafer_quantity=100,
+    )
+    _make_order(
+        db_session,
+        created_by=user.id,
+        customer_name="Beta Corp",
+        order_number="ORD-COMBO-003",
+        wafer_quantity=200,
+    )
+
+    res = client.get(
+        "/api/v1/orders?search=Alpha&sort_by=wafer_quantity&sort_order=asc",
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    items = body["items"]
+    assert body["total"] == 2
+    assert all("Alpha" in item["customer_name"] for item in items)
+    qtys = [item["wafer_quantity"] for item in items]
+    assert qtys == sorted(qtys)
