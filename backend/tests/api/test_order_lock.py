@@ -112,9 +112,7 @@ def locked_client(
     from app.core.db import get_db
     from app.main import app
 
-    asyncio.get_event_loop().run_until_complete(
-        fake_redis_instance.set(SCHEDULING_LOCK_KEY, "1", ex=SCHEDULING_LOCK_TTL_SECONDS)
-    )
+    asyncio.run(fake_redis_instance.set(SCHEDULING_LOCK_KEY, "1", ex=SCHEDULING_LOCK_TTL_SECONDS))
 
     async def _override_get_redis() -> AsyncGenerator[Redis, None]:
         yield fake_redis_instance  # type: ignore[misc]

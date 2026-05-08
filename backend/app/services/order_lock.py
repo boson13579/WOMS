@@ -111,6 +111,7 @@ def unlock_order(
     if not order.is_locked:
         return LockResponse.model_validate(order)
 
+    old_val: dict[str, Any] = {"is_locked": True, "locked_by": str(order.locked_by)}
     order = order_repo.update_lock(
         db,
         order,
@@ -118,7 +119,6 @@ def unlock_order(
         locked_by=None,
         locked_at=None,
     )
-    old_val: dict[str, Any] = {"is_locked": True}
     new_val: dict[str, Any] = {"is_locked": False}
     _write_lock_audit(
         db,
