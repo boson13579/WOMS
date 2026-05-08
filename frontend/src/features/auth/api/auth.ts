@@ -82,8 +82,10 @@ export async function login(payload: LoginRequest): Promise<LoginResponse> {
   });
 
   if (!res.ok) {
-    const errorData = (await res.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(errorData?.detail ?? 'Login failed');
+    const errorData = (await res.json().catch(() => null)) as {
+      error?: { message: string };
+    } | null;
+    throw new Error(errorData?.error?.message ?? 'Login failed');
   }
 
   return loginResponseSchema.parse(await res.json());
@@ -108,8 +110,10 @@ export async function register(payload: RegisterRequest): Promise<RegisterRespon
   });
 
   if (!res.ok) {
-    const errorData = (await res.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(errorData?.detail ?? 'Registration failed');
+    const errorData = (await res.json().catch(() => null)) as {
+      error?: { message: string };
+    } | null;
+    throw new Error(errorData?.error?.message ?? 'Registration failed');
   }
 
   return registerResponseSchema.parse(await res.json());
@@ -123,4 +127,18 @@ export function useLogin() {
 
 export function useRegister() {
   return useMutation({ mutationFn: register });
+}
+
+/**
+ * Phase 2 — logs out user via backend (clears cookies).
+ */
+export async function logout(): Promise<void> {
+  const res = await fetch('/api/v1/auth/logout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  if (!res.ok) {
+    throw new Error('Logout failed');
+  }
 }

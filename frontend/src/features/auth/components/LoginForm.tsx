@@ -8,6 +8,7 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Loader2, LogIn } from 'lucide-react';
 import { useForm } from 'react-hook-form';
+import { Link } from 'react-router-dom';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -110,18 +111,15 @@ export function LoginForm({ onSuccess, onSwitchToRegister }: LoginFormProps): JS
         )}
       </Button>
 
-      {onSwitchToRegister ? (
         <p className="text-center text-sm text-muted-foreground">
           Don&apos;t have an account?{' '}
-          <button
-            type="button"
-            onClick={onSwitchToRegister}
+          <Link
+            to="/register"
             className="font-medium text-primary underline-offset-4 hover:underline"
           >
             Create one
-          </button>
+          </Link>
         </p>
-      ) : null}
     </form>
   );
 }

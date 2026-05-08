@@ -6,8 +6,8 @@
  * Styling: dark gradient background, glassmorphism card, smooth fade
  * transition between forms — matches the premium design requirements.
  */
-import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
 
 import { ThemeToggle } from '@/components/layout/ThemeToggle';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -23,9 +23,18 @@ interface AuthPageProps {
 }
 
 export function AuthPage({ onLoginSuccess }: AuthPageProps): JSX.Element {
-  const [mode, setMode] = useState<AuthMode>('login');
-  const [registered, setRegistered] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
+
+  const mode: AuthMode = location.pathname === '/register' ? 'register' : 'login';
+  const [registered, setRegistered] = useState(false);
+
+  // Clear "Account created" message when switching away from login
+  useEffect(() => {
+    if (mode === 'register') {
+      setRegistered(false);
+    }
+  }, [mode]);
 
   const handleLoginSuccess = () => {
     if (onLoginSuccess) {
@@ -37,7 +46,7 @@ export function AuthPage({ onLoginSuccess }: AuthPageProps): JSX.Element {
 
   const handleRegisterSuccess = () => {
     setRegistered(true);
-    setMode('login');
+    navigate('/login');
   };
 
   return (
@@ -91,20 +100,9 @@ export function AuthPage({ onLoginSuccess }: AuthPageProps): JSX.Element {
             {/* Animated form swap */}
             <div key={mode} className="animate-in fade-in duration-300">
               {mode === 'login' ? (
-                <LoginForm
-                  onSuccess={handleLoginSuccess}
-                  onSwitchToRegister={() => {
-                    setRegistered(false);
-                    setMode('register');
-                  }}
-                />
+                <LoginForm onSuccess={handleLoginSuccess} />
               ) : (
-                <RegisterForm
-                  onSuccess={handleRegisterSuccess}
-                  onSwitchToLogin={() => {
-                    setMode('login');
-                  }}
-                />
+                <RegisterForm onSuccess={handleRegisterSuccess} />
               )}
             </div>
           </CardContent>

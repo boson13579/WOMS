@@ -41,7 +41,6 @@ describe('loginResponseSchema', () => {
     const result = loginResponseSchema.safeParse({
       access_token: 'some-jwt',
       token_type: 'bearer',
-      expires_in: 3600,
     });
     expect(result.success).toBe(true);
   });

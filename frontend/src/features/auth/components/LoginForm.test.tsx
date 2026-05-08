@@ -8,13 +8,18 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
+import { MemoryRouter } from 'react-router-dom';
 import { LoginForm } from './LoginForm';
 
 function renderWithClient(ui: React.ReactElement) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+  return render(
+    <MemoryRouter>
+      <QueryClientProvider client={client}>{ui}</QueryClientProvider>
+    </MemoryRouter>
+  );
 }
 
 describe('LoginForm', () => {
@@ -43,11 +48,11 @@ describe('LoginForm', () => {
     });
   });
 
-  it('calls onSwitchToRegister when "Create one" is clicked', async () => {
-    const onSwitch = vi.fn();
-    renderWithClient(<LoginForm onSwitchToRegister={onSwitch} />);
-    await userEvent.click(screen.getByRole('button', { name: /create one/i }));
-    expect(onSwitch).toHaveBeenCalledOnce();
+  it('renders "Create one" link with correct href', () => {
+    renderWithClient(<LoginForm />);
+    const link = screen.getByRole('link', { name: /create one/i });
+    expect(link).toBeInTheDocument();
+    expect(link).toHaveAttribute('href', '/register');
   });
 
   it('shows loading state during submission', async () => {

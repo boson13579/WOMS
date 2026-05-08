@@ -9,13 +9,18 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
+import { MemoryRouter } from 'react-router-dom';
 import { RegisterForm } from './RegisterForm';
 
 function renderWithClient(ui: React.ReactElement) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+  return render(
+    <MemoryRouter>
+      <QueryClientProvider client={client}>{ui}</QueryClientProvider>
+    </MemoryRouter>
+  );
 }
 
 describe('RegisterForm', () => {
@@ -78,10 +83,10 @@ describe('RegisterForm', () => {
     });
   });
 
-  it('calls onSwitchToLogin when "Sign in" link is clicked', async () => {
-    const onSwitch = vi.fn();
-    renderWithClient(<RegisterForm onSwitchToLogin={onSwitch} />);
-    await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
-    expect(onSwitch).toHaveBeenCalledOnce();
+  it('renders "Sign in" link with correct href', () => {
+    renderWithClient(<RegisterForm />);
+    const link = screen.getByRole('link', { name: /sign in/i });
+    expect(link).toBeInTheDocument();
+    expect(link).toHaveAttribute('href', '/login');
   });
 });
