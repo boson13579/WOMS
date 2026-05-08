@@ -83,7 +83,7 @@ def get_many(
     field = SORTABLE_FIELDS.get(sort_by or DEFAULT_SORT_BY, SORTABLE_FIELDS[DEFAULT_SORT_BY])
     order_clause = field.asc() if (sort_order or DEFAULT_SORT_ORDER) == "asc" else field.desc()
     rows = db.scalars(
-        base.order_by(order_clause).offset((page - 1) * page_size).limit(page_size)
+        base.order_by(order_clause, Order.id.asc()).offset((page - 1) * page_size).limit(page_size)
     ).all()
 
     return list(rows), total
