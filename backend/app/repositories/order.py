@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
-from typing import Any
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from app.models.order import Order, OrderStatus
 
@@ -23,7 +22,7 @@ __all__ = [
     "get_today_order_count",
 ]
 
-SORTABLE_FIELDS: dict[str, Any] = {
+SORTABLE_FIELDS: dict[str, InstrumentedAttribute[object]] = {
     "order_number": Order.order_number,
     "customer_name": Order.customer_name,
     "wafer_quantity": Order.wafer_quantity,

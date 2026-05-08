@@ -75,7 +75,7 @@ def list_orders(
     """
     if sort_by is not None and sort_by not in VALID_SORT_FIELDS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid sort_by value. Must be one of: {', '.join(sorted(VALID_SORT_FIELDS))}",
         )
     return order_service.list_orders(
