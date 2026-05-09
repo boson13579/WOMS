@@ -18,7 +18,7 @@ interface LoginFormProps {
 }
 
 export function LoginForm({ onSuccess }: LoginFormProps): JSX.Element {
-  const setToken = useAuthStore((s) => s.setToken);
+  const setSession = useAuthStore((s) => s.setSession);
 
   const {
     register,
@@ -34,7 +34,7 @@ export function LoginForm({ onSuccess }: LoginFormProps): JSX.Element {
   const onSubmit = handleSubmit((values) => {
     mutation.mutate(values, {
       onSuccess: (data) => {
-        setToken(data.access_token, values.username);
+        setSession(data.access_token, values.username);
         onSuccess?.();
       },
     });

@@ -1,9 +1,9 @@
 /**
  * Auth Zustand store for derived client-side authentication state.
  *
- * Server state stays in React Query. This store keeps only the bearer token and
- * the minimal identity decoded from the JWT so route guards and layout controls
- * can make local decisions.
+ * Server state stays in React Query. The access token is kept in an httpOnly
+ * cookie by the backend; this store persists only non-sensitive identity and
+ * expiry metadata for route guards and layout controls.
  */
 import { create } from 'zustand';
 
@@ -17,23 +17,50 @@ interface AuthUser {
 }
 
 interface PersistedAuthState {
-  token: string;
   user: AuthUser;
+  expiresAt: number;
 }
 
 interface AuthState {
-  token: string | null;
   user: AuthUser | null;
-  setToken: (token: string, username?: string) => void;
+  expiresAt: number | null;
+  setSession: (token: string, username?: string) => void;
   logout: () => Promise<void>;
 }
 
-function decodeUser(token: string, username?: string): AuthUser {
+function decodeJwtPayload(token: string): { role?: string; exp?: number } {
+  const payloadSegment = token.split('.')[1];
+  if (!payloadSegment) {
+    return {};
+  }
+
+  const normalizedPayload = payloadSegment.replace(/-/g, '+').replace(/_/g, '/');
+  const paddedPayload = normalizedPayload.padEnd(
+    normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
+    '=',
+  );
+  return JSON.parse(atob(paddedPayload)) as { role?: string; exp?: number };
+}
+
+function decodeSession(token: string, username?: string): PersistedAuthState {
   try {
-    const payload = JSON.parse(atob(token.split('.')[1])) as { role?: string };
-    return { username: username ?? 'User', role: payload.role ?? 'viewer' };
+    const payload = decodeJwtPayload(token);
+    return {
+      user: { username: username ?? 'User', role: payload.role ?? 'viewer' },
+      expiresAt: typeof payload.exp === 'number' ? payload.exp * 1000 : 0,
+    };
   } catch {
-    return { username: username ?? 'User', role: 'viewer' };
+    return { user: { username: username ?? 'User', role: 'viewer' }, expiresAt: 0 };
+  }
+}
+
+function isExpired(expiresAt: number): boolean {
+  return expiresAt <= Date.now();
+}
+
+function clearPersistedAuth(): void {
+  if (typeof window !== 'undefined') {
+    window.localStorage.removeItem(STORAGE_KEY);
   }
 }
 
@@ -48,13 +75,23 @@ function loadPersistedAuth(): PersistedAuthState | null {
   }
 
   try {
-    const parsed = JSON.parse(raw) as Partial<PersistedAuthState>;
-    if (!parsed.token || !parsed.user) {
+    const parsed = JSON.parse(raw) as Partial<PersistedAuthState> & { token?: string };
+    if (parsed.token) {
+      const migrated = decodeSession(parsed.token, parsed.user?.username);
+      if (isExpired(migrated.expiresAt)) {
+        clearPersistedAuth();
+        return null;
+      }
+      persistAuth(migrated);
+      return migrated;
+    }
+    if (!parsed.user || !parsed.expiresAt || isExpired(parsed.expiresAt)) {
+      clearPersistedAuth();
       return null;
     }
-    return { token: parsed.token, user: parsed.user };
+    return { user: parsed.user, expiresAt: parsed.expiresAt };
   } catch {
-    window.localStorage.removeItem(STORAGE_KEY);
+    clearPersistedAuth();
     return null;
   }
 }
@@ -75,13 +112,13 @@ function persistAuth(state: PersistedAuthState | null): void {
 const persisted = loadPersistedAuth();
 
 export const useAuthStore = create<AuthState>((set) => ({
-  token: persisted?.token ?? null,
   user: persisted?.user ?? null,
+  expiresAt: persisted?.expiresAt ?? null,
 
-  setToken: (token, username) => {
-    const user = decodeUser(token, username);
-    persistAuth({ token, user });
-    set({ token, user });
+  setSession: (token, username) => {
+    const session = decodeSession(token, username);
+    persistAuth(session);
+    set({ user: session.user, expiresAt: session.expiresAt });
   },
 
   logout: async () => {
@@ -91,6 +128,6 @@ export const useAuthStore = create<AuthState>((set) => ({
       // Local logout should still proceed if the server session is already gone.
     }
     persistAuth(null);
-    set({ token: null, user: null });
+    set({ user: null, expiresAt: null });
   },
 }));

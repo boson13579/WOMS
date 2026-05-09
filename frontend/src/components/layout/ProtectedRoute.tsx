@@ -3,9 +3,10 @@ import { Navigate, Outlet } from 'react-router-dom';
 import { useAuthStore } from '@/features/auth/stores/authStore';
 
 export function ProtectedRoute(): JSX.Element {
-  const token = useAuthStore((state) => state.token);
+  const user = useAuthStore((state) => state.user);
+  const expiresAt = useAuthStore((state) => state.expiresAt);
 
-  if (!token) {
+  if (!user || !expiresAt || expiresAt <= Date.now()) {
     return <Navigate to="/login" replace />;
   }
 

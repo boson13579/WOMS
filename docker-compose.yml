@@ -110,6 +110,7 @@ services:
   adminer:
     image: adminer
     restart: unless-stopped
+    profiles: ["dev"]
     ports:
       - "8080:8080"
     depends_on:

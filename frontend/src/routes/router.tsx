@@ -5,9 +5,6 @@
  * (login + register, outside the AppShell so it has its own full-screen layout).
  * Phase 2 will add nested routes under `/orders`, `/scheduling`, etc.
  * — keeping the AppShell layout consistent.
- *
- * Auth guard (redirecting unauthenticated users to /login) will be added
- * in Phase 2 once the real JWT flow is wired up.
  */
 import { createBrowserRouter } from 'react-router-dom';
 
