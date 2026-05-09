@@ -26,3 +26,33 @@ vi.mock('recharts', async (importOriginal) => {
       ),
   };
 });
+
+// Mock fetch for all React Query mutations in components
+global.fetch = vi.fn(async (url: RequestInfo | URL) => {
+  // Artificial delay to test loading states
+  await new Promise((resolve) => {
+    setTimeout(resolve, 50);
+  });
+
+  if (url === '/api/v1/auth/login') {
+    return new Response(JSON.stringify({ access_token: 'mock-token', token_type: 'bearer' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  if (url === '/api/v1/auth/register') {
+    return new Response(
+      JSON.stringify({
+        id: '123e4567-e89b-12d3-a456-426614174000',
+        username: 'testuser',
+        email: 'test@example.com',
+        role: 'viewer',
+        is_active: true,
+        version_id: 1,
+        created_at: new Date().toISOString(),
+      }),
+      { status: 201, headers: { 'Content-Type': 'application/json' } },
+    );
+  }
+  return new Response('Not Found', { status: 404 });
+}) as unknown as typeof fetch;

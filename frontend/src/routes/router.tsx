@@ -1,27 +1,37 @@
 /**
  * Application route map.
  *
- * Phase 1 ships only two routes: the dashboard (default) and a placeholder
- * login page. Phase 2 will add nested routes under `/orders`, `/scheduling`,
- * etc. — keeping the AppShell layout consistent.
+ * Phase 1 ships the dashboard (with AppShell layout) and the auth page
+ * (login + register, outside the AppShell so it has its own full-screen layout).
+ * Phase 2 will add nested routes under `/orders`, `/scheduling`, etc.
+ * — keeping the AppShell layout consistent.
  */
 import { createBrowserRouter } from 'react-router-dom';
 
 import { AppShell } from '@/components/layout/AppShell';
-import { LoginPage } from '@/features/auth/components/LoginPage';
+import { ProtectedRoute } from '@/components/layout/ProtectedRoute';
+import { AuthPage } from '@/features/auth/components/AuthPage';
 import { DashboardPage } from '@/features/dashboard/components/DashboardPage';
 
 export const router = createBrowserRouter([
   {
     path: '/',
-    element: <AppShell />,
+    element: <ProtectedRoute />,
     children: [
-      { index: true, element: <DashboardPage /> },
-      // Phase 2 stubs go here:
-      // { path: 'orders', element: <OrdersPage /> },
-      // { path: 'scheduling', element: <SchedulingPage /> },
+      {
+        path: '/',
+        element: <AppShell />,
+        children: [
+          { index: true, element: <DashboardPage /> },
+          // Phase 2 stubs go here:
+          // { path: 'orders', element: <OrdersPage /> },
+          // { path: 'scheduling', element: <SchedulingPage /> },
+          // { path: 'account', element: <AccountPage /> },
+        ],
+      },
     ],
   },
-  // Login lives outside the AppShell so it has its own centered layout.
-  { path: '/login', element: <LoginPage /> },
+  // Auth pages live outside the AppShell so they have their own full-screen layout.
+  { path: '/login', element: <AuthPage /> },
+  { path: '/register', element: <AuthPage /> },
 ]);

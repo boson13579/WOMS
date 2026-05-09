@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.db import get_db
 from app.core.security import get_current_user
 from app.models.user import User
@@ -15,17 +16,33 @@ router = APIRouter()
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(request: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse:
+def login(
+    request: LoginRequest, response: Response, db: Session = Depends(get_db)
+) -> LoginResponse:
     """Authenticate with username/password and return a JWT bearer token.
 
-    Permission: public — no token required.
-
-    Errors:
-        401: credentials invalid, account inactive, or account not found
-             (reason is intentionally not distinguished to prevent enumeration).
-        422: request body missing required fields.
+    Also sets an `access_token` httpOnly cookie for session persistence.
     """
-    return auth_service.login(db, request)
+    res = auth_service.login(db, request)
+    settings = get_settings()
+
+    response.set_cookie(
+        key="access_token",
+        value=res.access_token,
+        httponly=True,
+        samesite="lax",
+        secure=settings.APP_ENV == "prod",
+    )
+
+    return res
+
+
+@router.post("/logout")
+def logout(response: Response) -> dict[str, str]:
+    """Clear the authentication cookie and log out the user."""
+    settings = get_settings()
+    response.delete_cookie("access_token", secure=settings.APP_ENV == "prod", samesite="lax")
+    return {"message": "Successfully logged out"}
 
 
 @router.post(
