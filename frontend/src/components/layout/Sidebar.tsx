@@ -5,8 +5,8 @@
  * subtle accent stripe, matching the aesthetic of Vuetify navigation drawers
  * (s-ui style) but rendered with Tailwind primitives.
  *
- * Phase 1: only `/` (Dashboard) is wired up. The other links are visible but
- * disabled to communicate the planned IA — they'll light up in Phase 2.
+ * Dashboard is always wired up. User management is shown for root users; the
+ * remaining links are visible but disabled to communicate the planned IA.
  */
 import {
   Bell,
@@ -21,6 +21,7 @@ import type { LucideIcon } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 
 import { Separator } from '@/components/ui/separator';
+import { useAuthStore } from '@/features/auth/stores/authStore';
 import { cn } from '@/lib/utils';
 
 interface NavItem {
@@ -34,7 +35,6 @@ const PRIMARY_NAV: readonly NavItem[] = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/orders', label: 'Orders', icon: Package, disabled: true },
   { to: '/scheduling', label: 'Scheduling', icon: CalendarClock, disabled: true },
-  { to: '/users', label: 'Users', icon: Users, disabled: true },
 ];
 
 const SECONDARY_NAV: readonly NavItem[] = [
@@ -80,6 +80,9 @@ function NavRow({ item }: { item: NavItem }): JSX.Element {
 }
 
 export function Sidebar(): JSX.Element {
+  const role = useAuthStore((state) => state.user?.role);
+  const showUserManagement = role === 'root';
+
   return (
     <aside className="hidden w-60 shrink-0 flex-col border-r border-border bg-card md:flex">
       {/* Brand */}
@@ -105,6 +108,9 @@ export function Sidebar(): JSX.Element {
             {PRIMARY_NAV.map((item) => (
               <NavRow key={item.to} item={item} />
             ))}
+            {showUserManagement ? (
+              <NavRow item={{ to: '/users', label: 'Users', icon: Users }} />
+            ) : null}
           </div>
         </div>
 
