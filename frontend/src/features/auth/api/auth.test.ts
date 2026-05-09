@@ -4,14 +4,28 @@
  * Tests for the auth API schemas (zod validation).
  * These are pure unit tests — no DOM rendering needed.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  login,
   loginRequestSchema,
   loginResponseSchema,
+  logout,
+  register,
   registerRequestSchema,
   registerResponseSchema,
 } from './auth';
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('loginRequestSchema', () => {
   it('accepts valid credentials', () => {
@@ -49,7 +63,6 @@ describe('loginResponseSchema', () => {
     const result = loginResponseSchema.safeParse({
       access_token: 'some-jwt',
       token_type: 'basic',
-      expires_in: 3600,
     });
     expect(result.success).toBe(false);
   });
@@ -111,6 +124,41 @@ describe('registerRequestSchema', () => {
       const paths = result.error.issues.map((i) => i.path.join('.'));
       expect(paths).toContain('confirmPassword');
     }
+  });
+});
+
+describe('auth API error handling', () => {
+  it('throws backend login error messages', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      jsonResponse({ error: { message: 'Invalid credentials.' } }, 401),
+    );
+
+    await expect(login({ username: 'alice', password: 'Password1' })).rejects.toThrow(
+      'Invalid credentials.',
+    );
+  });
+
+  it('throws backend register error messages', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      jsonResponse({ error: { message: "Username 'alice' is already taken." } }, 409),
+    );
+
+    await expect(
+      register({
+        username: 'alice',
+        email: 'alice@example.com',
+        password: 'Password1',
+        confirmPassword: 'Password1',
+      }),
+    ).rejects.toThrow("Username 'alice' is already taken.");
+  });
+
+  it('throws backend logout error messages', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      jsonResponse({ error: { message: 'Logout failed on server.' } }, 500),
+    );
+
+    await expect(logout()).rejects.toThrow('Logout failed on server.');
   });
 });
 
