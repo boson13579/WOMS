@@ -120,6 +120,9 @@ describe('registerResponseSchema', () => {
       id: '00000000-0000-0000-0000-000000000001',
       username: 'alice123',
       email: 'alice@example.com',
+      role: 'viewer',
+      is_active: true,
+      version_id: 1,
       created_at: '2026-05-04T00:00:00.000Z',
     });
     expect(result.success).toBe(true);
@@ -130,6 +133,9 @@ describe('registerResponseSchema', () => {
       id: 'not-a-uuid',
       username: 'alice123',
       email: 'alice@example.com',
+      role: 'viewer',
+      is_active: true,
+      version_id: 1,
       created_at: '2026-05-04T00:00:00.000Z',
     });
     expect(result.success).toBe(false);

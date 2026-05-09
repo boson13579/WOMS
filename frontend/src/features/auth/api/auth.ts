@@ -1,18 +1,11 @@
 /**
  * Authentication API client.
  *
- * Phase 1: mock implementations that simulate network latency.
- * Phase 2: replace mock bodies with real fetch calls to:
- *   POST /api/v1/auth/login
- *   POST /api/v1/auth/register
- *
  * All responses are validated through zod `.parse()` at the boundary so the
  * rest of the codebase has compile-time type safety.
  */
 import { useMutation } from '@tanstack/react-query';
 import { z } from 'zod';
-
-// ─── Schemas ────────────────────────────────────────────────────────────────
 
 export const loginRequestSchema = z.object({
   username: z.string().min(1, 'Username is required'),
@@ -29,7 +22,7 @@ export const registerRequestSchema = z
     username: z
       .string()
       .min(3, 'Username must be at least 3 characters')
-      .max(50, 'Username must be at most 50 characters')
+      .max(64, 'Username must be at most 64 characters')
       .regex(/^[a-zA-Z0-9_]+$/, 'Username may only contain letters, numbers and underscores'),
     email: z.string().email('Invalid email address'),
     password: z
@@ -47,79 +40,64 @@ export const registerRequestSchema = z
 export const registerResponseSchema = z.object({
   id: z.string().uuid(),
   username: z.string(),
-  email: z.string().email(),
+  email: z.string().email().nullable(),
+  role: z.enum(['root', 'scheduler', 'order_manager', 'viewer']),
+  is_active: z.boolean(),
+  version_id: z.number().int(),
   created_at: z.string().datetime(),
 });
-
-// ─── Types (re-exported for convenience) ────────────────────────────────────
 
 export type LoginRequest = z.infer<typeof loginRequestSchema>;
 export type LoginResponse = z.infer<typeof loginResponseSchema>;
 export type RegisterRequest = z.infer<typeof registerRequestSchema>;
 export type RegisterResponse = z.infer<typeof registerResponseSchema>;
 
-// ─── API functions ───────────────────────────────────────────────────────────
+async function readErrorMessage(response: Response, fallback: string): Promise<string> {
+  const errorData = (await response.json().catch(() => null)) as {
+    detail?: string;
+    error?: { message?: string };
+  } | null;
 
-/**
- * Phase 1 mock — returns a hardcoded token after an artificial delay.
- *
- * Phase 2 replacement:
- *   const res = await fetch('/api/v1/auth/login', {
- *     method: 'POST',
- *     headers: { 'Content-Type': 'application/json' },
- *     body: JSON.stringify(payload),
- *   });
- *   if (!res.ok) throw new Error('Login failed');
- *   return loginResponseSchema.parse(await res.json());
- */
+  return errorData?.error?.message ?? errorData?.detail ?? fallback;
+}
+
 export async function login(payload: LoginRequest): Promise<LoginResponse> {
-  loginRequestSchema.parse(payload);
+  const body = loginRequestSchema.parse(payload);
 
   const res = await fetch('/api/v1/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
+    credentials: 'same-origin',
   });
 
   if (!res.ok) {
-    const errorData = (await res.json().catch(() => null)) as {
-      error?: { message: string };
-    } | null;
-    throw new Error(errorData?.error?.message ?? 'Login failed');
+    throw new Error(await readErrorMessage(res, 'Login failed'));
   }
 
   return loginResponseSchema.parse(await res.json());
 }
 
-/**
- * Phase 2 — registers user via backend.
- */
 export async function register(payload: RegisterRequest): Promise<RegisterResponse> {
-  registerRequestSchema.parse(payload);
+  const body = registerRequestSchema.parse(payload);
 
   const res = await fetch('/api/v1/auth/register', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      username: payload.username,
-      email: payload.email,
-      password: payload.password,
-      // Default to viewer role per backend schema if not provided
-      role: 'viewer',
+      username: body.username,
+      email: body.email,
+      password: body.password,
     }),
+    credentials: 'same-origin',
   });
 
   if (!res.ok) {
-    const errorData = (await res.json().catch(() => null)) as {
-      error?: { message: string };
-    } | null;
-    throw new Error(errorData?.error?.message ?? 'Registration failed');
+    throw new Error(await readErrorMessage(res, 'Registration failed'));
   }
 
   return registerResponseSchema.parse(await res.json());
 }
-
-// ─── React Query hooks ───────────────────────────────────────────────────────
 
 export function useLogin() {
   return useMutation({ mutationFn: login });
@@ -129,16 +107,14 @@ export function useRegister() {
   return useMutation({ mutationFn: register });
 }
 
-/**
- * Phase 2 — logs out user via backend (clears cookies).
- */
 export async function logout(): Promise<void> {
   const res = await fetch('/api/v1/auth/logout', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
   });
 
   if (!res.ok) {
-    throw new Error('Logout failed');
+    throw new Error(await readErrorMessage(res, 'Logout failed'));
   }
 }

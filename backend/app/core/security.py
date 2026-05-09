@@ -110,12 +110,7 @@ async def get_current_user(
 
     Raises HTTP 401 for any token problem or inactive account.
     """
-    token: str | None = None
-    if credentials:
-        token = credentials.credentials
-    else:
-        # Fallback to httpOnly cookie if header is missing
-        token = request.cookies.get("access_token")
+    token = credentials.credentials if credentials else request.cookies.get("access_token")
 
     if token is None:
         raise _UNAUTHORIZED

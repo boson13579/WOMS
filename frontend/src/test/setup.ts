@@ -48,6 +48,7 @@ global.fetch = vi.fn(async (url: RequestInfo | URL) => {
         email: 'test@example.com',
         role: 'viewer',
         is_active: true,
+        version_id: 1,
         created_at: new Date().toISOString(),
       }),
       { status: 201, headers: { 'Content-Type': 'application/json' } },

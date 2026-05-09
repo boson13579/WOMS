@@ -6,8 +6,8 @@ from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.security import get_current_user, require_roles
-from app.models.user import User, UserRole
+from app.core.security import get_current_user
+from app.models.user import User
 from app.schemas.user import LoginRequest, LoginResponse, RegisterRequest, UserResponse
 from app.services import auth as auth_service
 
@@ -51,19 +51,16 @@ def logout(response: Response) -> dict[str, str]:
 def register(
     request: RegisterRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(UserRole.root)),
 ) -> UserResponse:
     """Create a new user account and return the created user profile.
 
-    Permission: root only — bearer token with role=root required.
+    Permission: public — no token required.
 
     Errors:
-        401: missing or invalid bearer token.
-        403: authenticated user does not have the root role.
         409: username is already taken.
         422: request body fails validation (e.g. password shorter than 8 chars).
     """
-    return auth_service.register(db, request, current_user)
+    return auth_service.register(db, request)
 
 
 @router.get("/me", response_model=UserResponse)

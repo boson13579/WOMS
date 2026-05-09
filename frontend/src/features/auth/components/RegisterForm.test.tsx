@@ -8,8 +8,8 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-
 import { MemoryRouter } from 'react-router-dom';
+
 import { RegisterForm } from './RegisterForm';
 
 function renderWithClient(ui: React.ReactElement) {
@@ -19,7 +19,7 @@ function renderWithClient(ui: React.ReactElement) {
   return render(
     <MemoryRouter>
       <QueryClientProvider client={client}>{ui}</QueryClientProvider>
-    </MemoryRouter>
+    </MemoryRouter>,
   );
 }
 

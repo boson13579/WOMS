@@ -1,9 +1,5 @@
 /**
- * LoginForm — Phase 2-ready login form.
- *
- * Uses React Hook Form + Zod for validation, and the `useLogin` React Query
- * mutation. On success, persists the token in the Zustand auth store and calls
- * `onSuccess` so the parent (AuthPage) can switch view.
+ * Login form wired to the real FastAPI auth endpoint.
  */
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Loader2, LogIn } from 'lucide-react';
@@ -18,13 +14,10 @@ import { loginRequestSchema, useLogin, type LoginRequest } from '../api/auth';
 import { useAuthStore } from '../stores/authStore';
 
 interface LoginFormProps {
-  /** Called when login succeeds — parent uses this to navigate. */
   onSuccess?: () => void;
-  /** Called when user wants to switch to the register form. */
-  onSwitchToRegister?: () => void;
 }
 
-export function LoginForm({ onSuccess, onSwitchToRegister }: LoginFormProps): JSX.Element {
+export function LoginForm({ onSuccess }: LoginFormProps): JSX.Element {
   const setToken = useAuthStore((s) => s.setToken);
 
   const {
@@ -79,7 +72,7 @@ export function LoginForm({ onSuccess, onSwitchToRegister }: LoginFormProps): JS
           id="login-password"
           type="password"
           autoComplete="current-password"
-          placeholder="••••••••"
+          placeholder="Password"
           aria-invalid={errors.password !== undefined}
           aria-describedby={errors.password ? 'login-password-error' : undefined}
           {...register('password')}
@@ -93,7 +86,9 @@ export function LoginForm({ onSuccess, onSwitchToRegister }: LoginFormProps): JS
 
       {mutation.isError ? (
         <p className="text-xs text-destructive" role="alert">
-          Login failed. Please check your credentials and try again.
+          {mutation.error instanceof Error
+            ? mutation.error.message
+            : 'Login failed. Please check your credentials and try again.'}
         </p>
       ) : null}
 
@@ -101,7 +96,7 @@ export function LoginForm({ onSuccess, onSwitchToRegister }: LoginFormProps): JS
         {mutation.isPending ? (
           <>
             <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
-            Signing in…
+            Signing in...
           </>
         ) : (
           <>
@@ -111,15 +106,15 @@ export function LoginForm({ onSuccess, onSwitchToRegister }: LoginFormProps): JS
         )}
       </Button>
 
-        <p className="text-center text-sm text-muted-foreground">
-          Don&apos;t have an account?{' '}
-          <Link
-            to="/register"
-            className="font-medium text-primary underline-offset-4 hover:underline"
-          >
-            Create one
-          </Link>
-        </p>
+      <p className="text-center text-sm text-muted-foreground">
+        Don&apos;t have an account?{' '}
+        <Link
+          to="/register"
+          className="font-medium text-primary underline-offset-4 hover:underline"
+        >
+          Create one
+        </Link>
+      </p>
     </form>
   );
 }

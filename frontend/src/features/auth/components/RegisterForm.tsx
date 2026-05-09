@@ -1,9 +1,5 @@
 /**
- * RegisterForm — new user registration.
- *
- * Uses React Hook Form + Zod (password strength + confirmation validation),
- * and the `useRegister` React Query mutation. On success, calls `onSuccess`
- * so the parent (AuthPage) can switch to the login form.
+ * Public registration form wired to POST /api/v1/auth/register.
  */
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Loader2, UserPlus } from 'lucide-react';
@@ -17,13 +13,10 @@ import { Label } from '@/components/ui/label';
 import { registerRequestSchema, useRegister, type RegisterRequest } from '../api/auth';
 
 interface RegisterFormProps {
-  /** Called when registration succeeds — parent switches to login view. */
   onSuccess?: () => void;
-  /** Called when user wants to switch back to the login form. */
-  onSwitchToLogin?: () => void;
 }
 
-export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps): JSX.Element {
+export function RegisterForm({ onSuccess }: RegisterFormProps): JSX.Element {
   const {
     register,
     handleSubmit,
@@ -51,7 +44,6 @@ export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps):
       className="space-y-5"
       noValidate
     >
-      {/* Username */}
       <div className="space-y-2">
         <Label htmlFor="register-username">Username</Label>
         <Input
@@ -70,7 +62,6 @@ export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps):
         ) : null}
       </div>
 
-      {/* Email */}
       <div className="space-y-2">
         <Label htmlFor="register-email">Email</Label>
         <Input
@@ -89,14 +80,13 @@ export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps):
         ) : null}
       </div>
 
-      {/* Password */}
       <div className="space-y-2">
         <Label htmlFor="register-password">Password</Label>
         <Input
           id="register-password"
           type="password"
           autoComplete="new-password"
-          placeholder="••••••••"
+          placeholder="Password"
           aria-invalid={errors.password !== undefined}
           aria-describedby={errors.password ? 'register-password-error' : undefined}
           {...register('password')}
@@ -111,14 +101,13 @@ export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps):
         </p>
       </div>
 
-      {/* Confirm Password */}
       <div className="space-y-2">
         <Label htmlFor="register-confirm-password">Confirm Password</Label>
         <Input
           id="register-confirm-password"
           type="password"
           autoComplete="new-password"
-          placeholder="••••••••"
+          placeholder="Confirm password"
           aria-invalid={errors.confirmPassword !== undefined}
           aria-describedby={errors.confirmPassword ? 'register-confirm-password-error' : undefined}
           {...register('confirmPassword')}
@@ -132,7 +121,7 @@ export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps):
 
       {mutation.isError ? (
         <p className="text-xs text-destructive" role="alert">
-          Registration failed. Please try again.
+          {mutation.error instanceof Error ? mutation.error.message : 'Registration failed.'}
         </p>
       ) : null}
 
@@ -140,7 +129,7 @@ export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps):
         {mutation.isPending ? (
           <>
             <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
-            Creating account…
+            Creating account...
           </>
         ) : (
           <>
@@ -150,15 +139,12 @@ export function RegisterForm({ onSuccess, onSwitchToLogin }: RegisterFormProps):
         )}
       </Button>
 
-        <p className="text-center text-sm text-muted-foreground">
-          Already have an account?{' '}
-          <Link
-            to="/login"
-            className="font-medium text-primary underline-offset-4 hover:underline"
-          >
-            Sign in
-          </Link>
-        </p>
+      <p className="text-center text-sm text-muted-foreground">
+        Already have an account?{' '}
+        <Link to="/login" className="font-medium text-primary underline-offset-4 hover:underline">
+          Sign in
+        </Link>
+      </p>
     </form>
   );
 }
