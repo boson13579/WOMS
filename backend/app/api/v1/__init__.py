@@ -2,7 +2,6 @@
 
 from fastapi import APIRouter
 
-
 from app.api.v1 import auth, health, orders, schedule, users, websocket
 
 # Aggregate router — `app.main` includes only this single router with prefix
