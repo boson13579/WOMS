@@ -70,6 +70,7 @@ Thumbs.db
 # =============================================================================
 .claude/
 claude.local.md
+backend/CLAUDE.md
 
 # =============================================================================
 # Personal scratchpad — never commit. Anything you write under notes/ stays

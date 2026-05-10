@@ -8,7 +8,7 @@ It accepts and returns Pydantic schemas — never raw SQLAlchemy rows.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
@@ -30,16 +30,21 @@ from app.schemas.order import (
     OrderResponse,
     UpdateOrderRequest,
 )
+from app.schemas.schedule import DailyAssignment, ScheduleResultResponse
+from app.services.scheduling import ScheduledResult, SchedulingOrder
 
 logger = structlog.get_logger(__name__)
 
 __all__ = [
+    "apply_schedule",
     "batch_update_orders",
     "create_order",
     "delete_order",
     "get_audit_log",
     "get_order",
+    "list_for_scheduler",
     "list_orders",
+    "list_scheduled_orders",
     "update_order",
 ]
 
@@ -327,3 +332,135 @@ def get_audit_log(db: Session, order_id: uuid.UUID, current_user: User) -> list[
 
     logs = audit_log_repo.get_by_resource_id(db, order_id)
     return [AuditLogResponse.model_validate(log) for log in logs]
+
+
+# ---------------------------------------------------------------------------
+# Scheduling-related service operations
+# ---------------------------------------------------------------------------
+
+
+def list_scheduled_orders(
+    db: Session,
+    *,
+    breakdown: list[ScheduledResult] | None = None,
+) -> list[ScheduleResultResponse]:
+    """Return every order currently in ``scheduled`` status, sorted by start date.
+
+    When *breakdown* is supplied (typically the live result of
+    ``compute_schedule(state)`` for the current Redis-backed
+    ``SchedulerState``), each response gets a per-day ``daily_breakdown``
+    list showing how the order's wafers are split across days. With no
+    breakdown the field defaults to an empty list — useful for the very
+    first deploy or when Redis state has been wiped.
+    """
+    rows = order_repo.get_scheduled(db)
+
+    by_order: dict[uuid.UUID, list[DailyAssignment]] = {}
+    if breakdown:
+        for sr in sorted(breakdown, key=lambda x: x.scheduled_date):
+            by_order.setdefault(sr.order_id, []).append(
+                DailyAssignment(date=sr.scheduled_date, quantity=sr.quantity)
+            )
+
+    return [
+        ScheduleResultResponse.model_validate(r).model_copy(
+            update={"daily_breakdown": by_order.get(r.id, [])}
+        )
+        for r in rows
+    ]
+
+
+def list_for_scheduler(
+    db: Session,
+) -> tuple[list[SchedulingOrder], dict[uuid.UUID, uuid.UUID]]:
+    """Return scheduled orders as ``SchedulingOrder`` plus a creators map.
+
+    The second element is a ``order_id -> created_by`` mapping used by the
+    rebuild flow to push ``schedule.rebuild_skipped`` WebSocket messages
+    back to the original requester.
+
+    Used by ``rebuild_state`` to reconstruct the segment trees and priority
+    queue from DB truth after a migration or state corruption. The deadline
+    maps to ``requested_delivery_date``, consistent with how ops are enqueued
+    via ``POST /schedule/operations``.
+    """
+    rows = order_repo.get_scheduled(db)
+    orders = [
+        SchedulingOrder(
+            order_id=r.id,
+            order_number=r.order_number,
+            wafer_quantity=r.wafer_quantity,
+            deadline=r.requested_delivery_date,
+        )
+        for r in rows
+    ]
+    creators = {r.id: r.created_by for r in rows}
+    return orders, creators
+
+
+def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
+    """Persist a freshly-computed schedule to the orders table.
+
+    A single order can split across multiple days in `scheduled`; we collapse
+    those rows to `(earliest, latest)` per order_id, wipe the previous
+    schedule wholesale, then write the new dates and flip status to
+    `scheduled`. One system-level audit record is emitted per order.
+
+    Returns the number of orders that were marked as scheduled.
+    """
+    order_repo.clear_scheduled_dates(db)
+
+    per_order: dict[uuid.UUID, tuple[date, date]] = {}
+    for sr in scheduled:
+        cur = per_order.get(sr.order_id)
+        if cur is None:
+            per_order[sr.order_id] = (sr.scheduled_date, sr.scheduled_date)
+        else:
+            earliest, latest = cur
+            per_order[sr.order_id] = (
+                min(earliest, sr.scheduled_date),
+                max(latest, sr.scheduled_date),
+            )
+
+    applied = 0
+    for order_id, (earliest, latest) in per_order.items():
+        order = order_repo.set_schedule_dates(
+            db,
+            order_id=order_id,
+            scheduled_production_date=earliest,
+            expected_delivery_date=latest,
+        )
+        if order is None:
+            logger.warning(
+                "order.schedule.apply_missing",
+                order_id=str(order_id),
+            )
+            continue
+        applied += 1
+        new_value = {
+            "scheduled_production_date": str(earliest),
+            "expected_delivery_date": str(latest),
+            "status": OrderStatus.scheduled.value,
+        }
+        # Persist to audit_logs DB table — required by PRD §1.6 so the
+        # scheduling history is queryable from Postgres, not only from log
+        # shippers. user_id=None marks this as system-driven.
+        audit_log_repo.create(
+            db,
+            action="order.scheduled",
+            user_id=None,
+            resource_type="order",
+            resource_id=order_id,
+            new_value=new_value,
+        )
+        emit_audit_log(
+            action="order.scheduled",
+            actor_id=None,
+            resource_type="order",
+            resource_id=str(order_id),
+            changes=new_value,
+        )
+
+    db.commit()
+    logger.info("order.schedule.applied", applied=applied)
+    return applied
