@@ -62,7 +62,7 @@ function makeWrapper(): { wrapper: ({ children }: { children: ReactNode }) => JS
 function renderPage(role = 'root') {
   act(() => {
     useAuthStore.setState({
-      user: { username: `${role}_user`, role },
+      user: { id: `${role}_id`, username: `${role}_user`, role },
       expiresAt: Date.now() + 60_000,
     });
   });

@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Select } from '@/components/ui/select';
 import {
   Table,
   TableBody,
@@ -168,7 +169,7 @@ export function AdminUsersPage(): JSX.Element {
                     </TableCell>
                     <TableCell>
                       {isEditing ? (
-                        <select
+                        <Select
                           aria-label={`Role for ${user.username}`}
                           value={edit.role}
                           onChange={(event) => {
@@ -177,14 +178,14 @@ export function AdminUsersPage(): JSX.Element {
                               current ? { ...current, role: nextRole } : current,
                             );
                           }}
-                          className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+                          className="w-40"
                         >
                           {userRoleSchema.options.map((role) => (
                             <option key={role} value={role}>
                               {ROLE_LABELS[role]}
                             </option>
                           ))}
-                        </select>
+                        </Select>
                       ) : (
                         <Badge variant={roleBadgeVariant(user.role)}>
                           {ROLE_LABELS[user.role]}
