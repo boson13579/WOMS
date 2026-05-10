@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from redis.asyncio import ConnectionPool
 
 from app.api.errors import register_exception_handlers
 from app.api.v1 import api_router as api_v1_router
@@ -37,7 +38,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         env=settings.APP_ENV,
         version=settings.APP_VERSION,
     )
+    app.state.redis_pool = ConnectionPool.from_url(
+        str(settings.REDIS_URL),
+        decode_responses=True,
+    )
     yield
+    await app.state.redis_pool.disconnect()
     logger.info("app.shutdown")
 
 

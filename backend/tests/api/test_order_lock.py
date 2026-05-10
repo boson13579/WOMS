@@ -444,6 +444,7 @@ async def test_release_lock_succeeds() -> None:
             return 1
         return 0
 
+    # fakeredis does not natively support Lua eval; using AsyncMock as workaround
     fake.eval = AsyncMock(side_effect=_eval)  # type: ignore[method-assign]
     assert token is not None
     await release_scheduling_lock(fake, token)

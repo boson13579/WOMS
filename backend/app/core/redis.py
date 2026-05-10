@@ -4,19 +4,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 
-import redis.asyncio as aioredis
+from fastapi import Request
 from redis.asyncio import Redis
 
-from app.core.config import get_settings
 
-
-async def get_redis() -> AsyncGenerator[Redis, None]:
-    """FastAPI dependency — yields an async Redis client per request."""
-    settings = get_settings()
-    client: Redis = aioredis.from_url(  # type: ignore[no-untyped-call]
-        str(settings.REDIS_URL),
-        decode_responses=True,
-    )
+async def get_redis(request: Request) -> AsyncGenerator[Redis, None]:
+    """FastAPI dependency — yields an async Redis client backed by the app-level pool."""
+    pool = request.app.state.redis_pool
+    client: Redis = Redis(connection_pool=pool)
     try:
         yield client
     finally:
