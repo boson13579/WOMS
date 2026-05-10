@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Search, ShieldCheck, UserCog } from 'lucide-react';
+import { Loader2, Search, ShieldCheck, UserCog } from 'lucide-react';
 import { useMemo, useState } from 'react';
 
 import { Badge } from '@/components/ui/badge';
@@ -34,6 +34,8 @@ const ROLE_LABELS: Record<UserRole, string> = {
   viewer: 'Viewer',
 };
 
+const ADMIN_USERS_QUERY_KEY = 'admin-users';
+
 function roleBadgeVariant(role: UserRole): 'destructive' | 'secondary' | 'outline' {
   if (role === 'root') {
     return 'destructive';
@@ -51,7 +53,7 @@ export function AdminUsersPage(): JSX.Element {
   const [edit, setEdit] = useState<EditState | null>(null);
 
   const usersQuery = useQuery({
-    queryKey: ['users', search],
+    queryKey: [ADMIN_USERS_QUERY_KEY, search],
     queryFn: () => listUsers(search),
     enabled: currentRole === 'root',
   });
@@ -65,14 +67,14 @@ export function AdminUsersPage(): JSX.Element {
       }),
     onSuccess: () => {
       setEdit(null);
-      void queryClient.invalidateQueries({ queryKey: ['users'] });
+      void queryClient.invalidateQueries({ queryKey: [ADMIN_USERS_QUERY_KEY] });
     },
   });
 
   const deactivateMutation = useMutation({
     mutationFn: deactivateUser,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['users'] });
+      void queryClient.invalidateQueries({ queryKey: [ADMIN_USERS_QUERY_KEY] });
     },
   });
 
@@ -154,7 +156,10 @@ export function AdminUsersPage(): JSX.Element {
               {usersQuery.isLoading ? (
                 <TableRow>
                   <TableCell className="py-8 text-center text-muted-foreground" colSpan={5}>
-                    Loading users...
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      Loading users...
+                    </span>
                   </TableCell>
                 </TableRow>
               ) : null}
@@ -195,7 +200,7 @@ export function AdminUsersPage(): JSX.Element {
                     <TableCell>
                       {isEditing ? (
                         <div className="inline-flex items-center gap-2">
-                          <Input
+                          <input
                             id={`user-active-${user.id}`}
                             type="checkbox"
                             checked={edit.isActive}
@@ -204,7 +209,7 @@ export function AdminUsersPage(): JSX.Element {
                                 current ? { ...current, isActive: event.target.checked } : current,
                               );
                             }}
-                            className="h-4 w-4 p-0 accent-primary"
+                            className="h-4 w-4 rounded border-border accent-primary"
                           />
                           <Label htmlFor={`user-active-${user.id}`} className="text-sm">
                             Active

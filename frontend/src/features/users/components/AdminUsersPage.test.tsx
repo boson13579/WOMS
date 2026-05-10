@@ -252,7 +252,7 @@ describe('AdminUsersPage root operations', () => {
     await userEvent.click(within(aliceRow as HTMLElement).getByRole('button', { name: /edit/i }));
     await userEvent.click(within(aliceRow as HTMLElement).getByRole('button', { name: /save/i }));
     await waitFor(() => {
-      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['users'] });
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['admin-users'] });
     });
 
     await userEvent.click(
