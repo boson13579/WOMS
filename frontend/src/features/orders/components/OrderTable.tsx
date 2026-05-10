@@ -6,7 +6,6 @@
 import { ArrowDown, ArrowUp, ArrowUpDown, Calendar, Loader2, Pencil, Trash2 } from 'lucide-react';
 import type { ReactNode } from 'react';
 
-import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -17,6 +16,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { useCanWrite } from '@/lib/auth';
+import { cn } from '@/lib/utils';
 
 import { useDeleteOrder, useOrders } from '../api/orders';
 import { useOrderStore } from '../stores/orderStore';
@@ -37,9 +38,9 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
 type BadgeVariant = 'default' | 'info' | 'success' | 'warning' | 'destructive' | 'secondary';
 
 const STATUS_VARIANT: Record<OrderStatus, BadgeVariant> = {
-  pending: 'secondary',
-  in_production: 'info',
-  scheduled: 'warning',
+  pending: 'warning',
+  scheduled: 'info',
+  in_production: 'default',
   completed: 'success',
   cancelled: 'destructive',
 };
@@ -66,11 +67,14 @@ function SortableHead({
   children,
 }: SortableHeadProps): JSX.Element {
   const active = sortBy === field;
-  const Icon = active ? (sortOrder === 'asc' ? ArrowUp : ArrowDown) : ArrowUpDown;
+  const ActiveIcon = sortOrder === 'asc' ? ArrowUp : ArrowDown;
+  const Icon = active ? ActiveIcon : ArrowUpDown;
   return (
     <TableHead
       className={cn('cursor-pointer select-none', className)}
-      onClick={() => onSort(field)}
+      onClick={() => {
+        onSort(field);
+      }}
     >
       <span className="inline-flex items-center gap-1">
         {children}
@@ -103,6 +107,7 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
   });
 
   const deleteMutation = useDeleteOrder();
+  const canWrite = useCanWrite();
 
   function handleDelete(order: Order): void {
     // eslint-disable-next-line no-alert
@@ -119,11 +124,9 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
     );
   }
 
-  if (isError || !data) {
+  if (isError) {
     return (
-      <div className="py-20 text-center text-sm text-destructive">
-        載入失敗，請重新整理頁面。
-      </div>
+      <div className="py-20 text-center text-sm text-destructive">載入失敗，請重新整理頁面。</div>
     );
   }
 
@@ -134,17 +137,40 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
       <Table>
         <TableHeader>
           <TableRow>
-            <SortableHead field="order_number" sortBy={sortBy} sortOrder={sortOrder} onSort={setSort} className="w-36">
+            <SortableHead
+              field="order_number"
+              sortBy={sortBy}
+              sortOrder={sortOrder}
+              onSort={setSort}
+              className="w-36"
+            >
               訂單編號
             </SortableHead>
-            <SortableHead field="customer_name" sortBy={sortBy} sortOrder={sortOrder} onSort={setSort}>
+            <SortableHead
+              field="customer_name"
+              sortBy={sortBy}
+              sortOrder={sortOrder}
+              onSort={setSort}
+            >
               客戶
             </SortableHead>
-            <SortableHead field="wafer_quantity" sortBy={sortBy} sortOrder={sortOrder} onSort={setSort} className="w-24 text-right">
+            <SortableHead
+              field="wafer_quantity"
+              sortBy={sortBy}
+              sortOrder={sortOrder}
+              onSort={setSort}
+              className="w-24 text-right"
+            >
               晶圓數量
             </SortableHead>
             <TableHead className="w-28">狀態</TableHead>
-            <SortableHead field="requested_delivery_date" sortBy={sortBy} sortOrder={sortOrder} onSort={setSort} className="w-32">
+            <SortableHead
+              field="requested_delivery_date"
+              sortBy={sortBy}
+              sortOrder={sortOrder}
+              onSort={setSort}
+              className="w-32"
+            >
               要求交貨日
             </SortableHead>
             <TableHead className="w-32">預計交貨日</TableHead>
@@ -163,11 +189,11 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
               <TableRow key={order.id}>
                 <TableCell className="font-mono text-xs">{order.order_number}</TableCell>
                 <TableCell className="font-medium">{order.customer_name}</TableCell>
-                <TableCell className="text-right">{order.wafer_quantity.toLocaleString()}</TableCell>
+                <TableCell className="text-right">
+                  {order.wafer_quantity.toLocaleString()}
+                </TableCell>
                 <TableCell>
-                  <Badge variant={STATUS_VARIANT[order.status]}>
-                    {STATUS_LABEL[order.status]}
-                  </Badge>
+                  <Badge variant={STATUS_VARIANT[order.status]}>{STATUS_LABEL[order.status]}</Badge>
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground">
                   {new Date(order.requested_delivery_date).toLocaleDateString('zh-TW')}
@@ -179,32 +205,42 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
                 </TableCell>
                 <TableCell>
                   <div className="flex items-center justify-end gap-1">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => onEdit(order)}
-                      title="編輯"
-                    >
-                      <Pencil className="h-4 w-4" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => onSchedule(order.id)}
-                      title="觸發排程"
-                    >
-                      <Calendar className="h-4 w-4" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => handleDelete(order)}
-                      title="刪除"
-                      disabled={deleteMutation.isPending}
-                      className="text-destructive hover:text-destructive"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
+                    {canWrite && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => {
+                            onEdit(order);
+                          }}
+                          title="編輯"
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => {
+                            onSchedule(order.id);
+                          }}
+                          title="觸發排程"
+                        >
+                          <Calendar className="h-4 w-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => {
+                            handleDelete(order);
+                          }}
+                          title="刪除"
+                          disabled={deleteMutation.isPending}
+                          className="text-destructive hover:text-destructive"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </>
+                    )}
                   </div>
                 </TableCell>
               </TableRow>
@@ -222,7 +258,9 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setPage(page - 1)}
+              onClick={() => {
+                setPage(page - 1);
+              }}
               disabled={page <= 1}
             >
               上一頁
@@ -230,7 +268,9 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setPage(page + 1)}
+              onClick={() => {
+                setPage(page + 1);
+              }}
               disabled={page >= totalPages}
             >
               下一頁

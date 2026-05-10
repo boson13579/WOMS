@@ -13,19 +13,36 @@ import type { Order, OrderListResponse } from '../types';
 import { OrderTable } from './OrderTable';
 
 // ---------------------------------------------------------------------------
+// Mock @/lib/auth — controls canWrite per test
+// ---------------------------------------------------------------------------
+
+let mockCanWrite = true;
+
+vi.mock('@/lib/auth', () => ({
+  useCurrentUser: () => ({ username: 'test', role: 'scheduler' }),
+  useCanWrite: () => mockCanWrite,
+}));
+
+// ---------------------------------------------------------------------------
 // Mock hooks
 // ---------------------------------------------------------------------------
 
 const mockSetPage = vi.fn();
+const mockSetSort = vi.fn();
 const mockDeleteMutate = vi.fn();
 
+const mockStore = {
+  status: null as string | null,
+  search: '',
+  page: 1,
+  sortBy: 'order_number' as string,
+  sortOrder: 'asc' as 'asc' | 'desc',
+  setPage: mockSetPage,
+  setSort: mockSetSort,
+};
+
 vi.mock('../stores/orderStore', () => ({
-  useOrderStore: () => ({
-    status: null,
-    search: '',
-    page: 1,
-    setPage: mockSetPage,
-  }),
+  useOrderStore: () => mockStore,
 }));
 
 // return values are overridden per test to exercise different query states
@@ -33,7 +50,9 @@ const mockUseOrders = vi.fn();
 const mockUseDeleteOrder = vi.fn();
 
 vi.mock('../api/orders', () => ({
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-return
   useOrders: (...args: unknown[]) => mockUseOrders(...args),
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-return
   useDeleteOrder: () => mockUseDeleteOrder(),
 }));
 
@@ -75,6 +94,9 @@ describe('OrderTable', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockCanWrite = true;
+    mockStore.sortBy = 'order_number';
+    mockStore.sortOrder = 'asc';
     mockUseDeleteOrder.mockReturnValue({ mutate: mockDeleteMutate, isPending: false });
   });
 
@@ -168,6 +190,68 @@ describe('OrderTable', () => {
     await user.click(screen.getByTitle('刪除'));
 
     expect(mockDeleteMutate).toHaveBeenCalledWith('delete-me-id');
+  });
+
+  it('calls setSort with the column field when a sortable header is clicked', async () => {
+    const user = userEvent.setup();
+    const order = makeOrder();
+    mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
+
+    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    await user.click(screen.getByText('客戶'));
+
+    expect(mockSetSort).toHaveBeenCalledWith('customer_name');
+  });
+
+  it('calls setSort again to toggle sort order when the active column header is clicked', async () => {
+    const user = userEvent.setup();
+    mockStore.sortBy = 'customer_name';
+    mockStore.sortOrder = 'asc';
+    const order = makeOrder();
+    mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
+
+    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    await user.click(screen.getByText('客戶'));
+
+    expect(mockSetSort).toHaveBeenCalledWith('customer_name');
+  });
+
+  describe('role-based rendering', () => {
+    it('scheduler — shows edit, schedule, delete buttons', () => {
+      mockCanWrite = true;
+      const order = makeOrder();
+      mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
+
+      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+
+      expect(screen.getByTitle('編輯')).toBeInTheDocument();
+      expect(screen.getByTitle('觸發排程')).toBeInTheDocument();
+      expect(screen.getByTitle('刪除')).toBeInTheDocument();
+    });
+
+    it('root — shows edit, schedule, delete buttons', () => {
+      mockCanWrite = true;
+      const order = makeOrder();
+      mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
+
+      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+
+      expect(screen.getByTitle('編輯')).toBeInTheDocument();
+      expect(screen.getByTitle('觸發排程')).toBeInTheDocument();
+      expect(screen.getByTitle('刪除')).toBeInTheDocument();
+    });
+
+    it('order_manager — hides edit, schedule, delete buttons', () => {
+      mockCanWrite = false;
+      const order = makeOrder();
+      mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
+
+      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+
+      expect(screen.queryByTitle('編輯')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('觸發排程')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('刪除')).not.toBeInTheDocument();
+    });
   });
 
   it('does not render pagination when there is only one page', () => {

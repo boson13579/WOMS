@@ -43,7 +43,6 @@ describe('OrderFilters', () => {
     mockStore.search = '';
   });
 
-
   it('renders the search input and status select', () => {
     render(<OrderFilters />);
 
@@ -91,7 +90,12 @@ describe('OrderFilters', () => {
 
     await user.type(screen.getByRole('textbox', { name: /搜尋訂單/ }), 'TSM');
 
-    await waitFor(() => expect(mockSetSearch).toHaveBeenCalledWith('TSM'), { timeout: 1000 });
+    await waitFor(
+      () => {
+        expect(mockSetSearch).toHaveBeenCalledWith('TSM');
+      },
+      { timeout: 1000 },
+    );
     // debounce: called once with the final value, not once per character typed
     expect(mockSetSearch).toHaveBeenCalledOnce();
   });

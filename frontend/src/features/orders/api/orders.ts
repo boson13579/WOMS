@@ -5,9 +5,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { z } from 'zod';
 
-import { useAuthStore } from '@/features/auth/stores/authStore';
-
-import { MOCK_ORDER_LIST } from './mockData';
+import { useCurrentUser, useCurrentRole, useCurrentUserId } from '@/lib/auth';
 
 import type {
   Order,
@@ -16,6 +14,8 @@ import type {
   OrderUpdate,
   ScheduleTaskResponse,
 } from '../types';
+
+import { MOCK_ORDER_LIST } from './mockData';
 
 // ---------------------------------------------------------------------------
 // Zod schemas (runtime validation of API responses)
@@ -71,18 +71,14 @@ export const scheduleProgressSchema = z.object({
 // Shared fetch helper
 // ---------------------------------------------------------------------------
 
-function bearerHeaders(token: string): HeadersInit {
-  return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+function jsonHeaders(): HeadersInit {
+  return { 'Content-Type': 'application/json' };
 }
 
-async function apiFetch<T>(
-  url: string,
-  init: RequestInit,
-  parse: (raw: unknown) => T,
-): Promise<T> {
+async function apiFetch<T>(url: string, init: RequestInit, parse: (raw: unknown) => T): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
     const body = await res.json().catch((): any => ({}));
     const msg: string =
       // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
@@ -116,59 +112,50 @@ export interface ListOrdersParams {
   sortOrder?: 'asc' | 'desc';
 }
 
-export function useOrders(params: ListOrdersParams): ReturnType<
-  typeof useQuery<OrderListResponse>
-> {
-  const token = useAuthStore((s) => s.token) ?? 'mytoken';
+export function useOrders(
+  params: ListOrdersParams,
+): ReturnType<typeof useQuery<OrderListResponse>> {
+  const user = useCurrentUser();
+  const role = useCurrentRole();
+  const userId = useCurrentUserId();
 
   const qs = new URLSearchParams();
   if (params.status) qs.set('status', params.status);
-  // backend does not support free-text search yet; omit until the endpoint is ready
+  if (params.search) qs.set('search', params.search);
   if (params.page != null) qs.set('page', String(params.page));
   if (params.page_size != null) qs.set('page_size', String(params.page_size));
+  if (params.sortBy) qs.set('sort_by', params.sortBy);
+  if (params.sortOrder) qs.set('sort_order', params.sortOrder);
+  // non-root users only see orders assigned to themselves
+  if (role !== 'root' && userId) qs.set('assigned_to', userId);
 
   return useQuery<OrderListResponse>({
     queryKey: orderKeys.list(params),
     queryFn: async () => {
-      const { sortBy = 'order_number', sortOrder = 'asc' } = params;
-      const dir = sortOrder === 'desc' ? -1 : 1;
-
-      function sortItems(items: Order[]): Order[] {
-        return [...items].sort((a, b) => {
+      try {
+        return await apiFetch(`/api/v1/orders?${qs.toString()}`, { credentials: 'include' }, (d) =>
+          orderListSchema.parse(d),
+        );
+      } catch (err) {
+        if (!import.meta.env.DEV) throw err;
+        // DEV only: API unreachable — fall back to mock data with client-side filter/sort
+        const { sortBy = 'order_number', sortOrder = 'asc' } = params;
+        const dir = sortOrder === 'desc' ? -1 : 1;
+        let { items } = MOCK_ORDER_LIST;
+        if (params.status) items = items.filter((o) => o.status === params.status);
+        if (params.search) {
+          const q = params.search.toLowerCase();
+          items = items.filter(
+            (o) =>
+              o.order_number.toLowerCase().includes(q) || o.customer_name.toLowerCase().includes(q),
+          );
+        }
+        items = [...items].sort((a, b) => {
           const av = a[sortBy as keyof Order];
           const bv = b[sortBy as keyof Order];
           if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
           return String(av ?? '').localeCompare(String(bv ?? '')) * dir;
         });
-      }
-
-      function filterBySearch(items: Order[]): Order[] {
-        if (!params.search) return items;
-        const q = params.search.toLowerCase();
-        return items.filter(
-          (o) =>
-            o.order_number.toLowerCase().includes(q) ||
-            o.customer_name.toLowerCase().includes(q),
-        );
-      }
-
-      try {
-        const result = await apiFetch(
-          `/api/v1/orders?${qs.toString()}`,
-          { headers: bearerHeaders(token) },
-          (d) => orderListSchema.parse(d),
-        );
-        // client-side search + sort on current page — backend does not support these params yet
-        const filtered = filterBySearch(result.items);
-        return { ...result, items: sortItems(filtered) };
-      } catch (err) {
-        if (!import.meta.env.DEV) throw err;
-        // DEV only: API unreachable or token invalid — filter mock data client-side
-        let items = MOCK_ORDER_LIST.items;
-        if (params.status) {
-          items = items.filter((o) => o.status === params.status);
-        }
-        items = sortItems(filterBySearch(items)); // sort before pagination for correct results
         const page = params.page ?? 1;
         const size = params.page_size ?? 20;
         return {
@@ -179,19 +166,23 @@ export function useOrders(params: ListOrdersParams): ReturnType<
         };
       }
     },
-    enabled: Boolean(token),
+    enabled: Boolean(user),
   });
 }
 
 export function useCreateOrder(): ReturnType<typeof useMutation<Order, Error, OrderCreate>> {
-  const token = useAuthStore((s) => s.token) ?? 'mytoken';
   const qc = useQueryClient();
 
   return useMutation<Order, Error, OrderCreate>({
     mutationFn: (payload) =>
       apiFetch(
         '/api/v1/orders',
-        { method: 'POST', headers: bearerHeaders(token), body: JSON.stringify(payload) },
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: jsonHeaders(),
+          body: JSON.stringify(payload),
+        },
         (d) => orderSchema.parse(d),
       ),
     onSuccess: () => {
@@ -203,14 +194,18 @@ export function useCreateOrder(): ReturnType<typeof useMutation<Order, Error, Or
 export function useUpdateOrder(): ReturnType<
   typeof useMutation<Order, Error, { id: string; payload: OrderUpdate }>
 > {
-  const token = useAuthStore((s) => s.token) ?? 'mytoken';
   const qc = useQueryClient();
 
   return useMutation<Order, Error, { id: string; payload: OrderUpdate }>({
     mutationFn: ({ id, payload }) =>
       apiFetch(
         `/api/v1/orders/${id}`,
-        { method: 'PATCH', headers: bearerHeaders(token), body: JSON.stringify(payload) },
+        {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: jsonHeaders(),
+          body: JSON.stringify(payload),
+        },
         (d) => orderSchema.parse(d),
       ),
     onSuccess: () => {
@@ -220,14 +215,13 @@ export function useUpdateOrder(): ReturnType<
 }
 
 export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error, string>> {
-  const token = useAuthStore((s) => s.token) ?? 'mytoken';
   const qc = useQueryClient();
 
   return useMutation<undefined, Error, string>({
     mutationFn: (id) =>
       apiFetch<undefined>(
         `/api/v1/orders/${id}`,
-        { method: 'DELETE', headers: bearerHeaders(token) },
+        { method: 'DELETE', credentials: 'include' },
         () => undefined,
       ),
     onSuccess: () => {
@@ -239,13 +233,11 @@ export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error
 export function useTriggerSchedule(): ReturnType<
   typeof useMutation<ScheduleTaskResponse, Error, string>
 > {
-  const token = useAuthStore((s) => s.token) ?? 'mytoken';
-
   return useMutation<ScheduleTaskResponse, Error, string>({
     mutationFn: (orderId) =>
       apiFetch(
         `/api/v1/orders/${orderId}/schedule`,
-        { method: 'POST', headers: bearerHeaders(token) },
+        { method: 'POST', credentials: 'include' },
         (d) => scheduleTaskSchema.parse(d),
       ),
   });

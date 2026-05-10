@@ -24,6 +24,27 @@ vi.mock('../api/orders', () => ({
   useUpdateOrder: () => ({ mutate: mockUpdateMutate, isPending: false, isError: false }),
 }));
 
+vi.mock('@/features/auth/api/users', () => {
+  // Must be a stable reference — if useUsers() returns a new array every render,
+  // OrderModal's useEffect([order, reset, users]) re-runs infinitely and hangs.
+  const stableUsers = [
+    { id: 'uid-001', username: 'alice', email: 'alice@example.com' },
+    { id: 'uid-002', username: 'bob', email: 'bob@example.com' },
+  ];
+  return { useUsers: () => stableUsers };
+});
+
+// Radix Dialog has animation timers that keep the test runner alive.
+// Replace with a plain stub so tests exit cleanly.
+vi.mock('@/components/ui/dialog', () => ({
+  Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
+    open ? <div>{children}</div> : null,
+  DialogContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogTitle: ({ children }: { children: React.ReactNode }) => <h2>{children}</h2>,
+  DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+}));
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -96,6 +117,8 @@ describe('OrderModal', () => {
 
     await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
 
+    await user.type(screen.getByLabelText(/負責人/), 'alice@example.com');
+
     await user.click(screen.getByRole('button', { name: '新增' }));
 
     expect(mockCreateMutate).toHaveBeenCalledWith(
@@ -130,7 +153,8 @@ describe('OrderModal', () => {
 
   it('edit mode: passes version_id to updateMutation.mutate', async () => {
     const user = userEvent.setup();
-    const order = makeOrder({ id: 'edit-id', version_id: 3 });
+    // assigned_to must match a mock user so the pre-filled email passes validation
+    const order = makeOrder({ id: 'edit-id', version_id: 3, assigned_to: 'uid-001' });
     render(<OrderModal open order={order} onClose={onClose} />);
 
     await user.click(screen.getByRole('button', { name: '儲存' }));
@@ -138,6 +162,7 @@ describe('OrderModal', () => {
     expect(mockUpdateMutate).toHaveBeenCalledWith(
       expect.objectContaining({
         id: 'edit-id',
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         payload: expect.objectContaining({ version_id: 3 }),
       }),
       expect.anything(),

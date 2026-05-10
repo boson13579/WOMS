@@ -28,14 +28,23 @@ export const useOrderStore = create<OrderFilterState>()((set) => ({
   sortBy: 'order_number',
   sortOrder: 'asc',
 
-  setStatus: (status) => set({ status, page: 1 }),
-  setSearch: (search) => set({ search, page: 1 }),
-  setPage: (page) => set({ page }),
-  setSort: (field) =>
+  setStatus: (status) => {
+    set({ status, page: 1 });
+  },
+  setSearch: (search) => {
+    set({ search, page: 1 });
+  },
+  setPage: (page) => {
+    set({ page });
+  },
+  setSort: (field) => {
     set((s) => ({
       sortBy: field,
       sortOrder: s.sortBy === field && s.sortOrder === 'asc' ? 'desc' : 'asc',
       page: 1,
-    })),
-  reset: () => set({ status: null, search: '', page: 1, sortBy: 'order_number', sortOrder: 'asc' }),
+    }));
+  },
+  reset: () => {
+    set({ status: null, search: '', page: 1, sortBy: 'order_number', sortOrder: 'asc' });
+  },
 }));

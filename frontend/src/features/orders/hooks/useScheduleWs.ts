@@ -8,7 +8,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 
-import { useAuthStore } from '@/features/auth/stores/authStore';
+import { useCurrentUser } from '@/lib/auth';
 
 import { scheduleProgressSchema } from '../api/orders';
 import type { ScheduleProgress } from '../types';
@@ -19,22 +19,25 @@ interface UseScheduleWsResult {
 }
 
 export function useScheduleWs(taskId: string | null): UseScheduleWsResult {
-  const token = useAuthStore((s) => s.token);
+  const user = useCurrentUser();
   const [progress, setProgress] = useState<ScheduleProgress | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    if (!taskId || !token) return undefined;
+    if (!taskId || !user) return undefined;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/api/v1/ws/schedule/${taskId}?token=${encodeURIComponent(token)}`;
+    // Cookie is sent automatically by the browser for same-origin WS connections.
+    const url = `${protocol}//${window.location.host}/api/v1/ws/schedule/${taskId}`;
 
     const toastId = toast.loading('排程進行中…', { description: '正在啟動演算法' });
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
-    ws.onopen = () => setIsConnected(true);
+    ws.onopen = () => {
+      setIsConnected(true);
+    };
 
     ws.onmessage = (evt: MessageEvent<string>) => {
       const data: ScheduleProgress = scheduleProgressSchema.parse(JSON.parse(evt.data));
@@ -59,12 +62,15 @@ export function useScheduleWs(taskId: string | null): UseScheduleWsResult {
       setIsConnected(false);
     };
 
-    ws.onclose = () => setIsConnected(false);
+    ws.onclose = () => {
+      setIsConnected(false);
+    };
 
     return () => {
       ws.close();
+      toast.dismiss(toastId);
     };
-  }, [taskId, token]);
+  }, [taskId, user]);
 
   return { progress, isConnected };
 }

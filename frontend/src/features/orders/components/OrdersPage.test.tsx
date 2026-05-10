@@ -14,15 +14,20 @@ import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Order } from '../types';
+
 import { OrdersPage } from './OrdersPage';
 
 // ---------------------------------------------------------------------------
 // Mock react-router-dom (keep original module, override useNavigate only)
 // ---------------------------------------------------------------------------
 
-const mockNavigate = vi.fn();
+const { mockNavigate, mockLogout } = vi.hoisted(() => ({
+  mockNavigate: vi.fn(),
+  mockLogout: vi.fn().mockResolvedValue(undefined),
+}));
 
 vi.mock('react-router-dom', async (importOriginal) => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const mod = await importOriginal<typeof import('react-router-dom')>();
   return { ...mod, useNavigate: () => mockNavigate };
 });
@@ -31,10 +36,35 @@ vi.mock('react-router-dom', async (importOriginal) => {
 // Mock useAuthStore
 // ---------------------------------------------------------------------------
 
-const mockLogout = vi.fn();
-
 vi.mock('@/features/auth/stores/authStore', () => ({
-  useAuthStore: () => ({ user: { username: 'alice' }, logout: mockLogout }),
+  useAuthStore: (
+    sel: (s: {
+      user: { username: string; role: string; id: string };
+      logout: () => Promise<void>;
+    }) => unknown,
+  ) => sel({ user: { username: 'alice', role: 'scheduler', id: 'uid-001' }, logout: mockLogout }),
+}));
+
+// ---------------------------------------------------------------------------
+// Mock shared Header — stub with title + logout button
+// ---------------------------------------------------------------------------
+
+vi.mock('@/components/layout/Header', () => ({
+  Header: ({ title }: { title: string }) => (
+    <header>
+      <h1>{title}</h1>
+      <button
+        type="button"
+        onClick={() => {
+          void Promise.resolve(mockLogout()).then(() => {
+            mockNavigate('/login', { replace: true });
+          });
+        }}
+      >
+        登出
+      </button>
+    </header>
+  ),
 }));
 
 // ---------------------------------------------------------------------------
@@ -70,7 +100,8 @@ vi.mock('./OrderTable', () => ({
   }) => (
     <div data-testid="order-table">
       <button
-        onClick={() =>
+        type="button"
+        onClick={() => {
           onEdit({
             id: 'order-id-0001',
             order_number: 'ORD-20260504-0001',
@@ -86,12 +117,19 @@ vi.mock('./OrderTable', () => ({
             version_id: 1,
             created_at: '2026-05-04T08:00:00Z',
             updated_at: '2026-05-04T08:00:00Z',
-          })
-        }
+          });
+        }}
       >
         table-edit
       </button>
-      <button onClick={() => onSchedule('test-order-id')}>table-schedule</button>
+      <button
+        type="button"
+        onClick={() => {
+          onSchedule('test-order-id');
+        }}
+      >
+        table-schedule
+      </button>
     </div>
   ),
 }));
@@ -107,12 +145,10 @@ vi.mock('./OrderModal', () => ({
     order: Order | undefined;
     onClose: () => void;
   }) => (
-    <div
-      data-testid="order-modal"
-      data-open={String(open)}
-      data-order={order?.id ?? 'none'}
-    >
-      <button onClick={onClose}>modal-close</button>
+    <div data-testid="order-modal" data-open={String(open)} data-order={order?.id ?? 'none'}>
+      <button type="button" onClick={onClose}>
+        modal-close
+      </button>
     </div>
   ),
 }));
@@ -138,24 +174,10 @@ describe('OrdersPage', () => {
     vi.clearAllMocks();
   });
 
-  it('renders the page heading', () => {
+  it('renders the page heading via Header', () => {
     renderPage();
 
-    expect(
-      screen.getByRole('heading', { name: 'Smart Order Management', level: 1 }),
-    ).toBeInTheDocument();
-  });
-
-  it('renders the logged-in username', () => {
-    renderPage();
-
-    expect(screen.getByText('alice')).toBeInTheDocument();
-  });
-
-  it('renders the order list sub-heading', () => {
-    renderPage();
-
-    expect(screen.getByRole('heading', { name: '訂單列表', level: 2 })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '訂單列表', level: 1 })).toBeInTheDocument();
   });
 
   it('renders all three child components', () => {
@@ -221,6 +243,6 @@ describe('OrdersPage', () => {
     await user.click(screen.getByRole('button', { name: /登出/ }));
 
     expect(mockLogout).toHaveBeenCalledOnce();
-    expect(mockNavigate).toHaveBeenCalledWith('/login');
+    expect(mockNavigate).toHaveBeenCalledWith('/login', { replace: true });
   });
 });

@@ -44,13 +44,11 @@ TableRow.displayName = 'TableRow';
 const TableHead = React.forwardRef<
   HTMLTableCellElement,
   React.ThHTMLAttributes<HTMLTableCellElement>
+  // eslint-disable-next-line react/prop-types
 >(({ className, ...props }, ref) => (
   <th
     ref={ref}
-    className={cn(
-      'h-10 px-2 text-left align-middle font-medium text-muted-foreground',
-      className,
-    )}
+    className={cn('h-10 px-2 text-left align-middle font-medium text-muted-foreground', className)}
     {...props}
   />
 ));
@@ -59,6 +57,7 @@ TableHead.displayName = 'TableHead';
 const TableCell = React.forwardRef<
   HTMLTableCellElement,
   React.TdHTMLAttributes<HTMLTableCellElement>
+  // eslint-disable-next-line react/prop-types
 >(({ className, ...props }, ref) => (
   <td ref={ref} className={cn('p-2 align-middle', className)} {...props} />
 ));

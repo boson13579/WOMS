@@ -7,6 +7,8 @@ import { useEffect, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Select } from '@/components/ui/select';
 
 import { useOrderStore } from '../stores/orderStore';
 import type { OrderStatus } from '../types';
@@ -20,17 +22,18 @@ const STATUS_OPTIONS: { label: string; value: OrderStatus | '' }[] = [
   { label: '已取消', value: 'cancelled' },
 ];
 
-const selectCls =
-  'h-9 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring';
-
 export function OrderFilters(): JSX.Element {
   const { status, search, setStatus, setSearch, reset } = useOrderStore();
 
   // Debounce the search input by 300 ms to avoid spamming the API.
   const [localSearch, setLocalSearch] = useState(search);
   useEffect(() => {
-    const id = setTimeout(() => setSearch(localSearch), 300);
-    return () => clearTimeout(id);
+    const id = setTimeout(() => {
+      setSearch(localSearch);
+    }, 300);
+    return () => {
+      clearTimeout(id);
+    };
   }, [localSearch, setSearch]);
 
   return (
@@ -38,23 +41,32 @@ export function OrderFilters(): JSX.Element {
       <Input
         placeholder="搜尋訂單、客戶…"
         value={localSearch}
-        onChange={(e) => setLocalSearch(e.target.value)}
+        onChange={(e) => {
+          setLocalSearch(e.target.value);
+        }}
         className="w-60"
         aria-label="搜尋訂單"
       />
 
-      <select
-        value={status ?? ''}
-        onChange={(e) => setStatus((e.target.value as OrderStatus) || null)}
-        className={selectCls}
-        aria-label="篩選狀態"
-      >
-        {STATUS_OPTIONS.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
+      <div className="flex items-center gap-1.5">
+        <Label htmlFor="status-filter" className="sr-only">
+          篩選狀態
+        </Label>
+        <Select
+          id="status-filter"
+          value={status ?? ''}
+          onChange={(e) => {
+            const val = e.target.value as OrderStatus | '';
+            setStatus(val !== '' ? val : null);
+          }}
+        >
+          {STATUS_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </Select>
+      </div>
 
       <Button variant="outline" size="sm" onClick={reset}>
         重設

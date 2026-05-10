@@ -3,14 +3,13 @@
  * Mirrors the backend Pydantic schemas exactly so Zod can parse them safely.
  */
 
-export type OrderStatus =
-  | 'pending'
-  | 'scheduled'
-  | 'in_production'
-  | 'completed'
-  | 'cancelled';
+export type OrderStatus = 'pending' | 'scheduled' | 'in_production' | 'completed' | 'cancelled';
 
-export type SortField = 'order_number' | 'customer_name' | 'wafer_quantity' | 'requested_delivery_date';
+export type SortField =
+  | 'order_number'
+  | 'customer_name'
+  | 'wafer_quantity'
+  | 'requested_delivery_date';
 
 /** A single order record — matches backend OrderResponse */
 export interface Order {

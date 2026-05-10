@@ -29,9 +29,13 @@ function Dialog({ open, onOpenChange, children }: DialogProps): JSX.Element {
   React.useEffect(() => {
     const el = ref.current;
     if (!el) return undefined;
-    const handler = () => onOpenChange(false);
+    const handler = () => {
+      onOpenChange(false);
+    };
     el.addEventListener('close', handler);
-    return () => el.removeEventListener('close', handler);
+    return () => {
+      el.removeEventListener('close', handler);
+    };
   }, [onOpenChange]);
 
   return (
@@ -70,13 +74,13 @@ function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLDivEleme
 
 function DialogTitle({
   className,
+  children,
   ...props
 }: React.HTMLAttributes<HTMLHeadingElement>): JSX.Element {
   return (
-    <h2
-      className={cn('text-lg font-semibold leading-none tracking-tight', className)}
-      {...props}
-    />
+    <h2 className={cn('text-lg font-semibold leading-none tracking-tight', className)} {...props}>
+      {children}
+    </h2>
   );
 }
 

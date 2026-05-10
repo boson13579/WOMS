@@ -9,7 +9,6 @@
 import { createBrowserRouter } from 'react-router-dom';
 
 import { AppShell } from '@/components/layout/AppShell';
-import { ProtectedRoute } from '@/components/layout/ProtectedRoute';
 import { AuthPage } from '@/features/auth/components/AuthPage';
 import { DashboardPage } from '@/features/dashboard/components/DashboardPage';
 import { OrdersPage } from '@/features/orders/components/OrdersPage';

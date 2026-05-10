@@ -12,6 +12,7 @@ import { logout as authApiLogout } from '../api/auth';
 const STORAGE_KEY = 'smart-order.auth';
 
 interface AuthUser {
+  id: string;
   username: string;
   role: string;
 }
@@ -28,7 +29,7 @@ interface AuthState {
   logout: () => Promise<void>;
 }
 
-function decodeJwtPayload(token: string): { role?: string; exp?: number } {
+function decodeJwtPayload(token: string): { sub?: string; role?: string; exp?: number } {
   const payloadSegment = token.split('.')[1];
   if (!payloadSegment) {
     return {};
@@ -39,18 +40,18 @@ function decodeJwtPayload(token: string): { role?: string; exp?: number } {
     normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
     '=',
   );
-  return JSON.parse(atob(paddedPayload)) as { role?: string; exp?: number };
+  return JSON.parse(atob(paddedPayload)) as { sub?: string; role?: string; exp?: number };
 }
 
 function decodeSession(token: string, username?: string): PersistedAuthState {
   try {
     const payload = decodeJwtPayload(token);
     return {
-      user: { username: username ?? 'User', role: payload.role ?? 'viewer' },
+      user: { id: payload.sub ?? '', username: username ?? 'User', role: payload.role ?? 'viewer' },
       expiresAt: typeof payload.exp === 'number' ? payload.exp * 1000 : 0,
     };
   } catch {
-    return { user: { username: username ?? 'User', role: 'viewer' }, expiresAt: 0 };
+    return { user: { id: '', username: username ?? 'User', role: 'viewer' }, expiresAt: 0 };
   }
 }
 

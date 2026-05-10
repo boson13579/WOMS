@@ -16,10 +16,10 @@ import { vi } from 'vitest';
 
 // jsdom does not implement HTMLDialogElement.showModal / close.
 // Polyfill so any component using native <dialog> can be tested.
-HTMLDialogElement.prototype.showModal = vi.fn(function (this: HTMLDialogElement) {
+HTMLDialogElement.prototype.showModal = vi.fn(function showModal(this: HTMLDialogElement) {
   this.setAttribute('open', '');
 });
-HTMLDialogElement.prototype.close = vi.fn(function (this: HTMLDialogElement) {
+HTMLDialogElement.prototype.close = vi.fn(function close(this: HTMLDialogElement) {
   this.removeAttribute('open');
   this.dispatchEvent(new Event('close'));
 });
