@@ -1,14 +1,16 @@
 /**
  * Top app bar.
  *
- * Notion-inspired: page title left, lightweight contextual actions right.
- * No deep nav here — the sidebar owns navigation.
+ * Page title lives on the left; lightweight contextual actions live on the
+ * right. The sidebar owns primary navigation.
  */
-import { RefreshCcw, Search } from 'lucide-react';
+import { LogOut, RefreshCcw, Search } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 
 import { ThemeToggle } from '@/components/layout/ThemeToggle';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { useAuthStore } from '@/features/auth/stores/authStore';
 
 interface HeaderProps {
   title: string;
@@ -27,6 +29,15 @@ export function Header({
   onRefresh,
   refreshing = false,
 }: HeaderProps): JSX.Element {
+  const navigate = useNavigate();
+  const logout = useAuthStore((state) => state.logout);
+
+  const handleLogout = () => {
+    void logout().finally(() => {
+      navigate('/login', { replace: true });
+    });
+  };
+
   return (
     <header className="flex h-14 shrink-0 items-center gap-4 border-b border-border bg-background px-6">
       <div className="min-w-0 flex-1">
@@ -39,7 +50,6 @@ export function Header({
         {subtitle ? <p className="truncate text-xs text-muted-foreground">{subtitle}</p> : null}
       </div>
 
-      {/* Search affordance — disabled in Phase 1 */}
       <div className="relative hidden items-center md:flex">
         <Search className="pointer-events-none absolute left-2.5 h-4 w-4 text-muted-foreground" />
         <input
@@ -71,6 +81,10 @@ export function Header({
       ) : null}
 
       <ThemeToggle />
+      <Button type="button" variant="outline" size="sm" onClick={handleLogout}>
+        <LogOut className="mr-2 h-3.5 w-3.5" aria-hidden="true" />
+        Logout
+      </Button>
     </header>
   );
 }

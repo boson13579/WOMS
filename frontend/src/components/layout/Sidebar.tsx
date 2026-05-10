@@ -32,7 +32,7 @@ interface NavItem {
 
 const PRIMARY_NAV: readonly NavItem[] = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
-  { to: '/orders', label: 'Orders', icon: Package, disabled: true },
+  { to: '/orders', label: 'Orders', icon: Package },
   { to: '/scheduling', label: 'Scheduling', icon: CalendarClock, disabled: true },
   { to: '/users', label: 'Users', icon: Users, disabled: true },
 ];

@@ -7,9 +7,9 @@ so FastAPI does not interpret the literal string "batch-update" as a UUID.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
@@ -33,6 +33,10 @@ router = APIRouter()
 _READ_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
 # Roles allowed to write orders (scheduler and above)
 _WRITE_ROLES = require_roles(UserRole.scheduler, UserRole.root)
+
+VALID_SORT_FIELDS = frozenset(
+    {"order_number", "customer_name", "wafer_quantity", "requested_delivery_date"}
+)
 
 
 @router.post("", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
@@ -59,19 +63,30 @@ def list_orders(
     current_user: User = Depends(_READ_ROLES),
     status_filter: Annotated[list[OrderStatus] | None, Query(alias="status")] = None,
     assigned_to: uuid.UUID | None = None,
+    search: str | None = Query(default=None, max_length=200),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    sort_by: str | None = Query(default=None),
+    sort_order: Literal["asc", "desc"] | None = Query(default=None),
 ) -> OrderListResponse:
-    """List active orders with optional filtering and pagination.
+    """List active orders with optional filtering, sorting, and pagination.
 
     Permission: order_manager+.
     """
+    if sort_by is not None and sort_by not in VALID_SORT_FIELDS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid sort_by value. Must be one of: {', '.join(sorted(VALID_SORT_FIELDS))}",
+        )
     return order_service.list_orders(
         db,
         status=status_filter,
         assigned_to=assigned_to,
+        search=search,
         page=page,
         page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 
