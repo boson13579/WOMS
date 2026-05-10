@@ -9,7 +9,6 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
-
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
