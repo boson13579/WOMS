@@ -16,7 +16,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { useAuthStore } from '@/features/auth/stores/authStore';
+import { useCurrentRole } from '@/lib/auth';
 
 import { deactivateUser, listUsers, updateUser } from '../api/users';
 import { userRoleSchema, type UserResponse, type UserRole } from '../types/user';
@@ -46,7 +46,7 @@ function roleBadgeVariant(role: UserRole): 'destructive' | 'secondary' | 'outlin
 
 export function AdminUsersPage(): JSX.Element {
   const queryClient = useQueryClient();
-  const currentRole = useAuthStore((state) => state.user?.role);
+  const currentRole = useCurrentRole();
   const [search, setSearch] = useState('');
   const [edit, setEdit] = useState<EditState | null>(null);
 

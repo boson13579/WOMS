@@ -21,7 +21,7 @@ import type { LucideIcon } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 
 import { Separator } from '@/components/ui/separator';
-import { useAuthStore } from '@/features/auth/stores/authStore';
+import { useCurrentRole } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 
 interface NavItem {
@@ -80,7 +80,7 @@ function NavRow({ item }: { item: NavItem }): JSX.Element {
 }
 
 export function Sidebar(): JSX.Element {
-  const role = useAuthStore((state) => state.user?.role);
+  const role = useCurrentRole();
   const showUserManagement = role === 'root';
 
   return (

@@ -1,15 +1,21 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { useAuthStore } from '@/features/auth/stores/authStore';
-
 import { deactivateUser, listUsers, updateUser } from '../api/users';
-import type { UserResponse } from '../types/user';
+import type { UserResponse, UserRole } from '../types/user';
 
 import { AdminUsersPage } from './AdminUsersPage';
+
+const { mockCurrentRole } = vi.hoisted(() => ({
+  mockCurrentRole: vi.fn<() => UserRole | null>(),
+}));
+
+vi.mock('@/lib/auth', () => ({
+  useCurrentRole: mockCurrentRole,
+}));
 
 vi.mock('../api/users', () => ({
   listUsers: vi.fn(),
@@ -59,13 +65,8 @@ function makeWrapper(): { wrapper: ({ children }: { children: ReactNode }) => JS
   return { wrapper: Wrapper };
 }
 
-function renderPage(role = 'root') {
-  act(() => {
-    useAuthStore.setState({
-      user: { id: `${role}_id`, username: `${role}_user`, role },
-      expiresAt: Date.now() + 60_000,
-    });
-  });
+function renderPage(role: UserRole = 'root') {
+  mockCurrentRole.mockReturnValue(role);
 
   const { wrapper: Wrapper } = makeWrapper();
   return render(<AdminUsersPage />, { wrapper: Wrapper });
@@ -94,13 +95,10 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
-  act(() => {
-    useAuthStore.setState({ user: null, expiresAt: null });
-  });
 });
 
 describe('AdminUsersPage permissions', () => {
-  it.each(['viewer', 'scheduler', 'order_manager'])(
+  it.each<UserRole>(['viewer', 'scheduler', 'order_manager'])(
     'shows a root-only message for %s users and does not fetch accounts',
     (role) => {
       renderPage(role);
