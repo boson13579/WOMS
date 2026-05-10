@@ -3,7 +3,7 @@
 from fastapi import APIRouter
 
 
-from app.api.v1 import auth, health, orders, users, schedule, websocket
+from app.api.v1 import auth, health, orders, schedule, users, websocket
 
 # Aggregate router — `app.main` includes only this single router with prefix
 # `/api/v1`, keeping `main.py` free of per-feature wiring.
