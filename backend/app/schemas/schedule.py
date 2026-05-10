@@ -13,6 +13,7 @@ from app.models.order import OrderStatus
 __all__ = [
     "DailyAssignment",
     "ScheduleOperationRequest",
+    "ScheduleOperationResponse",
     "ScheduleRebuildResponse",
     "ScheduleResultResponse",
     "ScheduleStatusResponse",
@@ -87,6 +88,18 @@ class ScheduleTriggerResponse(BaseModel):
     """Returned by ``POST /schedule/trigger`` after dispatching a Celery task."""
 
     task_id: str
+    message: str
+
+
+class ScheduleOperationResponse(BaseModel):
+    """Returned by ``POST /schedule/operations`` after the op is enqueued.
+
+    Op processing is async (Celery worker drains the queue), so this response
+    just confirms the op landed in Redis. The caller should not block on the
+    schedule actually being applied — that will arrive via the
+    ``schedule.updated`` WebSocket broadcast.
+    """
+
     message: str
 
 

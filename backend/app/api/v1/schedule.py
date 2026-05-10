@@ -31,6 +31,7 @@ from app.core.security import require_roles
 from app.models.user import User, UserRole
 from app.schemas.schedule import (
     ScheduleOperationRequest,
+    ScheduleOperationResponse,
     ScheduleRebuildResponse,
     ScheduleResultResponse,
     ScheduleStatusResponse,
@@ -38,18 +39,22 @@ from app.schemas.schedule import (
 )
 from app.services import order as order_service
 from app.services.scheduling import (
-    ScheduledResult,
-    SchedulerState,
-    compute_schedule,
-)
-from app.workers.scheduling import (
     PENDING_OPS_KEY,
     PENDING_OPS_SEQ_KEY,
     STATE_KEY,
     STATUS_KEY,
+    ScheduledResult,
+    SchedulerState,
+    compute_schedule,
+    score_for_op,
+)
+
+# Workers are a peer of services; api → workers is allowed *only* for
+# dispatching Celery task objects (``.delay()``). Anything else (Redis keys,
+# encoding helpers, internal flags) lives in ``app.services.scheduling``.
+from app.workers.scheduling import (
     rebuild_schedule_task,
     run_scheduling_task,
-    score_for_op,
 )
 
 router = APIRouter()
@@ -118,12 +123,13 @@ def trigger_scheduling(
 
 @router.post(
     "/operations",
+    response_model=ScheduleOperationResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
 def enqueue_operation(
     request: ScheduleOperationRequest,
     current_user: User = Depends(_WRITE_ROLES),
-) -> dict[str, str]:
+) -> ScheduleOperationResponse:
     """Queue an order op for the next scheduling run.
 
     Order CRUD calls this after persisting create / update / delete. Modifying
@@ -153,7 +159,7 @@ def enqueue_operation(
     if status_doc is None or status_doc.get("state") != "running":
         run_scheduling_task.delay()
 
-    return {"message": "Operation queued"}
+    return ScheduleOperationResponse(message="Operation queued")
 
 
 # ---------------------------------------------------------------------------

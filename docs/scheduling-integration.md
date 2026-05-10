@@ -363,14 +363,17 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 | `schedule:state` key 不見 / Redis 被 flush | `POST /api/v1/schedule/rebuild` |
 | 前端 `daily_breakdown` 一直是空 | 同上 |
 | `schedule:status` 卡在 `running` 但 worker 已經死了 | 重啟 worker；如果還是卡，手動 `redis-cli set schedule:status '{"state":"idle"}'` |
+| `schedule:status.state == "failed"`、`error` 欄位有訊息 | 三支 task（`run_scheduling` / `advance_day` / `rebuild_schedule`）任一條失敗都會留這個記錄，先看 `error` + Celery traceback 找根因。`failed` 不會擋 `/trigger`（409 只擋 `running`），下次成功的 task 會把 status 蓋回 `idle`，不需要先手動清。 |
 | `schedule:waiter_pending` 卡住超過 10 分鐘 | TTL 會自己過期；如果 TTL 被改大可以手動 `redis-cli del schedule:waiter_pending` |
 | 排程結果跟 DB 不同步 | `POST /api/v1/schedule/rebuild` |
+| 前端 WebSocket 通知突然全停 | 看 backend log 有沒有 `websocket.consumer.failed`（ERROR）— 這代表 Redis pub/sub 中斷或訂閱失敗，consumer 已退出且**不會自我重啟**。重啟 FastAPI process 即可（lifespan 會重新建一個 consumer task）。 |
 
 ### 4.7 Ops 注意事項
 
 - **生產 deploy 不要清 `schedule:pending_ops:seq`**：清掉的話新進來的 op 會跟舊的同 score 撞 member。要清的話**也要一起清 `schedule:pending_ops`**。
 - **scaling**：`run_scheduling_task` 設計成同時只能跑一個（靠 `schedule:status` 守）。即使開多 worker container，concurrent 的這個 task 也只會有一個在做事。pending_ops 自然 serialize。
 - **logs**：worker 的關鍵事件用 `structlog` 寫，可以 grep `schedule.run.start` / `schedule.run.success` / `schedule.advance_day.success` / `schedule.rebuild.success` / `schedule.run.yield_to_waiter`（最後這個代表 race fix 起作用了）
+- **alert-worthy log lines**（建議在 log shipper 設告警）：`schedule.run.failed` / `schedule.advance_day.failed` / `schedule.rebuild.failed` / `websocket.consumer.failed` — 這四個都是 ERROR 級別，前三個對應 `schedule:status.state == "failed"`，最後一個代表 WebSocket 通知通道斷掉（需要重啟 FastAPI）
 - **WebSocket 在多 instance 部署下**：每個 FastAPI worker 各自持有自己的連線，靠 Redis pub/sub fan-out 同步事件。橫向擴展不需要 sticky session。
 
 ---

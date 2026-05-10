@@ -31,6 +31,10 @@ logger = structlog.get_logger(__name__)
 __all__ = [
     "DAILY_CAPACITY",
     "HORIZON_DAYS",
+    "PENDING_OPS_KEY",
+    "PENDING_OPS_SEQ_KEY",
+    "STATE_KEY",
+    "STATUS_KEY",
     "ScheduleResult",
     "ScheduledResult",
     "SchedulerState",
@@ -44,6 +48,7 @@ __all__ = [
     "rebuild_state",
     "rel_to_abs",
     "remove_order",
+    "score_for_op",
 ]
 
 
@@ -63,6 +68,55 @@ __all__ = [
 _settings = get_settings()
 DAILY_CAPACITY: int = _settings.SCHEDULER_DAILY_CAPACITY
 HORIZON_DAYS: int = _settings.SCHEDULER_HORIZON_DAYS
+
+
+# ---------------------------------------------------------------------------
+# Redis-key + queue-encoding contract
+# ---------------------------------------------------------------------------
+#
+# Redis keys and the ``score_for_op`` encoding live here — at the *services*
+# layer — because they are the contract between the API producer and the
+# Celery worker consumer. Both layers must agree on names and score format,
+# but the API has no business reaching into ``workers/`` for them (RULES.md
+# §3 forbids ``api/ → workers/`` for anything beyond Celery task dispatch).
+# Putting the contract in services/ makes it the single canonical source.
+
+STATE_KEY = "schedule:state"
+"""Redis string key holding the JSON-serialized ``SchedulerState``."""
+
+STATUS_KEY = "schedule:status"
+"""Redis string key holding the worker lifecycle JSON document."""
+
+PENDING_OPS_KEY = "schedule:pending_ops"
+"""Redis sorted-set key for queued add/remove ops (ZADD/ZPOPMIN, O(log n))."""
+
+PENDING_OPS_SEQ_KEY = "schedule:pending_ops:seq"
+"""Redis monotonic counter (INCR) for the ``seq`` field embedded in op scores."""
+
+# Score layout for ``schedule:pending_ops``:
+#   score = GROUP_OFFSET * group_priority + seq
+# where ``group_priority`` is 0 for shrink-group ops (popped first) and 1 for
+# grow-group ops, and ``seq`` is the ``PENDING_OPS_SEQ_KEY`` value (oldest op =
+# smallest seq = popped first within its group).
+#
+# 10**12 is large enough that we'd need a trillion ops in the shrink group
+# before colliding with the grow group's score range, while still well within
+# float64's exact-integer range (2**53 ≈ 9.0e15) so ZPOPMIN ordering stays
+# stable.
+_GROUP_OFFSET = 10**12
+
+
+def score_for_op(*, group: str, seq: int) -> float:
+    """Compute the ZADD score for a pending op.
+
+    Producer (``app.api.v1.schedule.enqueue_operation``) and consumer
+    (``app.workers.scheduling._pop_next_op``) both call through this single
+    helper so neither side has to know the encoding. Raises ``ValueError`` on
+    an unknown group rather than silently picking a wrong score.
+    """
+    if group not in ("shrink", "grow"):
+        raise ValueError(f"unknown pending-op group: {group!r}")
+    return float((0 if group == "shrink" else 1) * _GROUP_OFFSET + seq)
 
 
 # ---------------------------------------------------------------------------

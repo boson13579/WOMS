@@ -42,6 +42,9 @@ from app.core.db import SessionLocal
 from app.services import order as order_service
 from app.services import websocket
 from app.services.scheduling import (
+    PENDING_OPS_KEY,
+    STATE_KEY,
+    STATUS_KEY,
     SchedulerState,
     SchedulingOrder,
     add_order,
@@ -58,13 +61,15 @@ __all__ = ["advance_day_task", "rebuild_schedule_task", "run_scheduling_task"]
 
 
 # ---------------------------------------------------------------------------
-# Redis key + status constants
+# Status / waiter-flag constants (worker-internal)
 # ---------------------------------------------------------------------------
+#
+# The cross-layer contract keys (``STATE_KEY`` / ``STATUS_KEY`` /
+# ``PENDING_OPS_KEY`` / ``PENDING_OPS_SEQ_KEY``) and ``score_for_op`` live in
+# ``app.services.scheduling`` — see the import block above. The waiter flag
+# is purely an internal coordination knob between the three worker tasks and
+# is not part of the API contract, so it stays here.
 
-STATE_KEY = "schedule:state"
-PENDING_OPS_KEY = "schedule:pending_ops"
-PENDING_OPS_SEQ_KEY = "schedule:pending_ops:seq"
-STATUS_KEY = "schedule:status"
 WAITER_FLAG_KEY = "schedule:waiter_pending"
 
 _STATUS_IDLE = "idle"
@@ -80,18 +85,6 @@ _STATUS_FAILED = "failed"
 # ``SCHEDULER_WAITER_FLAG_TTL_SECONDS`` env var.
 _WAITER_FLAG_TTL_SECONDS = get_settings().SCHEDULER_WAITER_FLAG_TTL_SECONDS
 
-# Score layout for ``schedule:pending_ops`` (sorted set):
-#   score = GROUP_OFFSET * group_priority + seq
-# where group_priority is 0 for shrink-group ops (popped first) and 1 for
-# grow-group ops, and ``seq`` is a monotonically increasing INCR counter
-# (oldest op = smallest seq = popped first within its group).
-#
-# 10**12 is large enough that we'd need a trillion ops in the shrink group
-# before colliding with the grow group's score range, while still well
-# within float64's exact-integer range (2**53 ~= 9.0e15) so ZPOPMIN
-# ordering is stable.
-GROUP_OFFSET = 10**12
-
 # advance_day_task and rebuild_schedule_task both wait at most this long for
 # an in-flight run to finish before proceeding. Polling cadence is short
 # enough to be responsive and long enough to keep Redis traffic negligible.
@@ -99,18 +92,6 @@ GROUP_OFFSET = 10**12
 # ``SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS`` env vars.
 _RUN_WAIT_TIMEOUT_SECONDS = get_settings().SCHEDULER_RUN_WAIT_TIMEOUT_SECONDS
 _RUN_WAIT_POLL_INTERVAL_SECONDS = get_settings().SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS
-
-
-def score_for_op(*, group: str, seq: int) -> float:
-    """Compute the ZADD score for a pending op.
-
-    Producers (the API endpoint) use this to ensure the same scoring scheme
-    the worker assumes when it ZPOPMIN's. Exposed at module level so callers
-    don't have to know the encoding.
-    """
-    if group not in ("shrink", "grow"):
-        raise ValueError(f"unknown pending-op group: {group!r}")
-    return float((0 if group == "shrink" else 1) * GROUP_OFFSET + seq)
 
 
 # ---------------------------------------------------------------------------
@@ -473,12 +454,13 @@ def advance_day_task() -> None:
     to us instead of racing.
 
     Also claims ``schedule:status = running`` for the duration of its own
-    work (after the wait, before clearing in the inner ``finally``). Without
-    this claim, the window between ``_wait_for_idle_run`` returning and
-    ``_finalize_run`` completing reads ``idle`` to outside callers, so a
-    concurrent ``POST /schedule/trigger`` would dispatch a
-    ``run_scheduling_task`` that races our state writes — the waiter flag
-    suppresses *re-triggers* but not *new dispatches*.
+    work (after the wait). On clean completion the inner success path writes
+    ``idle``; on any exception the inner ``except`` writes ``failed`` (with
+    the error string captured in ``schedule:status.error``) and re-raises so
+    Celery still records the traceback. Writing ``idle`` regardless of
+    outcome — the previous design — meant ``GET /schedule/status`` showed a
+    healthy scheduler even when ``advance_day`` had blown up, hiding the
+    failure from operators.
     """
     logger.info("schedule.advance_day.start")
     _set_waiter_flag()
@@ -500,17 +482,30 @@ def advance_day_task() -> None:
             )
 
             # Drain any pending ops on top of the new state. If the queue is
-            # empty, this just sets status=idle and returns; finalize already
-            # broadcast.
+            # empty, finalize already broadcast and we have nothing to do.
             if cast("int", _get_redis().zcard(PENDING_OPS_KEY)) > 0:
                 run_scheduling_task.delay()
-        finally:
+
             finished_at = datetime.now(tz=UTC).isoformat()
             _set_status(
                 state=_STATUS_IDLE,
                 started_at=started_at,
                 finished_at=finished_at,
             )
+        except Exception as exc:
+            finished_at = datetime.now(tz=UTC).isoformat()
+            _set_status(
+                state=_STATUS_FAILED,
+                started_at=started_at,
+                finished_at=finished_at,
+                error=str(exc),
+            )
+            logger.error(
+                "schedule.advance_day.failed",
+                error=str(exc),
+                exc_info=True,
+            )
+            raise
     finally:
         _clear_waiter_flag()
 
@@ -529,6 +524,11 @@ def rebuild_schedule_task() -> None:
     Skipped orders are only those whose ``requested_delivery_date`` falls
     outside the 30-day horizon — this can happen for long-stuck scheduled
     orders whose deadline has been overtaken by ``base_date`` advancing.
+
+    Status handling mirrors ``advance_day_task``: clean exit writes ``idle``,
+    any exception inside the body writes ``failed`` with the error message
+    and re-raises so Celery records the traceback. See ``advance_day_task``
+    docstring for the rationale.
     """
     logger.info("schedule.rebuild.start")
     _set_waiter_flag()
@@ -578,12 +578,26 @@ def rebuild_schedule_task() -> None:
             # finalize already broadcast and we have nothing more to do.
             if cast("int", _get_redis().zcard(PENDING_OPS_KEY)) > 0:
                 run_scheduling_task.delay()
-        finally:
+
             finished_at = datetime.now(tz=UTC).isoformat()
             _set_status(
                 state=_STATUS_IDLE,
                 started_at=started_at,
                 finished_at=finished_at,
             )
+        except Exception as exc:
+            finished_at = datetime.now(tz=UTC).isoformat()
+            _set_status(
+                state=_STATUS_FAILED,
+                started_at=started_at,
+                finished_at=finished_at,
+                error=str(exc),
+            )
+            logger.error(
+                "schedule.rebuild.failed",
+                error=str(exc),
+                exc_info=True,
+            )
+            raise
     finally:
         _clear_waiter_flag()

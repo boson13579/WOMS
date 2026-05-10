@@ -20,15 +20,15 @@ from unittest.mock import MagicMock
 
 import pytest
 from app.services.scheduling import (
+    PENDING_OPS_KEY,
+    STATE_KEY,
+    STATUS_KEY,
     ScheduleResult,
     SchedulerState,
     SchedulingOrder,
     SkippedOrder,
 )
 from app.workers.scheduling import (
-    PENDING_OPS_KEY,
-    STATE_KEY,
-    STATUS_KEY,
     advance_day_task,
     rebuild_schedule_task,
     run_scheduling_task,
@@ -165,7 +165,7 @@ def _enqueue(fake_redis: _FakeRedis, op: dict[str, Any]) -> None:
     embeds it as ``_seq`` for member uniqueness, and ZADDs at the score
     computed by ``score_for_op``.
     """
-    from app.workers.scheduling import (
+    from app.services.scheduling import (
         PENDING_OPS_SEQ_KEY,
         score_for_op,
     )
@@ -363,6 +363,51 @@ def test_run_scheduling_notifies_user_on_remove_failure(
 # ---------------------------------------------------------------------------
 # run_scheduling_task — re-trigger when ops arrive mid-flight
 # ---------------------------------------------------------------------------
+
+
+def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``run_scheduling_task`` body raises, it MUST:
+
+    1. Write ``schedule:status`` to ``failed`` with the error string captured
+       (so ``GET /schedule/status`` exposes the breakage to operators).
+    2. NOT leave status stuck at ``running`` — that would 409 every future
+       ``POST /schedule/trigger`` permanently and the only escape is
+       hand-editing Redis.
+    3. Re-raise so Celery records the traceback in its result backend.
+
+    Pre-fix the body had no ``except``, so any exception left status frozen
+    at ``running`` and silently broke /trigger. Locking this contract with a
+    test means a future refactor can't strip the except block without
+    flipping a red light.
+    """
+    fake_redis = _FakeRedis()
+    _enqueue(fake_redis, _make_op(order_number="ORD-BOOM"))
+
+    # add_order is the realistic crash point — bug in segment tree code
+    # would manifest there. Any internal raise has the same contract.
+    failing_add = MagicMock(side_effect=RuntimeError("segment tree corrupted"))
+    mocks = _patch_common(monkeypatch, fake_redis, add_order=failing_add)
+
+    result = run_scheduling_task.apply()
+    # Celery sees the failure (traceback is in result.traceback).
+    assert not result.successful()
+    assert "segment tree corrupted" in (result.traceback or "")
+
+    # Status doc shows the failure so operators see it via /schedule/status.
+    raw = fake_redis.get(STATUS_KEY)
+    assert raw is not None
+    payload = json.loads(raw)
+    assert payload["state"] == "failed"
+    assert payload["error"] == "segment tree corrupted"
+    assert payload["finished_at"] is not None
+    # Crucially: NOT stuck at running (would hard-block /trigger).
+    assert payload["state"] != "running"
+
+    # No re-trigger fired on the failure path — there's nothing to gain
+    # from looping a known-broken task.
+    assert not mocks["delay"].called
 
 
 def test_run_scheduling_retriggers_when_more_ops_arrive(
@@ -726,13 +771,17 @@ def test_advance_day_claims_status_running_during_body_and_clears_to_idle(
     assert final["finished_at"] is not None
 
 
-def test_advance_day_clears_status_to_idle_even_on_exception(
+def test_advance_day_writes_status_failed_on_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the body raises after status was claimed, the inner finally must
-    still clear status back to ``idle`` — otherwise ``schedule:status``
-    sticks at ``running``, every future ``/trigger`` returns 409, and the
-    only way out is the ops runbook (manually editing the Redis key).
+    """If the body raises after status was claimed, status MUST flip to
+    ``failed`` (with the error captured) — NOT ``idle``. Writing ``idle``
+    after a real failure makes ``GET /schedule/status`` show a healthy
+    scheduler and silently masks the broken run from operators.
+
+    Also asserts status doesn't stick at ``running`` (that would 409 every
+    future ``/trigger``). The acceptable terminal states on exception are
+    ``failed`` (visible to ops) — never ``running`` and never ``idle``.
     """
     fake_redis = _FakeRedis()
     monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
@@ -754,7 +803,12 @@ def test_advance_day_clears_status_to_idle_even_on_exception(
 
     raw = fake_redis.get("schedule:status")
     assert raw is not None
-    assert json.loads(raw)["state"] == "idle"
+    payload = json.loads(raw)
+    assert payload["state"] == "failed"
+    # Error string carried through so operators reading /schedule/status see
+    # what broke without having to grep Celery logs.
+    assert payload["error"] == "boom"
+    assert payload["finished_at"] is not None
 
 
 # ---------------------------------------------------------------------------
