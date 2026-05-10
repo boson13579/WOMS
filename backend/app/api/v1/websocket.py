@@ -107,7 +107,10 @@ class ConnectionManager:
             try:
                 await ws.send_json(message)
                 delivered += 1
-            except (WebSocketDisconnect, RuntimeError) as exc:
+            except Exception as exc:
+                # One dead client (TCP-reset OSError, mid-handshake
+                # WebSocketDisconnect, app-state RuntimeError, etc.) must
+                # never starve the rest of the broadcast — log and move on.
                 logger.warning("websocket.send_failed", error=str(exc))
         return delivered
 

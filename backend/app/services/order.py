@@ -427,16 +427,28 @@ def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
             )
             continue
         applied += 1
+        new_value = {
+            "scheduled_production_date": str(earliest),
+            "expected_delivery_date": str(latest),
+            "status": OrderStatus.scheduled.value,
+        }
+        # Persist to audit_logs DB table — required by PRD §1.6 so the
+        # scheduling history is queryable from Postgres, not only from log
+        # shippers. user_id=None marks this as system-driven.
+        audit_log_repo.create(
+            db,
+            action="order.scheduled",
+            user_id=None,
+            resource_type="order",
+            resource_id=order_id,
+            new_value=new_value,
+        )
         emit_audit_log(
             action="order.scheduled",
-            actor_id=None,  # system-driven, no human actor
+            actor_id=None,
             resource_type="order",
             resource_id=str(order_id),
-            changes={
-                "scheduled_production_date": str(earliest),
-                "expected_delivery_date": str(latest),
-                "status": OrderStatus.scheduled.value,
-            },
+            changes=new_value,
         )
 
     db.commit()

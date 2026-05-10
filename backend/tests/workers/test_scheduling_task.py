@@ -315,6 +315,51 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
     assert str(failing_id) in notified_order_ids
 
 
+def test_run_scheduling_notifies_user_on_remove_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Symmetric to the add-failure path: when a ``remove`` op cannot be
+    applied (e.g. the order is no longer in the priority queue — typically
+    a stale CRUD producer or a race between cancel and rebuild), the task
+    must push ``schedule.remove_failed`` to the requester so the UI can
+    surface the inconsistency. Pre-fix this only logged a warning, leaving
+    the user with no signal at all.
+    """
+    fake_redis = _FakeRedis()
+
+    failing_id = uuid.uuid4()
+    failing_user = uuid.uuid4()
+    op_fail = _make_op(
+        op="remove",
+        order_id=failing_id,
+        order_number="ORD-DEL",
+        requested_by=failing_user,
+    )
+    _enqueue(fake_redis, op_fail)
+
+    remove_mock = MagicMock(
+        return_value=ScheduleResult(
+            status="deadline_too_far",
+            order_id=failing_id,
+            message="Deadline outside the 30-day scheduling horizon.",
+        )
+    )
+    mocks = _patch_common(monkeypatch, fake_redis)
+    monkeypatch.setattr("app.workers.scheduling.remove_order", remove_mock)
+    mocks["remove_order"] = remove_mock
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    assert remove_mock.call_count == 1
+    assert mocks["notify_user"].call_count == 1
+    kwargs = mocks["notify_user"].call_args.kwargs
+    assert kwargs["user_id"] == failing_user
+    assert kwargs["message"]["type"] == "schedule.remove_failed"
+    assert kwargs["message"]["order_id"] == str(failing_id)
+    assert kwargs["message"]["reason"] == "deadline_too_far"
+
+
 # ---------------------------------------------------------------------------
 # run_scheduling_task — re-trigger when ops arrive mid-flight
 # ---------------------------------------------------------------------------
@@ -616,6 +661,100 @@ def test_rebuild_clears_waiter_flag_even_on_exception(
     result = rebuild_schedule_task.apply()
     assert not result.successful()
     assert fake_redis.get("schedule:waiter_pending") is None
+
+
+# ---------------------------------------------------------------------------
+# Status-claim — advance_day / rebuild own schedule:status while working
+# ---------------------------------------------------------------------------
+
+
+def test_advance_day_claims_status_running_during_body_and_clears_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status-claim race fix: between ``_wait_for_idle_run`` returning and
+    the body finishing, ``schedule:status`` MUST read ``running`` so a
+    concurrent ``POST /schedule/trigger`` returns 409 instead of dispatching
+    a second run that races state writes. Inner finally must restore
+    ``idle``.
+
+    Without the fix, the window read ``idle`` and any /trigger or
+    /operations call landed a parallel ``run_scheduling_task`` that wrote
+    over the waiter's state.
+    """
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
+    monkeypatch.setattr(
+        "app.workers.scheduling._get_status",
+        lambda: {"state": "idle"},
+    )
+    _patch_rebuild_time(monkeypatch)
+
+    initial = SchedulerState.initial(date(2026, 5, 5))
+    advanced = SchedulerState.initial(date(2026, 5, 6))
+    monkeypatch.setattr("app.workers.scheduling._load_state", lambda: initial)
+
+    # Capture status from real Redis at the moment ``advance_day`` runs —
+    # this is mid-body, so it must read "running" (not "idle").
+    status_during_body: list[str] = []
+
+    def observe_advance(_state: SchedulerState) -> SchedulerState:
+        raw = fake_redis.get("schedule:status")
+        assert raw is not None
+        status_during_body.append(json.loads(raw)["state"])
+        return advanced
+
+    monkeypatch.setattr("app.workers.scheduling.advance_day", observe_advance)
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", MagicMock(return_value=[]))
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+
+    result = advance_day_task.apply()
+    assert result.successful(), result.traceback
+
+    # Mid-body: status was "running".
+    assert status_during_body == ["running"]
+    # Post-body: inner finally restored "idle".
+    raw = fake_redis.get("schedule:status")
+    assert raw is not None
+    final = json.loads(raw)
+    assert final["state"] == "idle"
+    assert final["finished_at"] is not None
+
+
+def test_advance_day_clears_status_to_idle_even_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the body raises after status was claimed, the inner finally must
+    still clear status back to ``idle`` — otherwise ``schedule:status``
+    sticks at ``running``, every future ``/trigger`` returns 409, and the
+    only way out is the ops runbook (manually editing the Redis key).
+    """
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
+    monkeypatch.setattr("app.workers.scheduling._get_status", lambda: {"state": "idle"})
+    _patch_rebuild_time(monkeypatch)
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._load_state",
+        lambda: SchedulerState.initial(date(2026, 5, 5)),
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling.advance_day",
+        MagicMock(side_effect=RuntimeError("boom")),
+    )
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+
+    result = advance_day_task.apply()
+    assert not result.successful()
+
+    raw = fake_redis.get("schedule:status")
+    assert raw is not None
+    assert json.loads(raw)["state"] == "idle"
 
 
 # ---------------------------------------------------------------------------

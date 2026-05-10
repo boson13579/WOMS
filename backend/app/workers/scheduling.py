@@ -260,12 +260,25 @@ def _process_one(state: SchedulerState, op: dict[str, Any]) -> None:
     order = _op_to_scheduling_order(op)
     if op_type == "remove":
         result = remove_order(state, order)
-        if result.status != "success":
-            logger.warning(
-                "schedule.run.remove_failed",
-                order_id=str(order.order_id),
-                status=result.status,
-                message=result.message,
+        if result.status == "success":
+            return
+        logger.warning(
+            "schedule.run.remove_failed",
+            order_id=str(order.order_id),
+            status=result.status,
+            message=result.message,
+        )
+        requested_by = op.get("requested_by")
+        if requested_by:
+            websocket.notify_user(
+                user_id=uuid.UUID(requested_by),
+                message={
+                    "type": "schedule.remove_failed",
+                    "order_id": str(order.order_id),
+                    "order_number": order.order_number,
+                    "reason": result.status,
+                    "detail": result.message,
+                },
             )
         return
 
@@ -458,28 +471,46 @@ def advance_day_task() -> None:
     ``_wait_for_idle_run``, cleared in ``finally``) so a concurrent
     ``run_scheduling_task`` finishing during our wait yields its re-trigger
     to us instead of racing.
+
+    Also claims ``schedule:status = running`` for the duration of its own
+    work (after the wait, before clearing in the inner ``finally``). Without
+    this claim, the window between ``_wait_for_idle_run`` returning and
+    ``_finalize_run`` completing reads ``idle`` to outside callers, so a
+    concurrent ``POST /schedule/trigger`` would dispatch a
+    ``run_scheduling_task`` that races our state writes — the waiter flag
+    suppresses *re-triggers* but not *new dispatches*.
     """
     logger.info("schedule.advance_day.start")
     _set_waiter_flag()
     try:
         _wait_for_idle_run(log_event="schedule.advance_day.wait_timeout")
 
-        state = _load_state()
-        new_state = advance_day(state)
-        _finalize_run(new_state)
+        started_at = datetime.now(tz=UTC).isoformat()
+        _set_status(state=_STATUS_RUNNING, started_at=started_at)
+        try:
+            state = _load_state()
+            new_state = advance_day(state)
+            _finalize_run(new_state)
 
-        logger.info(
-            "schedule.advance_day.success",
-            old_base=state.base_date.isoformat(),
-            new_base=new_state.base_date.isoformat(),
-            carried=len(new_state.priority_queue),
-        )
+            logger.info(
+                "schedule.advance_day.success",
+                old_base=state.base_date.isoformat(),
+                new_base=new_state.base_date.isoformat(),
+                carried=len(new_state.priority_queue),
+            )
 
-        # Drain any pending ops on top of the new state. If the queue is
-        # empty, this just sets status=idle and returns; finalize already
-        # broadcast.
-        if cast("int", _get_redis().zcard(PENDING_OPS_KEY)) > 0:
-            run_scheduling_task.delay()
+            # Drain any pending ops on top of the new state. If the queue is
+            # empty, this just sets status=idle and returns; finalize already
+            # broadcast.
+            if cast("int", _get_redis().zcard(PENDING_OPS_KEY)) > 0:
+                run_scheduling_task.delay()
+        finally:
+            finished_at = datetime.now(tz=UTC).isoformat()
+            _set_status(
+                state=_STATUS_IDLE,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
     finally:
         _clear_waiter_flag()
 
@@ -504,45 +535,55 @@ def rebuild_schedule_task() -> None:
     try:
         _wait_for_idle_run(log_event="schedule.rebuild.wait_timeout")
 
-        raw = cast("str | None", _get_redis().get(STATE_KEY))
-        if raw is not None:
-            base_date = SchedulerState.from_json(raw).base_date
-        else:
-            base_date = datetime.now(tz=UTC).date()
-
-        db: Session = SessionLocal()
+        started_at = datetime.now(tz=UTC).isoformat()
+        _set_status(state=_STATUS_RUNNING, started_at=started_at)
         try:
-            orders, creators = order_service.list_for_scheduler(db)
-        finally:
-            db.close()
+            raw = cast("str | None", _get_redis().get(STATE_KEY))
+            if raw is not None:
+                base_date = SchedulerState.from_json(raw).base_date
+            else:
+                base_date = datetime.now(tz=UTC).date()
 
-        new_state, skipped = rebuild_state(orders, base_date)
-        _finalize_run(new_state)
+            db: Session = SessionLocal()
+            try:
+                orders, creators = order_service.list_for_scheduler(db)
+            finally:
+                db.close()
 
-        for skip in skipped:
-            creator_id = creators.get(skip.order_id)
-            if creator_id is None:
-                continue
-            websocket.notify_user(
-                user_id=creator_id,
-                message={
-                    "type": "schedule.rebuild_skipped",
-                    "order_id": str(skip.order_id),
-                    "order_number": skip.order_number,
-                    "reason": skip.reason,
-                },
+            new_state, skipped = rebuild_state(orders, base_date)
+            _finalize_run(new_state)
+
+            for skip in skipped:
+                creator_id = creators.get(skip.order_id)
+                if creator_id is None:
+                    continue
+                websocket.notify_user(
+                    user_id=creator_id,
+                    message={
+                        "type": "schedule.rebuild_skipped",
+                        "order_id": str(skip.order_id),
+                        "order_number": skip.order_number,
+                        "reason": skip.reason,
+                    },
+                )
+
+            logger.info(
+                "schedule.rebuild.success",
+                base_date=base_date.isoformat(),
+                orders_added=len(new_state.priority_queue),
+                orders_skipped=len(skipped),
             )
 
-        logger.info(
-            "schedule.rebuild.success",
-            base_date=base_date.isoformat(),
-            orders_added=len(new_state.priority_queue),
-            orders_skipped=len(skipped),
-        )
-
-        # Drain any pending ops on top of the rebuilt state. If empty,
-        # finalize already broadcast and we have nothing more to do.
-        if cast("int", _get_redis().zcard(PENDING_OPS_KEY)) > 0:
-            run_scheduling_task.delay()
+            # Drain any pending ops on top of the rebuilt state. If empty,
+            # finalize already broadcast and we have nothing more to do.
+            if cast("int", _get_redis().zcard(PENDING_OPS_KEY)) > 0:
+                run_scheduling_task.delay()
+        finally:
+            finished_at = datetime.now(tz=UTC).isoformat()
+            _set_status(
+                state=_STATUS_IDLE,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
     finally:
         _clear_waiter_flag()

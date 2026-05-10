@@ -237,6 +237,10 @@ ws.addEventListener("message", (e) => {
             // 自己創的訂單排不進去（產能不夠或 deadline 超 30 天）
             toast.error(`訂單 ${msg.order_number} 排不進去：${msg.reason}`);
             break;
+        case "schedule.remove_failed":
+            // 自己創的訂單在排程裡找不到（通常是狀態已不一致，建議刷新）
+            toast.warning(`訂單 ${msg.order_number} 移除失敗：${msg.reason}`);
+            break;
         case "schedule.rebuild_skipped":
             // 自己創的訂單在 rebuild 時被跳過（通常是 deadline 已過期）
             toast.warning(`重建時 ${msg.order_number} 無法排入（${msg.reason}），請確認`);
@@ -262,6 +266,7 @@ ws.addEventListener("close", (e) => {
 |---|---|---|---|
 | `schedule.updated` | 任何排程結果有變動（單筆 op 處理完、換天、rebuild） | **所有連線的 client**（broadcast） | `{ type: "schedule.updated" }` |
 | `schedule.add_failed` | `add_order` 失敗（產能 / horizon） | 訂單的 `requested_by` user | `{ type, order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail }` |
+| `schedule.remove_failed` | `remove_order` 失敗（一般是訂單已不在 pq、典型場景是 race 或重複的 cancel op） | 訂單的 `requested_by` user | `{ type, order_id, order_number, reason: "deadline_too_far", detail }` |
 | `schedule.rebuild_skipped` | rebuild 時某筆 scheduled 訂單塞不回去（通常 deadline 已被 base_date 越過） | 訂單的 `created_by` user | `{ type, order_id, order_number, reason: "deadline_too_far"\|"capacity_exceeded" }` |
 
 ### 3.4 前端注意事項

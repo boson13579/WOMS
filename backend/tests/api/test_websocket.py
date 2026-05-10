@@ -125,6 +125,34 @@ async def test_manager_send_failure_does_not_remove_socket() -> None:
     assert bad in manager._connections[user_id]
 
 
+@pytest.mark.asyncio
+async def test_broadcast_continues_past_unexpected_exception() -> None:
+    """One dead client (TCP-reset OSError, unknown library exception, etc.)
+    must NOT abort the broadcast — every other connected socket has to
+    receive the notification.
+
+    Pre-fix the loop only caught ``WebSocketDisconnect`` / ``RuntimeError``;
+    a peer disconnect surfaced as ``OSError`` would propagate, the
+    enumeration would unwind, and every client after the bad one in the
+    iteration order silently lost the message.
+    """
+    manager = ConnectionManager()
+    bad = AsyncMock()
+    bad.send_json.side_effect = OSError("connection reset by peer")
+    good_a = AsyncMock()
+    good_b = AsyncMock()
+    await manager.connect(uuid.uuid4(), bad)
+    await manager.connect(uuid.uuid4(), good_a)
+    await manager.connect(uuid.uuid4(), good_b)
+
+    delivered = await manager.broadcast({"type": "schedule.updated"})
+
+    # Two of three deliveries succeeded; the bad socket logged-and-skipped.
+    assert delivered == 2
+    good_a.send_json.assert_awaited_once_with({"type": "schedule.updated"})
+    good_b.send_json.assert_awaited_once_with({"type": "schedule.updated"})
+
+
 # ---------------------------------------------------------------------------
 # _handle_event — envelope decoding + dispatch
 # ---------------------------------------------------------------------------
