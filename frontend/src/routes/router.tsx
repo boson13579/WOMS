@@ -9,26 +9,19 @@
 import { createBrowserRouter } from 'react-router-dom';
 
 import { AppShell } from '@/components/layout/AppShell';
-import { ProtectedRoute } from '@/components/layout/ProtectedRoute';
 import { AuthPage } from '@/features/auth/components/AuthPage';
 import { DashboardPage } from '@/features/dashboard/components/DashboardPage';
+import { OrdersPage } from '@/features/orders/components/OrdersPage';
 
 export const router = createBrowserRouter([
   {
     path: '/',
-    element: <ProtectedRoute />,
+    element: <AppShell />,
     children: [
-      {
-        path: '/',
-        element: <AppShell />,
-        children: [
-          { index: true, element: <DashboardPage /> },
-          // Phase 2 stubs go here:
-          // { path: 'orders', element: <OrdersPage /> },
-          // { path: 'scheduling', element: <SchedulingPage /> },
-          // { path: 'account', element: <AccountPage /> },
-        ],
-      },
+      { index: true, element: <DashboardPage /> },
+      // Phase 2 stubs go here:
+      { path: 'orders', element: <OrdersPage /> },
+      // { path: 'scheduling', element: <SchedulingPage /> },
     ],
   },
   // Auth pages live outside the AppShell so they have their own full-screen layout.

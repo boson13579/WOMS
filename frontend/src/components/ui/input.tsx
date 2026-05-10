@@ -1,7 +1,3 @@
-/**
- * shadcn/ui Input — base text input primitive.
- * Follows the shadcn pattern: style via `className`, extend via composition.
- */
 import * as React from 'react';
 
 import { cn } from '@/lib/utils';
@@ -9,6 +5,7 @@ import { cn } from '@/lib/utils';
 export type InputProps = React.InputHTMLAttributes<HTMLInputElement>;
 
 const Input = React.forwardRef<HTMLInputElement, InputProps>(
+  // eslint-disable-next-line react/prop-types
   ({ className, type, ...props }, ref) => (
     <input
       type={type}
