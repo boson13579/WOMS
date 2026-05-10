@@ -144,7 +144,5 @@ def test_apply_schedule_with_no_results_writes_no_audit_rows(db_session: Session
     applied = order_service.apply_schedule(db_session, [])
     assert applied == 0
 
-    rows = db_session.scalars(
-        select(AuditLog).where(AuditLog.action == "order.scheduled")
-    ).all()
+    rows = db_session.scalars(select(AuditLog).where(AuditLog.action == "order.scheduled")).all()
     assert list(rows) == []

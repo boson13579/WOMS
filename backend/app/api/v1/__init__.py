@@ -16,4 +16,3 @@ api_router.include_router(users.router, prefix="/users", tags=["users"])
 api_router.include_router(schedule.router, prefix="/schedule", tags=["schedule"])
 # WebSocket router has no prefix — endpoint is /api/v1/ws (single channel).
 api_router.include_router(websocket.router, tags=["websocket"])
-
