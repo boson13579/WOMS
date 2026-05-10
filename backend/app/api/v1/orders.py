@@ -164,16 +164,14 @@ async def update_order(
     return order_service.update_order(db, order_id, request, current_user)
 
 
-@router.delete("/{order_id}", response_model=OrderResponse)
+@router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_order(
     order_id: uuid.UUID,
     db: Session = Depends(get_db),
     redis: Redis = Depends(get_redis),
     current_user: User = Depends(_WRITE_ROLES),
-) -> OrderResponse:
+) -> None:
     """Soft-delete an order: sets is_deleted=True and status=cancelled.
-
-    Returns the updated order record.
 
     Permission: scheduler+.
 
@@ -183,7 +181,7 @@ async def delete_order(
     """
     if await is_scheduling_locked(redis):
         raise _scheduling_locked()
-    return order_service.delete_order(db, order_id, current_user)
+    order_service.delete_order(db, order_id, current_user)
 
 
 @router.get("/{order_id}/audit-log", response_model=list[AuditLogResponse])

@@ -399,9 +399,8 @@ def test_delete_order_sets_cancelled_and_soft_deleted(
 
     res = client.delete(f"/api/v1/orders/{order.id}", headers=_auth(token))
 
-    assert res.status_code == 200
-    body = res.json()
-    assert body["status"] == "cancelled"
+    assert res.status_code == 204
+    assert res.content == b""
 
     db_session.refresh(order)
     assert order.is_deleted is True
@@ -606,7 +605,7 @@ def test_get_audit_log_after_cancel_still_returns_logs(
 
     # Cancel the order (soft-delete, writes order.cancelled audit log)
     res = client.delete(f"/api/v1/orders/{order_id}", headers=_auth(sched_token))
-    assert res.status_code == 200
+    assert res.status_code == 204
 
     # Audit log must still be queryable even though the order is soft-deleted
     res = client.get(f"/api/v1/orders/{order_id}/audit-log", headers=_auth(mgr_token))
