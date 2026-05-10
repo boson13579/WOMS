@@ -9,17 +9,20 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from app.models.order import Order, OrderStatus
 
 __all__ = [
+    "clear_scheduled_dates",
     "create",
     "get_by_id",
     "get_by_id_including_deleted",
     "get_many",
+    "get_scheduled",
     "get_today_order_count",
+    "set_schedule_dates",
     "update_lock",
     "update_soft_pin",
 ]
@@ -128,6 +131,74 @@ def create(
     db.flush()
     db.refresh(order)
     return order
+
+
+# ---------------------------------------------------------------------------
+# Scheduling-related queries
+# ---------------------------------------------------------------------------
+
+
+def get_scheduled(db: Session) -> list[Order]:
+    """Return every active order whose status is `scheduled`.
+
+    Sorted by `scheduled_production_date` ascending so callers (e.g. the
+    scheduler dashboard) see a natural timeline.
+    """
+    stmt = (
+        select(Order)
+        .where(Order.is_deleted.is_(False))
+        .where(Order.status == OrderStatus.scheduled)
+        .order_by(Order.scheduled_production_date.asc())
+    )
+    return list(db.scalars(stmt).all())
+
+
+def clear_scheduled_dates(db: Session) -> int:
+    """Bulk-clear `scheduled_production_date` and `expected_delivery_date`.
+
+    Used by the scheduler before writing the new assignment so any stale
+    per-order dates are wiped in one round-trip. Returns the number of
+    rows touched.
+    """
+    stmt = (
+        update(Order)
+        .where(Order.is_deleted.is_(False))
+        .where(Order.status == OrderStatus.scheduled)
+        .values(scheduled_production_date=None, expected_delivery_date=None)
+    )
+    # ``Session.execute`` is typed as ``Result[Any]`` but for an UPDATE it
+    # actually returns a ``CursorResult`` which carries ``rowcount``.
+    result = db.execute(stmt)
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+
+def set_schedule_dates(
+    db: Session,
+    *,
+    order_id: uuid.UUID,
+    scheduled_production_date: date,
+    expected_delivery_date: date,
+) -> Order | None:
+    """Mark an order as scheduled with explicit production / delivery dates.
+
+    Returns the refreshed entity, or `None` if the order is missing or
+    soft-deleted (caller decides how to react).
+    """
+    stmt = select(Order).where(Order.id == order_id, Order.is_deleted.is_(False))
+    order = db.scalars(stmt).first()
+    if order is None:
+        return None
+    order.scheduled_production_date = scheduled_production_date
+    order.expected_delivery_date = expected_delivery_date
+    order.status = OrderStatus.scheduled
+    db.flush()
+    db.refresh(order)
+    return order
+
+
+# ---------------------------------------------------------------------------
+# Lock-related queries
+# ---------------------------------------------------------------------------
 
 
 def update_lock(

@@ -13,7 +13,7 @@ from typing import Any
 
 import bcrypt
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -102,16 +102,20 @@ _UNAUTHORIZED = HTTPException(
 
 
 async def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(http_bearer),
     db: Session = Depends(get_db),
 ) -> User:
-    """Validate the bearer token and return the corresponding active User.
+    """Validate the bearer token or cookie and return the corresponding active User.
 
     Raises HTTP 401 for any token problem or inactive account.
     """
-    if credentials is None:
+    token = credentials.credentials if credentials else request.cookies.get("access_token")
+
+    if token is None:
         raise _UNAUTHORIZED
-    payload = decode_access_token(credentials.credentials)
+
+    payload = decode_access_token(token)
     try:
         user_id = uuid.UUID(payload.sub)
     except ValueError as exc:

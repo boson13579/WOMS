@@ -234,3 +234,5 @@ pnpm test
 - **[Development guidelines](docs/DEVELOPMENT_GUIDELINES.md)** — 開發 SOP、命名、TDD 流程、API 錯誤格式。
 - **[How to test](docs/HOW_TO_TEST.md)** — Phase 1 你可以手動測試什麼、怎麼測。
 - **[GitHub setup](docs/GITHUB_SETUP.md)** — 怎麼把 repo 放上 GitHub、CI 自動跑、PR 上看測試結果。
+- **[Scheduling — integration guide](docs/scheduling-integration.md)** ⭐ — 跟排程模組整合的隊友（Order CRUD / 前端 / Ops）看的「怎麼用」指南：推 op 的兩種方法、複合更新的 `group` 規則、5 條 REST endpoints、3 種 WebSocket message type、Celery + env vars + Redis 觀察、災難復原表、FAQ。
+- **[Scheduling — design doc](docs/scheduling.md)** — 排程模組內部實作細節（segment tree 線段樹、EDF 演算法、sorted-set score 編碼、per-op + waiter-flag race fix、測試矩陣）。要動模組內部 code 才需要看；只是要 call API 用 integration guide 就夠。

@@ -65,6 +65,45 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: Literal["HS256", "HS384", "HS512"] = "HS256"
     JWT_ACCESS_TOKEN_TTL_SECONDS: int = 60 * 60  # 1 hour
 
+    # --- Scheduler tuning -----------------------------------------------------
+    # Business / operational knobs that callers may want to change per
+    # environment. Algorithm-internal magic numbers (e.g. score-encoding
+    # offsets) stay as code constants.
+    SCHEDULER_DAILY_CAPACITY: int = Field(
+        default=10_000,
+        gt=0,
+        description=("Wafers per day; segment trees use this as the per-day capacity."),
+    )
+    SCHEDULER_HORIZON_DAYS: int = Field(
+        default=30,
+        gt=0,
+        description=(
+            "How many days ahead the scheduler accepts deadlines for; "
+            "segment trees are sized by this."
+        ),
+    )
+    SCHEDULER_RUN_WAIT_TIMEOUT_SECONDS: int = Field(
+        default=5 * 60,
+        gt=0,
+        description=(
+            "advance_day / rebuild tasks wait at most this long for an "
+            "in-flight run before proceeding."
+        ),
+    )
+    SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS: int = Field(
+        default=2,
+        gt=0,
+        description="Polling cadence inside _wait_for_idle_run.",
+    )
+    SCHEDULER_WAITER_FLAG_TTL_SECONDS: int = Field(
+        default=10 * 60,
+        gt=0,
+        description=(
+            "Auto-expiry on schedule:waiter_pending so a crashed waiter "
+            "doesn't permanently suppress retriggers."
+        ),
+    )
+
     # --- Logging --------------------------------------------------------------
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 

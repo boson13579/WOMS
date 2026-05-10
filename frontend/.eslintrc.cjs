@@ -49,6 +49,7 @@ module.exports = {
     /* React 17+ JSX transform — `import React` not required. */
     'react/react-in-jsx-scope': 'off',
     'react/require-default-props': 'off',
+    'react/prop-types': 'off',
 
     /* HMR boundary check (Vite). */
     'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],

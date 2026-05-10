@@ -5,11 +5,17 @@
  * inside `<RouterProvider>` so future code can read `useNavigate` etc.
  */
 import { RouterProvider } from 'react-router-dom';
+import { Toaster } from 'sonner';
 
 import { router } from '@/routes/router';
 
 function App(): JSX.Element {
-  return <RouterProvider router={router} />;
+  return (
+    <>
+      <RouterProvider router={router} />
+      <Toaster richColors position="top-right" />
+    </>
+  );
 }
 
 export default App;
