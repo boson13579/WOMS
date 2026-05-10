@@ -38,13 +38,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         env=settings.APP_ENV,
         version=settings.APP_VERSION,
     )
-    app.state.redis_pool = ConnectionPool.from_url(
-        str(settings.REDIS_URL),
-        decode_responses=True,
-    )
+    try:
+        app.state.redis_pool = ConnectionPool.from_url(
+            str(settings.REDIS_URL),
+            decode_responses=True,
+        )
+    except Exception as exc:
+        logger.critical("redis.pool_init_failed", url=str(settings.REDIS_URL), exc_info=exc)
+        raise
     yield
-    await app.state.redis_pool.disconnect()
-    logger.info("app.shutdown")
+    try:
+        await app.state.redis_pool.aclose()
+    except Exception:
+        logger.warning("redis.pool_disconnect_failed", exc_info=True)
+    finally:
+        logger.info("app.shutdown")
 
 
 def create_app() -> FastAPI:

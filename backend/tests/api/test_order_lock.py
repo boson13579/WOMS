@@ -434,12 +434,12 @@ async def test_acquire_lock_fails_when_held() -> None:
 @pytest.mark.asyncio
 async def test_release_lock_succeeds() -> None:
     """release_scheduling_lock deletes the key; is_scheduling_locked returns False."""
-    fake = fakeredis.aioredis.FakeRedis()
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
     token = await acquire_scheduling_lock(fake)
 
     async def _eval(script: str, numkeys: int, key: str, tok: str) -> int:
         stored = await fake.get(key)
-        if stored is not None and stored.decode() == tok:
+        if stored is not None and stored == tok:
             await fake.delete(key)
             return 1
         return 0
@@ -475,11 +475,11 @@ async def test_lock_expires_after_ttl() -> None:
 @pytest.mark.asyncio
 async def test_scheduling_lock_context_acquires_and_releases() -> None:
     """scheduling_lock_context holds the lock inside the block and releases on exit."""
-    fake = fakeredis.aioredis.FakeRedis()
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
     async def _eval(script: str, numkeys: int, key: str, tok: str) -> int:
         stored = await fake.get(key)
-        if stored is not None and stored.decode() == tok:
+        if stored is not None and stored == tok:
             await fake.delete(key)
             return 1
         return 0
