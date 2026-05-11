@@ -22,6 +22,7 @@ dependencies = [
     "pyjwt>=2.10.0",
     "python-multipart>=0.0.20",
     "httpx>=0.28.0",
+    "sortedcontainers>=2.4.0",
 ]
 
 [dependency-groups]
@@ -109,7 +110,7 @@ plugins = []
 
 [[tool.mypy.overrides]]
 # Third-party libs without bundled type stubs.
-module = ["celery.*"]
+module = ["celery.*", "sortedcontainers.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

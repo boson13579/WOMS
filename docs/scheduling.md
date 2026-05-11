@@ -576,10 +576,34 @@ run_scheduling_task.delay()
 
 - 兩棵 30 天線段樹：`capacity_tree`（每日剩餘產能）、`deadline_tree`（每天 deadline 上的訂單總和）
 - `priority_queue`：deadline 早 → wafer\_quantity 大 → order\_number 字母順序
-- `pinned_orders`：**強制日期** list（PinnedOrder = order\_id, order\_number, qty, deadline, fake\_deadline）。pq 跟 pinned\_orders 互斥 — 一筆訂單同時間只能在其中一邊。
+- `pinned_orders`：**強制日期**（PinnedOrder = order\_id, order\_number, qty, deadline, fake\_deadline）。pq 跟 pinned\_orders 互斥 — 一筆訂單同時間只能在其中一邊。
 - `add_order` / `remove_order` / `pin_order` / `unpin_order` / `compute_schedule` / `advance_day` / **`rebuild_state`** 七個入口
 - **Producer ↔ consumer 契約**：Redis key 常數（`STATE_KEY` / `STATUS_KEY` / `PENDING_OPS_KEY` / `PENDING_OPS_SEQ_KEY`）跟 `score_for_op` 編碼也住在這個檔，因為兩端（API 跟 worker）都要對得上，把契約放在共同上游避免 api → workers 反向依賴（RULES.md §3）。
 - 演算法詳細推導見 [`backend/CLAUDE.md`](../backend/CLAUDE.md) §業務規則
+
+#### 4.1.2 PQ / pinned 資料結構與複雜度
+
+| 集合 | 內部結構 | 為何 |
+|---|---|---|
+| `priority_queue` | `sortedcontainers.SortedKeyList(key=sort_key)` | 維持 EDF 排序的同時支援 O(log n) insert / remove。比 `list` + `sort` 的 O(n log n) per insert 跟「拿 order_id 找對應元素」O(n) 的線性掃要好。 |
+| `pq_index` | `dict[order_id, SchedulingOrder]` | 鏡像 pq 內每筆訂單的引用 — pin / unpin / remove guard 從「掃 pq」變成 O(1) 字典查詢 + O(log n) SortedKeyList remove。 |
+| `pinned_orders` | `dict[order_id, PinnedOrder]` | Python 3.7+ dict 保留插入序，所以 iteration 順序對 compute_schedule / log replay 都是穩定的；同時 contains / remove 也是 O(1)。 |
+
+每個 op 的複雜度（n = pq 大小，p = pinned\_orders 大小）：
+
+| 操作 | 複雜度 | 主要 cost |
+|---|---|---|
+| `add_order` | **O(log n)** | SortedKeyList.add (bisect-by-key) + dict 寫 |
+| `remove_order` | **O(log n)** | dict.pop 拿物件 → SortedKeyList.remove 用 bisect-by-key 找 + 一個 chunk 內線性 |
+| `pin_order` | **O(log n + log p)** | pq remove + pinned_orders dict 寫 |
+| `unpin_order` | **O(log n + log p)** | pinned_orders dict pop + pq add |
+| 「is in pq」/「is pinned」guard | **O(1)** | dict contains |
+| `compute_schedule` | **O(n + p)** | iterate pq in EDF order + iterate pinned dict |
+| `advance_day` | **O(n + p)** | 跟 compute_schedule 同源 — 主要是 iteration |
+
+關於 sortedcontainers：純 Python、無 C 擴展、單檔約 100 KB。它的 SortedKeyList 用「list of small lists」結構（每個 chunk 大小 ~1000），實效是 O(log n) 而非 sorted-search-tree 的嚴格 log。對 n 在幾百到幾千的場景比 BST 跟 skip list 都快。
+
+**advance\_day boundary 語意調整**：以前 boundary order（今天做了一部分、明天還要接著做）會被「保留在原本的 pq 位置」（即跳過 re-sort）。Phase-3 重構後，boundary 訂單的 qty 變小，sort\_key (deadline, -qty, name) 改變，SortedKeyList 會自動把它放到新的 EDF 位置。例如同 deadline 下原本 f (qty=2000) g (qty=2000) 是 f 先（"f" < "g"），advance\_day 之後 f' (qty=1000) g (qty=2000)，因為 -1000 > -2000，f' 變成排在 g 後面。這比舊的「位置鎖死」更 EDF-correct，spec 文件已經跟著改了。對應測試 `test_advance_day_processes_pq_and_shifts_trees` 的 assertion 也更新成新順序。
 
 #### 4.1.1 Pin 機制：把訂單鎖到特定生產日
 

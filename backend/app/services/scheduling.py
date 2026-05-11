@@ -23,6 +23,7 @@ from typing import Literal
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
+from sortedcontainers import SortedKeyList
 
 from app.core.config import get_settings
 
@@ -349,15 +350,44 @@ class SkippedOrder(BaseModel):
     reason: Literal["capacity_exceeded", "deadline_too_far"]
 
 
+def _new_priority_queue(
+    orders: list[SchedulingOrder] | None = None,
+) -> SortedKeyList:
+    """Factory for the ``priority_queue`` field.
+
+    Uses ``sortedcontainers.SortedKeyList`` so insert / remove / membership
+    are O(log n) instead of O(n) (the old list-then-resort approach). The
+    key function matches ``SchedulingOrder.sort_key`` — every mutation is
+    sorted in-place.
+    """
+    return SortedKeyList(orders or [], key=lambda o: o.sort_key())
+
+
 class SchedulerState(BaseModel):
-    """Live scheduler state; persisted to Redis as JSON between runs."""
+    """Live scheduler state; persisted to Redis as JSON between runs.
+
+    Data structure choices for the live collections — see also
+    ``docs/scheduling.md §4.1.2``:
+
+    - ``priority_queue`` is a ``SortedKeyList`` keyed by
+      ``SchedulingOrder.sort_key``. add / remove are O(log n); in-order
+      iteration is O(n).
+    - ``pq_index`` is a ``dict[order_id, SchedulingOrder]`` that mirrors
+      pq's membership for O(1) ``contains`` / lookup. Mutating helpers
+      (``_pq_add`` / ``_pq_remove``) keep both in sync; ``to_json`` /
+      ``from_json`` rebuilds the index alongside the SortedKeyList.
+    - ``pinned_orders`` is a ``dict[order_id, PinnedOrder]``. Python dicts
+      preserve insertion order (3.7+) so iteration order is deterministic
+      for tests / WS replay, while still giving O(1) ``contains`` / ``remove``.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     capacity_tree: SegmentTree
     deadline_tree: SegmentTree
-    priority_queue: list[SchedulingOrder]
-    pinned_orders: list[PinnedOrder] = Field(default_factory=list)
+    priority_queue: SortedKeyList = Field(default_factory=_new_priority_queue)
+    pq_index: dict[uuid.UUID, SchedulingOrder] = Field(default_factory=dict)
+    pinned_orders: dict[uuid.UUID, PinnedOrder] = Field(default_factory=dict)
     base_date: date
 
     @classmethod
@@ -366,8 +396,9 @@ class SchedulerState(BaseModel):
         return cls(
             capacity_tree=SegmentTree(n=HORIZON_DAYS, initial=DAILY_CAPACITY),
             deadline_tree=SegmentTree(n=HORIZON_DAYS, initial=0),
-            priority_queue=[],
-            pinned_orders=[],
+            priority_queue=_new_priority_queue(),
+            pq_index={},
+            pinned_orders={},
             base_date=base_date,
         )
 
@@ -378,7 +409,7 @@ class SchedulerState(BaseModel):
                 "capacity_values": self.capacity_tree.to_array(),
                 "deadline_values": self.deadline_tree.to_array(),
                 "priority_queue": [o.model_dump(mode="json") for o in self.priority_queue],
-                "pinned_orders": [p.model_dump(mode="json") for p in self.pinned_orders],
+                "pinned_orders": [p.model_dump(mode="json") for p in self.pinned_orders.values()],
                 "base_date": self.base_date.isoformat(),
             }
         )
@@ -389,16 +420,18 @@ class SchedulerState(BaseModel):
 
         ``pinned_orders`` defaults to ``[]`` if absent — keeps the loader
         backward-compatible with state blobs persisted before the pin
-        feature shipped.
+        feature shipped. The pq + pinned dict indices are rebuilt from
+        the JSON list payloads, so post-load lookups stay O(1).
         """
         data = json.loads(raw)
+        pq_orders = [SchedulingOrder.model_validate(o) for o in data["priority_queue"]]
+        pinned = [PinnedOrder.model_validate(p) for p in data.get("pinned_orders", [])]
         return cls(
             capacity_tree=SegmentTree.from_array(data["capacity_values"]),
             deadline_tree=SegmentTree.from_array(data["deadline_values"]),
-            priority_queue=[SchedulingOrder.model_validate(o) for o in data["priority_queue"]],
-            pinned_orders=[
-                PinnedOrder.model_validate(p) for p in data.get("pinned_orders", [])
-            ],
+            priority_queue=_new_priority_queue(pq_orders),
+            pq_index={o.order_id: o for o in pq_orders},
+            pinned_orders={p.order_id: p for p in pinned},
             base_date=date.fromisoformat(data["base_date"]),
         )
 
@@ -420,10 +453,41 @@ def _leftmost_prefix_geq(tree: SegmentTree, target: int, max_idx: int) -> int:
     return max_idx  # unreachable when caller's precondition holds
 
 
-def _insert_sorted(pq: list[SchedulingOrder], order: SchedulingOrder) -> None:
-    """Insert ``order`` into ``pq`` while keeping it sorted by priority."""
-    pq.append(order)
-    pq.sort(key=lambda o: o.sort_key())
+def _pq_add(state: SchedulerState, order: SchedulingOrder) -> None:
+    """Insert ``order`` into both pq and its index dict.
+
+    O(log n) for the SortedKeyList insert (sortedcontainers' chunked
+    array gives effective log-time bisect + insert); O(1) for the dict.
+    Caller is responsible for ensuring the order isn't already present —
+    ``add_order`` does this check upfront and returns capacity_exceeded
+    on conflict.
+    """
+    state.priority_queue.add(order)
+    state.pq_index[order.order_id] = order
+
+
+def _pq_remove_by_id(
+    state: SchedulerState, order_id: uuid.UUID
+) -> SchedulingOrder | None:
+    """Drop the order with ``order_id`` from pq + index; return it or None.
+
+    O(1) for the dict pop (which gives us the object reference);
+    O(log n) for the SortedKeyList remove (sortedcontainers does bisect
+    by sort_key + a tiny linear scan within the matching chunk). The
+    indexed dict is what gets us from "I have an order_id" → "remove from
+    pq" in log time — before this refactor it was an O(n) ``list[:] =
+    [o for o in pq if o.order_id != target]`` filter.
+    """
+    order = state.pq_index.pop(order_id, None)
+    if order is None:
+        return None
+    state.priority_queue.remove(order)
+    return order
+
+
+def _pq_contains(state: SchedulerState, order_id: uuid.UUID) -> bool:
+    """O(1) membership check via the index dict."""
+    return order_id in state.pq_index
 
 
 def _apply_add_to_trees(state: SchedulerState, order: SchedulingOrder) -> None:
@@ -529,7 +593,7 @@ def add_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
     # state until rebuild. Typical trigger: producer sends `add` for an
     # order that was already added (e.g., a duplicate op leaked through, or
     # a PATCH flow that forgot the preceding `remove`).
-    if any(o.order_id == order.order_id for o in state.priority_queue):
+    if _pq_contains(state, order.order_id):
         logger.warning(
             "schedule.add.already_in_pq",
             order_id=str(order.order_id),
@@ -539,7 +603,7 @@ def add_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
             order_id=order.order_id,
             message="Order is already in the priority queue.",
         )
-    if any(p.order_id == order.order_id for p in state.pinned_orders):
+    if order.order_id in state.pinned_orders:
         logger.warning(
             "schedule.add.already_pinned",
             order_id=str(order.order_id),
@@ -567,7 +631,7 @@ def add_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
             ),
         )
 
-    _insert_sorted(state.priority_queue, order)
+    _pq_add(state, order)
     _apply_add_to_trees(state, order)
 
     logger.info(
@@ -607,8 +671,8 @@ def remove_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResul
     # Most realistic trigger: producer sends `remove` for a pinned order
     # without first sending `unpin` (pinned orders live in pinned_orders,
     # not pq). The caller is told via WS so they can correct the flow.
-    if not any(o.order_id == order.order_id for o in state.priority_queue):
-        is_pinned = any(p.order_id == order.order_id for p in state.pinned_orders)
+    if not _pq_contains(state, order.order_id):
+        is_pinned = order.order_id in state.pinned_orders
         logger.warning(
             "schedule.remove.not_in_pq",
             order_id=str(order.order_id),
@@ -624,7 +688,7 @@ def remove_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResul
             ),
         )
 
-    state.priority_queue[:] = [o for o in state.priority_queue if o.order_id != order.order_id]
+    _pq_remove_by_id(state, order.order_id)
     _apply_remove_to_trees(state, order)
 
     logger.info(
@@ -679,8 +743,7 @@ def pin_order(
 
     # Order MUST be in pq currently — otherwise we have nothing to remove
     # and the trees would double-count if we still re-added at fake.
-    in_pq = any(o.order_id == order.order_id for o in state.priority_queue)
-    if not in_pq:
+    if not _pq_contains(state, order.order_id):
         logger.warning(
             "schedule.pin.order_not_in_pq",
             order_id=str(order.order_id),
@@ -692,9 +755,7 @@ def pin_order(
         )
 
     # Step 1: tentatively free the order's tree contribution at real deadline.
-    state.priority_queue[:] = [
-        o for o in state.priority_queue if o.order_id != order.order_id
-    ]
+    _pq_remove_by_id(state, order.order_id)
     _apply_remove_to_trees(state, order)
 
     # Step 2: capacity check at fake_deadline (same query as add_order).
@@ -702,7 +763,7 @@ def pin_order(
     if available < order.wafer_quantity:
         # Undo: re-add at the real deadline so state is bit-for-bit unchanged.
         _apply_add_to_trees(state, order)
-        _insert_sorted(state.priority_queue, order)
+        _pq_add(state, order)
         logger.warning(
             "schedule.pin.capacity_exceeded",
             order_id=str(order.order_id),
@@ -729,14 +790,12 @@ def pin_order(
         deadline=fake_deadline,
     )
     _apply_add_to_trees(state, pinned_view)
-    state.pinned_orders.append(
-        PinnedOrder(
-            order_id=order.order_id,
-            order_number=order.order_number,
-            wafer_quantity=order.wafer_quantity,
-            deadline=order.deadline,
-            fake_deadline=fake_deadline,
-        )
+    state.pinned_orders[order.order_id] = PinnedOrder(
+        order_id=order.order_id,
+        order_number=order.order_number,
+        wafer_quantity=order.wafer_quantity,
+        deadline=order.deadline,
+        fake_deadline=fake_deadline,
     )
 
     logger.info(
@@ -760,10 +819,8 @@ def unpin_order(state: SchedulerState, order_id: uuid.UUID) -> ScheduleResult:
     ``deadline_too_far`` and leaves the order off the pq with state
     unchanged from the post-remove view.
     """
-    target = next(
-        (p for p in state.pinned_orders if p.order_id == order_id),
-        None,
-    )
+    # O(1) lookup + remove from the pinned_orders dict.
+    target = state.pinned_orders.pop(order_id, None)
     if target is None:
         logger.warning(
             "schedule.unpin.not_pinned",
@@ -784,7 +841,6 @@ def unpin_order(state: SchedulerState, order_id: uuid.UUID) -> ScheduleResult:
         deadline=target.fake_deadline,
     )
     _apply_remove_to_trees(state, pinned_view)
-    state.pinned_orders[:] = [p for p in state.pinned_orders if p.order_id != order_id]
 
     real_view = SchedulingOrder(
         order_id=target.order_id,
@@ -806,7 +862,7 @@ def unpin_order(state: SchedulerState, order_id: uuid.UUID) -> ScheduleResult:
         )
 
     _apply_add_to_trees(state, real_view)
-    _insert_sorted(state.priority_queue, real_view)
+    _pq_add(state, real_view)
 
     logger.info(
         "schedule.unpin.success",
@@ -844,7 +900,7 @@ def compute_schedule(state: SchedulerState) -> list[ScheduledResult]:
     results: list[ScheduledResult] = []
 
     # Phase 1: pinned orders consume their reserved day.
-    for pinned in state.pinned_orders:
+    for pinned in state.pinned_orders.values():
         fake_rel = abs_to_rel(pinned.fake_deadline, state.base_date)
         if fake_rel is None:
             # Pin has been overtaken by base_date; out-of-band cleanup
@@ -939,22 +995,23 @@ def advance_day(state: SchedulerState) -> SchedulerState:
     working = SchedulerState(
         capacity_tree=SegmentTree.from_array(state.capacity_tree.to_array()),
         deadline_tree=SegmentTree.from_array(state.deadline_tree.to_array()),
-        priority_queue=[],  # helpers don't read this; pq is rebuilt below
-        pinned_orders=[],   # rebuilt below
+        priority_queue=_new_priority_queue(),  # helpers don't read this; rebuilt below
+        pq_index={},
+        pinned_orders={},   # rebuilt below
         base_date=state.base_date,
     )
 
     # ----- Step 0: pinned-today (fake_deadline == today) ------------------
     pinned_today: list[PinnedOrder] = []
-    pinned_remaining: list[PinnedOrder] = []
+    pinned_remaining: dict[uuid.UUID, PinnedOrder] = {}
     pinned_today_total = 0
-    for pinned in state.pinned_orders:
+    for pinned in state.pinned_orders.values():
         fake_rel = abs_to_rel(pinned.fake_deadline, state.base_date)
         if fake_rel == 1:
             pinned_today.append(pinned)
             pinned_today_total += pinned.wafer_quantity
         else:
-            pinned_remaining.append(pinned)
+            pinned_remaining[pinned.order_id] = pinned
 
     # Drop pinned-today from trees (they're done today).
     for pinned in pinned_today:
@@ -996,10 +1053,18 @@ def advance_day(state: SchedulerState) -> SchedulerState:
     for done in fully_done_orders:
         _apply_remove_to_trees(working, done)
 
-    # New pq starts as everything past the fully-done prefix; the boundary
-    # order (if any) is at index 0 and gets rewritten in place.
-    new_pq: list[SchedulingOrder] = list(state.priority_queue[fully_done_count:])
+    # New pq = everything past the fully-done prefix. With the SortedKeyList
+    # backing, slicing returns a list which we re-wrap as a SortedKeyList
+    # (no extra sort cost — input is already in order).
+    carried_orders: list[SchedulingOrder] = list(state.priority_queue[fully_done_count:])
 
+    # The boundary order's qty drops to ``new_quantity`` for the remaining
+    # days. Its sort_key (deadline, -qty, order_number) shifts: smaller qty
+    # → larger -qty → lower priority within the same deadline. Per Phase 3
+    # data-structure refactor we let the SortedKeyList re-sort by the new
+    # key rather than pin the boundary at index 0 of the old position —
+    # the new position is the EDF-correct one and the spec doc has been
+    # updated to match.
     if boundary_order is not None:
         done_today = pq_ceiling - cumulative
         new_quantity = boundary_order.wafer_quantity - done_today
@@ -1010,8 +1075,14 @@ def advance_day(state: SchedulerState) -> SchedulerState:
             wafer_quantity=new_quantity,
             deadline=boundary_order.deadline,
         )
-        new_pq[0] = new_boundary  # preserve position; do not re-sort
+        # Drop old boundary entry and add the reduced-qty one — SortedKeyList
+        # will place new_boundary at its new EDF position.
+        carried_orders = [o for o in carried_orders if o.order_id != boundary_order.order_id]
+        carried_orders.append(new_boundary)
         _apply_add_to_trees(working, new_boundary)
+
+    new_pq = _new_priority_queue(carried_orders)
+    new_pq_index = {o.order_id: o for o in carried_orders}
 
     # ----- Step 4: shift trees left by one day -----------------------------
     cap_values = working.capacity_tree.to_array()
@@ -1024,6 +1095,7 @@ def advance_day(state: SchedulerState) -> SchedulerState:
         capacity_tree=SegmentTree.from_array(new_cap_values),
         deadline_tree=SegmentTree.from_array(new_dead_values),
         priority_queue=new_pq,
+        pq_index=new_pq_index,
         pinned_orders=pinned_remaining,
         base_date=state.base_date + timedelta(days=1),
     )

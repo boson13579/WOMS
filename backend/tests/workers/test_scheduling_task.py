@@ -1065,14 +1065,16 @@ def test_advance_day_marks_today_orders_in_production(
 
     old_state = SchedulerState.initial(today)
     new_state = SchedulerState.initial(tomorrow)
-    new_state.priority_queue.append(
-        SchedulingOrder(
-            order_id=order_y,
-            order_number="ORD-Y",
-            wafer_quantity=1000,
-            deadline=tomorrow + timedelta(days=2),
-        )
+    order_y_obj = SchedulingOrder(
+        order_id=order_y,
+        order_number="ORD-Y",
+        wafer_quantity=1000,
+        deadline=tomorrow + timedelta(days=2),
     )
+    # SortedKeyList uses ``add`` (not append) to maintain sort order; mirror
+    # the index dict so contains-check / lookup paths still work.
+    new_state.priority_queue.add(order_y_obj)
+    new_state.pq_index[order_y] = order_y_obj
 
     monkeypatch.setattr("app.workers.scheduling._load_state", lambda: old_state)
     monkeypatch.setattr(
@@ -1197,7 +1199,8 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
 
     # rebuild_state succeeds with no skipped.
     rebuilt_state = SchedulerState.initial(base)
-    rebuilt_state.priority_queue.append(pulled_order)
+    rebuilt_state.priority_queue.add(pulled_order)
+    rebuilt_state.pq_index[pulled_order.order_id] = pulled_order
     rebuild_mock = MagicMock(return_value=(rebuilt_state, []))
     monkeypatch.setattr("app.workers.scheduling.rebuild_state", rebuild_mock)
 
@@ -1642,7 +1645,7 @@ def test_finalize_run_passes_pinned_map_to_apply_schedule(
 
     def fake_load_state() -> SchedulerState:
         s = SchedulerState.initial(date(2026, 5, 5))
-        s.pinned_orders.append(
+        s.pinned_orders[pinned_id] = (
             PinnedOrder(
                 order_id=pinned_id,
                 order_number="PINNED",

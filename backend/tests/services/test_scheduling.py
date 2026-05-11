@@ -293,9 +293,14 @@ def test_advance_day_processes_pq_and_shifts_trees() -> None:
     assert surviving[f.order_id].wafer_quantity == 1000
     # g was untouched.
     assert surviving[g.order_id].wafer_quantity == 2000
-    # f keeps its position (was directly after the fully-done prefix).
-    assert new_state.priority_queue[0].order_id == f.order_id
-    assert new_state.priority_queue[1].order_id == g.order_id
+    # PQ data-structure refactor (SortedKeyList): after boundary qty
+    # reduction, f's sort_key changes to (day3, -1000, "f"). g still has
+    # (day3, -2000, "g"). Because -1000 > -2000, f now sorts AFTER g
+    # within the same deadline — g first, then f. This is the EDF-correct
+    # ordering; the old per-spec "preserve position" was a deliberate
+    # simplification of pre-refactor code and isn't a semantic invariant.
+    assert new_state.priority_queue[0].order_id == g.order_id
+    assert new_state.priority_queue[1].order_id == f.order_id
 
     # Capacity prefix after the doc's "步驟 4": 10000, 17000 for the first two
     # days of the new horizon (third day onwards is fresh full-capacity slots).
@@ -510,7 +515,7 @@ def test_pin_order_rejected_when_capacity_insufficient_at_pin_day() -> None:
     assert state.capacity_tree.to_array() == cap_before
     assert state.deadline_tree.to_array() == dead_before
     assert [o.order_id for o in state.priority_queue] == pq_ids_before
-    assert state.pinned_orders == []
+    assert state.pinned_orders == {}
 
 
 def test_pin_order_success_matches_spec_example_2() -> None:
@@ -550,7 +555,7 @@ def test_pin_order_success_matches_spec_example_2() -> None:
     assert state.deadline_tree.query(3) == 11000
 
     pq_ids = {o.order_id for o in state.priority_queue}
-    pinned_ids = {p.order_id for p in state.pinned_orders}
+    pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id}
     assert pinned_ids == {b.order_id, c.order_id}
 
@@ -582,7 +587,7 @@ def test_unpin_order_restores_state_to_pre_pin() -> None:
     assert state.deadline_tree.query(3) == 11000
 
     pq_ids = {o.order_id for o in state.priority_queue}
-    pinned_ids = {p.order_id for p in state.pinned_orders}
+    pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id, c.order_id}
     assert pinned_ids == {b.order_id}
 
@@ -597,12 +602,12 @@ def test_unpin_order_unknown_id_returns_error_without_mutating_state() -> None:
 
     cap_before = state.capacity_tree.to_array()
     pq_before = list(state.priority_queue)
-    pinned_before = list(state.pinned_orders)
+    pinned_before = dict(state.pinned_orders)
 
     result = unpin_order(state, uuid.uuid4())
     assert result.status == "capacity_exceeded"
     assert state.capacity_tree.to_array() == cap_before
-    assert state.priority_queue == pq_before
+    assert list(state.priority_queue) == pq_before
     assert state.pinned_orders == pinned_before
 
 
@@ -651,7 +656,7 @@ def test_advance_day_completes_pinned_today_and_fills_remainder_from_pq() -> Non
     new_state = advance_day(state)
 
     # Pinned x is gone — produced today.
-    assert new_state.pinned_orders == []
+    assert new_state.pinned_orders == {}
     # y remains in pq with qty reduced by 8000 (the pq budget after pinned-today).
     assert len(new_state.priority_queue) == 1
     assert new_state.priority_queue[0].order_id == y.order_id
@@ -683,11 +688,11 @@ def test_rebuild_state_separates_pinned_from_pq() -> None:
 
     assert skipped == []
     pq_ids = {o.order_id for o in state.priority_queue}
-    pinned_ids = {p.order_id for p in state.pinned_orders}
+    pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id}
     assert pinned_ids == {b.order_id}
     # Pinned order is recorded with both real + fake deadlines for unpin.
-    pinned_b = next(p for p in state.pinned_orders if p.order_id == b.order_id)
+    pinned_b = state.pinned_orders[b.order_id]
     assert pinned_b.deadline == deadline_3
     assert pinned_b.fake_deadline == _BASE
 
@@ -699,19 +704,19 @@ def test_scheduler_state_roundtrip_preserves_pinned_orders() -> None:
     (i.e. without ``pinned_orders`` key) must deserialize as empty list.
     """
     state = SchedulerState.initial(_BASE)
-    state.pinned_orders.append(
-        PinnedOrder(
-            order_id=uuid.uuid4(),
-            order_number="b",
-            wafer_quantity=1000,
-            deadline=_BASE + timedelta(days=2),
-            fake_deadline=_BASE,
-        )
+    seeded = PinnedOrder(
+        order_id=uuid.uuid4(),
+        order_number="b",
+        wafer_quantity=1000,
+        deadline=_BASE + timedelta(days=2),
+        fake_deadline=_BASE,
     )
+    state.pinned_orders[seeded.order_id] = seeded
     raw = state.to_json()
     revived = SchedulerState.from_json(raw)
     assert len(revived.pinned_orders) == 1
-    assert revived.pinned_orders[0].fake_deadline == _BASE
+    revived_pin = next(iter(revived.pinned_orders.values()))
+    assert revived_pin.fake_deadline == _BASE
 
     # Backward-compat: an old blob without "pinned_orders" key.
     import json as _json
@@ -720,4 +725,4 @@ def test_scheduler_state_roundtrip_preserves_pinned_orders() -> None:
     legacy.pop("pinned_orders")
     legacy_raw = _json.dumps(legacy)
     revived_legacy = SchedulerState.from_json(legacy_raw)
-    assert revived_legacy.pinned_orders == []
+    assert revived_legacy.pinned_orders == {}

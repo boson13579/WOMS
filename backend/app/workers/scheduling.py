@@ -458,7 +458,7 @@ def _finalize_run(state: SchedulerState) -> int:
     Returns the number of scheduled rows written, for logging.
     """
     scheduled = compute_schedule(state)
-    pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders}
+    pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders.values()}
 
     db: Session = SessionLocal()
     try:
@@ -682,7 +682,7 @@ def advance_day_task() -> None:
             # in_production rows are done.
             new_alive_ids: set[uuid.UUID] = (
                 {o.order_id for o in new_state.priority_queue}
-                | {p.order_id for p in new_state.pinned_orders}
+                | set(new_state.pinned_orders.keys())
             )
 
             # Combined DB workflow: apply_schedule + status flips. We bypass
@@ -690,7 +690,7 @@ def advance_day_task() -> None:
             # in one session before ``_save_state`` + broadcast.
             scheduled_results = compute_schedule(new_state)
             pinned_map = {
-                p.order_id: p.fake_deadline for p in new_state.pinned_orders
+                p.order_id: p.fake_deadline for p in new_state.pinned_orders.values()
             }
             db: Session = SessionLocal()
             try:
