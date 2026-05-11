@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.repositories import order as order_repo
 from app.services import order as order_service
 from app.services import websocket
 from app.services.scheduling import (
@@ -586,24 +587,38 @@ def advance_day_task() -> None:
     regardless — better to re-base on a slightly stale state than to skip
     the day rollover entirely.
 
-    Calls ``_finalize_run`` directly (state changed, frontend needs to
-    refresh) so we don't depend on ``run_scheduling_task`` to broadcast for
-    us — under the per-op design, run_scheduling skips broadcast when the
-    queue is empty.
+    **Phase 3 — DB status workflow**. At each fire the task does two extra
+    UPDATEs alongside the existing finalize:
 
-    Sets the waiter flag for the entire duration of this task (set before
-    ``_wait_for_idle_run``, cleared in ``finally``) so a concurrent
+    1. **``in_production → completed``** for orders that WERE locked in
+       on a previous day and are no longer in the new scheduler state's
+       living set (= ``priority_queue + pinned_orders``). Signal: those
+       orders' last remaining work was made yesterday, they're done.
+    2. **(scheduled | …) → ``in_production``** for orders that have any
+       production assigned to "today" (the day-1 of the OLD state, which
+       advance_day removes / partially consumes). This includes pinned-
+       today, fully-done pq, and boundary orders. We snapshot the
+       today-set from ``compute_schedule(old_state)`` BEFORE running
+       advance_day, since after advance_day base_date has shifted and
+       day-1 of new_state is tomorrow.
+
+    The override order is: ``apply_schedule`` first (writes
+    ``scheduled_production_date`` / ``expected_delivery_date`` /
+    ``status='scheduled'`` for orders in the new state) → then
+    ``mark_completed_outside_set`` → then ``mark_in_production`` last (so
+    boundary orders which apply_schedule wrote as ``scheduled`` get
+    correctly upgraded to ``in_production``).
+
+    Sets the waiter flag for the entire duration (set before
+    ``_wait_for_idle_run``, cleared in outer ``finally``) so a concurrent
     ``run_scheduling_task`` finishing during our wait yields its re-trigger
     to us instead of racing.
 
-    Also claims ``schedule:status = running`` for the duration of its own
-    work (after the wait). On clean completion the inner success path writes
-    ``idle``; on any exception the inner ``except`` writes ``failed`` (with
-    the error string captured in ``schedule:status.error``) and re-raises so
-    Celery still records the traceback. Writing ``idle`` regardless of
-    outcome — the previous design — meant ``GET /schedule/status`` showed a
-    healthy scheduler even when ``advance_day`` had blown up, hiding the
-    failure from operators.
+    Also claims ``schedule:status = running`` for the duration. On clean
+    completion the inner success path writes ``idle``; on any exception the
+    inner ``except`` writes ``failed`` (with the error string captured in
+    ``schedule:status.error``) and re-raises so Celery still records the
+    traceback.
     """
     logger.info("schedule.advance_day.start")
     _set_waiter_flag()
@@ -614,18 +629,71 @@ def advance_day_task() -> None:
         _set_status(state=_STATUS_RUNNING, started_at=started_at)
         try:
             state = _load_state()
+
+            # Snapshot "today's locked-in" set BEFORE advance_day shifts
+            # state. compute_schedule(state) gives us every order with any
+            # work on day-1 of the OLD state (= today by definition of the
+            # 00:00 UTC fire). Filter by scheduled_date == state.base_date
+            # to be explicit.
+            today = state.base_date
+            today_locked_in_ids: set[uuid.UUID] = {
+                sr.order_id
+                for sr in compute_schedule(state)
+                if sr.scheduled_date == today
+            }
+
             new_state = advance_day(state)
-            _finalize_run(new_state)
+
+            # Orders still alive in the new state — used by
+            # ``mark_completed_outside_set`` to decide which currently-
+            # in_production rows are done.
+            new_alive_ids: set[uuid.UUID] = (
+                {o.order_id for o in new_state.priority_queue}
+                | {p.order_id for p in new_state.pinned_orders}
+            )
+
+            # Combined DB workflow: apply_schedule + status flips. We bypass
+            # ``_finalize_run`` here so we can serialize the three DB writes
+            # in one session before ``_save_state`` + broadcast.
+            scheduled_results = compute_schedule(new_state)
+            pinned_map = {
+                p.order_id: p.fake_deadline for p in new_state.pinned_orders
+            }
+            db: Session = SessionLocal()
+            try:
+                # 1. Set scheduled_production_date / dates / pin columns
+                #    for orders still in state (status=scheduled).
+                order_service.apply_schedule(db, scheduled_results, pinned_map)
+                # 2. Yesterday's in_production orders that have no remaining
+                #    work in state → completed.
+                completed_count = order_repo.mark_completed_outside_set(
+                    db, new_alive_ids
+                )
+                # 3. Today's-locked-in (advance_day moved them out of state)
+                #    → in_production. Overrides apply_schedule's
+                #    ``scheduled`` for any boundary order present here.
+                in_prod_count = order_repo.mark_in_production(
+                    db, today_locked_in_ids
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            _save_state(new_state)
+            websocket.broadcast({"type": "schedule.updated"})
 
             logger.info(
                 "schedule.advance_day.success",
                 old_base=state.base_date.isoformat(),
                 new_base=new_state.base_date.isoformat(),
                 carried=len(new_state.priority_queue),
+                in_production_count=in_prod_count,
+                completed_count=completed_count,
             )
 
-            # Drain any pending ops on top of the new state. If the queue is
-            # empty, finalize already broadcast and we have nothing to do.
+            # Drain any pending compounds on top of the new state. If the
+            # queue is empty, finalize already broadcast and we have nothing
+            # more to do.
             if cast("int", _get_redis().zcard(PENDING_OPS_KEY)) > 0:
                 run_scheduling_task.delay()
 

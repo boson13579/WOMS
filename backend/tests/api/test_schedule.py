@@ -299,6 +299,109 @@ def test_operations_without_token_returns_401(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# DELETE /operations/{compound_id} — cancel
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_compound_200_when_in_queue(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """Happy path: compound is still in the queue → 200, cancel_compound
+    helper returns ``CancelResult.cancelled``.
+    """
+    from app.services.schedule_queue import CancelResult
+
+    _make_user(db_session, username="sched_cancel_ok", role=UserRole.scheduler)
+    token = _login(client, "sched_cancel_ok")
+
+    cancel_mock = MagicMock(return_value=CancelResult.cancelled)
+    monkeypatch.setattr("app.api.v1.schedule.cancel_compound", cancel_mock)
+
+    compound_id = uuid.uuid4()
+    res = client.delete(
+        f"/api/v1/schedule/operations/{compound_id}",
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["compound_id"] == str(compound_id)
+    assert body["message"] == "Compound cancelled"
+    # cancel_compound called with the parsed UUID.
+    cancel_mock.assert_called_once_with(compound_id)
+
+
+def test_cancel_compound_409_when_already_in_progress(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """Worker won the race between our HGET and ZREM. Helper returns
+    ``CancelResult.in_progress`` → endpoint returns 409.
+    """
+    from app.services.schedule_queue import CancelResult
+
+    _make_user(db_session, username="sched_cancel_race", role=UserRole.scheduler)
+    token = _login(client, "sched_cancel_race")
+
+    monkeypatch.setattr(
+        "app.api.v1.schedule.cancel_compound",
+        MagicMock(return_value=CancelResult.in_progress),
+    )
+
+    compound_id = uuid.uuid4()
+    res = client.delete(
+        f"/api/v1/schedule/operations/{compound_id}",
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_cancel_compound_404_when_unknown(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """Compound id is unknown to the secondary index → 404."""
+    from app.services.schedule_queue import CancelResult
+
+    _make_user(db_session, username="sched_cancel_missing", role=UserRole.scheduler)
+    token = _login(client, "sched_cancel_missing")
+
+    monkeypatch.setattr(
+        "app.api.v1.schedule.cancel_compound",
+        MagicMock(return_value=CancelResult.not_found),
+    )
+
+    res = client.delete(
+        f"/api/v1/schedule/operations/{uuid.uuid4()}",
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == 404
+
+
+def test_cancel_compound_by_viewer_returns_403(
+    client: TestClient, db_session: Session
+) -> None:
+    _make_user(db_session, username="viewer_cancel", role=UserRole.viewer)
+    token = _login(client, "viewer_cancel")
+
+    res = client.delete(
+        f"/api/v1/schedule/operations/{uuid.uuid4()}",
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_cancel_compound_without_token_returns_401(client: TestClient) -> None:
+    res = client.delete(f"/api/v1/schedule/operations/{uuid.uuid4()}")
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
 # GET /status
 # ---------------------------------------------------------------------------
 

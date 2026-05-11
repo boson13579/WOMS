@@ -18,6 +18,7 @@ process and vice versa).
 from __future__ import annotations
 
 import json
+import uuid
 from functools import lru_cache
 from typing import Any, cast
 
@@ -38,7 +39,7 @@ from app.schemas.schedule import (
     ScheduleTriggerResponse,
 )
 from app.services import order as order_service
-from app.services.schedule_queue import enqueue_compound
+from app.services.schedule_queue import CancelResult, cancel_compound, enqueue_compound
 from app.services.scheduling import (
     STATE_KEY,
     STATUS_KEY,
@@ -160,6 +161,54 @@ def enqueue_operation(
     return ScheduleCompoundResponse(
         compound_id=request.compound_id,
         message="Compound queued",
+    )
+
+
+# ---------------------------------------------------------------------------
+# DELETE /operations/{compound_id}
+# ---------------------------------------------------------------------------
+
+
+@router.delete(
+    "/operations/{compound_id}",
+    response_model=ScheduleCompoundResponse,
+)
+def cancel_compound_endpoint(
+    compound_id: uuid.UUID,
+    current_user: User = Depends(_WRITE_ROLES),
+) -> ScheduleCompoundResponse:
+    """Cancel a still-queued scheduler compound.
+
+    Looks up the compound by id in the
+    ``schedule:pending_ops:by_compound_id`` secondary index, ``ZREM``s it
+    from the sorted set, and fires ``schedule.compound_cancelled`` to the
+    compound's ``requested_by``.
+
+    Returns:
+        ``200`` — compound was in queue and got removed.
+        ``409`` — compound was in the index but the worker popped it
+                 between our lookup and our ``ZREM`` (already in flight).
+                 The frontend should fall back to waiting for the regular
+                 ``schedule.updated`` / ``schedule.compound_failed`` outcome.
+        ``404`` — compound id is unknown (never enqueued, or processed
+                 long enough ago that the index entry was cleaned).
+
+    Permission: scheduler+.
+    """
+    result = cancel_compound(compound_id)
+    if result is CancelResult.cancelled:
+        return ScheduleCompoundResponse(
+            compound_id=compound_id,
+            message="Compound cancelled",
+        )
+    if result is CancelResult.in_progress:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Compound is already in progress; cancellation lost the race.",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Compound not found in the pending queue.",
     )
 
 

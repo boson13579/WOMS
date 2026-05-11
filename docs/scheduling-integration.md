@@ -182,9 +182,10 @@ def unpin_order(order, actor):
 |---|---|---|---|
 | `POST` | `/trigger` | scheduler+ | 手動補觸發排程任務 |
 | `GET` | `/status` | order_manager+ | 排程 worker 的 lifecycle snapshot（`idle`/`running`/`failed`） |
-| `GET` | `/result` | order_manager+ | 目前已排定的訂單清單（含每筆訂單的逐日數量 `daily_breakdown`） |
+| `GET` | `/result` | order_manager+ | 目前已排定 / 進行中的訂單清單（含每筆訂單的逐日數量 `daily_breakdown`，包含 `scheduled` 跟 `in_production` 兩種 status） |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建排程 state（async；不會 block） |
-| `POST` | `/operations` | scheduler+ | 推訂單 op（**這條 frontend 通常不需要碰**，由 Order CRUD 後端內部呼叫） |
+| `POST` | `/operations` | scheduler+ | 推 compound 進佇列（Phase 2 後 Order CRUD 自動處理大部分情況，前端只在「手動 pin / unpin」時直接打） |
+| `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound（前端「取消」按鈕）。200 = 取消成功；409 = worker 已開始處理，無法取消；404 = compound id 未知 |
 
 錯誤回應一律走 unified envelope：
 ```json
@@ -280,6 +281,11 @@ ws.addEventListener("message", (e) => {
             }
             // state 已 rollback，前端不用主動還原 UI；下次刷 /schedule/result 看到的就是失敗前的狀態。
             break;
+        case "schedule.compound_cancelled":
+            // 自己按了取消、後端確認成功。可以收回 optimistic UI 的「取消中」標記。
+            toast.success(`已取消排隊中的操作`);
+            queryClient.invalidateQueries(["schedule", "result"]);
+            break;
         case "schedule.rebuild_skipped":
             // 自己創的訂單在 rebuild 時被跳過（通常是 deadline 已過期）
             toast.warning(`重建時 ${msg.order_number} 無法排入（${msg.reason}），請確認`);
@@ -305,6 +311,7 @@ ws.addEventListener("close", (e) => {
 |---|---|---|---|
 | `schedule.updated` | 任何排程結果有變動（單筆 op 處理完、換天、rebuild） | **所有連線的 client**（broadcast） | `{ type: "schedule.updated" }` |
 | `schedule.compound_failed` | Compound 內任一 op 失敗（add / remove / pin / unpin），整個 compound 已 saga-rollback 至 pre-compound 狀態 | compound 的 `requested_by` user | `{ type, compound_id, failed_op_index, failed_op: "add"\|"remove"\|"pin"\|"unpin", order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail, rolled_back: true }` |
+| `schedule.compound_cancelled` | `DELETE /operations/{compound_id}` 取消成功 | compound 的 `requested_by` user | `{ type, compound_id }` |
 | `schedule.rebuild_skipped` | rebuild 時某筆 scheduled 訂單塞不回去（通常 deadline 已被 base_date 越過） | 訂單的 `created_by` user | `{ type, order_id, order_number, reason: "deadline_too_far"\|"capacity_exceeded" }` |
 
 ### 3.4 前端注意事項

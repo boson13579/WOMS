@@ -26,6 +26,8 @@ otherwise arise (``workers.scheduling`` already imports
 from __future__ import annotations
 
 import json
+import uuid
+from enum import StrEnum
 from functools import lru_cache
 from typing import Any, cast
 
@@ -34,6 +36,7 @@ from redis import Redis
 
 from app.core.config import get_settings
 from app.schemas.schedule import ScheduleCompoundRequest
+from app.services import websocket
 from app.services.scheduling import (
     PENDING_OPS_KEY,
     PENDING_OPS_SEQ_KEY,
@@ -41,10 +44,28 @@ from app.services.scheduling import (
     score_for_op,
 )
 
+
+class CancelResult(StrEnum):
+    """Outcome of a cancel-compound request.
+
+    - ``cancelled`` — compound was in queue, ZREM removed it, WS notify fired.
+    - ``in_progress`` — compound was found in the secondary index but
+      ZREM returned 0 (worker just popped it; cancellation lost the race).
+    - ``not_found`` — compound id is unknown to the queue (either it was
+      never enqueued, or it was processed long enough ago that the index
+      entry was cleaned).
+    """
+
+    cancelled = "cancelled"
+    in_progress = "in_progress"
+    not_found = "not_found"
+
 logger = structlog.get_logger(__name__)
 
 __all__ = [
     "BY_COMPOUND_ID_KEY",
+    "CancelResult",
+    "cancel_compound",
     "enqueue_compound",
 ]
 
@@ -118,6 +139,71 @@ def enqueue_compound(compound: ScheduleCompoundRequest) -> None:
     status_doc = _read_status()
     if status_doc is None or status_doc.get("state") != "running":
         _send_run_task()
+
+
+def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
+    """Try to remove a queued compound from ``schedule:pending_ops`` by id.
+
+    Uses the ``schedule:pending_ops:by_compound_id`` secondary index
+    maintained by ``enqueue_compound`` to look up the serialized member
+    string in O(1), then ``ZREM`` it from the sorted set and ``HDEL`` the
+    index entry. If ``ZREM`` returns 0 the compound was popped by the
+    worker in the moment between our ``HGET`` and ``ZREM`` — we report
+    ``in_progress`` so the caller can return 409, and we still ``HDEL``
+    the index entry (worker's best-effort cleanup may already have
+    fired, but defensive cleanup is cheap).
+
+    On successful cancel, emits ``schedule.compound_cancelled`` to the
+    compound's ``requested_by`` so the frontend can clear any optimistic
+    UI state (e.g., re-enable a "Cancel" button or restore an indicator).
+    """
+    rds = _redis()
+    compound_id_str = str(compound_id)
+
+    member_raw = cast("str | None", rds.hget(BY_COMPOUND_ID_KEY, compound_id_str))
+    if member_raw is None:
+        logger.info(
+            "schedule.compound.cancel_not_found",
+            compound_id=compound_id_str,
+        )
+        return CancelResult.not_found
+
+    removed = cast("int", rds.zrem(PENDING_OPS_KEY, member_raw))
+    # Always clean up the index entry, regardless of zrem result — the
+    # worker's best-effort cleanup may have already nuked the sorted set
+    # entry but not the index.
+    rds.hdel(BY_COMPOUND_ID_KEY, compound_id_str)
+
+    if removed == 0:
+        # Worker won the race: it popped the compound between our HGET
+        # and ZREM. The compound is already being processed; cancellation
+        # can no longer take effect.
+        logger.info(
+            "schedule.compound.cancel_race_lost",
+            compound_id=compound_id_str,
+        )
+        return CancelResult.in_progress
+
+    # Successfully removed from queue. Notify the requester.
+    try:
+        payload = json.loads(member_raw)
+        requested_by_raw = payload.get("requested_by")
+    except json.JSONDecodeError:
+        requested_by_raw = None
+    if requested_by_raw:
+        websocket.notify_user(
+            user_id=uuid.UUID(requested_by_raw),
+            message={
+                "type": "schedule.compound_cancelled",
+                "compound_id": compound_id_str,
+            },
+        )
+
+    logger.info(
+        "schedule.compound.cancelled",
+        compound_id=compound_id_str,
+    )
+    return CancelResult.cancelled
 
 
 def _send_run_task() -> None:

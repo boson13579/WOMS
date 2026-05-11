@@ -22,6 +22,8 @@ __all__ = [
     "get_many",
     "get_scheduled",
     "get_today_order_count",
+    "mark_completed_outside_set",
+    "mark_in_production",
     "set_schedule_dates",
 ]
 
@@ -137,15 +139,22 @@ def create(
 
 
 def get_scheduled(db: Session) -> list[Order]:
-    """Return every active order whose status is `scheduled`.
+    """Return every active order with status ``scheduled`` or ``in_production``.
 
-    Sorted by `scheduled_production_date` ascending so callers (e.g. the
-    scheduler dashboard) see a natural timeline.
+    Both statuses represent an order on the production timeline that the
+    frontend wants to show on ``GET /schedule/result``. ``scheduled`` =
+    queued for a future day, ``in_production`` = its day arrived (locked in
+    at the most recent ``advance_day``) and physical production is in
+    progress. ``completed`` rows are excluded — they're shown elsewhere
+    (e.g., a separate "history" view).
+
+    Sorted by ``scheduled_production_date`` ascending so callers see a
+    natural timeline.
     """
     stmt = (
         select(Order)
         .where(Order.is_deleted.is_(False))
-        .where(Order.status == OrderStatus.scheduled)
+        .where(Order.status.in_((OrderStatus.scheduled, OrderStatus.in_production)))
         .order_by(Order.scheduled_production_date.asc())
     )
     return list(db.scalars(stmt).all())
@@ -214,3 +223,62 @@ def set_schedule_dates(
     db.flush()
     db.refresh(order)
     return order
+
+
+# ---------------------------------------------------------------------------
+# Status transitions driven by advance_day (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def mark_in_production(db: Session, order_ids: set[uuid.UUID]) -> int:
+    """Bulk-flip the given orders' status to ``in_production``.
+
+    Called by ``advance_day_task`` for orders whose scheduled production
+    day is "today" (the day just locked in by the current advance_day
+    invocation). Overrides ``apply_schedule``'s ``scheduled`` status from
+    earlier in the same transaction, which is intentional — apply_schedule
+    runs first to set scheduled_production_date / expected_delivery_date,
+    then this overrides the status column for the locked-in subset.
+
+    Returns the number of rows touched (0 if ``order_ids`` is empty —
+    SQLAlchemy turns an empty IN clause into an always-false predicate).
+    """
+    if not order_ids:
+        return 0
+    stmt = (
+        update(Order)
+        .where(Order.is_deleted.is_(False))
+        .where(Order.id.in_(order_ids))
+        .values(status=OrderStatus.in_production)
+    )
+    result = db.execute(stmt)
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+
+def mark_completed_outside_set(db: Session, alive_ids: set[uuid.UUID]) -> int:
+    """Mark ``in_production`` orders no longer in *alive_ids* as ``completed``.
+
+    Called by ``advance_day_task`` at the top of its run. Semantics: an
+    order that WAS in_production yesterday (= currently has status
+    'in_production') AND is NOT in the new scheduler state's living set
+    (pq + pinned_orders) must have finished its production — its final
+    portion was made on the day that just ended.
+
+    Why "outside set" rather than a date-based check: a boundary order's
+    last day might span 2-3 calendar days; the cleanest signal that it's
+    done is "no longer in the state's pq/pinned_orders". Date math gets
+    fragile around boundary orders.
+
+    Returns the number of rows flipped to ``completed``.
+    """
+    stmt = (
+        update(Order)
+        .where(Order.is_deleted.is_(False))
+        .where(Order.status == OrderStatus.in_production)
+    )
+    if alive_ids:
+        # Exclude orders that are still scheduled in the live state.
+        stmt = stmt.where(Order.id.notin_(alive_ids))
+    stmt = stmt.values(status=OrderStatus.completed)
+    result = db.execute(stmt)
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]

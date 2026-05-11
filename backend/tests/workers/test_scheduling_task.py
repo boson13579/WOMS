@@ -23,6 +23,7 @@ from app.services.scheduling import (
     PENDING_OPS_KEY,
     STATE_KEY,
     STATUS_KEY,
+    ScheduledResult,
     ScheduleResult,
     SchedulerState,
     SchedulingOrder,
@@ -981,11 +982,26 @@ def test_advance_day_waits_then_advances_finalizes_and_retriggers(
     monkeypatch.setattr("app.workers.scheduling.advance_day", advance_mock)
 
     # Stubs for the finalize chain (compute → apply → save → broadcast).
+    # Phase 3: compute_schedule is called TWICE per advance_day_task
+    # invocation — once on the OLD state to identify today's-locked-in
+    # orders, once on the NEW state for apply_schedule. Return [] for both
+    # to keep this happy-path lightweight.
     compute_mock = MagicMock(return_value=[])
     monkeypatch.setattr("app.workers.scheduling.compute_schedule", compute_mock)
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
     apply_mock = MagicMock(return_value=0)
     monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
+    # Phase 3: status-transition repo calls.
+    mark_completed_mock = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_repo.mark_completed_outside_set",
+        mark_completed_mock,
+    )
+    mark_in_prod_mock = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_repo.mark_in_production",
+        mark_in_prod_mock,
+    )
     broadcast_mock = MagicMock()
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", broadcast_mock)
 
@@ -1002,14 +1018,111 @@ def test_advance_day_waits_then_advances_finalizes_and_retriggers(
     assert len(sleep_calls) == 1
     # advance_day called with the loaded state.
     advance_mock.assert_called_once_with(initial)
-    # _finalize_run did its full pipeline on the advanced state.
-    compute_mock.assert_called_once_with(advanced)
+    # compute_schedule fires twice (old state + new state). Last call was
+    # with the advanced state so apply_schedule had the post-shift view.
+    assert compute_mock.call_count == 2
+    assert compute_mock.call_args_list[-1].args == (advanced,)
     apply_mock.assert_called_once()
+    # Status workflow ran: complete-stale then mark-today (Phase 3).
+    mark_completed_mock.assert_called_once()
+    mark_in_prod_mock.assert_called_once()
     broadcast_mock.assert_called_once_with({"type": "schedule.updated"})
-    # The advanced state was persisted (via _save_state inside _finalize_run).
+    # The advanced state was persisted.
     assert saved == [advanced]
     # A scheduling re-run was kicked off because there was 1 pending op.
     assert delay_mock.called
+
+
+def test_advance_day_marks_today_orders_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3 case 17: advance_day flips ``today's d0`` orders to
+    ``in_production`` and ``previously-in_production-now-out-of-state``
+    orders to ``completed``.
+
+    Setup: OLD state's compute_schedule returns one ScheduledResult on
+    today's date (``order_X``); new state's pq contains a different
+    ``order_Y`` (still being scheduled for the future). Assert the
+    mark_in_production call gets ``{order_X}`` and mark_completed_outside_set
+    gets ``{order_Y}`` (the only alive id).
+    """
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
+    monkeypatch.setattr(
+        "app.workers.scheduling._get_status",
+        lambda: {"state": "idle"},
+    )
+    _patch_rebuild_time(monkeypatch)
+
+    today = date(2026, 5, 5)
+    tomorrow = today + timedelta(days=1)
+    order_x = uuid.uuid4()  # today's d0 production
+    order_y = uuid.uuid4()  # still scheduled in new state
+
+    old_state = SchedulerState.initial(today)
+    new_state = SchedulerState.initial(tomorrow)
+    new_state.priority_queue.append(
+        SchedulingOrder(
+            order_id=order_y,
+            order_number="ORD-Y",
+            wafer_quantity=1000,
+            deadline=tomorrow + timedelta(days=2),
+        )
+    )
+
+    monkeypatch.setattr("app.workers.scheduling._load_state", lambda: old_state)
+    monkeypatch.setattr(
+        "app.workers.scheduling.advance_day",
+        MagicMock(return_value=new_state),
+    )
+
+    # compute_schedule called twice:
+    #   1) on old_state for today_locked_in detection → ScheduledResult on today.
+    #   2) on new_state for apply_schedule → ScheduledResult on tomorrow.
+    compute_side_effects = iter(
+        [
+            [ScheduledResult(order_id=order_x, scheduled_date=today, quantity=1000)],
+            [
+                ScheduledResult(
+                    order_id=order_y, scheduled_date=tomorrow, quantity=1000
+                )
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling.compute_schedule",
+        lambda _state: next(compute_side_effects),
+    )
+
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+
+    mark_completed_mock = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_repo.mark_completed_outside_set",
+        mark_completed_mock,
+    )
+    mark_in_prod_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_repo.mark_in_production",
+        mark_in_prod_mock,
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+
+    result = advance_day_task.apply()
+    assert result.successful(), result.traceback
+
+    # in_production set = today's d0 order = {order_x}.
+    in_prod_args = mark_in_prod_mock.call_args.args
+    assert in_prod_args[1] == {order_x}
+
+    # completed-outside-set called with new state's alive ids = {order_y}.
+    completed_args = mark_completed_mock.call_args.args
+    assert completed_args[1] == {order_y}
 
 
 # ---------------------------------------------------------------------------
