@@ -40,43 +40,47 @@ import uuid
 
 # 建立訂單後（如果 backend Order CRUD 已自動處理，這段可以略）
 def on_order_created(order, actor):
+    ops = [
+        {
+            "op": "add",
+            "order_id": str(order.id),
+            "order_number": order.order_number,
+            "wafer_quantity": order.wafer_quantity,
+            "deadline": order.requested_delivery_date.isoformat(),
+        },
+    ]
     httpx.post(
         "http://backend/api/v1/schedule/operations",
         json={
             "compound_id": str(uuid.uuid4()),
             "group": "grow",
+            "op_count": len(ops),  # 必須等於 len(ops)，schema 會驗
             "requested_by": str(actor.id),
-            "ops": [
-                {
-                    "op": "add",
-                    "order_id": str(order.id),
-                    "order_number": order.order_number,
-                    "wafer_quantity": order.wafer_quantity,
-                    "deadline": order.requested_delivery_date.isoformat(),
-                },
-            ],
+            "ops": ops,
         },
         headers={"Authorization": f"Bearer {service_token}"},
     )
 
 # 手動把訂單 pin 到 5/12
 def on_user_pinned(order, actor, pin_day):
+    ops = [
+        {
+            "op": "pin",
+            "order_id": str(order.id),
+            "order_number": order.order_number,
+            "wafer_quantity": order.wafer_quantity,
+            "deadline": order.requested_delivery_date.isoformat(),
+            "fake_deadline": pin_day.isoformat(),
+        },
+    ]
     httpx.post(
         "http://backend/api/v1/schedule/operations",
         json={
             "compound_id": str(uuid.uuid4()),
             "group": "grow",
+            "op_count": len(ops),
             "requested_by": str(actor.id),
-            "ops": [
-                {
-                    "op": "pin",
-                    "order_id": str(order.id),
-                    "order_number": order.order_number,
-                    "wafer_quantity": order.wafer_quantity,
-                    "deadline": order.requested_delivery_date.isoformat(),
-                    "fake_deadline": pin_day.isoformat(),
-                },
-            ],
+            "ops": ops,
         },
         headers={"Authorization": f"Bearer {service_token}"},
     )
@@ -119,6 +123,8 @@ Phase 2 之後，**只要呼叫 backend 的 Order CRUD endpoint，scheduler comp
 ### 2.5 注意事項
 
 - **`requested_by` 一定要填**：compound 失敗時用這個 user id 推 `schedule.compound_failed` 通知。
+- **`op_count` 必須等於 `len(ops)`**：schema 跟 worker 都會驗，不一致直接 422 / `schedule.compound_failed`。這是 producer 對 payload 自我宣告長度的契約，網路截斷或人工改 payload 漏掉一筆 op 都能立刻被偵測到。
+- **`ops` 沒上限**：compound 可以是 1 筆 op（pin 單筆訂單）也可以是 30 筆 op（複雜的 batch 改動）— 業務動作要做幾步就放幾步。worker atomic 處理整個 compound。
 - **不需要等排程跑完**：endpoint 回 202 就可以接著做事，排程是 async。
 - **同 compound 內 ops 必須同 `order_id`**：schema 自帶 validator，多 order 一次直接 422。
 - **Compound 內 ops 順序由 producer 決定**（worker 不重排）；service 內建 builder 已經把順序排好。手動戳的話注意 `unpin → remove → add → pin`（如有）的拓樸。
@@ -132,33 +138,37 @@ import uuid
 
 # UI 按「把訂單 pin 到 5/12」按鈕
 def pin_order(order, actor, pin_day):
+    ops = [{
+        "op": "pin",
+        "order_id": str(order.id),
+        "order_number": order.order_number,
+        "wafer_quantity": order.wafer_quantity,
+        "deadline": order.requested_delivery_date.isoformat(),
+        "fake_deadline": pin_day.isoformat(),
+    }]
     httpx.post(URL, json={
         "compound_id": str(uuid.uuid4()),
         "group": "grow",
+        "op_count": len(ops),
         "requested_by": str(actor.id),
-        "ops": [{
-            "op": "pin",
-            "order_id": str(order.id),
-            "order_number": order.order_number,
-            "wafer_quantity": order.wafer_quantity,
-            "deadline": order.requested_delivery_date.isoformat(),
-            "fake_deadline": pin_day.isoformat(),
-        }],
+        "ops": ops,
     })
 
 # 解 pin
 def unpin_order(order, actor):
+    ops = [{
+        "op": "unpin",
+        "order_id": str(order.id),
+        "order_number": order.order_number,
+        "wafer_quantity": order.wafer_quantity,
+        "deadline": order.requested_delivery_date.isoformat(),
+    }]
     httpx.post(URL, json={
         "compound_id": str(uuid.uuid4()),
         "group": "shrink",
+        "op_count": len(ops),
         "requested_by": str(actor.id),
-        "ops": [{
-            "op": "unpin",
-            "order_id": str(order.id),
-            "order_number": order.order_number,
-            "wafer_quantity": order.wafer_quantity,
-            "deadline": order.requested_delivery_date.isoformat(),
-        }],
+        "ops": ops,
     })
 ```
 

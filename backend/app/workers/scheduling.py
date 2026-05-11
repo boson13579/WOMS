@@ -362,6 +362,39 @@ def _process_compound(
     snapshot = state.to_json()
     ops: list[dict[str, Any]] = compound.get("ops", [])
 
+    # Tamper / truncation guard: payload self-declares its op count.
+    # Schema validation at enqueue time already enforced this, but the
+    # Redis member could in principle be corrupted post-enqueue (manual
+    # surgery, partial write, etc.). A mismatch here means we have no
+    # idea what we're processing — fail the whole compound up front
+    # rather than execute a half-truncated business action.
+    declared_op_count = compound.get("op_count")
+    if declared_op_count is not None and declared_op_count != len(ops):
+        logger.warning(
+            "schedule.compound.op_count_mismatch",
+            compound_id=compound.get("compound_id"),
+            declared=declared_op_count,
+            actual=len(ops),
+        )
+        sentinel_op = {
+            "op": ops[0]["op"] if ops else "add",
+            "order_id": ops[0]["order_id"] if ops else None,
+            "order_number": ops[0].get("order_number", "") if ops else "",
+        }
+        _notify_compound_failure(
+            compound=compound,
+            failed_op_index=-1,
+            failed_op=sentinel_op,
+            result=ScheduleResult(
+                status="capacity_exceeded",
+                message=(
+                    f"Compound payload corrupted: op_count={declared_op_count} "
+                    f"but ops list has {len(ops)} entries."
+                ),
+            ),
+        )
+        return False
+
     for i, op in enumerate(ops):
         result = _apply_op(state, op)
         if result.status != "success":

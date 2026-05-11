@@ -82,17 +82,19 @@ def _build_create_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoun
     the remove runs first; the add then either succeeds or fails-with-
     rollback on a clean state.
     """
+    ops = [
+        ScheduleOpInCompound(
+            op="add",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=order.wafer_quantity,
+            deadline=order.requested_delivery_date,
+        ),
+    ]
     return ScheduleCompoundRequest(
         group="grow",
-        ops=[
-            ScheduleOpInCompound(
-                op="add",
-                order_id=order.id,
-                order_number=order.order_number,
-                wafer_quantity=order.wafer_quantity,
-                deadline=order.requested_delivery_date,
-            ),
-        ],
+        op_count=len(ops),
+        ops=ops,
         requested_by=actor_id,
     )
 
@@ -127,6 +129,7 @@ def _build_delete_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoun
     )
     return ScheduleCompoundRequest(
         group="shrink",
+        op_count=len(ops),
         ops=ops,
         requested_by=actor_id,
     )
@@ -231,6 +234,7 @@ def _build_patch_compound(
 
     return ScheduleCompoundRequest(
         group=group,
+        op_count=len(ops),
         ops=ops,
         requested_by=actor_id,
     )

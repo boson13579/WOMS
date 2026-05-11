@@ -121,7 +121,7 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 
 #### `POST /schedule/operations` — 推訂單 compound 進 pending_ops
 
-> **Phase 2 變更**：endpoint 已從「一次接一筆 op」改成「一次接一個 compound」。Compound 是一組 1-4 筆 leaf ops，**worker 端 atomic 執行**：任何一筆 op 失敗就把整個 compound 連已成功的部分一起 snapshot rollback。Order CRUD 內部已自動 build 對應 compound（見下表），多數 producer 不必直接戳這支 endpoint。
+> **Phase 2 變更**：endpoint 已從「一次接一筆 op」改成「一次接一個 compound」。Compound 是一組 N 筆 leaf ops（沒上限，常見的 PATCH-pinned-order 是 3-4 筆、batch 動作可以更多），**worker 端 atomic 執行**：任何一筆 op 失敗就把整個 compound 連已成功的部分一起 snapshot rollback。Order CRUD 內部已自動 build 對應 compound（見下表），多數 producer 不必直接戳這支 endpoint。
 
 **功能**：接收一筆 `ScheduleCompoundRequest`，透過 `services.schedule_queue.enqueue_compound` 推進 sorted set（一個 compound = 一個 member）。`schedule:status` 是 `idle` / `failed` 就 `celery_app.send_task("scheduling.run")` 觸發 worker；`running` 就讓 in-flight task 自己 re-trigger 撿。
 
@@ -134,6 +134,7 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 {
   "compound_id": "uuid",          // 系統會 default_factory 產生；cancel 時要用
   "group": "shrink" | "grow",
+  "op_count": 3,                  // 必須等於 len(ops)，tamper / truncation 守門
   "requested_by": "uuid",
   "ops": [
     {
@@ -149,9 +150,12 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 ```
 
 Schema-level validation：
-- `ops` 至少 1 筆。
+- `ops` 至少 1 筆（沒上限 — 想塞 3 筆、30 筆都行，看業務動作要做幾步）。
+- `op_count` 必須等於 `len(ops)`。不一致就 422。這是 producer 端對 payload「自我宣告長度」的契約，網路截斷或人工改 payload 漏掉一筆 op 時，後端能立刻偵測到。
 - 所有 ops 必須對同一個 `order_id`（多 order 一次 = 業務 bug）。
 - `op="pin"` 必須帶 `fake_deadline`，其他 op 不得帶。
+
+**Worker 端 double-check**：worker pop 出 compound member 後 也驗一次 `op_count == len(ops)`，不對就直接 `schedule.compound_failed`（`failed_op_index=-1` 表示「不是哪一筆 op 的錯、而是整個 payload 壞掉」），不執行任何 op。這層是給 Redis member 在 enqueue 之後被改壞 / 人工 surgery 弄錯時做的兜底。
 
 **Response 202** (`ScheduleCompoundResponse`)：
 ```json

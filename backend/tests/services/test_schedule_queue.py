@@ -97,19 +97,21 @@ class _FakeRedis:
 def _make_compound(
     *, compound_id: uuid.UUID | None = None
 ) -> ScheduleCompoundRequest:
+    ops = [
+        ScheduleOpInCompound(
+            op="add",
+            order_id=uuid.uuid4(),
+            order_number="ORD-T",
+            wafer_quantity=100,
+            deadline="2026-07-01",
+        ),
+    ]
     return ScheduleCompoundRequest(
         compound_id=compound_id or uuid.uuid4(),
         group="grow",
+        op_count=len(ops),
+        ops=ops,
         requested_by=uuid.uuid4(),
-        ops=[
-            ScheduleOpInCompound(
-                op="add",
-                order_id=uuid.uuid4(),
-                order_number="ORD-T",
-                wafer_quantity=100,
-                deadline="2026-07-01",
-            ),
-        ],
     )
 
 

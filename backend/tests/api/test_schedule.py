@@ -148,6 +148,7 @@ def _patch_redis_and_delay(monkeypatch, fake_redis: _FakeRedis) -> MagicMock:
 
 _VALID_COMPOUND_PAYLOAD = {
     "group": "grow",
+    "op_count": 1,
     "requested_by": str(uuid.uuid4()),
     "ops": [
         {
@@ -264,8 +265,43 @@ def test_operations_rejects_empty_ops(client: TestClient, db_session: Session) -
 
     payload = {
         "group": "grow",
+        "op_count": 0,
         "requested_by": str(uuid.uuid4()),
         "ops": [],
+    }
+
+    res = client.post(
+        "/api/v1/schedule/operations",
+        headers=_auth(token),
+        json=payload,
+    )
+
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
+
+
+def test_operations_rejects_op_count_mismatch(
+    client: TestClient, db_session: Session
+) -> None:
+    """``op_count`` MUST equal ``len(ops)``. Sending a wrong count triggers
+    the schema-level tamper guard, before any Redis interaction.
+    """
+    _make_user(db_session, username="sched_op_count", role=UserRole.scheduler)
+    token = _login(client, "sched_op_count")
+
+    payload = {
+        "group": "grow",
+        "op_count": 5,  # lies — only 1 op below
+        "requested_by": str(uuid.uuid4()),
+        "ops": [
+            {
+                "op": "add",
+                "order_id": str(uuid.uuid4()),
+                "order_number": "ORD-COUNT",
+                "wafer_quantity": 100,
+                "deadline": "2026-08-01",
+            }
+        ],
     }
 
     res = client.post(

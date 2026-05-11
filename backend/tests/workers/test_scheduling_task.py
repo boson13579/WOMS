@@ -167,12 +167,15 @@ def _make_compound(
     group: str | None = None,
     requested_by: uuid.UUID | None = None,
     compound_id: uuid.UUID | None = None,
+    op_count: int | None = None,
 ) -> dict[str, Any]:
     """Build a compound dict that ``_enqueue`` can land in the fake redis.
 
     Defaults to a single-add compound for the most common test case. When
     ``group`` isn't given, infer from the first op (``shrink`` for
-    remove/unpin, ``grow`` for add/pin).
+    remove/unpin, ``grow`` for add/pin). ``op_count`` defaults to
+    ``len(ops)`` but can be overridden to deliberately trip the
+    worker-side mismatch guard in tests.
     """
     if not ops:
         ops = [_make_leaf_op()]
@@ -182,6 +185,7 @@ def _make_compound(
     return {
         "compound_id": str(compound_id or uuid.uuid4()),
         "group": group,
+        "op_count": op_count if op_count is not None else len(ops),
         "requested_by": str(requested_by or uuid.uuid4()),
         "ops": ops,
     }
@@ -1476,6 +1480,54 @@ def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
     assert msg["failed_op"] == "add"
     assert msg["failed_op_index"] == 1
     assert msg["rolled_back"] is True
+
+
+def test_run_scheduling_rejects_compound_with_op_count_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker-side tamper guard: a compound whose declared ``op_count``
+    doesn't match ``len(ops)`` is rejected before any leaf op runs.
+
+    Schema validation at enqueue time enforces this, but the Redis
+    sorted-set member could in principle be corrupted post-enqueue (manual
+    redis-cli surgery, mid-byte truncation, etc.). The worker re-checks
+    and fails the whole compound rather than execute a half-truncated
+    business action.
+    """
+    fake_redis = _FakeRedis()
+    failing_user = uuid.uuid4()
+    failing_compound_id = uuid.uuid4()
+    compound = _make_compound(
+        ops=[
+            _make_leaf_op(order_number="ORD-T"),
+        ],
+        requested_by=failing_user,
+        compound_id=failing_compound_id,
+        op_count=99,  # lies — only 1 op
+    )
+    _enqueue(fake_redis, compound)
+
+    mocks = _patch_common(monkeypatch, fake_redis)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # No op_count-mismatch compound should ever reach add/remove etc.
+    assert mocks["add_order"].call_count == 0
+    assert mocks["remove_order"].call_count == 0
+    assert mocks["pin_order"].call_count == 0
+    assert mocks["unpin_order"].call_count == 0
+
+    # WS notify fires with compound_failed + a clear message about the
+    # mismatch. failed_op_index is -1 to signal "no specific op — the
+    # whole compound was malformed".
+    assert mocks["notify_user"].call_count == 1
+    msg = mocks["notify_user"].call_args.kwargs["message"]
+    assert msg["type"] == "schedule.compound_failed"
+    assert msg["compound_id"] == str(failing_compound_id)
+    assert msg["failed_op_index"] == -1
+    assert msg["rolled_back"] is True
+    assert "op_count" in (msg["detail"] or "")
 
 
 def test_run_scheduling_pin_failure_rolls_back_and_notifies(

@@ -66,11 +66,13 @@ class ScheduleOpInCompound(BaseModel):
 class ScheduleCompoundRequest(BaseModel):
     """One atomic business action against the scheduler.
 
-    A compound is a list of leaf ops that the worker processes as a single
-    atomic unit. The full sequence of ops either completes successfully or
-    the worker snapshot-rollbacks ``SchedulerState`` to its pre-compound
-    state and emits ``schedule.compound_failed`` over WebSocket — no
-    partial successes leaking past the compound boundary.
+    A compound is a list of N leaf ops (no upper bound; producer drives the
+    count to match the business action's complexity) that the worker
+    processes as a single atomic unit. The full sequence of ops either
+    completes successfully or the worker snapshot-rollbacks
+    ``SchedulerState`` to its pre-compound state and emits
+    ``schedule.compound_failed`` over WebSocket — no partial successes
+    leaking past the compound boundary.
 
     Why compound instead of per-op:
 
@@ -85,13 +87,20 @@ class ScheduleCompoundRequest(BaseModel):
       world.
     - **Aligns with how producers think**: a PATCH that defers a pinned
       order is one business action containing 3-4 worker ops; modelling it
-      as one Redis member matches that reality.
+      as one Redis member matches that reality. A more elaborate batch
+      action might fan out to dozens of ops — that's fine too.
 
     Producer responsibility:
 
     - Pick a single ``group`` for the whole compound. The compound is
       scored as shrink (sorted before grow) or grow (sorted after shrink)
       and worker pops one compound per ``run_scheduling_task`` invocation.
+    - **Set ``op_count`` to exactly ``len(ops)``**. The field is required
+      and the schema validator rejects a mismatch — that's the contract
+      the user spec calls out so producers can't silently send a partial
+      compound payload (e.g. truncated by a network hiccup). Worker also
+      double-checks at consumption time and rolls back if a stale member
+      in Redis somehow has a wrong count.
     - Order the ops correctly: pin/unpin lifecycle ops must precede the
       modify ops they bracket. E.g. modifying a pinned order's deadline:
       ``[unpin, remove(old), add(new), pin(same day)]`` — wrong order will
@@ -102,8 +111,25 @@ class ScheduleCompoundRequest(BaseModel):
 
     compound_id: uuid.UUID = Field(default_factory=uuid.uuid4)
     group: Literal["shrink", "grow"]
+    op_count: int = Field(gt=0)
     ops: list[ScheduleOpInCompound] = Field(min_length=1)
     requested_by: uuid.UUID
+
+    @model_validator(mode="after")
+    def _op_count_matches_ops_length(self) -> ScheduleCompoundRequest:
+        """``op_count`` MUST equal ``len(ops)``.
+
+        Tamper / truncation guard: if a producer sends a compound saying
+        "I'm 4 ops" but ``ops`` only contains 3, we reject at the schema
+        boundary. The worker also re-checks at consumption time (in case
+        the Redis member got corrupted post-enqueue), but blocking it
+        here is the cheapest layer.
+        """
+        if self.op_count != len(self.ops):
+            raise ValueError(
+                f"op_count={self.op_count} does not match len(ops)={len(self.ops)}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _ops_target_same_order_within_compound(self) -> ScheduleCompoundRequest:
