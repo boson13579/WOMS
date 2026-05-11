@@ -38,6 +38,7 @@ from app.core.config import get_settings
 from app.schemas.schedule import ScheduleCompoundRequest
 from app.services import websocket
 from app.services.scheduling import (
+    MATERIALIZE_NOTIFY_PENDING_KEY,
     PENDING_OPS_KEY,
     PENDING_OPS_SEQ_KEY,
     STATUS_KEY,
@@ -67,6 +68,7 @@ __all__ = [
     "CancelResult",
     "cancel_compound",
     "enqueue_compound",
+    "enqueue_notify_user",
 ]
 
 
@@ -204,6 +206,22 @@ def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
         compound_id=compound_id_str,
     )
     return CancelResult.cancelled
+
+
+def enqueue_notify_user(user_id: uuid.UUID) -> None:
+    """Mark *user_id* as awaiting a materializer notification.
+
+    Called by ``run_scheduling_task`` after a compound succeeds. The
+    materializer drains this set (via atomic RENAME swap) and emits
+    ``schedule.materialized`` to each user once DB rows reflecting the
+    in-memory state have been written. Users whose compounds arrive
+    *after* the materializer's drain go into the next batch; they're not
+    silently dropped.
+
+    Set semantics naturally dedupe: multiple compounds from the same user
+    in one materializer window collapse to one notification.
+    """
+    _redis().sadd(MATERIALIZE_NOTIFY_PENDING_KEY, str(user_id))
 
 
 def _send_run_task() -> None:

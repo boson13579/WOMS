@@ -40,13 +40,7 @@ from app.schemas.schedule import (
 )
 from app.services import order as order_service
 from app.services.schedule_queue import CancelResult, cancel_compound, enqueue_compound
-from app.services.scheduling import (
-    STATE_KEY,
-    STATUS_KEY,
-    ScheduledResult,
-    SchedulerState,
-    compute_schedule,
-)
+from app.services.scheduling import STATUS_KEY
 
 # Workers are a peer of services; api → workers is allowed *only* for
 # dispatching Celery task objects (``.delay()``). Anything else (Redis keys,
@@ -253,20 +247,19 @@ def get_schedule_result(
     """Return every order currently in ``scheduled`` status, with per-day breakdown.
 
     Sorted by ``scheduled_production_date`` ascending so the timeline is
-    natural for the UI. ``daily_breakdown`` is derived from the live
-    ``SchedulerState`` in Redis via ``compute_schedule(state)`` — it
-    reflects the same forward-fill assignment that produced the persisted
-    ``scheduled_production_date`` / ``expected_delivery_date`` summary
-    fields. Empty when no scheduler run has happened yet.
+    natural for the UI. Both the summary dates and the ``daily_breakdown``
+    list come straight from Postgres — the columns are kept fresh by
+    ``materialize_schedule_task``, which re-computes the schedule after
+    every accepted compound and writes the per-day split into
+    ``orders.daily_breakdown`` (JSONB). The Redis ``SchedulerState`` is
+    NOT consulted on this read path; it stays a pure algorithm cache.
+
+    Empty when no scheduler run has happened yet (column NULL → empty
+    list).
 
     Permission: order_manager+.
     """
-    breakdown: list[ScheduledResult] = []
-    raw = cast("str | None", _redis().get(STATE_KEY))
-    if raw is not None:
-        state = SchedulerState.from_json(raw)
-        breakdown = compute_schedule(state)
-    return order_service.list_scheduled_orders(db, breakdown=breakdown)
+    return order_service.list_scheduled_orders(db)
 
 
 # ---------------------------------------------------------------------------

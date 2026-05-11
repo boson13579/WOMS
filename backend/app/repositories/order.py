@@ -163,13 +163,12 @@ def get_scheduled(db: Session) -> list[Order]:
 def clear_scheduled_dates(db: Session) -> int:
     """Bulk-clear scheduling-state columns on every active scheduled order.
 
-    Wipes ``scheduled_production_date`` / ``expected_delivery_date`` (so
-    stale dates don't leak past a re-run) AND the two pin columns
-    ``is_pinned`` / ``pinned_production_date`` (so an order that was
-    pinned and then advance_day-ed out of state doesn't keep a stale
-    is_pinned=true forever — its scheduling state is gone, the pin flag
-    should be too). ``set_schedule_dates`` rewrites the appropriate values
-    per-row immediately after, so the bulk clear is safe to be wide.
+    Wipes the dates summary (``scheduled_production_date`` /
+    ``expected_delivery_date``) plus the JSONB ``daily_breakdown`` AND the
+    two pin columns (``is_pinned`` / ``pinned_production_date``). One
+    bulk UPDATE is cheaper than touching each row twice;
+    ``set_schedule_dates`` rewrites whatever's actually scheduled right
+    after, so wiping wide is safe.
 
     Returns the number of rows touched.
     """
@@ -180,6 +179,7 @@ def clear_scheduled_dates(db: Session) -> int:
         .values(
             scheduled_production_date=None,
             expected_delivery_date=None,
+            daily_breakdown=None,
             is_pinned=False,
             pinned_production_date=None,
         )
@@ -196,16 +196,24 @@ def set_schedule_dates(
     order_id: uuid.UUID,
     scheduled_production_date: date,
     expected_delivery_date: date,
+    daily_breakdown: list[dict[str, str | int]] | None = None,
     is_pinned: bool = False,
     pinned_production_date: date | None = None,
 ) -> Order | None:
-    """Mark an order as scheduled with explicit production / delivery dates.
+    """Mark an order as scheduled with full materialized per-day info.
 
-    Also rewrites the pin columns: when ``is_pinned`` is true the row is
-    locked to ``pinned_production_date``; otherwise both pin columns are
-    cleared. ``is_processing_locked`` is always cleared here — landing in
-    ``apply_schedule`` means the worker has finished its op for this order
-    and the frontend may unlock the row for editing again.
+    Writes the summary dates, the JSONB ``daily_breakdown`` (per-day
+    quantity split) and the pin columns. ``is_processing_locked`` is
+    always cleared — landing in ``apply_schedule`` means the worker has
+    finished its op for this order and the frontend may unlock the row
+    for editing again.
+
+    ``daily_breakdown`` is expected to be a chronologically-sorted list of
+    ``{"date": "YYYY-MM-DD", "quantity": int}`` dicts. Pass ``None`` (or
+    omit) only if the order has no schedule info, in which case the
+    column is set to NULL — but in normal apply_schedule flow the
+    materializer always passes a non-empty list since the order is by
+    definition currently scheduled.
 
     Returns the refreshed entity, or `None` if the order is missing or
     soft-deleted (caller decides how to react).
@@ -216,6 +224,7 @@ def set_schedule_dates(
         return None
     order.scheduled_production_date = scheduled_production_date
     order.expected_delivery_date = expected_delivery_date
+    order.daily_breakdown = daily_breakdown
     order.status = OrderStatus.scheduled
     order.is_pinned = is_pinned
     order.pinned_production_date = pinned_production_date if is_pinned else None

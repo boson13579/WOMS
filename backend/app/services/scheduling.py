@@ -32,6 +32,9 @@ logger = structlog.get_logger(__name__)
 __all__ = [
     "DAILY_CAPACITY",
     "HORIZON_DAYS",
+    "MATERIALIZE_NOTIFY_PENDING_KEY",
+    "MATERIALIZE_NOTIFY_PROCESSING_KEY",
+    "MATERIALIZE_RUNNING_KEY",
     "PENDING_OPS_KEY",
     "PENDING_OPS_SEQ_KEY",
     "STATE_KEY",
@@ -96,6 +99,37 @@ PENDING_OPS_KEY = "schedule:pending_ops"
 
 PENDING_OPS_SEQ_KEY = "schedule:pending_ops:seq"
 """Redis monotonic counter (INCR) for the ``seq`` field embedded in op scores."""
+
+# ---------------------------------------------------------------------------
+# Materializer-side coordination keys (Phase 4 fast/slow split)
+# ---------------------------------------------------------------------------
+#
+# ``run_scheduling_task`` (fast path) only mutates the in-memory ``SchedulerState``
+# and saves the segment-tree + pq snapshot to Redis; it does NOT call
+# ``apply_schedule`` (= DB write of every ``status='scheduled'`` row). DB
+# materialization is offloaded to ``materialize_schedule_task`` so the
+# producer's accept/reject feedback is O(log n)·N per compound rather than
+# being gated on N DB round-trips.
+#
+# Coordination among the three keys below:
+#   * Fast task SADDs the compound's ``requested_by`` into
+#     MATERIALIZE_NOTIFY_PENDING_KEY and dispatches the materializer.
+#   * Materializer claims MATERIALIZE_RUNNING_KEY (SET NX EX 300). Multiple
+#     fast tasks coalesce into one materializer run.
+#   * Materializer atomically RENAMEs notify_pending → notify_processing
+#     (the rename is the "swap & drain" primitive: new SADDs land in a
+#     fresh notify_pending set), then writes DB, then notifies the captured
+#     users. On failure, notify_processing is merged back into
+#     notify_pending so retries are lossless.
+
+MATERIALIZE_NOTIFY_PENDING_KEY = "schedule:materialize_notify_pending"
+"""Redis set of ``requested_by`` UUIDs awaiting materializer notification."""
+
+MATERIALIZE_NOTIFY_PROCESSING_KEY = "schedule:materialize_notify_processing"
+"""Redis set holding the in-flight batch the materializer is currently working on."""
+
+MATERIALIZE_RUNNING_KEY = "schedule:materialize_running"
+"""Redis SET-NX-EX flag indicating a materializer task is currently running."""
 
 # Score layout for ``schedule:pending_ops``:
 #   score = GROUP_OFFSET * group_priority + seq

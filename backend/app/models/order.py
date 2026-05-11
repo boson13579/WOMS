@@ -7,6 +7,7 @@ from datetime import date
 from enum import StrEnum
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -119,4 +120,17 @@ class Order(Base):
         sa.Boolean,
         nullable=False,
         server_default=sa.false(),
+    )
+
+    # Per-day production split, materialized by ``materialize_schedule_task``.
+    # Shape: ``[{"date": "2026-05-12", "quantity": 6000}, ...]`` sorted by
+    # date ascending. NULL when the order isn't currently scheduled (same
+    # semantic as ``scheduled_production_date IS NULL``).
+    # ``GET /schedule/result`` reads this directly instead of recomputing
+    # the breakdown from the live Redis state — the materializer's job is
+    # to keep this column in sync with whatever ``compute_schedule`` would
+    # have produced for the current state.
+    daily_breakdown: Mapped[list[dict[str, str | int]] | None] = mapped_column(
+        JSONB,
+        nullable=True,
     )

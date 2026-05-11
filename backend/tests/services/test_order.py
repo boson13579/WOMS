@@ -143,6 +143,52 @@ def test_apply_schedule_persists_audit_row_per_order(db_session: Session) -> Non
     }
 
 
+def test_apply_schedule_persists_daily_breakdown_column(db_session: Session) -> None:
+    """``apply_schedule`` must write the per-day quantity split into
+    ``orders.daily_breakdown`` (JSONB) alongside the earliest/latest date
+    summary. The materializer flow promises that ``GET /schedule/result``
+    can read the breakdown straight from the DB column — that contract
+    only holds if apply_schedule writes the column in the right shape:
+    ``[{"date": "...", "quantity": N}, ...]`` sorted by date.
+    """
+    creator = _make_user(db_session, username="apply-sched-breakdown")
+    multi = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-BD-MULTI",
+        deadline=date(2026, 5, 25),
+    )
+    single = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-BD-SINGLE",
+        deadline=date(2026, 5, 26),
+    )
+
+    # Multi-day order: deliberately pass days out of order so we can also
+    # assert the service sorts the stored JSON by date.
+    scheduled = [
+        ScheduledResult(order_id=multi.id, scheduled_date=date(2026, 5, 13), quantity=4_000),
+        ScheduledResult(order_id=multi.id, scheduled_date=date(2026, 5, 12), quantity=10_000),
+        ScheduledResult(order_id=single.id, scheduled_date=date(2026, 5, 14), quantity=500),
+    ]
+    order_service.apply_schedule(db_session, scheduled)
+
+    db_session.refresh(multi)
+    db_session.refresh(single)
+
+    assert multi.daily_breakdown == [
+        {"date": "2026-05-12", "quantity": 10_000},
+        {"date": "2026-05-13", "quantity": 4_000},
+    ]
+    assert single.daily_breakdown == [
+        {"date": "2026-05-14", "quantity": 500},
+    ]
+    # Summary dates remain correct alongside the breakdown.
+    assert multi.scheduled_production_date == date(2026, 5, 12)
+    assert multi.expected_delivery_date == date(2026, 5, 13)
+
+
 def test_apply_schedule_with_no_results_writes_no_audit_rows(db_session: Session) -> None:
     """An empty ``scheduled`` list still wipes prior dates (clear-then-write
     contract) but must NOT manufacture audit rows. Guards against a regression
@@ -190,6 +236,7 @@ def test_apply_schedule_clears_stale_pin_columns_on_orders_no_longer_in_state(
         expected_delivery_date=date(2026, 5, 10),
         is_pinned=True,
         pinned_production_date=date(2026, 5, 10),
+        daily_breakdown=[{"date": "2026-05-10", "quantity": 100}],
     )
     db_session.add(stale)
     db_session.commit()
@@ -199,9 +246,11 @@ def test_apply_schedule_clears_stale_pin_columns_on_orders_no_longer_in_state(
     order_service.apply_schedule(db_session, [])
 
     db_session.refresh(stale)
-    # Dates + pin columns all wiped; the stale row no longer reads as pinned.
+    # Dates + pin columns + breakdown all wiped; the stale row no longer
+    # reads as pinned or scheduled in any way.
     assert stale.scheduled_production_date is None
     assert stale.expected_delivery_date is None
+    assert stale.daily_breakdown is None
     assert stale.is_pinned is False
     assert stale.pinned_production_date is None
 

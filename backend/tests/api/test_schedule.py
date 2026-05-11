@@ -15,7 +15,6 @@ from unittest.mock import MagicMock
 import bcrypt
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
-from app.services.scheduling import SchedulerState, SchedulingOrder
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -545,16 +544,21 @@ def test_result_returns_scheduled_orders_sorted_by_production_date(
     assert items[0]["scheduled_production_date"] == "2026-05-20"
     assert items[0]["expected_delivery_date"] == "2026-05-22"
     assert items[0]["status"] == "scheduled"
-    # No scheduler state in Redis ⇒ daily_breakdown falls back to empty list.
+    # daily_breakdown column is NULL ⇒ response falls back to empty list.
     assert items[0]["daily_breakdown"] == []
     assert items[1]["daily_breakdown"] == []
 
 
-def test_result_includes_daily_breakdown_from_redis_state(
+def test_result_includes_daily_breakdown_from_db_column(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
-    """When SchedulerState is present in Redis, GET /result attaches a
-    per-day breakdown derived from compute_schedule(state)."""
+    """GET /result reads ``daily_breakdown`` straight from the DB column.
+
+    Redis ``SchedulerState`` is no longer consulted on this read path —
+    ``materialize_schedule_task`` is responsible for keeping
+    ``orders.daily_breakdown`` in sync, so the endpoint just echoes what's
+    in Postgres.
+    """
     fake_redis = _FakeRedis()
     _patch_redis_and_delay(monkeypatch, fake_redis)
 
@@ -570,19 +574,11 @@ def test_result_includes_daily_breakdown_from_redis_state(
         scheduled_production_date=base,
         expected_delivery_date=next_day,
     )
-
-    # Construct a state where the same order spans two days. compute_schedule
-    # forward-fills: day 1 takes the full 10,000 cap, day 2 takes the rest.
-    state = SchedulerState.initial(base)
-    state.priority_queue.append(
-        SchedulingOrder(
-            order_id=order.id,
-            order_number=order.order_number,
-            wafer_quantity=15_000,
-            deadline=next_day,
-        )
-    )
-    fake_redis.set("schedule:state", state.to_json())
+    order.daily_breakdown = [
+        {"date": base.isoformat(), "quantity": 10_000},
+        {"date": next_day.isoformat(), "quantity": 5_000},
+    ]
+    db_session.commit()
 
     res = client.get("/api/v1/schedule/result", headers=_auth(token))
 

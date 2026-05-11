@@ -35,6 +35,7 @@ from typing import Any, cast
 import structlog
 from celery import Task
 from redis import Redis
+from redis.exceptions import ResponseError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -42,7 +43,11 @@ from app.core.db import SessionLocal
 from app.repositories import order as order_repo
 from app.services import order as order_service
 from app.services import websocket
+from app.services.schedule_queue import enqueue_notify_user
 from app.services.scheduling import (
+    MATERIALIZE_NOTIFY_PENDING_KEY,
+    MATERIALIZE_NOTIFY_PROCESSING_KEY,
+    MATERIALIZE_RUNNING_KEY,
     PENDING_OPS_KEY,
     STATE_KEY,
     STATUS_KEY,
@@ -475,19 +480,32 @@ def _finalize_run(state: SchedulerState) -> int:
 def run_scheduling_task(self: Task) -> None:
     """Process **one compound** end-to-end, then re-fire if more queued.
 
+    **Phase 4 fast/slow split**: this task is the fast path. It does the
+    in-memory state mutation (O(log n)·N per compound thanks to
+    SortedKeyList + pq_index) plus the small ``_save_state`` to Redis,
+    then immediately emits ``schedule.compound_accepted`` so the producer
+    knows their compound was accepted. **It does NOT run
+    ``compute_schedule`` / ``apply_schedule`` / DB writes** — those are
+    offloaded to ``materialize_schedule_task`` which self-coalesces so
+    bursts of compounds collapse into one DB rewrite. The user spec calls
+    out the goal: accept/reject feedback in O(log n)·N instead of being
+    gated on N DB round-trips per compound.
+
     Each task invocation:
 
     1. Sets ``schedule:status`` to ``running``.
     2. ``ZPOPMIN``s the highest-priority compound (shrink-group compounds
        sort before grow, FIFO within each group). If the queue is empty,
        sets status back to ``idle`` and returns — no state change, no
-       broadcast.
+       notify.
     3. Otherwise: applies the compound atomically via ``_process_compound``
-       (saga rollback on any leaf-op failure). On success, ``_finalize_run``
-       computes the schedule, writes DB, persists state, broadcasts. On
-       failure, state is rolled back, ``schedule.compound_failed`` is
-       notified, and **no finalize / broadcast** runs because state is
-       unchanged.
+       (saga rollback on any leaf-op failure). On success:
+       ``_save_state`` to Redis, ``notify_user(schedule.compound_accepted)``
+       to ``requested_by``, ``enqueue_notify_user`` for the deferred
+       materializer to notify post-DB-write, and
+       ``materialize_schedule_task.delay()``. On failure, state is rolled
+       back, ``schedule.compound_failed`` is notified inside
+       ``_process_compound`` — no state save, no materialize trigger.
     4. Flips status back to ``idle``.
     5. If more compounds are still pending, ``self.delay()`` to fire another
        invocation (unless a waiter has set the ``schedule:waiter_pending``
@@ -535,17 +553,35 @@ def run_scheduling_task(self: Task) -> None:
         applied = _process_compound(state, compound)
 
         if applied:
-            # Compound succeeded end-to-end. Persist + broadcast.
-            scheduled_rows = _finalize_run(state)
+            # Fast-path success: persist state to Redis (O(n) serialize, but
+            # tiny in absolute terms — just int arrays + small pq dump) and
+            # notify the requester *immediately* that the compound was
+            # accepted. The heavy compute_schedule + apply_schedule + DB
+            # write is offloaded to ``materialize_schedule_task``; this is
+            # what keeps the producer's accept/reject feedback O(log n)·N
+            # instead of being gated on N DB round-trips per compound.
+            _save_state(state)
+            requested_by_raw = compound.get("requested_by")
+            if requested_by_raw:
+                websocket.notify_user(
+                    user_id=uuid.UUID(requested_by_raw),
+                    message={
+                        "type": "schedule.compound_accepted",
+                        "compound_id": str(compound.get("compound_id")),
+                    },
+                )
+                # Defer DB materialization + per-user refetch notify.
+                enqueue_notify_user(uuid.UUID(requested_by_raw))
+            materialize_schedule_task.delay()
             logger.info(
                 "schedule.run.success",
                 task_id=task_id,
                 compound_id=compound.get("compound_id"),
-                scheduled_rows=scheduled_rows,
             )
         else:
-            # Compound rolled back. No state change, no broadcast — the
-            # WS notify_user already fired inside ``_process_compound``.
+            # Compound rolled back. No state change, no materialize trigger
+            # — the WS notify_user (compound_failed) already fired inside
+            # ``_process_compound``.
             logger.info(
                 "schedule.run.rolled_back",
                 task_id=task_id,
@@ -592,6 +628,153 @@ def run_scheduling_task(self: Task) -> None:
             exc_info=True,
         )
         raise
+
+
+# ---------------------------------------------------------------------------
+# materialize_schedule_task — Phase 4 deferred DB writer
+# ---------------------------------------------------------------------------
+
+
+_MATERIALIZE_RUNNING_TTL_SECONDS = 300  # 5 min safety window for crash recovery
+
+
+@celery_app.task(name="scheduling.materialize")  # type: ignore[untyped-decorator]
+def materialize_schedule_task() -> None:
+    """Drain pending notifications and write the schedule to DB.
+
+    Phase 4 slow path. Self-coalescing: many ``run_scheduling_task`` fast-
+    path successes can collapse into one materializer run, so a burst of N
+    compounds doesn't cause N full DB rewrites.
+
+    Coordination via three Redis keys (see ``services.scheduling`` for the
+    constants):
+
+    * ``MATERIALIZE_RUNNING_KEY``: ``SET NX EX 300``. Only one materializer
+      runs at a time. If we don't get the slot, exit silently — the
+      currently-running task will re-trigger us if needed.
+    * ``MATERIALIZE_NOTIFY_PENDING_KEY``: SADD'd by ``run_scheduling_task``
+      with each successful compound's ``requested_by``. The set is the
+      "to-notify" backlog.
+    * ``MATERIALIZE_NOTIFY_PROCESSING_KEY``: in-flight batch. Atomic swap
+      via ``RENAME`` ensures the worker drains a consistent snapshot;
+      concurrent fast-path SADDs land in a fresh notify_pending set and
+      get picked up on the next loop iteration (or a re-triggered run).
+
+    Loop body per iteration:
+
+    1. ``RENAME notify_pending → notify_processing``. If pending was empty
+       the rename raises ``ResponseError`` and we exit the loop.
+    2. Read the captured user IDs (``SMEMBERS notify_processing``).
+    3. ``_load_state()`` → ``compute_schedule(state)`` →
+       ``order_service.apply_schedule(db, scheduled, pinned_map)``. Writes
+       the latest in-memory schedule to DB.
+    4. For each captured user: ``notify_user(schedule.materialized)`` so
+       their frontend refetches ``GET /schedule/result`` and sees the
+       fresh DB rows.
+    5. ``DEL notify_processing``.
+    6. Loop again — concurrent fast tasks may have repopulated
+       notify_pending while we were working.
+
+    On exception inside the loop, the in-flight batch is merged back into
+    ``notify_pending`` (``SUNIONSTORE``) so we don't lose users on retry.
+
+    On normal exit (loop break), release the running flag and check one
+    last time — if more arrived between the loop's final empty rename and
+    our flag release, ``.delay()`` ourselves so the next worker picks
+    them up.
+    """
+    rds = _get_redis()
+
+    # Single-flight claim. Multiple delayed invocations cooperate via NX.
+    claimed = rds.set(
+        MATERIALIZE_RUNNING_KEY,
+        "1",
+        nx=True,
+        ex=_MATERIALIZE_RUNNING_TTL_SECONDS,
+    )
+    if not claimed:
+        logger.info("schedule.materialize.skip_concurrent")
+        return
+
+    try:
+        # Crash recovery: salvage anything left in notify_processing from a
+        # previous run that died mid-iteration. SUNIONSTORE merges the two
+        # sets, DEL clears the processing key.
+        if rds.exists(MATERIALIZE_NOTIFY_PROCESSING_KEY):
+            rds.sunionstore(
+                MATERIALIZE_NOTIFY_PENDING_KEY,
+                [MATERIALIZE_NOTIFY_PENDING_KEY, MATERIALIZE_NOTIFY_PROCESSING_KEY],
+            )
+            rds.delete(MATERIALIZE_NOTIFY_PROCESSING_KEY)
+
+        while True:
+            try:
+                rds.rename(
+                    MATERIALIZE_NOTIFY_PENDING_KEY,
+                    MATERIALIZE_NOTIFY_PROCESSING_KEY,
+                )
+            except ResponseError:
+                # notify_pending didn't exist → no work this iteration.
+                break
+
+            users_raw = cast(
+                "set[str]",
+                rds.smembers(MATERIALIZE_NOTIFY_PROCESSING_KEY),
+            )
+
+            try:
+                state = _load_state()
+                scheduled_results = compute_schedule(state)
+                pinned_map = {
+                    p.order_id: p.fake_deadline
+                    for p in state.pinned_orders.values()
+                }
+                db: Session = SessionLocal()
+                try:
+                    order_service.apply_schedule(
+                        db, scheduled_results, pinned_map
+                    )
+                finally:
+                    db.close()
+
+                for user_raw in users_raw:
+                    try:
+                        websocket.notify_user(
+                            user_id=uuid.UUID(user_raw),
+                            message={"type": "schedule.materialized"},
+                        )
+                    except ValueError:
+                        # Bad UUID slipped into the set somehow — log and
+                        # move on, don't block the batch on one bad entry.
+                        logger.warning(
+                            "schedule.materialize.bad_user_id",
+                            user=user_raw,
+                        )
+
+                rds.delete(MATERIALIZE_NOTIFY_PROCESSING_KEY)
+                logger.info(
+                    "schedule.materialize.batch_done",
+                    notified=len(users_raw),
+                    scheduled_rows=len(scheduled_results),
+                )
+            except Exception:
+                # Restore the batch so the next run can retry. We don't
+                # want to silently lose users on a transient DB outage.
+                rds.sunionstore(
+                    MATERIALIZE_NOTIFY_PENDING_KEY,
+                    [MATERIALIZE_NOTIFY_PENDING_KEY, MATERIALIZE_NOTIFY_PROCESSING_KEY],
+                )
+                rds.delete(MATERIALIZE_NOTIFY_PROCESSING_KEY)
+                raise
+    finally:
+        rds.delete(MATERIALIZE_RUNNING_KEY)
+
+    # Post-release check: a fast task may have SADD'd between our final
+    # empty rename and the running-flag DEL. Re-trigger so the new pending
+    # users don't sit idle until the next fast task fires its own .delay().
+    if rds.exists(MATERIALIZE_NOTIFY_PENDING_KEY):
+        logger.info("schedule.materialize.re_trigger")
+        materialize_schedule_task.delay()
 
 
 def _wait_for_idle_run(*, log_event: str) -> None:

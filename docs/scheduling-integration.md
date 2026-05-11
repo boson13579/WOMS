@@ -230,7 +230,7 @@ const orders = await res.json();
 // ]
 ```
 
-訂單按 `scheduled_production_date` 升冪排序。`daily_breakdown` 為空表示 Redis state 還沒被建起來（首次部署或 Redis 被清過）。
+訂單按 `scheduled_production_date` 升冪排序。`daily_breakdown` 來自 DB 的 `orders.daily_breakdown` JSONB 欄位（由 `materialize_schedule_task` 寫入），不再即時從 Redis 算 — 所以 Redis 被清過不影響這個欄位的內容。`daily_breakdown` 為空表示這筆訂單還沒被 materializer 寫過（首次部署、或欄位是 NULL）。
 
 #### 3.2.2 `GET /api/v1/schedule/status` — 顯示排程狀態
 
@@ -246,7 +246,7 @@ const status = await res.json();
 
 #### 3.2.3 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
 
-當 `daily_breakdown` 一直是空、或者懷疑排程跟現實不同步時，叫管理員按這個按鈕。
+當懷疑排程跟現實不同步（例如 DB 跟 Redis state 對不起來，或者 `daily_breakdown` 看起來明顯錯誤）時，叫管理員按這個按鈕：rebuild 會從 DB 重建 Redis state，再跑一輪 materializer 把 `orders.daily_breakdown` 改寫回正確值。
 
 ```ts
 const res = await fetch("/api/v1/schedule/rebuild", {
@@ -269,8 +269,19 @@ ws.addEventListener("message", (e) => {
     const msg = JSON.parse(e.data);
     switch (msg.type) {
         case "schedule.updated":
-            // 排程結果有更新（包含換天、rebuild、compound 成功）
+            // 系統動作（換天 advance_day / 重建 rebuild）廣播給所有連線 client
             queryClient.invalidateQueries(["schedule", "result"]);
+            break;
+        case "schedule.compound_accepted":
+            // Phase 4 fast-path：你的 compound 通過了，但 DB 還在 deferred materializer 排隊。
+            // 通常拿來把 UI 上的 "處理中" badge 換成 "已接受、等 DB 寫入"。
+            toast.success(`操作已接受，正在更新排程資料`);
+            break;
+        case "schedule.materialized":
+            // Phase 4 slow-path：materializer 已經把你提交的修改寫進 DB。
+            // 觸發 refetch 看到最新數字。
+            queryClient.invalidateQueries(["schedule", "result"]);
+            queryClient.invalidateQueries(["orders"]);
             break;
         case "schedule.compound_failed":
             // 自己送的 compound 失敗 + 已 saga-rollback。
@@ -320,7 +331,9 @@ ws.addEventListener("close", (e) => {
 | `type` | 觸發時機 | 收件對象 | payload |
 |---|---|---|---|
 | `schedule.updated` | 任何排程結果有變動（單筆 op 處理完、換天、rebuild） | **所有連線的 client**（broadcast） | `{ type: "schedule.updated" }` |
+| `schedule.compound_accepted` | Phase 4 fast-path：compound 通過 saga，trees / pq / pinned 都更新好，accept/reject 結果出來。**DB 還沒寫入**（materializer 排隊中） | compound 的 `requested_by` user | `{ type, compound_id }` |
 | `schedule.compound_failed` | Compound 內任一 op 失敗（add / remove / pin / unpin），整個 compound 已 saga-rollback 至 pre-compound 狀態 | compound 的 `requested_by` user | `{ type, compound_id, failed_op_index, failed_op: "add"\|"remove"\|"pin"\|"unpin", order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail, rolled_back: true }` |
+| `schedule.materialized` | Phase 4 slow-path：materializer 一批 DB 寫完，這個 user 有 compound 在這批裡 | 那批 compound 對應的 `requested_by` user | `{ type }` — payload 沒額外欄位，前端收到就 invalidate cache + refetch `/schedule/result` |
 | `schedule.compound_cancelled` | `DELETE /operations/{compound_id}` 取消成功 | compound 的 `requested_by` user | `{ type, compound_id }` |
 | `schedule.rebuild_skipped` | rebuild 時某筆 scheduled 訂單塞不回去（通常 deadline 已被 base_date 越過） | 訂單的 `created_by` user | `{ type, order_id, order_number, reason: "deadline_too_far"\|"capacity_exceeded" }` |
 
@@ -416,7 +429,7 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 | 症狀 | 怎麼辦 |
 |---|---|
 | `schedule:state` key 不見 / Redis 被 flush | `POST /api/v1/schedule/rebuild` |
-| 前端 `daily_breakdown` 一直是空 | 同上 |
+| 前端 `daily_breakdown` 一直是空 | 表示 `orders.daily_breakdown` 欄位是 NULL — 通常代表 materializer 還沒跑過或寫入失敗。觸發一次 `POST /api/v1/schedule/trigger` 讓 worker 跑完整流程；如果還是空就 `POST /api/v1/schedule/rebuild` 強制重建。 |
 | `schedule:status` 卡在 `running` 但 worker 已經死了 | 重啟 worker；如果還是卡，手動 `redis-cli set schedule:status '{"state":"idle"}'` |
 | `schedule:status.state == "failed"`、`error` 欄位有訊息 | 三支 task（`run_scheduling` / `advance_day` / `rebuild_schedule`）任一條失敗都會留這個記錄，先看 `error` + Celery traceback 找根因。`failed` 不會擋 `/trigger`（409 只擋 `running`），下次成功的 task 會把 status 蓋回 `idle`，不需要先手動清。 |
 | `schedule:waiter_pending` 卡住超過 10 分鐘 | TTL 會自己過期；如果 TTL 被改大可以手動 `redis-cli del schedule:waiter_pending` |

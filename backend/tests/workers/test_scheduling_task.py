@@ -56,16 +56,39 @@ class _FakeRedis:
         self._zsets: dict[str, list[tuple[float, str]]] = {}
         # Hash maps for secondary indexes (e.g. by-compound-id).
         self._hashes: dict[str, dict[str, str]] = {}
+        # Plain sets for the materializer's notify queue (Phase 4).
+        self._sets: dict[str, set[str]] = {}
 
     # ----- String ops --------------------------------------------------------
     def get(self, key: str) -> str | None:
         return self._strings.get(key)
 
-    def set(self, key: str, value: str, ex: int | None = None) -> None:
+    def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+        nx: bool = False,
+    ) -> bool | None:
         # ``ex`` (TTL seconds) is accepted for API compatibility — tests
         # don't actually expire keys; callers that care about TTL behavior
         # should manually evict via ``delete``.
+        # ``nx`` matches real redis: only set if key doesn't exist; returns
+        # True on success, None on conflict.
+        if nx:
+            if key in self._strings:
+                return None
+            self._strings[key] = value
+            return True
         self._strings[key] = value
+        return True
+
+    def exists(self, *keys: str) -> int:
+        return sum(
+            1
+            for key in keys
+            if key in self._strings or key in self._zsets or key in self._hashes or key in self._sets
+        )
 
     def incr(self, key: str) -> int:
         cur = int(self._strings.get(key, "0")) + 1
@@ -79,7 +102,42 @@ class _FakeRedis:
                 n += 1
             if self._zsets.pop(key, None) is not None:
                 n += 1
+            if self._hashes.pop(key, None) is not None:
+                n += 1
+            if self._sets.pop(key, None) is not None:
+                n += 1
         return n
+
+    def rename(self, src: str, dst: str) -> bool:
+        for bucket in (self._strings, self._zsets, self._hashes, self._sets):
+            if src in bucket:
+                bucket[dst] = bucket.pop(src)
+                return True
+        from redis.exceptions import ResponseError
+        raise ResponseError(f"no such key: {src}")
+
+    # ----- Plain set ops (Phase 4 materializer queue) -------------------------
+    def sadd(self, key: str, *members: str) -> int:
+        bucket = self._sets.setdefault(key, set())
+        added = 0
+        for m in members:
+            if m not in bucket:
+                bucket.add(m)
+                added += 1
+        return added
+
+    def smembers(self, key: str) -> set[str]:
+        return set(self._sets.get(key, set()))
+
+    def scard(self, key: str) -> int:
+        return len(self._sets.get(key, set()))
+
+    def sunionstore(self, dest: str, keys: list[str]) -> int:
+        union: set[str] = set()
+        for k in keys:
+            union |= self._sets.get(k, set())
+        self._sets[dest] = union
+        return len(union)
 
     # ----- Sorted-set ops ----------------------------------------------------
     def zadd(self, key: str, mapping: dict[str, float]) -> int:
@@ -305,6 +363,24 @@ def _patch_common(
 
     delay_mock = _install_auto_retrigger_delay(monkeypatch)
 
+    # Phase 4: run_scheduling_task now also dispatches the slow materializer
+    # task on each compound success. Tests that focus on the fast path
+    # don't want the real materializer to run, so we mock its .delay().
+    # The dedicated materialize tests reset this monkeypatch locally.
+    materialize_delay_mock = MagicMock()
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        materialize_delay_mock,
+    )
+    # enqueue_notify_user touches Redis directly; redirect to fake_redis
+    # so the SADD is observable in tests that want to assert it.
+    monkeypatch.setattr(
+        "app.workers.scheduling.enqueue_notify_user",
+        lambda user_id: fake_redis.sadd(
+            "schedule:materialize_notify_pending", str(user_id)
+        ),
+    )
+
     return {
         "add_order": add_mock,
         "remove_order": remove_mock,
@@ -314,6 +390,7 @@ def _patch_common(
         "broadcast": broadcast_mock,
         "notify_user": notify_mock,
         "delay": delay_mock,
+        "materialize_delay": materialize_delay_mock,
     }
 
 
@@ -335,23 +412,32 @@ def test_run_scheduling_processes_two_adds(monkeypatch: pytest.MonkeyPatch) -> N
     result = run_scheduling_task.apply()
 
     assert result.successful(), result.traceback
-    # Per-op design: each invocation handles one op and re-triggers itself.
-    # The test's auto-retrigger delay-side-effect bridges those calls so the
-    # whole queue drains under a single test-driven apply().
+    # Per-compound design: each invocation handles one compound and
+    # re-triggers itself. The test's auto-retrigger delay-side-effect
+    # bridges those calls so the whole queue drains under a single
+    # test-driven apply().
     assert mocks["add_order"].call_count == 2
-    # apply_schedule + broadcast fire once per op (per-op refresh signal).
-    assert mocks["apply_schedule"].call_count == 2
-    assert mocks["broadcast"].call_count == 2
-    mocks["broadcast"].assert_called_with({"type": "schedule.updated"})
-    # delay() fired once between op1 and op2; not after op2 because the
-    # queue was empty.
+    # Phase 4 fast/slow split: fast path no longer calls apply_schedule
+    # or broadcast. Both moved to the deferred materializer.
+    assert mocks["apply_schedule"].call_count == 0
+    assert mocks["broadcast"].call_count == 0
+    # Per-compound: notify_user(compound_accepted) and
+    # materialize_schedule_task.delay() fire on each success.
+    assert mocks["notify_user"].call_count == 2
+    for call in mocks["notify_user"].call_args_list:
+        assert call.kwargs["message"]["type"] == "schedule.compound_accepted"
+    assert mocks["materialize_delay"].call_count == 2
+    # run_scheduling_task.delay() fired once between compound1 and
+    # compound2 (after compound1 sees the second still queued).
     assert mocks["delay"].call_count == 1
     # Final status: idle, with a finished_at timestamp
     status_doc = json.loads(fake_redis.get(STATUS_KEY))
     assert status_doc["state"] == "idle"
     assert status_doc["finished_at"] is not None
-    # State persisted
+    # State persisted by the fast path (cheap O(n) serialize).
     assert fake_redis.get(STATE_KEY) is not None
+    # Both requesters got SADD'd into the materializer's notify queue.
+    assert fake_redis.scard("schedule:materialize_notify_pending") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -404,18 +490,28 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
     # compound finalized normally.
     assert mocks["add_order"].call_count == 2
 
-    # Exactly one notify_user — the failed compound's requester.
-    assert mocks["notify_user"].call_count == 1
-    kwargs = mocks["notify_user"].call_args.kwargs
-    assert kwargs["user_id"] == failing_user
-    msg = kwargs["message"]
-    assert msg["type"] == "schedule.compound_failed"
-    assert msg["compound_id"] == str(failing_compound_id)
-    assert msg["failed_op"] == "add"
-    assert msg["failed_op_index"] == 0
-    assert msg["order_id"] == str(failing_id)
-    assert msg["reason"] == "capacity_exceeded"
-    assert msg["rolled_back"] is True
+    # Phase 4 fast/slow split: notify_user fires twice now —
+    #   1) compound_failed for the rolled-back compound
+    #   2) compound_accepted for the successful compound
+    # (broadcast / apply_schedule no longer fire here; they happen in
+    # the deferred materializer.)
+    notify_calls = mocks["notify_user"].call_args_list
+    by_type = {c.kwargs["message"]["type"]: c.kwargs for c in notify_calls}
+    assert set(by_type.keys()) == {
+        "schedule.compound_failed",
+        "schedule.compound_accepted",
+    }
+    failed_msg = by_type["schedule.compound_failed"]["message"]
+    assert by_type["schedule.compound_failed"]["user_id"] == failing_user
+    assert failed_msg["compound_id"] == str(failing_compound_id)
+    assert failed_msg["failed_op"] == "add"
+    assert failed_msg["failed_op_index"] == 0
+    assert failed_msg["order_id"] == str(failing_id)
+    assert failed_msg["reason"] == "capacity_exceeded"
+    assert failed_msg["rolled_back"] is True
+
+    # Only the successful compound dispatches the materializer.
+    assert mocks["materialize_delay"].call_count == 1
 
 
 def test_run_scheduling_notifies_user_on_remove_failure(
@@ -523,20 +619,32 @@ def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
 def test_run_scheduling_retriggers_when_more_ops_arrive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A compound arriving mid-processing must be picked up via re-trigger
+    instead of waiting for an external dispatch.
+
+    Phase 4 changed the fast path so ``compute_schedule`` is no longer
+    called in this task body — the mid-task injection point moves to
+    ``add_order`` (which IS called during compound processing). The
+    re-trigger check still happens at the end via ``zcard``.
+    """
     fake_redis = _FakeRedis()
     _enqueue(fake_redis, _make_op())
 
-    # Inject a "new" op after the drain by hooking compute_schedule.
-    def fake_compute(_state: SchedulerState) -> list:
-        _enqueue(fake_redis, _make_op(order_number="LATE"))
-        return []
+    injected = {"done": False}
 
-    mocks = _patch_common(monkeypatch, fake_redis, compute_schedule=fake_compute)
+    def add_with_late_injection(_state: SchedulerState, _order: SchedulingOrder) -> ScheduleResult:
+        if not injected["done"]:
+            _enqueue(fake_redis, _make_op(order_number="LATE"))
+            injected["done"] = True
+        return ScheduleResult(status="success")
+
+    mocks = _patch_common(monkeypatch, fake_redis, add_order=MagicMock(side_effect=add_with_late_injection))
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    assert mocks["delay"].called  # fired itself again
+    # First compound processed, then re-triggered to pick up LATE.
+    assert mocks["delay"].called
 
 
 def test_run_scheduling_processes_shrink_group_before_grow(
@@ -1624,45 +1732,177 @@ def test_run_scheduling_dispatches_unpin_op(
     assert mocks["pin_order"].call_count == 0
 
 
-def test_finalize_run_passes_pinned_map_to_apply_schedule(
+def test_materialize_task_drains_pending_users_and_notifies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_finalize_run`` derives ``{order_id: fake_deadline}`` from
+    """Happy path: notify_pending has users → materializer renames it,
+    runs apply_schedule, then notify_user(schedule.materialized) per user.
+    """
+    from app.workers.scheduling import materialize_schedule_task
+
+    fake_redis = _FakeRedis()
+    user_a = uuid.uuid4()
+    user_b = uuid.uuid4()
+    fake_redis.sadd("schedule:materialize_notify_pending", str(user_a), str(user_b))
+
+    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
+    monkeypatch.setattr(
+        "app.workers.scheduling._load_state",
+        lambda: SchedulerState.initial(date(2026, 5, 5)),
+    )
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    apply_mock = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule", apply_mock
+    )
+    notify_mock = MagicMock()
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+
+    result = materialize_schedule_task.apply()
+    assert result.successful(), result.traceback
+
+    # apply_schedule called exactly once.
+    assert apply_mock.call_count == 1
+    # Both users notified with schedule.materialized.
+    notified = {
+        c.kwargs["user_id"]: c.kwargs["message"]["type"]
+        for c in notify_mock.call_args_list
+    }
+    assert notified == {
+        user_a: "schedule.materialized",
+        user_b: "schedule.materialized",
+    }
+    # Pending set drained.
+    assert fake_redis.scard("schedule:materialize_notify_pending") == 0
+    # Running flag released.
+    assert fake_redis.get("schedule:materialize_running") is None
+
+
+def test_materialize_task_exits_when_already_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-coalescing: if another materializer already claimed the
+    running flag, this invocation exits immediately. No work done.
+    """
+    from app.workers.scheduling import materialize_schedule_task
+
+    fake_redis = _FakeRedis()
+    # Pre-claim the flag — simulating another materializer running.
+    fake_redis.set("schedule:materialize_running", "1", ex=300)
+    fake_redis.sadd("schedule:materialize_notify_pending", str(uuid.uuid4()))
+
+    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
+    apply_mock = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule", apply_mock
+    )
+    notify_mock = MagicMock()
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+
+    result = materialize_schedule_task.apply()
+    assert result.successful(), result.traceback
+
+    # Nothing was done; the other in-flight materializer owns the work.
+    assert apply_mock.call_count == 0
+    assert notify_mock.call_count == 0
+    # Pending set untouched.
+    assert fake_redis.scard("schedule:materialize_notify_pending") == 1
+    # The flag we pre-set is still there (we didn't clobber another runner's slot).
+    assert fake_redis.get("schedule:materialize_running") == "1"
+
+
+def test_materialize_task_exits_when_no_pending_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty notify_pending → rename raises ResponseError → loop exits
+    immediately. No apply_schedule, no notify. Running flag released.
+    """
+    from app.workers.scheduling import materialize_schedule_task
+
+    fake_redis = _FakeRedis()
+    # No SADD — notify_pending doesn't exist.
+
+    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
+    apply_mock = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule", apply_mock
+    )
+    notify_mock = MagicMock()
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+
+    result = materialize_schedule_task.apply()
+    assert result.successful(), result.traceback
+
+    assert apply_mock.call_count == 0
+    assert notify_mock.call_count == 0
+    # Flag was claimed but released by the finally.
+    assert fake_redis.get("schedule:materialize_running") is None
+
+
+def test_materialize_task_passes_pinned_map_to_apply_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The materializer derives ``{order_id: fake_deadline}`` from
     ``state.pinned_orders`` and threads it into ``apply_schedule`` so DB
     rows get ``is_pinned=true`` / ``pinned_production_date=fake_deadline``.
 
-    Pre-fix apply_schedule was called with positional ``scheduled`` only,
-    so even with the new ``pinned`` parameter the worker had to be wired
-    to actually pass it. This locks that wiring.
+    Phase 4: this invariant moved from ``_finalize_run`` (which the fast
+    task no longer calls) to ``materialize_schedule_task``. The test was
+    renamed and re-targeted accordingly.
     """
     from app.services.scheduling import PinnedOrder
+    from app.workers.scheduling import materialize_schedule_task
 
     fake_redis = _FakeRedis()
-    _enqueue(fake_redis, _make_op(order_number="GROW-1"))
-
     pinned_id = uuid.uuid4()
     pinned_day = date(2026, 5, 12)
+    requester = uuid.uuid4()
+
+    # Seed the materializer's pending notify-user set so it has work to do.
+    fake_redis.sadd("schedule:materialize_notify_pending", str(requester))
 
     def fake_load_state() -> SchedulerState:
         s = SchedulerState.initial(date(2026, 5, 5))
-        s.pinned_orders[pinned_id] = (
-            PinnedOrder(
-                order_id=pinned_id,
-                order_number="PINNED",
-                wafer_quantity=500,
-                deadline=date(2026, 5, 15),
-                fake_deadline=pinned_day,
-            )
+        s.pinned_orders[pinned_id] = PinnedOrder(
+            order_id=pinned_id,
+            order_number="PINNED",
+            wafer_quantity=500,
+            deadline=date(2026, 5, 15),
+            fake_deadline=pinned_day,
         )
         return s
 
+    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr("app.workers.scheduling._load_state", fake_load_state)
-    mocks = _patch_common(monkeypatch, fake_redis)
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    apply_mock = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule", apply_mock
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
 
-    result = run_scheduling_task.apply()
+    result = materialize_schedule_task.apply()
     assert result.successful(), result.traceback
 
     # apply_schedule was called with the pinned map (3rd positional arg).
-    args, _ = mocks["apply_schedule"].call_args
+    args, _ = apply_mock.call_args
     _, _scheduled_arg, pinned_arg = args
     assert pinned_arg == {pinned_id: pinned_day}

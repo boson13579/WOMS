@@ -612,35 +612,47 @@ def get_audit_log(db: Session, order_id: uuid.UUID, current_user: User) -> list[
 # ---------------------------------------------------------------------------
 
 
-def list_scheduled_orders(
-    db: Session,
-    *,
-    breakdown: list[ScheduledResult] | None = None,
-) -> list[ScheduleResultResponse]:
+def list_scheduled_orders(db: Session) -> list[ScheduleResultResponse]:
     """Return every order currently in ``scheduled`` status, sorted by start date.
 
-    When *breakdown* is supplied (typically the live result of
-    ``compute_schedule(state)`` for the current Redis-backed
-    ``SchedulerState``), each response gets a per-day ``daily_breakdown``
-    list showing how the order's wafers are split across days. With no
-    breakdown the field defaults to an empty list — useful for the very
-    first deploy or when Redis state has been wiped.
+    Reads the per-day breakdown straight from the DB column
+    ``orders.daily_breakdown`` (JSONB) that the materializer keeps in sync.
+    No live Redis state is consulted on this read path — the column IS the
+    source of truth for "what will this order's day-by-day production look
+    like under the most recent accepted schedule". A NULL column degrades
+    to an empty ``daily_breakdown`` list in the response.
     """
     rows = order_repo.get_scheduled(db)
-
-    by_order: dict[uuid.UUID, list[DailyAssignment]] = {}
-    if breakdown:
-        for sr in sorted(breakdown, key=lambda x: x.scheduled_date):
-            by_order.setdefault(sr.order_id, []).append(
-                DailyAssignment(date=sr.scheduled_date, quantity=sr.quantity)
+    out: list[ScheduleResultResponse] = []
+    for r in rows:
+        breakdown_payload: list[DailyAssignment] = []
+        if r.daily_breakdown:
+            for entry in r.daily_breakdown:
+                breakdown_payload.append(
+                    DailyAssignment(
+                        date=date.fromisoformat(str(entry["date"])),
+                        quantity=int(entry["quantity"]),
+                    )
+                )
+        # Build the response directly instead of model_validate(r) →
+        # model_copy: pydantic's ``from_attributes`` would otherwise try to
+        # validate the raw ``Order.daily_breakdown`` (JSONB or None) against
+        # ``list[DailyAssignment]`` and fail on the NULL case. Constructing
+        # the schema explicitly lets us drop in our parsed breakdown_payload.
+        out.append(
+            ScheduleResultResponse(
+                id=r.id,
+                order_number=r.order_number,
+                customer_name=r.customer_name,
+                wafer_quantity=r.wafer_quantity,
+                requested_delivery_date=r.requested_delivery_date,
+                scheduled_production_date=r.scheduled_production_date,
+                expected_delivery_date=r.expected_delivery_date,
+                status=r.status,
+                daily_breakdown=breakdown_payload,
             )
-
-    return [
-        ScheduleResultResponse.model_validate(r).model_copy(
-            update={"daily_breakdown": by_order.get(r.id, [])}
         )
-        for r in rows
-    ]
+    return out
 
 
 def list_for_scheduler(
@@ -702,26 +714,30 @@ def apply_schedule(
     order_repo.clear_scheduled_dates(db)
     pinned_map = pinned or {}
 
-    per_order: dict[uuid.UUID, tuple[date, date]] = {}
+    # Group ScheduledResults by order_id and remember per-day quantities so
+    # we can persist the full breakdown (not just earliest/latest summary)
+    # to the JSONB column. Sort each per-order list by date so the stored
+    # JSON is chronological — saves the read-path from re-sorting.
+    per_order: dict[uuid.UUID, list[ScheduledResult]] = {}
     for sr in scheduled:
-        cur = per_order.get(sr.order_id)
-        if cur is None:
-            per_order[sr.order_id] = (sr.scheduled_date, sr.scheduled_date)
-        else:
-            earliest, latest = cur
-            per_order[sr.order_id] = (
-                min(earliest, sr.scheduled_date),
-                max(latest, sr.scheduled_date),
-            )
+        per_order.setdefault(sr.order_id, []).append(sr)
 
     applied = 0
-    for order_id, (earliest, latest) in per_order.items():
+    for order_id, results in per_order.items():
+        results.sort(key=lambda x: x.scheduled_date)
+        earliest = results[0].scheduled_date
+        latest = results[-1].scheduled_date
+        daily_breakdown_payload: list[dict[str, str | int]] = [
+            {"date": sr.scheduled_date.isoformat(), "quantity": int(sr.quantity)}
+            for sr in results
+        ]
         is_pinned = order_id in pinned_map
         order = order_repo.set_schedule_dates(
             db,
             order_id=order_id,
             scheduled_production_date=earliest,
             expected_delivery_date=latest,
+            daily_breakdown=daily_breakdown_payload,
             is_pinned=is_pinned,
             pinned_production_date=pinned_map.get(order_id),
         )
