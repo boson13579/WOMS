@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from fastapi import HTTPException, status
@@ -30,7 +30,13 @@ from app.schemas.order import (
     OrderResponse,
     UpdateOrderRequest,
 )
-from app.schemas.schedule import DailyAssignment, ScheduleResultResponse
+from app.schemas.schedule import (
+    DailyAssignment,
+    ScheduleCompoundRequest,
+    ScheduleOpInCompound,
+    ScheduleResultResponse,
+)
+from app.services.schedule_queue import enqueue_compound
 from app.services.scheduling import ScheduledResult, SchedulingOrder
 
 logger = structlog.get_logger(__name__)
@@ -65,6 +71,169 @@ def _generate_order_number(db: Session) -> str:
     count = order_repo.get_today_order_count(db, today)
     seq = count + 1
     return f"ORD-{today.strftime('%Y%m%d')}-{seq:04d}"
+
+
+def _build_create_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoundRequest:
+    """Compound for a newly-created order: just an ``add``.
+
+    Group=grow because the order is consuming new capacity. If a producer
+    has a pending ``remove`` for an earlier version of this order_id (only
+    possible if there's a race with delete), shrink-first ordering ensures
+    the remove runs first; the add then either succeeds or fails-with-
+    rollback on a clean state.
+    """
+    return ScheduleCompoundRequest(
+        group="grow",
+        ops=[
+            ScheduleOpInCompound(
+                op="add",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=order.wafer_quantity,
+                deadline=order.requested_delivery_date,
+            ),
+        ],
+        requested_by=actor_id,
+    )
+
+
+def _build_delete_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoundRequest:
+    """Compound for a soft-deleted order: ``unpin`` (if pinned) then ``remove``.
+
+    Group=shrink because the order frees capacity. If the order was never
+    actually scheduled (still status=pending when delete fires), the
+    worker-side membership guard catches the no-op gracefully and emits
+    ``schedule.compound_failed`` — producer can ignore or surface.
+    """
+    ops: list[ScheduleOpInCompound] = []
+    if order.is_pinned:
+        ops.append(
+            ScheduleOpInCompound(
+                op="unpin",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=order.wafer_quantity,
+                deadline=order.requested_delivery_date,
+            )
+        )
+    ops.append(
+        ScheduleOpInCompound(
+            op="remove",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=order.wafer_quantity,
+            deadline=order.requested_delivery_date,
+        )
+    )
+    return ScheduleCompoundRequest(
+        group="shrink",
+        ops=ops,
+        requested_by=actor_id,
+    )
+
+
+def _build_patch_compound(
+    *,
+    order: Order,
+    new_qty: int,
+    new_deadline: date,
+    actor_id: uuid.UUID,
+) -> ScheduleCompoundRequest | None:
+    """Build the schedule compound for a PATCH that may touch qty / deadline.
+
+    Implements the **case-8 smart-routing rules** from
+    ``docs/scheduling.md``:
+
+    * No qty/deadline change → returns ``None``, caller skips the enqueue.
+    * Order not pinned → ``[remove(old), add(new)]``.
+    * Order pinned:
+      * Always prepend ``unpin`` (worker can't process ``remove`` on a
+        pinned order — membership guard would reject it).
+      * Auto-re-pin to the same day **only when both** conditions hold:
+        ``new_deadline >= old_pin_day`` AND ``new_qty <= old_qty``. Either
+        condition failing means the pin day's capacity might be exceeded
+        if we forced the re-pin; we silent-drop the pin (per case 13/14).
+
+    Group selection: ``shrink`` if any of (qty smaller, deadline later);
+    otherwise ``grow``. This matches the existing CRUD-to-op rules for
+    non-pinned PATCH and falls through cleanly when pin/unpin ops are
+    prepended/appended — every op in a compound shares one group anyway.
+    """
+    old_qty = order.wafer_quantity
+    old_deadline = order.requested_delivery_date
+
+    qty_changed = new_qty != old_qty
+    deadline_changed = new_deadline != old_deadline
+    if not (qty_changed or deadline_changed):
+        # PATCH affected only notes / immaterial fields — no need to bother
+        # the scheduler.
+        return None
+
+    qty_smaller = new_qty < old_qty
+    deadline_later = new_deadline > old_deadline
+    group: Literal["shrink", "grow"] = "shrink" if (qty_smaller or deadline_later) else "grow"
+
+    is_pinned_before = order.is_pinned
+    pin_day = order.pinned_production_date
+
+    ops: list[ScheduleOpInCompound] = []
+
+    if is_pinned_before:
+        ops.append(
+            ScheduleOpInCompound(
+                op="unpin",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=old_qty,
+                deadline=old_deadline,
+            )
+        )
+
+    ops.append(
+        ScheduleOpInCompound(
+            op="remove",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=old_qty,
+            deadline=old_deadline,
+        )
+    )
+    ops.append(
+        ScheduleOpInCompound(
+            op="add",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=new_qty,
+            deadline=new_deadline,
+        )
+    )
+
+    # Case 14 auto-re-pin gate. ALL of these must hold:
+    #   - order was pinned before the PATCH;
+    #   - the PATCH didn't make the new deadline cross the pin day
+    #     (otherwise pin can't satisfy "fake_deadline ≤ deadline");
+    #   - qty didn't grow (otherwise the pin day's capacity might overflow).
+    # Failing any → silent drop pin (case 13 semantics extended to all
+    # incompatible PATCHes, not just the deadline-before-pin one).
+    if is_pinned_before and pin_day is not None:
+        can_repin = new_deadline >= pin_day and new_qty <= old_qty
+        if can_repin:
+            ops.append(
+                ScheduleOpInCompound(
+                    op="pin",
+                    order_id=order.id,
+                    order_number=order.order_number,
+                    wafer_quantity=new_qty,
+                    deadline=new_deadline,
+                    fake_deadline=pin_day,
+                )
+            )
+
+    return ScheduleCompoundRequest(
+        group=group,
+        ops=ops,
+        requested_by=actor_id,
+    )
 
 
 def _write_audit(
@@ -131,6 +300,12 @@ def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResp
     _write_audit(db, action="order.created", actor=actor, order=order, new_value=new_val)
     db.commit()
     db.refresh(order)
+
+    # Push the [add] compound to the scheduler queue. DB commit must
+    # succeed first so the worker (which can read order state from DB on
+    # rebuild) doesn't see ops for an order that hasn't landed yet.
+    enqueue_compound(_build_create_compound(order, actor.id))
+
     logger.info("order.created", order_number=order.order_number, actor_id=str(actor.id))
     return OrderResponse.model_validate(order)
 
@@ -200,6 +375,14 @@ def update_order(
         "status": order.status.value,
     }
 
+    # Snapshot the pre-PATCH order BEFORE we mutate it — the compound
+    # builder needs the *old* qty / deadline / pin info to construct
+    # remove(old) + unpin(if pinned) correctly.
+    pre_patch_qty = order.wafer_quantity
+    pre_patch_deadline = order.requested_delivery_date
+    pre_patch_is_pinned = order.is_pinned
+    pre_patch_pin_day = order.pinned_production_date
+
     if req.wafer_quantity is not None:
         order.wafer_quantity = req.wafer_quantity
     if req.requested_delivery_date is not None:
@@ -207,12 +390,11 @@ def update_order(
     if "notes" in req.model_fields_set:
         order.notes = req.notes
     order.status = OrderStatus.pending
-    # Order is back in the pending pool waiting for the worker to apply the
-    # follow-up remove/add ops; relock the editing UI until apply_schedule
-    # clears the flag again. Production pin (is_pinned) stays untouched in
-    # the DB column — the producer of the schedule ops (frontend / API
-    # caller) is responsible for prepending an unpin op so the worker
-    # eventually rewrites is_pinned=false via apply_schedule.
+    # Order is back in the pending pool waiting for the worker to apply
+    # the compound; relock the editing UI until apply_schedule clears the
+    # flag again. Production pin (is_pinned) stays untouched in the DB
+    # column for now — apply_schedule will reset it correctly when the
+    # compound's unpin+(re-pin?) ops finish.
     order.is_processing_locked = True
 
     new_val: dict[str, Any] = {
@@ -241,14 +423,52 @@ def update_order(
         ) from exc
 
     db.refresh(order)
+
+    # Build + enqueue the scheduler compound *after* DB commit so producer
+    # responsibilities are clean: the DB is the source of truth, the queue
+    # follows. Use the pre-PATCH snapshot of the row to construct the
+    # ``remove(old)`` / ``unpin(if was pinned)`` ops; the post-PATCH order
+    # provides the ``add(new)`` payload and decision inputs.
+    pre_patch_order_view = Order(
+        id=order.id,
+        order_number=order.order_number,
+        wafer_quantity=pre_patch_qty,
+        requested_delivery_date=pre_patch_deadline,
+        is_pinned=pre_patch_is_pinned,
+        pinned_production_date=pre_patch_pin_day,
+    )
+    compound = _build_patch_compound(
+        order=pre_patch_order_view,
+        new_qty=order.wafer_quantity,
+        new_deadline=order.requested_delivery_date,
+        actor_id=actor.id,
+    )
+    if compound is not None:
+        enqueue_compound(compound)
     return OrderResponse.model_validate(order)
 
 
 def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse:
-    """Soft-delete an order by setting is_deleted=True and status=cancelled."""
+    """Soft-delete an order by setting is_deleted=True and status=cancelled.
+
+    Also pushes the deletion compound to the scheduler queue
+    (``unpin`` if pinned, then ``remove``). The compound MUST be built
+    from the pre-mutation order (we need the pre-delete qty / deadline /
+    pin info for the ops); we snapshot that view before commit.
+    """
     order = order_repo.get_by_id(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
+
+    # Snapshot pre-delete view for the compound builder.
+    pre_delete_view = Order(
+        id=order.id,
+        order_number=order.order_number,
+        wafer_quantity=order.wafer_quantity,
+        requested_delivery_date=order.requested_delivery_date,
+        is_pinned=order.is_pinned,
+        pinned_production_date=order.pinned_production_date,
+    )
 
     old_val: dict[str, Any] = {"status": order.status.value, "is_deleted": False}
     order.is_deleted = True
@@ -265,14 +485,26 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
             detail="Order was modified by another user. Refresh and try again.",
         ) from exc
 
+    enqueue_compound(_build_delete_compound(pre_delete_view, actor.id))
+
     logger.info("order.cancelled", order_id=str(order_id), actor_id=str(actor.id))
     return OrderResponse.model_validate(order)
 
 
 def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> BatchUpdateResponse:
-    """Bulk-update delivery dates; silently skip immutable-status orders."""
+    """Bulk-update delivery dates; silently skip immutable-status orders.
+
+    Each successfully-updated row gets its own scheduler compound — same
+    case-8 routing as :func:`update_order`. We enqueue them *after* the
+    outer commit so a transaction-level conflict (e.g. ``StaleDataError``
+    on commit) rolls back DB changes AND doesn't leave orphan compounds in
+    Redis.
+    """
     updated: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []
+    # Stage compounds in memory; only flush to Redis after the outer commit
+    # succeeds, so a failed commit doesn't leak ops to the worker.
+    pending_compounds: list[ScheduleCompoundRequest] = []
 
     for order_id in req.order_ids:
         order = order_repo.get_by_id(db, order_id)
@@ -282,6 +514,15 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
 
         savepoint = db.begin_nested()
         try:
+            # Snapshot pre-PATCH view for compound builder.
+            pre_view = Order(
+                id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=order.wafer_quantity,
+                requested_delivery_date=order.requested_delivery_date,
+                is_pinned=order.is_pinned,
+                pinned_production_date=order.pinned_production_date,
+            )
             old_date = str(order.requested_delivery_date)
             order.requested_delivery_date = req.requested_delivery_date
             order.status = OrderStatus.pending
@@ -297,6 +538,15 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
             db.flush()
             savepoint.commit()
             updated.append(order_id)
+
+            compound = _build_patch_compound(
+                order=pre_view,
+                new_qty=order.wafer_quantity,
+                new_deadline=req.requested_delivery_date,
+                actor_id=actor.id,
+            )
+            if compound is not None:
+                pending_compounds.append(compound)
         except StaleDataError:
             savepoint.rollback()
             db.expire_all()
@@ -321,6 +571,10 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
             status_code=status.HTTP_409_CONFLICT,
             detail="One or more orders were modified by another request. Please retry.",
         ) from exc
+
+    # Outer commit succeeded — now flush the staged compounds.
+    for compound in pending_compounds:
+        enqueue_compound(compound)
 
     logger.info(
         "order.batch_updated",

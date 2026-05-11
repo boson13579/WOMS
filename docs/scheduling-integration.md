@@ -30,145 +30,143 @@
 
 **強烈建議用 A**，除非你確定要省那一次 RTT 而且能接受耦合。
 
+> **Phase 2 變更**：endpoint shape 從「一次接一筆 op」改成「一次接一個 compound」。一個 compound = 一組 1-4 筆 leaf ops，worker 端 **atomic 執行 + snapshot rollback**（任何一筆 op 失敗就把整個 compound 連已成功的部分一起 undo）。Order CRUD service 內部已自動 build 對應 compound（見 `app/services/order.py::_build_*_compound`），多數情況**前端 / 第三方服務只在「手動 pin / unpin」**時需要直接戳這支 endpoint。
+
 ### 2.2 方法 A — HTTP（推薦）
 
 ```python
 import httpx
+import uuid
 
-# 建立訂單後
+# 建立訂單後（如果 backend Order CRUD 已自動處理，這段可以略）
 def on_order_created(order, actor):
     httpx.post(
         "http://backend/api/v1/schedule/operations",
         json={
-            "op": "add",
-            "order_id": str(order.id),
-            "order_number": order.order_number,
-            "wafer_quantity": order.wafer_quantity,
-            "deadline": order.requested_delivery_date.isoformat(),
+            "compound_id": str(uuid.uuid4()),
+            "group": "grow",
             "requested_by": str(actor.id),
+            "ops": [
+                {
+                    "op": "add",
+                    "order_id": str(order.id),
+                    "order_number": order.order_number,
+                    "wafer_quantity": order.wafer_quantity,
+                    "deadline": order.requested_delivery_date.isoformat(),
+                },
+            ],
         },
         headers={"Authorization": f"Bearer {service_token}"},
     )
 
-# 取消訂單時
-def on_order_cancelled(order, actor):
+# 手動把訂單 pin 到 5/12
+def on_user_pinned(order, actor, pin_day):
     httpx.post(
         "http://backend/api/v1/schedule/operations",
         json={
-            "op": "remove",
-            "order_id": str(order.id),
-            "order_number": order.order_number,
-            "wafer_quantity": order.wafer_quantity,
-            "deadline": order.requested_delivery_date.isoformat(),
+            "compound_id": str(uuid.uuid4()),
+            "group": "grow",
             "requested_by": str(actor.id),
+            "ops": [
+                {
+                    "op": "pin",
+                    "order_id": str(order.id),
+                    "order_number": order.order_number,
+                    "wafer_quantity": order.wafer_quantity,
+                    "deadline": order.requested_delivery_date.isoformat(),
+                    "fake_deadline": pin_day.isoformat(),
+                },
+            ],
         },
         headers={"Authorization": f"Bearer {service_token}"},
     )
 ```
 
-**Response 202**：`{"message": "Operation queued"}`，無同步結果。
+**Response 202**：`{"compound_id": "...", "message": "Compound queued"}`。實際結果走 WS：
+- 成功 → `schedule.updated` broadcast。
+- 失敗 → `schedule.compound_failed` notify\_user 給 `requested_by`，state 已 rollback。
 
-### 2.3 方法 B — 直連 Redis
+### 2.3 方法 B — 直連 Redis（不推薦，僅在無法走 HTTP 時用）
 
 ```python
-import json
-from redis import Redis
-from app.core.config import get_settings
-from app.workers.scheduling import (
-    PENDING_OPS_KEY,
-    PENDING_OPS_SEQ_KEY,
-    run_scheduling_task,
-    score_for_op,
-)
-
-_redis = Redis.from_url(str(get_settings().REDIS_URL), decode_responses=True)
-
-def enqueue_op(payload: dict, group: str) -> None:
-    seq = _redis.incr(PENDING_OPS_SEQ_KEY)
-    payload["_seq"] = seq
-    _redis.zadd(
-        PENDING_OPS_KEY,
-        {json.dumps(payload): score_for_op(group=group, seq=seq)},
-    )
-    run_scheduling_task.delay()
+from app.services.schedule_queue import enqueue_compound
+from app.schemas.schedule import ScheduleCompoundRequest, ScheduleOpInCompound
+# ↑ 這條路徑只有同進程 Python 才走得通；微服務之間請用 HTTP。
 ```
 
-### 2.4 修改訂單（複合更新）— ⚠️ 注意事項
+直接戳 Redis 不會 self-validate（schema 跳過），請避免。
 
-排程演算法只認 `add` / `remove` 兩種原子操作。**修 quantity 或 deadline 必須拆成兩筆**：先 remove 舊值、再 add 新值。
+### 2.4 修改訂單 — Order CRUD 已自動處理
 
-而且這兩筆必須由你**明確標 `group` 欄位**（值要一致），否則 add 那半會跑錯 phase 拿不到 remove 釋放的產能：
+Phase 2 之後，**只要呼叫 backend 的 Order CRUD endpoint，scheduler compound 會自動建好推進佇列**，不需要第三方服務 / 前端額外打 `/schedule/operations`：
 
-| 業務動作 | 兩筆 op 的 group |
+| Order CRUD | service 自動 build 的 compound |
 |---|---|
-| **Defer**（deadline 往後延） | 兩筆都 `"shrink"` |
-| **Advance**（deadline 提前） | 兩筆都 `"grow"` |
-| **Qty 變小** | 兩筆都 `"shrink"` |
-| **Qty 變大** | 兩筆都 `"grow"` |
-| **Qty + deadline 一起改** | 保守標 `"grow"`（讓所有 shrink 先跑完再動） |
+| `POST /api/v1/orders` | `[add(新)]` |
+| `PATCH /api/v1/orders/{id}` 改 qty / deadline（非 pinned） | `[remove(舊), add(新)]` |
+| `PATCH /api/v1/orders/{id}`（pinned，新 deadline ≥ pin 日 AND 新 qty ≤ 舊 qty） | `[unpin, remove, add, pin(原 pin 日)]` — 自動 re-pin |
+| `PATCH /api/v1/orders/{id}`（pinned，其他情況） | `[unpin, remove, add]` — silent drop pin |
+| `PATCH /orders/batch-update` | 每筆訂單獨立 compound，內部規則同上 |
+| `DELETE /api/v1/orders/{id}`（非 pinned） | `[remove]` |
+| `DELETE /api/v1/orders/{id}`（pinned） | `[unpin, remove]` |
 
-```python
-# Defer：把訂單從 5/10 延到 5/15
-def on_order_deadline_extended(order_old, order_new, actor):
-    base = {
-        "order_id": str(order_old.id),
-        "order_number": order_old.order_number,
-        "requested_by": str(actor.id),
-    }
-    # 1. 先推 remove（舊值）
-    httpx.post(URL, json={
-        **base,
-        "op": "remove",
-        "group": "shrink",  # ← 必須帶
-        "wafer_quantity": order_old.wafer_quantity,
-        "deadline": order_old.requested_delivery_date.isoformat(),
-    })
-    # 2. 再推 add（新值）
-    httpx.post(URL, json={
-        **base,
-        "op": "add",
-        "group": "shrink",  # ← 一定要跟上面一樣
-        "wafer_quantity": order_new.wafer_quantity,
-        "deadline": order_new.requested_delivery_date.isoformat(),
-    })
-```
+「`group` 是 shrink 還是 grow」由 service 端按 `defer / qty 變小 → shrink`、`advance / qty 變大 → grow` 自動推導，所有 ops 都標同一個 group 進 compound。
+
+**直接戳 `/schedule/operations` 的場景**只剩兩種：
+1. **手動 pin / unpin**（user 在 UI 上按「鎖到 5/12」按鈕） — 前端送 1-op compound 帶 `pin` 或 `unpin`。
+2. **第三方非標準業務 op**（譬如另一條 service 想直接動排程）。
 
 ### 2.5 注意事項
 
-- **`requested_by` 一定要填**：排程失敗（產能不夠 / deadline 超 30 天 / pin 那天 capacity 不足）會透過 WebSocket 推 `schedule.{op}_failed`（`add` / `remove` / `pin` / `unpin`）給這個 user_id。沒填的話通知不會送出。
-- **不需要等排程跑完**：endpoint 回 202 就可以接著做事，排程是 async。前端會透過 WebSocket 收到 `schedule.updated` 知道結果。
-- **單純的 `add` / `remove` / `pin` / `unpin` 可以省略 `group`**：schema validator 會用 `op` 推預設（`remove`/`unpin → shrink`、`add`/`pin → grow`）。**但複合更新一定要顯式帶**，不然會出錯。
+- **`requested_by` 一定要填**：compound 失敗時用這個 user id 推 `schedule.compound_failed` 通知。
+- **不需要等排程跑完**：endpoint 回 202 就可以接著做事，排程是 async。
+- **同 compound 內 ops 必須同 `order_id`**：schema 自帶 validator，多 order 一次直接 422。
+- **Compound 內 ops 順序由 producer 決定**（worker 不重排）；service 內建 builder 已經把順序排好。手動戳的話注意 `unpin → remove → add → pin`（如有）的拓樸。
 - **權限**：`POST /schedule/operations` 要 `scheduler+`。從 Order CRUD 內部呼叫時要帶 scheduler 等級的 service token。
 
-### 2.6 Pin / Unpin op
-
-訂單可以被「鎖到指定生產日」，由 producer 推一筆 `op="pin"` 操作即可：
+### 2.6 Pin / Unpin 手動操作
 
 ```python
-httpx.post(URL, json={
-    "order_id": str(order.id),
-    "order_number": order.order_number,
-    "wafer_quantity": order.wafer_quantity,
-    "deadline": order.requested_delivery_date.isoformat(),  # 真 deadline
-    "op": "pin",
-    "fake_deadline": "2026-05-12",  # 強制這天做掉，必須 ≤ deadline
-    "requested_by": str(actor.id),
-})
+import httpx
+import uuid
+
+# UI 按「把訂單 pin 到 5/12」按鈕
+def pin_order(order, actor, pin_day):
+    httpx.post(URL, json={
+        "compound_id": str(uuid.uuid4()),
+        "group": "grow",
+        "requested_by": str(actor.id),
+        "ops": [{
+            "op": "pin",
+            "order_id": str(order.id),
+            "order_number": order.order_number,
+            "wafer_quantity": order.wafer_quantity,
+            "deadline": order.requested_delivery_date.isoformat(),
+            "fake_deadline": pin_day.isoformat(),
+        }],
+    })
+
+# 解 pin
+def unpin_order(order, actor):
+    httpx.post(URL, json={
+        "compound_id": str(uuid.uuid4()),
+        "group": "shrink",
+        "requested_by": str(actor.id),
+        "ops": [{
+            "op": "unpin",
+            "order_id": str(order.id),
+            "order_number": order.order_number,
+            "wafer_quantity": order.wafer_quantity,
+            "deadline": order.requested_delivery_date.isoformat(),
+        }],
+    })
 ```
 
-接受條件：worker 嘗試把訂單從 pq 移到 `pinned_orders`，trees 改用 `fake_deadline` 索引；如果那天 capacity 不足會回 `schedule.pin_failed`，state 不變。**不會**自動找替代日 — 要不要重試是 producer 的決定。
+失敗時拿到 `schedule.compound_failed`（`failed_op="pin"` 或 `"unpin"`），**state 已 rollback** — pin 失敗的訂單仍保持原樣（未 pinned）；unpin 失敗的訂單仍是原 pin 狀態。
 
-解 pin 推 `op="unpin"`（不需要 `fake_deadline`）。
+`is_pinned` / `pinned_production_date` 由 worker 處理完 compound 之後 `apply_schedule` 寫回 DB；compound 失敗就不會寫，DB 維持舊值。
 
-**對 pinned 訂單下 PATCH 必須先解 pin**：worker 看到 pinned 訂單的 `remove` op 會在 pq 找不到該訂單而回 `schedule.remove_failed`。所以正確順序是：
-
-```
-unpin (shrink) → remove 舊值 (shrink/grow，依 update 種類) → add 新值 (同 group)
-```
-
-`is_pinned` / `pinned_production_date` 會在 worker 處理完 unpin op 之後由 `apply_schedule` 寫回 DB，所以前端拿到的訂單列表只要在 PATCH 前看到 `is_pinned=true` 就要記得 prepend 一筆 unpin。
-
-`is_processing_locked` 是另一個獨立的 flag — 在 order CRUD 階段就被設成 true，等到該訂單下次被 `apply_schedule` 處理才清成 false。前端拿來在那段時間 disable 該列的 inline edit，但不影響演算法行為。
+`is_processing_locked` 是獨立的「UI 編輯鎖」flag — Order CRUD 時設 true、`apply_schedule` 跑完設 false。前端拿來在那段時間 disable 該列的 inline edit。
 
 ---
 
@@ -260,16 +258,27 @@ ws.addEventListener("message", (e) => {
     const msg = JSON.parse(e.data);
     switch (msg.type) {
         case "schedule.updated":
-            // 排程結果有更新（包含換天、rebuild、單筆 op 處理完）
+            // 排程結果有更新（包含換天、rebuild、compound 成功）
             queryClient.invalidateQueries(["schedule", "result"]);
             break;
-        case "schedule.add_failed":
-            // 自己創的訂單排不進去（產能不夠或 deadline 超 30 天）
-            toast.error(`訂單 ${msg.order_number} 排不進去：${msg.reason}`);
-            break;
-        case "schedule.remove_failed":
-            // 自己創的訂單在排程裡找不到（通常是狀態已不一致，建議刷新）
-            toast.warning(`訂單 ${msg.order_number} 移除失敗：${msg.reason}`);
+        case "schedule.compound_failed":
+            // 自己送的 compound 失敗 + 已 saga-rollback。
+            // failed_op 可以是 "add" / "remove" / "pin" / "unpin"，按需要分流。
+            switch (msg.failed_op) {
+                case "add":
+                    toast.error(`訂單 ${msg.order_number} 排不進去：${msg.reason}`);
+                    break;
+                case "pin":
+                    toast.error(`訂單 ${msg.order_number} 鎖定生產日失敗：${msg.reason}`);
+                    break;
+                case "remove":
+                    toast.warning(`訂單 ${msg.order_number} 移除失敗：${msg.reason}（狀態可能已不一致，建議刷新）`);
+                    break;
+                case "unpin":
+                    toast.warning(`訂單 ${msg.order_number} 解除鎖定失敗：${msg.reason}`);
+                    break;
+            }
+            // state 已 rollback，前端不用主動還原 UI；下次刷 /schedule/result 看到的就是失敗前的狀態。
             break;
         case "schedule.rebuild_skipped":
             // 自己創的訂單在 rebuild 時被跳過（通常是 deadline 已過期）
@@ -295,10 +304,7 @@ ws.addEventListener("close", (e) => {
 | `type` | 觸發時機 | 收件對象 | payload |
 |---|---|---|---|
 | `schedule.updated` | 任何排程結果有變動（單筆 op 處理完、換天、rebuild） | **所有連線的 client**（broadcast） | `{ type: "schedule.updated" }` |
-| `schedule.add_failed` | `add_order` 失敗（產能 / horizon） | 訂單的 `requested_by` user | `{ type, order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail }` |
-| `schedule.remove_failed` | `remove_order` 失敗（一般是訂單已不在 pq、典型場景是 race 或重複的 cancel op） | 訂單的 `requested_by` user | `{ type, order_id, order_number, reason: "deadline_too_far", detail }` |
-| `schedule.pin_failed` | `pin_order` 失敗（pin 那天 capacity 不夠 / 超 horizon / 訂單不在 pq） | pin 操作的 `requested_by` user | `{ type, order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail }` |
-| `schedule.unpin_failed` | `unpin_order` 失敗（訂單目前不在 `pinned_orders`、通常是重複送 unpin） | unpin 操作的 `requested_by` user | `{ type, order_id, order_number, reason, detail }` |
+| `schedule.compound_failed` | Compound 內任一 op 失敗（add / remove / pin / unpin），整個 compound 已 saga-rollback 至 pre-compound 狀態 | compound 的 `requested_by` user | `{ type, compound_id, failed_op_index, failed_op: "add"\|"remove"\|"pin"\|"unpin", order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail, rolled_back: true }` |
 | `schedule.rebuild_skipped` | rebuild 時某筆 scheduled 訂單塞不回去（通常 deadline 已被 base_date 越過） | 訂單的 `created_by` user | `{ type, order_id, order_number, reason: "deadline_too_far"\|"capacity_exceeded" }` |
 
 ### 3.4 前端注意事項

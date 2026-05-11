@@ -53,6 +53,8 @@ class _FakeRedis:
         # ties broken by member lex order (matches real Redis semantics
         # closely enough for our tests).
         self._zsets: dict[str, list[tuple[float, str]]] = {}
+        # Hash maps for secondary indexes (e.g. by-compound-id).
+        self._hashes: dict[str, dict[str, str]] = {}
 
     # ----- String ops --------------------------------------------------------
     def get(self, key: str) -> str | None:
@@ -108,10 +110,80 @@ class _FakeRedis:
     def zcard(self, key: str) -> int:
         return len(self._zsets.get(key, []))
 
+    # ----- Hash ops ----------------------------------------------------------
+    def hset(self, key: str, field: str, value: str) -> int:
+        bucket = self._hashes.setdefault(key, {})
+        is_new = field not in bucket
+        bucket[field] = value
+        return 1 if is_new else 0
+
+    def hdel(self, key: str, *fields: str) -> int:
+        bucket = self._hashes.get(key)
+        if bucket is None:
+            return 0
+        removed = 0
+        for f in fields:
+            if bucket.pop(f, None) is not None:
+                removed += 1
+        return removed
+
+    def hget(self, key: str, field: str) -> str | None:
+        return self._hashes.get(key, {}).get(field)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _make_leaf_op(
+    *,
+    op: str = "add",
+    order_id: uuid.UUID | None = None,
+    order_number: str = "ORD-T",
+    wafer_quantity: int = 1000,
+    deadline: str = "2026-05-07",
+    fake_deadline: str | None = None,
+) -> dict[str, Any]:
+    """Build a leaf op dict (shape matches ``ScheduleOpInCompound`` minus its
+    pydantic instance — JSON-equivalent).
+    """
+    payload: dict[str, Any] = {
+        "op": op,
+        "order_id": str(order_id or uuid.uuid4()),
+        "order_number": order_number,
+        "wafer_quantity": wafer_quantity,
+        "deadline": deadline,
+    }
+    if fake_deadline is not None:
+        payload["fake_deadline"] = fake_deadline
+    return payload
+
+
+def _make_compound(
+    *,
+    ops: list[dict[str, Any]] | None = None,
+    group: str | None = None,
+    requested_by: uuid.UUID | None = None,
+    compound_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """Build a compound dict that ``_enqueue`` can land in the fake redis.
+
+    Defaults to a single-add compound for the most common test case. When
+    ``group`` isn't given, infer from the first op (``shrink`` for
+    remove/unpin, ``grow`` for add/pin).
+    """
+    if not ops:
+        ops = [_make_leaf_op()]
+    if group is None:
+        first = ops[0]["op"]
+        group = "shrink" if first in ("remove", "unpin") else "grow"
+    return {
+        "compound_id": str(compound_id or uuid.uuid4()),
+        "group": group,
+        "requested_by": str(requested_by or uuid.uuid4()),
+        "ops": ops,
+    }
 
 
 def _make_op(
@@ -125,29 +197,36 @@ def _make_op(
     fake_deadline: str | None = None,
     requested_by: uuid.UUID | None = None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "op": op,
-        "order_id": str(order_id or uuid.uuid4()),
-        "order_number": order_number,
-        "wafer_quantity": wafer_quantity,
-        "deadline": deadline,
-        "requested_by": str(requested_by or uuid.uuid4()),
-    }
-    if group is not None:
-        payload["group"] = group
-    if fake_deadline is not None:
-        payload["fake_deadline"] = fake_deadline
-    return payload
+    """Backward-compat helper: build a 1-op compound from leaf-op kwargs.
+
+    Most existing tests want "stick a single ``add`` (or ``pin`` etc.) into
+    the queue". Under the compound model that's a 1-op compound. This
+    wrapper preserves the old call sites verbatim — pass leaf-op kwargs,
+    get a compound back. For multi-op compounds use ``_make_compound``
+    explicitly.
+    """
+    leaf = _make_leaf_op(
+        op=op,
+        order_id=order_id,
+        order_number=order_number,
+        wafer_quantity=wafer_quantity,
+        deadline=deadline,
+        fake_deadline=fake_deadline,
+    )
+    return _make_compound(
+        ops=[leaf],
+        group=group,
+        requested_by=requested_by,
+    )
 
 
 def _install_auto_retrigger_delay(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Wire ``run_scheduling_task.delay`` to synchronously call ``apply()``.
 
-    Per-op design: each task invocation handles one op then ``.delay()``s
-    itself if more remain. Tests want to call ``apply()`` once and have the
-    whole queue drain — so we route ``.delay()`` straight back into
-    ``apply()`` here. A depth cap catches infinite-loop bugs (e.g. an
-    op-injecting fake_compute that never stops).
+    Compound design: each task invocation handles ONE compound then
+    ``.delay()``s itself if more remain. Tests want to call ``apply()``
+    once and have the whole queue drain — so we route ``.delay()`` straight
+    back into ``apply()`` here. A depth cap catches infinite-loop bugs.
     """
     delay_mock = MagicMock()
 
@@ -161,25 +240,22 @@ def _install_auto_retrigger_delay(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     return delay_mock
 
 
-def _enqueue(fake_redis: _FakeRedis, op: dict[str, Any]) -> None:
-    """Enqueue *op* into the fake sorted-set the way the real producer would.
+def _enqueue(fake_redis: _FakeRedis, compound: dict[str, Any]) -> None:
+    """Enqueue *compound* into the fake sorted-set like the real producer.
 
-    Mirrors ``app.api.v1.schedule.enqueue_operation``: bumps the seq counter,
-    embeds it as ``_seq`` for member uniqueness, and ZADDs at the score
-    computed by ``score_for_op``.
+    Mirrors ``schedule_queue.enqueue_compound``: bumps the seq counter,
+    embeds it as ``_seq``, and ZADDs at the score computed by ``score_for_op``
+    using the compound's group field.
     """
     from app.services.scheduling import (
         PENDING_OPS_SEQ_KEY,
         score_for_op,
     )
 
-    explicit = op.get("group")
-    if explicit is None:
-        op_kind = op["op"]
-        explicit = "shrink" if op_kind in ("remove", "unpin") else "grow"
+    group = compound["group"]
     seq = fake_redis.incr(PENDING_OPS_SEQ_KEY)
-    payload = {**op, "_seq": seq}
-    fake_redis.zadd(PENDING_OPS_KEY, {json.dumps(payload): score_for_op(group=explicit, seq=seq)})
+    payload = {**compound, "_seq": seq}
+    fake_redis.zadd(PENDING_OPS_KEY, {json.dumps(payload): score_for_op(group=group, seq=seq)})
 
 
 def _patch_common(
@@ -281,19 +357,28 @@ def test_run_scheduling_processes_two_adds(monkeypatch: pytest.MonkeyPatch) -> N
 def test_run_scheduling_notifies_user_on_capacity_exceeded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Compound containing a failing ``add`` rolls back + WS-notifies.
+
+    Compound model contract: an op-level failure inside a compound triggers
+    a snapshot rollback and ``schedule.compound_failed`` to the compound's
+    ``requested_by``. The successful op inside a separate compound runs
+    normally on its own turn.
+    """
     fake_redis = _FakeRedis()
 
     failing_id = uuid.uuid4()
     failing_user = uuid.uuid4()
-    op_fail = _make_op(
+    failing_compound_id = uuid.uuid4()
+    compound_fail = _make_op(
         order_id=failing_id,
         order_number="ORD-FAIL",
         wafer_quantity=50_000,
         requested_by=failing_user,
     )
-    op_ok = _make_op(order_number="ORD-OK", wafer_quantity=1000)
-    _enqueue(fake_redis, op_fail)
-    _enqueue(fake_redis, op_ok)
+    compound_fail["compound_id"] = str(failing_compound_id)
+    compound_ok = _make_op(order_number="ORD-OK", wafer_quantity=1000)
+    _enqueue(fake_redis, compound_fail)
+    _enqueue(fake_redis, compound_ok)
 
     add_mock = MagicMock(
         side_effect=[
@@ -310,46 +395,48 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # Both adds were attempted — the failure didn't abort processing.
+    # Both compounds were popped; failed compound rolled back, successful
+    # compound finalized normally.
     assert mocks["add_order"].call_count == 2
 
-    # notify_user fired exactly once for the failing order's requester.
+    # Exactly one notify_user — the failed compound's requester.
     assert mocks["notify_user"].call_count == 1
     kwargs = mocks["notify_user"].call_args.kwargs
     assert kwargs["user_id"] == failing_user
-    assert kwargs["message"]["type"] == "schedule.add_failed"
-    assert kwargs["message"]["order_id"] == str(failing_id)
-    assert kwargs["message"]["reason"] == "capacity_exceeded"
-
-    # The successful order wasn't notified.
-    # (Already covered by call_count == 1; explicit assertion below for clarity.)
-    notified_order_ids = [
-        c.kwargs["message"]["order_id"] for c in mocks["notify_user"].call_args_list
-    ]
-    assert str(failing_id) in notified_order_ids
+    msg = kwargs["message"]
+    assert msg["type"] == "schedule.compound_failed"
+    assert msg["compound_id"] == str(failing_compound_id)
+    assert msg["failed_op"] == "add"
+    assert msg["failed_op_index"] == 0
+    assert msg["order_id"] == str(failing_id)
+    assert msg["reason"] == "capacity_exceeded"
+    assert msg["rolled_back"] is True
 
 
 def test_run_scheduling_notifies_user_on_remove_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Symmetric to the add-failure path: when a ``remove`` op cannot be
-    applied (e.g. the order is no longer in the priority queue — typically
-    a stale CRUD producer or a race between cancel and rebuild), the task
-    must push ``schedule.remove_failed`` to the requester so the UI can
-    surface the inconsistency. Pre-fix this only logged a warning, leaving
-    the user with no signal at all.
+    """Compound containing a failing ``remove`` rolls back + WS-notifies.
+
+    Realistic trigger: a stale producer pushed a ``remove`` for an order
+    that's no longer in the pq (e.g. it was pinned out, or already removed
+    by a previous compound). The compound rolls back (no-op since remove
+    was the only op) and the requester gets ``schedule.compound_failed``
+    with ``failed_op="remove"`` so the UI can surface the inconsistency.
     """
     fake_redis = _FakeRedis()
 
     failing_id = uuid.uuid4()
     failing_user = uuid.uuid4()
-    op_fail = _make_op(
+    failing_compound_id = uuid.uuid4()
+    compound = _make_op(
         op="remove",
         order_id=failing_id,
         order_number="ORD-DEL",
         requested_by=failing_user,
     )
-    _enqueue(fake_redis, op_fail)
+    compound["compound_id"] = str(failing_compound_id)
+    _enqueue(fake_redis, compound)
 
     remove_mock = MagicMock(
         return_value=ScheduleResult(
@@ -369,9 +456,13 @@ def test_run_scheduling_notifies_user_on_remove_failure(
     assert mocks["notify_user"].call_count == 1
     kwargs = mocks["notify_user"].call_args.kwargs
     assert kwargs["user_id"] == failing_user
-    assert kwargs["message"]["type"] == "schedule.remove_failed"
-    assert kwargs["message"]["order_id"] == str(failing_id)
-    assert kwargs["message"]["reason"] == "deadline_too_far"
+    msg = kwargs["message"]
+    assert msg["type"] == "schedule.compound_failed"
+    assert msg["compound_id"] == str(failing_compound_id)
+    assert msg["failed_op"] == "remove"
+    assert msg["order_id"] == str(failing_id)
+    assert msg["reason"] == "deadline_too_far"
+    assert msg["rolled_back"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1176,16 +1267,118 @@ def test_run_scheduling_dispatches_pin_op_with_fake_deadline(
     assert fake_arg == date(2026, 5, 12)
 
 
-def test_run_scheduling_pin_failure_notifies_user(
+def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When ``pin_order`` returns capacity_exceeded, the worker must:
-       (1) keep processing the rest of the queue; and
-       (2) notify the requester via ``schedule.pin_failed``.
+    """Saga rollback invariant: a compound's earlier successful ops are
+    undone when a later op fails.
+
+    Setup: a compound of [remove, add] where ``add`` fails. State going in
+    has the order in pq with old qty; after rollback the order MUST still
+    be in pq with old qty — the remove that succeeded mid-compound got
+    reversed by snapshot restore.
+
+    This locks the Phase-2 atomicity contract: no partial mutation is ever
+    observable to ``_finalize_run`` after a failure.
+    """
+    from datetime import date as _date
+
+    from app.services.scheduling import SchedulingOrder, add_order
+
+    fake_redis = _FakeRedis()
+
+    # Pre-seed state in Redis with one order so remove has something real
+    # to undo and add can credibly fail.
+    state = SchedulerState.initial(_date(2026, 5, 5))
+    order_id = uuid.uuid4()
+    add_order(
+        state,
+        SchedulingOrder(
+            order_id=order_id,
+            order_number="ORD-EXISTING",
+            wafer_quantity=1000,
+            deadline=_date(2026, 5, 10),
+        ),
+    )
+    fake_redis.set(STATE_KEY, state.to_json())
+
+    failing_user = uuid.uuid4()
+    failing_compound_id = uuid.uuid4()
+    compound = _make_compound(
+        ops=[
+            _make_leaf_op(
+                op="remove",
+                order_id=order_id,
+                order_number="ORD-EXISTING",
+                wafer_quantity=1000,
+                deadline="2026-05-10",
+            ),
+            _make_leaf_op(
+                op="add",
+                order_id=order_id,
+                order_number="ORD-EXISTING",
+                wafer_quantity=999_999,  # too large — will fail capacity
+                deadline="2026-05-10",
+            ),
+        ],
+        group="grow",
+        requested_by=failing_user,
+        compound_id=failing_compound_id,
+    )
+    _enqueue(fake_redis, compound)
+
+    # No mocks for add/remove — we want the REAL algorithm to fail on the
+    # huge qty, so we can observe true state rollback.
+    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _: [])
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    notify_mock = MagicMock()
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # Compound failed → state in Redis should be UNCHANGED from pre-compound.
+    saved_raw = fake_redis.get(STATE_KEY)
+    assert saved_raw is not None
+    # State should NOT have been mutated by the failed compound. The
+    # cleanest check: the pre-compound snapshot we put in equals what's
+    # in Redis now (i.e., _save_state was never called because finalize
+    # only runs on success).
+    saved = SchedulerState.from_json(saved_raw)
+    assert len(saved.priority_queue) == 1
+    assert saved.priority_queue[0].order_id == order_id
+    assert saved.priority_queue[0].wafer_quantity == 1000
+
+    # WS notify shows the rollback to the requester.
+    assert notify_mock.call_count == 1
+    msg = notify_mock.call_args.kwargs["message"]
+    assert msg["type"] == "schedule.compound_failed"
+    assert msg["failed_op"] == "add"
+    assert msg["failed_op_index"] == 1
+    assert msg["rolled_back"] is True
+
+
+def test_run_scheduling_pin_failure_rolls_back_and_notifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 1-op pin compound that fails triggers a rollback + WS notify.
+
+    The next compound (a successful add) still runs on its own turn —
+    compound failures are independent across compounds. WS payload type
+    is the unified ``schedule.compound_failed`` (no more per-op
+    ``schedule.pin_failed``), with ``failed_op="pin"`` in the detail.
     """
     fake_redis = _FakeRedis()
     pin_user = uuid.uuid4()
-    pin_op = _make_op(
+    pin_compound_id = uuid.uuid4()
+    pin_compound = _make_op(
         op="pin",
         group="grow",
         order_number="PIN-FAIL",
@@ -1193,9 +1386,10 @@ def test_run_scheduling_pin_failure_notifies_user(
         fake_deadline="2026-05-12",
         requested_by=pin_user,
     )
-    follow_op = _make_op(order_number="ORD-OK")
-    _enqueue(fake_redis, pin_op)
-    _enqueue(fake_redis, follow_op)
+    pin_compound["compound_id"] = str(pin_compound_id)
+    follow_compound = _make_op(order_number="ORD-OK")
+    _enqueue(fake_redis, pin_compound)
+    _enqueue(fake_redis, follow_compound)
 
     pin_mock = MagicMock(
         return_value=ScheduleResult(
@@ -1210,20 +1404,23 @@ def test_run_scheduling_pin_failure_notifies_user(
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # Pin failed but follow-up add was still processed.
+    # Pin compound rolled back; the follow-up add compound ran on its own turn.
     assert pin_mock.call_count == 1
     assert mocks["add_order"].call_count == 1
 
-    # WS notify went to the pin requester with type=schedule.pin_failed.
-    pin_calls = [
+    # WS notify: schedule.compound_failed for the pin compound.
+    failed_calls = [
         c for c in mocks["notify_user"].call_args_list
-        if c.kwargs["message"]["type"] == "schedule.pin_failed"
+        if c.kwargs["message"]["type"] == "schedule.compound_failed"
     ]
-    assert len(pin_calls) == 1
-    payload = pin_calls[0].kwargs["message"]
-    assert pin_calls[0].kwargs["user_id"] == pin_user
+    assert len(failed_calls) == 1
+    payload = failed_calls[0].kwargs["message"]
+    assert failed_calls[0].kwargs["user_id"] == pin_user
+    assert payload["compound_id"] == str(pin_compound_id)
+    assert payload["failed_op"] == "pin"
     assert payload["order_number"] == "PIN-FAIL"
     assert payload["reason"] == "capacity_exceeded"
+    assert payload["rolled_back"] is True
 
 
 def test_run_scheduling_dispatches_unpin_op(

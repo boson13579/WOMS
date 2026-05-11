@@ -30,28 +30,27 @@ from app.core.db import get_db
 from app.core.security import require_roles
 from app.models.user import User, UserRole
 from app.schemas.schedule import (
-    ScheduleOperationRequest,
-    ScheduleOperationResponse,
+    ScheduleCompoundRequest,
+    ScheduleCompoundResponse,
     ScheduleRebuildResponse,
     ScheduleResultResponse,
     ScheduleStatusResponse,
     ScheduleTriggerResponse,
 )
 from app.services import order as order_service
+from app.services.schedule_queue import enqueue_compound
 from app.services.scheduling import (
-    PENDING_OPS_KEY,
-    PENDING_OPS_SEQ_KEY,
     STATE_KEY,
     STATUS_KEY,
     ScheduledResult,
     SchedulerState,
     compute_schedule,
-    score_for_op,
 )
 
 # Workers are a peer of services; api → workers is allowed *only* for
 # dispatching Celery task objects (``.delay()``). Anything else (Redis keys,
-# encoding helpers, internal flags) lives in ``app.services.scheduling``.
+# encoding helpers, internal flags) lives in ``app.services.scheduling`` or
+# ``app.services.schedule_queue``.
 from app.workers.scheduling import (
     rebuild_schedule_task,
     run_scheduling_task,
@@ -123,43 +122,45 @@ def trigger_scheduling(
 
 @router.post(
     "/operations",
-    response_model=ScheduleOperationResponse,
+    response_model=ScheduleCompoundResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
 def enqueue_operation(
-    request: ScheduleOperationRequest,
+    request: ScheduleCompoundRequest,
     current_user: User = Depends(_WRITE_ROLES),
-) -> ScheduleOperationResponse:
-    """Queue an order op for the next scheduling run.
+) -> ScheduleCompoundResponse:
+    """Queue a scheduler compound for the next ``run_scheduling_task``.
 
-    Order CRUD calls this after persisting create / update / delete. Modifying
-    a quantity or deadline must be split into ``remove`` (old values) followed
-    by ``add`` (new values) — the algorithm has no native ``modify``.
+    A compound is an atomic business action containing 1-4 leaf ops (add /
+    remove / pin / unpin). See :class:`ScheduleCompoundRequest` for the
+    full contract; in brief:
 
-    Backend writes to a Redis **sorted set** keyed by score
-    ``score_for_op(group, seq)`` — shrink ops sort before grow, FIFO inside
-    each group. ``seq`` is a per-op monotonic ``INCR`` so duplicate payloads
-    don't collide on the sorted-set member key, and so the worker's
-    ``ZPOPMIN`` is O(log n) regardless of queue depth.
+    - All ops in a compound target the same order_id.
+    - The compound has a single ``group`` (shrink or grow). Shrink
+      compounds sort before grow compounds in the worker queue; FIFO
+      within each group.
+    - Worker processes the compound atomically — any leaf-op failure
+      triggers a snapshot rollback of ``SchedulerState`` and a
+      ``schedule.compound_failed`` WebSocket message to ``requested_by``.
 
-    A new run fires only if the worker is currently idle; if it is already
-    running, the in-flight task will pick up this op when it loops back to
-    drain ``pending_ops`` at the end of its cycle.
+    Backed by a Redis **sorted set** scored by ``score_for_op(group, seq)``
+    where ``seq`` is the next value of ``schedule:pending_ops:seq``.
+    Worker ``ZPOPMIN``s one compound per ``run_scheduling_task``
+    invocation. All Redis I/O is delegated to
+    ``services.schedule_queue.enqueue_compound``.
+
+    A new ``run_scheduling_task`` fires only if the worker is currently
+    idle; if it is already running, the in-flight task will pick up this
+    compound when it loops back to drain ``pending_ops`` at the end of
+    its cycle.
 
     Permission: scheduler+.
     """
-    rds = _redis()
-    seq = cast("int", rds.incr(PENDING_OPS_SEQ_KEY))
-    payload = request.model_dump(mode="json")
-    payload["_seq"] = seq  # uniqueness guarantee for the sorted-set member
-    score = score_for_op(group=request.group, seq=seq)
-    rds.zadd(PENDING_OPS_KEY, {json.dumps(payload): score})
-
-    status_doc = _read_status()
-    if status_doc is None or status_doc.get("state") != "running":
-        run_scheduling_task.delay()
-
-    return ScheduleOperationResponse(message="Operation queued")
+    enqueue_compound(request)
+    return ScheduleCompoundResponse(
+        compound_id=request.compound_id,
+        message="Compound queued",
+    )
 
 
 # ---------------------------------------------------------------------------

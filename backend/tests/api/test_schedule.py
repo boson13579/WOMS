@@ -146,13 +146,18 @@ def _patch_redis_and_delay(monkeypatch, fake_redis: _FakeRedis) -> MagicMock:
     return delay_mock
 
 
-_VALID_OP_PAYLOAD = {
-    "op": "add",
-    "order_id": str(uuid.uuid4()),
-    "order_number": "ORD-OP-PAYLOAD",
-    "wafer_quantity": 100,
-    "deadline": "2026-08-01",
+_VALID_COMPOUND_PAYLOAD = {
+    "group": "grow",
     "requested_by": str(uuid.uuid4()),
+    "ops": [
+        {
+            "op": "add",
+            "order_id": str(uuid.uuid4()),
+            "order_number": "ORD-OP-PAYLOAD",
+            "wafer_quantity": 100,
+            "deadline": "2026-08-01",
+        }
+    ],
 }
 
 
@@ -217,62 +222,70 @@ def test_trigger_without_token_returns_401(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_operations_enqueues_and_triggers_when_idle(
-    client: TestClient, db_session: Session, monkeypatch
+def test_operations_enqueues_compound(
+    client: TestClient,
+    db_session: Session,
+    _autouse_mock_enqueue_compound: MagicMock,
 ) -> None:
-    fake_redis = _FakeRedis()
-    delay_mock = _patch_redis_and_delay(monkeypatch, fake_redis)
+    """Endpoint accepts compound shape and forwards to schedule_queue.
+
+    The autouse fixture has replaced ``enqueue_compound`` with a MagicMock,
+    so we don't need a fake Redis here — just verify the endpoint reached
+    the helper with the right payload.
+    """
     _make_user(db_session, username="sched_op_idle", role=UserRole.scheduler)
     token = _login(client, "sched_op_idle")
 
     res = client.post(
         "/api/v1/schedule/operations",
         headers=_auth(token),
-        json=_VALID_OP_PAYLOAD,
+        json=_VALID_COMPOUND_PAYLOAD,
     )
 
     assert res.status_code == 202
-    assert res.json()["message"] == "Operation queued"
-    # Op was pushed onto the pending queue.
-    assert fake_redis.zcard("schedule:pending_ops") == 1
-    # And a run was kicked off.
-    assert delay_mock.called
+    body = res.json()
+    assert body["message"] == "Compound queued"
+    assert "compound_id" in body
+    # enqueue_compound was called exactly once with the parsed compound.
+    assert _autouse_mock_enqueue_compound.call_count == 1
+    enqueued = _autouse_mock_enqueue_compound.call_args.args[0]
+    assert enqueued.group == "grow"
+    assert len(enqueued.ops) == 1
+    assert enqueued.ops[0].op == "add"
 
 
-def test_operations_skips_trigger_while_running(
-    client: TestClient, db_session: Session, monkeypatch
-) -> None:
-    fake_redis = _FakeRedis()
-    fake_redis.set("schedule:status", json.dumps({"state": "running"}))
-    delay_mock = _patch_redis_and_delay(monkeypatch, fake_redis)
-    _make_user(db_session, username="sched_op_run", role=UserRole.scheduler)
-    token = _login(client, "sched_op_run")
+def test_operations_rejects_empty_ops(client: TestClient, db_session: Session) -> None:
+    """The compound schema requires at least 1 op (``min_length=1``). Sending
+    an empty ``ops`` list trips a standard pydantic validation error — the
+    422 unified-error contract is what tests should observe.
+    """
+    _make_user(db_session, username="sched_op_empty", role=UserRole.scheduler)
+    token = _login(client, "sched_op_empty")
+
+    payload = {
+        "group": "grow",
+        "requested_by": str(uuid.uuid4()),
+        "ops": [],
+    }
 
     res = client.post(
         "/api/v1/schedule/operations",
         headers=_auth(token),
-        json=_VALID_OP_PAYLOAD,
+        json=payload,
     )
 
-    assert res.status_code == 202
-    # Op enqueued — the in-flight task picks it up at the end of its cycle.
-    assert fake_redis.zcard("schedule:pending_ops") == 1
-    # No fresh trigger.
-    assert not delay_mock.called
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
 
 
-def test_operations_by_viewer_returns_403(
-    client: TestClient, db_session: Session, monkeypatch
-) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+def test_operations_by_viewer_returns_403(client: TestClient, db_session: Session) -> None:
     _make_user(db_session, username="viewer_ops", role=UserRole.viewer)
     token = _login(client, "viewer_ops")
 
     res = client.post(
         "/api/v1/schedule/operations",
         headers=_auth(token),
-        json=_VALID_OP_PAYLOAD,
+        json=_VALID_COMPOUND_PAYLOAD,
     )
 
     assert res.status_code == 403
@@ -280,7 +293,7 @@ def test_operations_by_viewer_returns_403(
 
 
 def test_operations_without_token_returns_401(client: TestClient) -> None:
-    res = client.post("/api/v1/schedule/operations", json=_VALID_OP_PAYLOAD)
+    res = client.post("/api/v1/schedule/operations", json=_VALID_COMPOUND_PAYLOAD)
     assert res.status_code == 401
     assert res.json()["error"]["code"] == 401
 

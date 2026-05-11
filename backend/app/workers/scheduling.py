@@ -45,6 +45,7 @@ from app.services.scheduling import (
     PENDING_OPS_KEY,
     STATE_KEY,
     STATUS_KEY,
+    ScheduleResult,
     SchedulerState,
     SchedulingOrder,
     add_order,
@@ -185,25 +186,25 @@ def _is_waiter_pending() -> bool:
     return _get_redis().get(WAITER_FLAG_KEY) is not None
 
 
-def _pop_next_op() -> dict[str, Any] | None:
-    """Pop the highest-priority pending op, or ``None`` if the queue is empty.
+def _pop_next_compound() -> dict[str, Any] | None:
+    """Pop the highest-priority pending compound, or ``None`` if empty.
 
-    Priority: shrink-group ops before grow-group ops; FIFO within each group.
-    Both invariants are encoded in the sorted-set score by the producer
-    (``score_for_op``), so this function is just an atomic ``ZPOPMIN`` —
-    O(log n) regardless of queue depth, and no scan-and-sort like the old
-    list-based implementation.
+    Priority: shrink-group compounds before grow-group, FIFO within each
+    group. Both invariants are encoded in the sorted-set score by the
+    producer (``score_for_op``), so this function is just an atomic
+    ``ZPOPMIN`` — O(log n) regardless of queue depth.
 
-    Calling this in a loop — re-popping after every processed op — is what
-    lets a freshly-arrived shrink op interrupt the tail of an old grow batch:
-    its score (``< GROUP_OFFSET``) is smaller than every pending grow op's
-    score (``>= GROUP_OFFSET``), so the next ``ZPOPMIN`` picks it up before
-    any remaining grow.
+    Each sorted-set member is a JSON-serialized
+    :class:`ScheduleCompoundRequest` (with ``_seq`` added by
+    ``schedule_queue.enqueue_compound``). Worker processes the compound's
+    ops atomically; a freshly-arrived shrink compound CANNOT interrupt
+    a compound currently being processed — that's the atomicity guarantee
+    that supersedes the per-op "shrink jumps grow" mid-run behavior.
 
     Malformed JSON entries (shouldn't happen given the schema-validated
     producer, but Redis itself doesn't enforce content) are silently
     discarded with a warning; the loop continues until it finds a valid
-    op or empties the queue.
+    compound or empties the queue.
     """
     rds = _get_redis()
     while True:
@@ -214,7 +215,7 @@ def _pop_next_op() -> dict[str, Any] | None:
         try:
             return cast("dict[str, Any]", json.loads(member))
         except json.JSONDecodeError:
-            logger.warning("schedule.pending_op.malformed", raw=member)
+            logger.warning("schedule.pending_compound.malformed", raw=member)
             # Discarded by ZPOPMIN already; loop to try the next one.
 
 
@@ -229,110 +230,176 @@ def _op_to_scheduling_order(op: dict[str, Any]) -> SchedulingOrder:
 
 
 # ---------------------------------------------------------------------------
-# Pending-op application
+# Compound application
 # ---------------------------------------------------------------------------
 
 
-def _notify_op_failure(
-    *,
-    op_kind: str,
-    order: SchedulingOrder,
-    op: dict[str, Any],
-    result_status: str,
-    result_message: str | None,
-) -> None:
-    """Log + WS-notify a failed pending-op application.
+def _apply_op(state: SchedulerState, op: dict[str, Any]) -> ScheduleResult:
+    """Dispatch a single leaf op to the appropriate algorithm entrypoint.
 
-    Centralized so add / remove / pin / unpin use the same envelope shape
-    (``schedule.{op_kind}_failed``) and the same ``requested_by``-or-skip
-    fallback. Every failure is logged at WARNING; only ops with a
-    ``requested_by`` field generate a notify_user call.
+    Returns the ``ScheduleResult`` directly so the compound driver can
+    detect failure and trigger snapshot rollback. Malformed ops (unknown
+    ``op`` field, missing required keys) come back as ``capacity_exceeded``
+    with a clear message — same failure path as a legitimate algorithm
+    rejection, so the caller's rollback / WS code doesn't need to special-
+    case them.
+    """
+    op_type = op.get("op")
+    if op_type == "remove":
+        return remove_order(state, _op_to_scheduling_order(op))
+    if op_type == "add":
+        return add_order(state, _op_to_scheduling_order(op))
+    if op_type == "pin":
+        fake_raw = op.get("fake_deadline")
+        if fake_raw is None:
+            # Schema layer should have rejected this at enqueue time; if it
+            # still gets here the payload is malformed.
+            return ScheduleResult(
+                status="capacity_exceeded",
+                order_id=uuid.UUID(op["order_id"]),
+                message="op='pin' is missing fake_deadline.",
+            )
+        return pin_order(
+            state,
+            _op_to_scheduling_order(op),
+            date.fromisoformat(fake_raw),
+        )
+    if op_type == "unpin":
+        return unpin_order(state, uuid.UUID(op["order_id"]))
+    # Unknown op_type — surface as a structured failure.
+    logger.warning("schedule.compound.unknown_op", op=op_type)
+    return ScheduleResult(
+        status="capacity_exceeded",
+        order_id=uuid.UUID(op["order_id"]) if op.get("order_id") else None,
+        message=f"unknown op kind: {op_type!r}",
+    )
+
+
+def _notify_compound_failure(
+    *,
+    compound: dict[str, Any],
+    failed_op_index: int,
+    failed_op: dict[str, Any],
+    result: ScheduleResult,
+) -> None:
+    """Log + WS-notify a failed compound (post-rollback).
+
+    Envelope shape matches :class:`ScheduleCompoundFailedDetail` in
+    ``app.schemas.schedule`` so the frontend has a structured contract.
+    Only emits ``notify_user`` if ``requested_by`` is present on the
+    compound — internal-only compounds (no human originator) get logged
+    but not pushed to any WS recipient.
     """
     logger.warning(
-        f"schedule.run.{op_kind}_failed",
-        order_id=str(order.order_id),
-        status=result_status,
-        message=result_message,
+        "schedule.compound.failed",
+        compound_id=compound.get("compound_id"),
+        failed_op_index=failed_op_index,
+        failed_op=failed_op.get("op"),
+        status=result.status,
+        message=result.message,
     )
-    requested_by = op.get("requested_by")
+    requested_by = compound.get("requested_by")
     if not requested_by:
         return
     websocket.notify_user(
         user_id=uuid.UUID(requested_by),
         message={
-            "type": f"schedule.{op_kind}_failed",
-            "order_id": str(order.order_id),
-            "order_number": order.order_number,
-            "reason": result_status,
-            "detail": result_message,
+            "type": "schedule.compound_failed",
+            "compound_id": str(compound.get("compound_id")),
+            "failed_op_index": failed_op_index,
+            "failed_op": failed_op.get("op"),
+            "order_id": str(failed_op.get("order_id")),
+            "order_number": failed_op.get("order_number"),
+            "reason": result.status,
+            "detail": result.message,
+            "rolled_back": True,
         },
     )
 
 
-def _process_one(state: SchedulerState, op: dict[str, Any]) -> None:
-    """Run a single ``add``/``remove``/``pin``/``unpin`` against *state*."""
-    op_type = op.get("op")
-    if op_type not in ("add", "remove", "pin", "unpin"):
-        logger.warning("schedule.pending_op.unknown", op=op_type)
-        return
+def _restore_state_in_place(state: SchedulerState, snapshot_json: str) -> None:
+    """Mutate *state* in-place to match the JSON snapshot.
 
-    order = _op_to_scheduling_order(op)
+    Used by the compound driver to roll back to pre-compound state on any
+    leaf-op failure. We can't simply ``state = SchedulerState.from_json(...)``
+    because that just rebinds the local name; callers hold a reference and
+    expect the same object's internals to be updated.
+    """
+    restored = SchedulerState.from_json(snapshot_json)
+    state.capacity_tree = restored.capacity_tree
+    state.deadline_tree = restored.deadline_tree
+    state.priority_queue = restored.priority_queue
+    state.pinned_orders = restored.pinned_orders
+    state.base_date = restored.base_date
 
-    if op_type == "remove":
-        result = remove_order(state, order)
+
+def _process_compound(
+    state: SchedulerState,
+    compound: dict[str, Any],
+) -> bool:
+    """Apply a compound's ops in order, with snapshot-based saga rollback.
+
+    Steps:
+
+    1. Take a JSON snapshot of *state* (cheap — segment trees serialize as
+       small int arrays).
+    2. Iterate ops in order. Each calls into the appropriate algorithm
+       function (``add_order`` / ``remove_order`` / ``pin_order`` /
+       ``unpin_order``) and returns a :class:`ScheduleResult`.
+    3. **Any single leaf op returning non-success** → restore state from
+       the snapshot, emit ``schedule.compound_failed``, return ``False``.
+       No partial mutation is observable past this function's return.
+    4. All ops succeed → return ``True``. Caller will then ``_finalize_run``
+       to compute + persist + broadcast.
+
+    The whole compound is treated as one atomic unit; ``schedule:status``
+    stays ``running`` for the entire span (set by the caller before this
+    function is invoked, cleared after). That's the key invariant that lets
+    ``advance_day`` / ``rebuild`` no longer slip into the middle of a
+    compound — a problem the previous per-op design had.
+    """
+    snapshot = state.to_json()
+    ops: list[dict[str, Any]] = compound.get("ops", [])
+
+    for i, op in enumerate(ops):
+        result = _apply_op(state, op)
         if result.status != "success":
-            _notify_op_failure(
-                op_kind="remove",
-                order=order,
-                op=op,
-                result_status=result.status,
-                result_message=result.message,
+            _restore_state_in_place(state, snapshot)
+            _notify_compound_failure(
+                compound=compound,
+                failed_op_index=i,
+                failed_op=op,
+                result=result,
             )
-        return
+            return False
 
-    if op_type == "add":
-        result = add_order(state, order)
-        if result.status != "success":
-            _notify_op_failure(
-                op_kind="add",
-                order=order,
-                op=op,
-                result_status=result.status,
-                result_message=result.message,
-            )
-        return
+    logger.info(
+        "schedule.compound.success",
+        compound_id=compound.get("compound_id"),
+        op_count=len(ops),
+    )
+    return True
 
-    if op_type == "pin":
-        fake_raw = op.get("fake_deadline")
-        if fake_raw is None:
-            # Schema validation should have caught this in enqueue_operation;
-            # treat a missing fake_deadline at consumer time as a malformed op.
-            logger.warning(
-                "schedule.run.pin_missing_fake_deadline",
-                order_id=str(order.order_id),
-            )
-            return
-        fake = date.fromisoformat(fake_raw)
-        result = pin_order(state, order, fake)
-        if result.status != "success":
-            _notify_op_failure(
-                op_kind="pin",
-                order=order,
-                op=op,
-                result_status=result.status,
-                result_message=result.message,
-            )
-        return
 
-    # op_type == "unpin"
-    result = unpin_order(state, order.order_id)
-    if result.status != "success":
-        _notify_op_failure(
-            op_kind="unpin",
-            order=order,
-            op=op,
-            result_status=result.status,
-            result_message=result.message,
+def _drop_compound_index_entry(compound_id: str | None) -> None:
+    """Best-effort cleanup of the by-compound-id secondary index.
+
+    The index is maintained by ``schedule_queue.enqueue_compound`` so a
+    future cancel-by-compound-id endpoint can ``ZREM`` in O(1). Once we
+    ``ZPOPMIN`` a compound, the cancellation window is closed and the
+    index entry is stale — best-effort remove keeps Redis from growing
+    unboundedly.
+    """
+    if not compound_id:
+        return
+    try:
+        _get_redis().hdel("schedule:pending_ops:by_compound_id", compound_id)
+    except Exception as exc:
+        # Logging only; a stale index entry doesn't break correctness.
+        logger.warning(
+            "schedule.compound.index_cleanup_failed",
+            compound_id=compound_id,
+            error=str(exc),
         )
 
 
@@ -372,33 +439,39 @@ def _finalize_run(state: SchedulerState) -> int:
 
 @celery_app.task(bind=True, name="scheduling.run")  # type: ignore[untyped-decorator]
 def run_scheduling_task(self: Task) -> None:
-    """Process **one** pending op, persist, broadcast, and re-fire if more.
+    """Process **one compound** end-to-end, then re-fire if more queued.
 
     Each task invocation:
 
     1. Sets ``schedule:status`` to ``running``.
-    2. ``ZPOPMIN``s the highest-priority op (shrink before grow, FIFO inside
-       each group). If the queue is empty, sets status back to ``idle`` and
-       returns without computing anything — no state change, no broadcast.
-    3. Otherwise: applies the op to the in-memory state via ``_process_one``
-       (``add_order`` / ``remove_order`` plus per-op ``notify_user`` on
-       failure), then ``_finalize_run`` (compute schedule → write DB →
-       persist state to Redis → broadcast ``schedule.updated``).
+    2. ``ZPOPMIN``s the highest-priority compound (shrink-group compounds
+       sort before grow, FIFO within each group). If the queue is empty,
+       sets status back to ``idle`` and returns — no state change, no
+       broadcast.
+    3. Otherwise: applies the compound atomically via ``_process_compound``
+       (saga rollback on any leaf-op failure). On success, ``_finalize_run``
+       computes the schedule, writes DB, persists state, broadcasts. On
+       failure, state is rolled back, ``schedule.compound_failed`` is
+       notified, and **no finalize / broadcast** runs because state is
+       unchanged.
     4. Flips status back to ``idle``.
-    5. If more ops are still pending, ``self.delay()`` to fire another
-       invocation.
+    5. If more compounds are still pending, ``self.delay()`` to fire another
+       invocation (unless a waiter has set the ``schedule:waiter_pending``
+       flag, in which case yield to the waiter).
 
-    **Per-op design rationale**: between every op the status flips to
-    ``idle``, which lets ``advance_day_task`` / ``rebuild_schedule_task``
-    (both polling status) slip in after the *current* op finishes — they
-    no longer have to wait for the entire pending queue to drain. The
-    cost is that ``compute_schedule`` + ``apply_schedule`` + broadcast
-    runs N times instead of once for N ops; this trade-off is intentional
-    so the frontend gets per-op refresh signals and rebuilds can interleave
-    promptly with normal scheduling work.
+    **Compound atomicity invariant** (replaces the old per-op invariant):
+    ``schedule:status`` stays ``running`` for the entire compound — every
+    leaf op inside the compound runs without ``advance_day`` /
+    ``rebuild_schedule`` getting a chance to slip in. The trade-off vs.
+    per-op design: a long compound holds the lock longer, but the
+    correctness benefit (no cross-action interleaving in trees) outweighs
+    that.
 
-    On any exception the status is flipped to ``failed`` and re-raised so
-    Celery records the traceback.
+    On any exception (not a leaf-op failure — those are caught and turn
+    into rollback — but a genuine Python exception like a Redis outage)
+    the status is flipped to ``failed`` and re-raised so Celery records
+    the traceback. ``failed`` doesn't block subsequent ``/trigger`` calls
+    because the 409 logic only checks ``running``.
     """
     started_at = datetime.now(tz=UTC).isoformat()
     task_id = str(self.request.id) if self.request.id else None
@@ -406,9 +479,9 @@ def run_scheduling_task(self: Task) -> None:
     logger.info("schedule.run.start", task_id=task_id)
 
     try:
-        op = _pop_next_op()
+        compound = _pop_next_compound()
 
-        if op is None:
+        if compound is None:
             # Empty queue — flip back to idle without touching state.
             finished_at = datetime.now(tz=UTC).isoformat()
             _set_status(
@@ -420,9 +493,30 @@ def run_scheduling_task(self: Task) -> None:
             logger.info("schedule.run.empty_queue", task_id=task_id)
             return
 
+        # Best-effort secondary-index cleanup BEFORE applying — the compound
+        # is no longer cancellable now that we've popped it.
+        _drop_compound_index_entry(compound.get("compound_id"))
+
         state = _load_state()
-        _process_one(state, op)
-        scheduled_rows = _finalize_run(state)
+        applied = _process_compound(state, compound)
+
+        if applied:
+            # Compound succeeded end-to-end. Persist + broadcast.
+            scheduled_rows = _finalize_run(state)
+            logger.info(
+                "schedule.run.success",
+                task_id=task_id,
+                compound_id=compound.get("compound_id"),
+                scheduled_rows=scheduled_rows,
+            )
+        else:
+            # Compound rolled back. No state change, no broadcast — the
+            # WS notify_user already fired inside ``_process_compound``.
+            logger.info(
+                "schedule.run.rolled_back",
+                task_id=task_id,
+                compound_id=compound.get("compound_id"),
+            )
 
         finished_at = datetime.now(tz=UTC).isoformat()
         _set_status(
@@ -431,15 +525,10 @@ def run_scheduling_task(self: Task) -> None:
             finished_at=finished_at,
             task_id=task_id,
         )
-        logger.info(
-            "schedule.run.success",
-            task_id=task_id,
-            scheduled_rows=scheduled_rows,
-        )
 
-        # If more ops are queued (either pre-existing or arrived while we
-        # were running), fire another invocation so the next op gets
-        # processed without waiting for an external trigger.
+        # If more compounds are queued (either pre-existing or arrived
+        # while we were running), fire another invocation so the next
+        # compound gets processed without waiting for an external trigger.
         #
         # Exception: if a waiter task (advance_day / rebuild) has set the
         # waiter flag — meaning it's currently inside _wait_for_idle_run

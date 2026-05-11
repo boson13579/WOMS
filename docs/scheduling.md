@@ -118,52 +118,64 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 
 ---
 
-#### `POST /schedule/operations` — 推訂單操作進 pending_ops
+#### `POST /schedule/operations` — 推訂單 compound 進 pending_ops
 
-**功能**：接收一筆 `ScheduleOperationRequest`，`INCR schedule:pending_ops:seq` 拿到序號，計算 `score_for_op(group, seq)` 後 `ZADD schedule:pending_ops`；再看 `schedule:status`：
-- `state == "running"` → 不額外 `.delay()`，等當前 task 跑完時自我 re-trigger 撿起這筆。
-- 其他（`idle` / `failed` / 還沒有 status）→ 立刻 `run_scheduling_task.delay()`。
+> **Phase 2 變更**：endpoint 已從「一次接一筆 op」改成「一次接一個 compound」。Compound 是一組 1-4 筆 leaf ops，**worker 端 atomic 執行**：任何一筆 op 失敗就把整個 compound 連已成功的部分一起 snapshot rollback。Order CRUD 內部已自動 build 對應 compound（見下表），多數 producer 不必直接戳這支 endpoint。
 
-> sorted-set 的 score 同時編碼了「shrink 先於 grow」（高 bit）跟「組內 FIFO」（低 bit = seq），所以 worker 那邊單純做 `ZPOPMIN` 就能拿到優先序最高的 op，不用全 list 掃一遍。
+**功能**：接收一筆 `ScheduleCompoundRequest`，透過 `services.schedule_queue.enqueue_compound` 推進 sorted set（一個 compound = 一個 member）。`schedule:status` 是 `idle` / `failed` 就 `celery_app.send_task("scheduling.run")` 觸發 worker；`running` 就讓 in-flight task 自己 re-trigger 撿。
 
-**權限**：`scheduler+`（從另一個 backend 服務內部呼叫時也要帶 scheduler token）。
+> sorted-set 的 score 同時編碼了「shrink compound 先於 grow compound」跟「組內 FIFO」（seq），所以 worker 端只是 `ZPOPMIN` 拿下一個 compound 處理。Compound 內 ops 順序由 producer 安排，worker 不重排。
 
-**Request body**（見 §2.2 `ScheduleOperationRequest`）：
+**權限**：`scheduler+`。
+
+**Request body** (`ScheduleCompoundRequest`)：
 ```json
 {
-  "op": "add" | "remove" | "pin" | "unpin",
-  "order_id": "uuid",
-  "order_number": "ORD-20260505-0001",
-  "wafer_quantity": 200,
-  "deadline": "2026-06-15",
-  "fake_deadline": "2026-06-12",   // 只 op="pin" 才需要、其他 op 必須省略
-  "requested_by": "uuid"
+  "compound_id": "uuid",          // 系統會 default_factory 產生；cancel 時要用
+  "group": "shrink" | "grow",
+  "requested_by": "uuid",
+  "ops": [
+    {
+      "op": "add" | "remove" | "pin" | "unpin",
+      "order_id": "uuid",            // 同 compound 內所有 ops 必須同一個 order_id
+      "order_number": "ORD-...",
+      "wafer_quantity": 200,
+      "deadline": "2026-06-15",
+      "fake_deadline": "2026-06-12"  // 只 op="pin" 才填，其他 op 必須省略
+    }
+  ]
 }
 ```
 
-> `fake_deadline` 是「強制把訂單做在這天」的目標生產日，必須 ≤ `deadline`。schema 端的 validator 會在 `op="pin"` 沒填、或其他 op 多填的時候直接 422。
+Schema-level validation：
+- `ops` 至少 1 筆。
+- 所有 ops 必須對同一個 `order_id`（多 order 一次 = 業務 bug）。
+- `op="pin"` 必須帶 `fake_deadline`，其他 op 不得帶。
 
-**Response 202** (`ScheduleOperationResponse`)：
+**Response 202** (`ScheduleCompoundResponse`)：
 ```json
-{ "message": "Operation queued" }
+{ "compound_id": "uuid", "message": "Compound queued" }
 ```
-永遠 202 — 操作只是進佇列，實際排程結果走 WebSocket `schedule.updated` 通知。schema 看似簡單但跟其他 endpoint 一樣有 `response_model=`，這樣 OpenAPI 出來的 contract 才完整、未來要在 response 加欄位也不用改 endpoint signature。
+永遠 202 — 結果經 WebSocket 通知。成功 → `schedule.updated` broadcast；失敗 → `schedule.compound_failed` notify\_user（envelope 含 `compound_id` / `failed_op_index` / `failed_op` / `reason` / `rolled_back: true`）。
 
-**什麼時候會被叫**（這是 Order CRUD 的主要 integration point）：
+**Order CRUD 自動 build 的 compound**（service 層的 case-8 smart routing）：
 
-| Order CRUD 動作 | 該推幾筆 op |
-|---|---|
-| `POST /api/v1/orders` 新增訂單 | 1 筆 `add`（用新訂單的 quantity / deadline） |
-| `DELETE /api/v1/orders/{id}` 軟刪除 | 1 筆 `remove`（用刪除**前**的 quantity / deadline） |
-| `PATCH /api/v1/orders/{id}` 改 `wafer_quantity` 或 `requested_delivery_date` | **1 筆 `remove`（舊值）+ 1 筆 `add`（新值）**，順序不能反；若訂單目前 `is_pinned=true`，**前面再多推一筆 `unpin`**（先解 pin、再走 remove+add） |
-| `PATCH /api/v1/orders/batch-update` 批次改交期 | 對每筆 update 成功的訂單各推一對 `remove` + `add`（pinned 的順手 prepend 一筆 `unpin`） |
-| 「把這筆訂單鎖到某天做」 | 1 筆 `pin`，`fake_deadline` 設目標日 |
-| 「解除某筆訂單的 pin」 | 1 筆 `unpin` |
-| 修改不影響排程的欄位（`notes`、`assigned_to`、`customer_name` 等） | 不用推 |
+| Order CRUD 動作 | 自動 build 的 compound 內容 | Group |
+|---|---|---|
+| `POST /api/v1/orders` 新增訂單 | `[add(新)]` | grow |
+| `DELETE /api/v1/orders/{id}` 軟刪除（非 pinned） | `[remove(舊)]` | shrink |
+| `DELETE /api/v1/orders/{id}` 軟刪除（**pinned**） | `[unpin, remove(舊)]` | shrink |
+| `PATCH` 改 `wafer_quantity` / `requested_delivery_date`（非 pinned） | `[remove(舊), add(新)]` | shrink（defer / qty 變小）或 grow（advance / qty 變大） |
+| `PATCH` 改（**pinned**，新 deadline ≥ pin 日 AND 新 qty ≤ 舊 qty） | `[unpin, remove(舊), add(新), pin(原 pin 日)]` — **自動 re-pin** | 同上 |
+| `PATCH` 改（**pinned**，其他情況） | `[unpin, remove(舊), add(新)]` — **silent drop pin** | 同上 |
+| `PATCH` 只改 `notes` / `assigned_to` / `customer_name` 等 | 不推 compound | — |
+| `PATCH /orders/batch-update` | **每筆訂單獨立 1 個 compound**，內部規則同上 | 每筆獨立判斷 |
 
-> `requested_by` 必填。worker 處理 op 失敗時用這個 user id 推對應的 `schedule.{op}_failed` 通知（`add` / `remove` / `pin` / `unpin` 四條失敗路徑都統一格式）。
->
-> Producer 端對 pinned 訂單下 PATCH 時必須先 `unpin` 再 `remove+add`，原因是 worker 看到舊狀態的 `remove` 會在 pq 裡找不到該訂單（pinned 不在 pq）。`unpin` 跑完之後該訂單會回到 pq，後面的 `remove`+`add` 才能正常執行。
+Auto-re-pin 條件（case 14）：**兩個都要成立**才會在 compound 末尾加上 `pin(舊 pin 日)`：
+1. 新 deadline ≥ 舊 pin 日（否則 pin 日落到 deadline 之後，pin 在物理上不可能滿足）
+2. 新 qty ≤ 舊 qty（否則 pin 那天的 capacity 可能不夠，pin 會在 worker 那邊 fail，整個 compound rollback）
+
+「把訂單 pin 到某天」或「解除 pin」這兩個獨立 user action 目前**沒有專屬 endpoint**，前端直接打 `POST /schedule/operations` 帶單筆 `[pin]` 或 `[unpin]` 的 compound 就好。
 
 ---
 
@@ -331,10 +343,7 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 | 場景 | 走哪個 publisher | payload |
 |---|---|---|
 | 排程完成、結果有更新 | `broadcast` | `{"type": "schedule.updated"}` |
-| `add` 失敗（產能不夠 / deadline 超 30 天） | `notify_user` | `{"type": "schedule.add_failed", "order_id": "...", "order_number": "...", "reason": "capacity_exceeded"\|"deadline_too_far", "detail": "..."}` |
-| `remove` 失敗（pq 找不到該訂單，通常代表狀態已不一致） | `notify_user` | `{"type": "schedule.remove_failed", "order_id": "...", "order_number": "...", "reason": "...", "detail": "..."}` |
-| `pin` 失敗（pin 日 capacity 不足、超 horizon、或訂單不在 pq） | `notify_user` | `{"type": "schedule.pin_failed", "order_id": "...", "order_number": "...", "reason": "capacity_exceeded"\|"deadline_too_far", "detail": "..."}` |
-| `unpin` 失敗（訂單不在 pinned_orders；通常是 producer 重複送了 unpin） | `notify_user` | `{"type": "schedule.unpin_failed", "order_id": "...", "order_number": "...", "reason": "...", "detail": "..."}` |
+| Compound 內任何一筆 op 失敗（add / remove / pin / unpin 任一） | `notify_user` | `{"type": "schedule.compound_failed", "compound_id": "...", "failed_op_index": N, "failed_op": "add"\|"remove"\|"pin"\|"unpin", "order_id": "...", "order_number": "...", "reason": "capacity_exceeded"\|"deadline_too_far", "detail": "...", "rolled_back": true}` |
 | rebuild 時某筆 scheduled 訂單塞不回去（通常是 deadline 已被 `base_date` 越過） | `notify_user` | `{"type": "schedule.rebuild_skipped", "order_id": "...", "order_number": "...", "reason": "deadline_too_far"\|"capacity_exceeded"}` |
 
 **前端怎麼接**：
@@ -598,9 +607,18 @@ run_scheduling_task.delay()
 3. `_save_state(state)` 序列化回 `schedule:state`
 4. `websocket.broadcast({"type": "schedule.updated"})`
 
-#### `run_scheduling_task` — **per-op 模式**
+#### `run_scheduling_task` — **per-compound 模式**（Phase 2）
 
-每次 task 呼叫只處理**一筆** op，跑完就把 status 翻回 `idle`，看還有沒有 pending 才再 `.delay()` 自己。設計動機 §4.3 說明。
+每次 task 呼叫處理**一個 compound**（含 1-N 筆 leaf ops），整個 compound 期間 `schedule:status` 維持 `running`，跑完才翻回 `idle`，看還有沒有 pending compound 才再 `.delay()` 自己。
+
+Compound 內 ops 失敗的 saga rollback 行為：
+
+1. **進 compound 前**：`SchedulerState.to_json()` 拍 snapshot。
+2. **逐 op 套用**：每筆 `_apply_op(state, op)` 回 `ScheduleResult`。
+3. **任何一筆失敗**：`SchedulerState.from_json(snapshot)` 把 state 還原回 pre-compound → WS `schedule.compound_failed` → return False（**不**進 `_finalize_run`，state 不寫回 Redis、不 broadcast）。
+4. **全部成功**：`_finalize_run` 算 schedule、寫 DB、save\_state、broadcast `schedule.updated`。
+
+`advance_day` / `rebuild` 不能在 compound 中間插隊，因為 status 在整段期間都是 `running`。這比 Phase 1 的 per-op 模式給了 compound 真正的 atomicity 保證。設計動機 §4.3 說明。
 
 1. `_set_status("running")` 寫 `schedule:status`
 2. `_pop_next_op()` 直接 `ZPOPMIN schedule:pending_ops` 拿一筆。
@@ -1173,7 +1191,7 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 
 ---
 
-#### `backend/tests/workers/test_scheduling_task.py` — Celery task body（22 個）
+#### `backend/tests/workers/test_scheduling_task.py` — Celery task body（23 個）
 
 這組測試在驗「Celery task 的編排邏輯」，也就是 `run_scheduling_task`、`advance_day_task`、`rebuild_schedule_task` 這三個函式的「主體行為」，而不是演算法本身（演算法已在 services 那組測了）。
 
@@ -1491,7 +1509,9 @@ WebSocket 的測試分三個層次，每個層次的目的不同：
 
 ---
 
-#### `backend/tests/services/test_order.py` — `apply_schedule` 稽核 DB 寫入（2 個，PR-review 補強）
+#### `backend/tests/services/test_order.py` — `apply_schedule` 稽核 + case-8 smart routing（10 個）
+
+包括 PR-review 補強的 2 個 `apply_schedule` audit DB 測試，再加 Phase 2 新增的 8 個 compound build 測試 — 涵蓋 create / delete（pinned / 非 pinned）/ update（純 modify / pinned auto-re-pin / pinned silent-drop / notes-only skip）。每個都驗證 `enqueue_compound` 被呼叫時帶的是哪一種 ops 序列、哪一個 group。
 
 這份檔案的範圍刻意收窄 — 只圍繞 PR review 第 3 點要求的「`apply_schedule` 必須把 `order.scheduled` 事件落到 `audit_logs` DB table，而不是只發 stdout audit log」這個契約。`services/order.py` 的其他路徑（CRUD、batch update 等）的測試覆蓋不在這個檔案的範圍內，靠 `tests/api/test_orders.py` 的 endpoint 測試從上層帶到。
 

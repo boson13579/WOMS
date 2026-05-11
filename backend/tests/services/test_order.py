@@ -15,15 +15,31 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
+from unittest.mock import MagicMock
 
 import bcrypt
+import pytest
 from app.models.audit_log import AuditLog
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
+from app.schemas.order import CreateOrderRequest, UpdateOrderRequest
 from app.services import order as order_service
 from app.services.scheduling import ScheduledResult
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+
+@pytest.fixture
+def mock_enqueue(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Capture ``enqueue_compound`` calls made by the order service.
+
+    Order CRUD now pushes compounds to the scheduler queue after every
+    create / update / delete; tests that don't need a live Redis bind the
+    helper to a mock and inspect what compound the service built.
+    """
+    mock = MagicMock()
+    monkeypatch.setattr("app.services.order.enqueue_compound", mock)
+    return mock
 
 
 def _make_user(db: Session, *, username: str) -> User:
@@ -188,3 +204,268 @@ def test_apply_schedule_clears_stale_pin_columns_on_orders_no_longer_in_state(
     assert stale.expected_delivery_date is None
     assert stale.is_pinned is False
     assert stale.pinned_production_date is None
+
+
+# ---------------------------------------------------------------------------
+# Case 8 smart-routing in update_order (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def _make_pinned_order(
+    db: Session,
+    *,
+    creator_id: uuid.UUID,
+    order_number: str,
+    deadline: date,
+    pin_day: date,
+    quantity: int = 100,
+) -> Order:
+    """Build a row that's already gone through the scheduler:
+    status=scheduled, is_pinned=True, pinned_production_date=pin_day.
+    """
+    order = Order(
+        order_number=order_number,
+        customer_name="ACME",
+        wafer_quantity=quantity,
+        requested_delivery_date=deadline,
+        scheduled_production_date=pin_day,
+        expected_delivery_date=pin_day,
+        created_by=creator_id,
+        status=OrderStatus.scheduled,
+        is_pinned=True,
+        pinned_production_date=pin_day,
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def test_update_order_unpinned_pushes_remove_add_compound(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """PATCH on a non-pinned order pushes ``[remove(old), add(new)]``.
+
+    Group = shrink for defer (deadline later) — matches old per-op rule.
+    No pin / unpin appear in the compound for a never-pinned order.
+    """
+    creator = _make_user(db_session, username="sru-1")
+    order = Order(
+        order_number="ORD-NP",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    req = UpdateOrderRequest(
+        requested_delivery_date=date(2026, 5, 25),  # defer
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    assert mock_enqueue.call_count == 1
+    compound = mock_enqueue.call_args.args[0]
+    assert compound.group == "shrink"  # defer = shrink
+    op_kinds = [op.op for op in compound.ops]
+    assert op_kinds == ["remove", "add"]
+    assert compound.ops[0].deadline == date(2026, 5, 20)  # old
+    assert compound.ops[1].deadline == date(2026, 5, 25)  # new
+
+
+def test_update_order_pinned_with_compatible_change_auto_re_pins(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """Case 14: PATCH on a pinned order where (new deadline >= pin day) AND
+    (new qty <= old qty) → compound is ``[unpin, remove, add, pin(same day)]``.
+
+    "Compatible" = pin day's capacity won't be exceeded by the new values.
+    Auto re-pin preserves the user's pin intent without them re-issuing it.
+    """
+    creator = _make_user(db_session, username="sru-2")
+    pin_day = date(2026, 5, 15)
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-PIN-OK",
+        deadline=date(2026, 5, 20),
+        pin_day=pin_day,
+        quantity=100,
+    )
+
+    req = UpdateOrderRequest(
+        wafer_quantity=80,  # smaller — OK
+        requested_delivery_date=date(2026, 5, 25),  # deferred — still ≥ pin day
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    assert mock_enqueue.call_count == 1
+    compound = mock_enqueue.call_args.args[0]
+    op_kinds = [op.op for op in compound.ops]
+    assert op_kinds == ["unpin", "remove", "add", "pin"]
+    # The re-pin uses the SAME pin day, the new qty, and the new deadline.
+    pin_op = compound.ops[3]
+    assert pin_op.fake_deadline == pin_day
+    assert pin_op.wafer_quantity == 80
+    assert pin_op.deadline == date(2026, 5, 25)
+
+
+def test_update_order_pinned_with_qty_increase_silent_drops_pin(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """Case 14 negative: qty increased, so pin day's capacity might overflow.
+    Per spec we silent-drop the pin — compound is ``[unpin, remove, add]``
+    WITHOUT the trailing pin. User can re-pin manually if desired.
+    """
+    creator = _make_user(db_session, username="sru-3")
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-PIN-DROP",
+        deadline=date(2026, 5, 20),
+        pin_day=date(2026, 5, 15),
+        quantity=100,
+    )
+
+    req = UpdateOrderRequest(
+        wafer_quantity=200,  # bigger — disqualifies auto-re-pin
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    op_kinds = [op.op for op in compound.ops]
+    assert op_kinds == ["unpin", "remove", "add"]
+
+
+def test_update_order_pinned_with_deadline_before_pin_day_silent_drops_pin(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """Case 13: new deadline < pin day. Pin day is no longer a valid
+    production day for this order, so silent-drop pin.
+    """
+    creator = _make_user(db_session, username="sru-4")
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-PIN-DL",
+        deadline=date(2026, 5, 20),
+        pin_day=date(2026, 5, 15),
+        quantity=100,
+    )
+
+    req = UpdateOrderRequest(
+        requested_delivery_date=date(2026, 5, 10),  # BEFORE pin day
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    op_kinds = [op.op for op in compound.ops]
+    assert op_kinds == ["unpin", "remove", "add"]
+
+
+def test_update_order_notes_only_skips_compound(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """A PATCH that only touches non-scheduling fields (notes) doesn't push
+    any compound to the queue. The order still flips back to ``pending``
+    via the existing status guard, but the scheduler doesn't need to do
+    anything.
+    """
+    creator = _make_user(db_session, username="sru-5")
+    order = Order(
+        order_number="ORD-NOTES",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+        notes=None,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    req = UpdateOrderRequest(
+        notes="rush job",
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    assert mock_enqueue.call_count == 0
+
+
+def test_create_order_pushes_add_compound(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """create_order pushes a 1-op ``[add]`` compound (group=grow).
+
+    Also confirms is_processing_locked is set so the frontend can disable
+    edits while the worker handles the add.
+    """
+    creator = _make_user(db_session, username="sru-6")
+    req = CreateOrderRequest(
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+    )
+    order_service.create_order(db_session, req, creator)
+
+    assert mock_enqueue.call_count == 1
+    compound = mock_enqueue.call_args.args[0]
+    assert compound.group == "grow"
+    assert [op.op for op in compound.ops] == ["add"]
+
+
+def test_delete_order_unpinned_pushes_remove_compound(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """delete_order on a non-pinned order pushes ``[remove]`` (group=shrink)."""
+    creator = _make_user(db_session, username="sru-7")
+    order = Order(
+        order_number="ORD-DEL-NP",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    order_service.delete_order(db_session, order.id, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert compound.group == "shrink"
+    assert [op.op for op in compound.ops] == ["remove"]
+
+
+def test_delete_order_pinned_pushes_unpin_then_remove_compound(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """delete_order on a pinned order pushes ``[unpin, remove]``.
+
+    Without the prepended unpin, the worker's membership guard would 反爆 —
+    pinned orders live in ``pinned_orders``, not pq. Order service
+    auto-handles this so producers don't have to.
+    """
+    creator = _make_user(db_session, username="sru-8")
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-DEL-P",
+        deadline=date(2026, 5, 20),
+        pin_day=date(2026, 5, 15),
+    )
+
+    order_service.delete_order(db_session, order.id, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert [op.op for op in compound.ops] == ["unpin", "remove"]
