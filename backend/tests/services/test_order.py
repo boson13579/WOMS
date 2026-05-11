@@ -146,3 +146,45 @@ def test_apply_schedule_with_no_results_writes_no_audit_rows(db_session: Session
 
     rows = db_session.scalars(select(AuditLog).where(AuditLog.action == "order.scheduled")).all()
     assert list(rows) == []
+
+
+def test_apply_schedule_clears_stale_pin_columns_on_orders_no_longer_in_state(
+    db_session: Session,
+) -> None:
+    """If a previously-pinned order is no longer in the new schedule (e.g.
+    advance_day removed it because its pin day was today and it's now in
+    production), the DB's ``is_pinned`` / ``pinned_production_date`` must
+    be wiped — they reflect "currently pinned", not "was once pinned".
+
+    Without the wipe, that order would stay ``is_pinned=true`` forever
+    pointing at a date that's already past, confusing the frontend lock UI
+    and showing wrong info in the orders list.
+    """
+    creator = _make_user(db_session, username="apply-sched-user-3")
+    # Seed a stale order: it was pinned, scheduled, etc., but the new
+    # apply_schedule run no longer includes it.
+    stale = Order(
+        order_number="ORD-STALE-PIN",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 25),
+        created_by=creator.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=date(2026, 5, 10),
+        expected_delivery_date=date(2026, 5, 10),
+        is_pinned=True,
+        pinned_production_date=date(2026, 5, 10),
+    )
+    db_session.add(stale)
+    db_session.commit()
+
+    # New apply_schedule run with EMPTY scheduled list — the stale order is
+    # no longer part of the schedule.
+    order_service.apply_schedule(db_session, [])
+
+    db_session.refresh(stale)
+    # Dates + pin columns all wiped; the stale row no longer reads as pinned.
+    assert stale.scheduled_production_date is None
+    assert stale.expected_delivery_date is None
+    assert stale.is_pinned is False
+    assert stale.pinned_production_date is None

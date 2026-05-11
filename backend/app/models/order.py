@@ -92,3 +92,31 @@ class Order(Base):
         sa.Text,
         nullable=True,
     )
+
+    # ----- Pin fields ------------------------------------------------------
+    # Two independent flags, both spec'd in docs/scheduling.md §pinning:
+    #
+    # ``is_pinned`` + ``pinned_production_date`` form the *production pin*: a
+    # user-requested forced production day (must be ≤ requested_delivery_date).
+    # When the scheduler accepts the request, it stores the pin day here and
+    # treats the order as fixed-on-that-day in segment trees / compute_schedule.
+    # ``pinned_production_date`` is null whenever ``is_pinned`` is false.
+    #
+    # ``is_processing_locked`` is the *editing-lock pin*: set true while an op
+    # for this order is in flight in the scheduler queue, cleared once the
+    # worker has applied it. The frontend treats it as "do not let the user
+    # edit this row right now" — a UX hint, not a hard authorization gate.
+    pinned_production_date: Mapped[date | None] = mapped_column(
+        sa.Date,
+        nullable=True,
+    )
+    is_pinned: Mapped[bool] = mapped_column(
+        sa.Boolean,
+        nullable=False,
+        server_default=sa.false(),
+    )
+    is_processing_locked: Mapped[bool] = mapped_column(
+        sa.Boolean,
+        nullable=False,
+        server_default=sa.false(),
+    )

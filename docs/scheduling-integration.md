@@ -135,10 +135,40 @@ def on_order_deadline_extended(order_old, order_new, actor):
 
 ### 2.5 注意事項
 
-- **`requested_by` 一定要填**：排程失敗（產能不夠 / deadline 超 30 天）會透過 WebSocket 推 `schedule.add_failed` 給這個 user_id。沒填的話通知不會送出。
+- **`requested_by` 一定要填**：排程失敗（產能不夠 / deadline 超 30 天 / pin 那天 capacity 不足）會透過 WebSocket 推 `schedule.{op}_failed`（`add` / `remove` / `pin` / `unpin`）給這個 user_id。沒填的話通知不會送出。
 - **不需要等排程跑完**：endpoint 回 202 就可以接著做事，排程是 async。前端會透過 WebSocket 收到 `schedule.updated` 知道結果。
-- **單純的 `add` / `remove` 可以省略 `group`**：schema validator 會用 `op` 推預設（`remove → shrink`、`add → grow`）。**但複合更新一定要顯式帶**，不然會出錯。
+- **單純的 `add` / `remove` / `pin` / `unpin` 可以省略 `group`**：schema validator 會用 `op` 推預設（`remove`/`unpin → shrink`、`add`/`pin → grow`）。**但複合更新一定要顯式帶**，不然會出錯。
 - **權限**：`POST /schedule/operations` 要 `scheduler+`。從 Order CRUD 內部呼叫時要帶 scheduler 等級的 service token。
+
+### 2.6 Pin / Unpin op
+
+訂單可以被「鎖到指定生產日」，由 producer 推一筆 `op="pin"` 操作即可：
+
+```python
+httpx.post(URL, json={
+    "order_id": str(order.id),
+    "order_number": order.order_number,
+    "wafer_quantity": order.wafer_quantity,
+    "deadline": order.requested_delivery_date.isoformat(),  # 真 deadline
+    "op": "pin",
+    "fake_deadline": "2026-05-12",  # 強制這天做掉，必須 ≤ deadline
+    "requested_by": str(actor.id),
+})
+```
+
+接受條件：worker 嘗試把訂單從 pq 移到 `pinned_orders`，trees 改用 `fake_deadline` 索引；如果那天 capacity 不足會回 `schedule.pin_failed`，state 不變。**不會**自動找替代日 — 要不要重試是 producer 的決定。
+
+解 pin 推 `op="unpin"`（不需要 `fake_deadline`）。
+
+**對 pinned 訂單下 PATCH 必須先解 pin**：worker 看到 pinned 訂單的 `remove` op 會在 pq 找不到該訂單而回 `schedule.remove_failed`。所以正確順序是：
+
+```
+unpin (shrink) → remove 舊值 (shrink/grow，依 update 種類) → add 新值 (同 group)
+```
+
+`is_pinned` / `pinned_production_date` 會在 worker 處理完 unpin op 之後由 `apply_schedule` 寫回 DB，所以前端拿到的訂單列表只要在 PATCH 前看到 `is_pinned=true` 就要記得 prepend 一筆 unpin。
+
+`is_processing_locked` 是另一個獨立的 flag — 在 order CRUD 階段就被設成 true，等到該訂單下次被 `apply_schedule` 處理才清成 false。前端拿來在那段時間 disable 該列的 inline edit，但不影響演算法行為。
 
 ---
 
@@ -267,6 +297,8 @@ ws.addEventListener("close", (e) => {
 | `schedule.updated` | 任何排程結果有變動（單筆 op 處理完、換天、rebuild） | **所有連線的 client**（broadcast） | `{ type: "schedule.updated" }` |
 | `schedule.add_failed` | `add_order` 失敗（產能 / horizon） | 訂單的 `requested_by` user | `{ type, order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail }` |
 | `schedule.remove_failed` | `remove_order` 失敗（一般是訂單已不在 pq、典型場景是 race 或重複的 cancel op） | 訂單的 `requested_by` user | `{ type, order_id, order_number, reason: "deadline_too_far", detail }` |
+| `schedule.pin_failed` | `pin_order` 失敗（pin 那天 capacity 不夠 / 超 horizon / 訂單不在 pq） | pin 操作的 `requested_by` user | `{ type, order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail }` |
+| `schedule.unpin_failed` | `unpin_order` 失敗（訂單目前不在 `pinned_orders`、通常是重複送 unpin） | unpin 操作的 `requested_by` user | `{ type, order_id, order_number, reason, detail }` |
 | `schedule.rebuild_skipped` | rebuild 時某筆 scheduled 訂單塞不回去（通常 deadline 已被 base_date 越過） | 訂單的 `created_by` user | `{ type, order_id, order_number, reason: "deadline_too_far"\|"capacity_exceeded" }` |
 
 ### 3.4 前端注意事項

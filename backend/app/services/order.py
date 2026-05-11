@@ -101,7 +101,13 @@ def _write_audit(
 
 
 def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResponse:
-    """Create an order, write audit log, and return the response schema."""
+    """Create an order, write audit log, and return the response schema.
+
+    Newly-created orders enter the pending pool, so ``is_processing_locked``
+    is set immediately — the frontend uses it to disable inline edits until
+    the scheduler has applied the pending op (``apply_schedule`` clears it
+    via ``set_schedule_dates``).
+    """
     order_number = _generate_order_number(db)
     order = order_repo.create(
         db,
@@ -113,6 +119,7 @@ def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResp
         assigned_to=req.assigned_to,
         notes=req.notes,
     )
+    order.is_processing_locked = True
     new_val: dict[str, Any] = {
         "customer_name": order.customer_name,
         "wafer_quantity": order.wafer_quantity,
@@ -200,6 +207,13 @@ def update_order(
     if "notes" in req.model_fields_set:
         order.notes = req.notes
     order.status = OrderStatus.pending
+    # Order is back in the pending pool waiting for the worker to apply the
+    # follow-up remove/add ops; relock the editing UI until apply_schedule
+    # clears the flag again. Production pin (is_pinned) stays untouched in
+    # the DB column — the producer of the schedule ops (frontend / API
+    # caller) is responsible for prepending an unpin op so the worker
+    # eventually rewrites is_pinned=false via apply_schedule.
+    order.is_processing_locked = True
 
     new_val: dict[str, Any] = {
         "wafer_quantity": order.wafer_quantity,
@@ -271,6 +285,7 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
             old_date = str(order.requested_delivery_date)
             order.requested_delivery_date = req.requested_delivery_date
             order.status = OrderStatus.pending
+            order.is_processing_locked = True
             _write_audit(
                 db,
                 action="order.updated",
@@ -391,6 +406,13 @@ def list_for_scheduler(
             order_number=r.order_number,
             wafer_quantity=r.wafer_quantity,
             deadline=r.requested_delivery_date,
+            # Pin info is read at rebuild time so pinned orders land back
+            # in pinned_orders rather than the pq. Only populate when the
+            # row has both flags set — defends against a stale DB row with
+            # is_pinned=true but no pinned_production_date.
+            pinned_production_date=(
+                r.pinned_production_date if r.is_pinned and r.pinned_production_date else None
+            ),
         )
         for r in rows
     ]
@@ -398,7 +420,11 @@ def list_for_scheduler(
     return orders, creators
 
 
-def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
+def apply_schedule(
+    db: Session,
+    scheduled: list[ScheduledResult],
+    pinned: dict[uuid.UUID, date] | None = None,
+) -> int:
     """Persist a freshly-computed schedule to the orders table.
 
     A single order can split across multiple days in `scheduled`; we collapse
@@ -406,9 +432,17 @@ def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
     schedule wholesale, then write the new dates and flip status to
     `scheduled`. One system-level audit record is emitted per order.
 
+    ``pinned`` (optional) maps ``order_id -> fake_deadline`` and reflects the
+    current ``state.pinned_orders``. Orders present in this map land in DB
+    with ``is_pinned=true`` and ``pinned_production_date=fake_deadline``;
+    orders absent from it have both pin columns cleared. Pass ``None`` (or
+    omit) when no pin information is available — equivalent to "no orders
+    are pinned".
+
     Returns the number of orders that were marked as scheduled.
     """
     order_repo.clear_scheduled_dates(db)
+    pinned_map = pinned or {}
 
     per_order: dict[uuid.UUID, tuple[date, date]] = {}
     for sr in scheduled:
@@ -424,11 +458,14 @@ def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
 
     applied = 0
     for order_id, (earliest, latest) in per_order.items():
+        is_pinned = order_id in pinned_map
         order = order_repo.set_schedule_dates(
             db,
             order_id=order_id,
             scheduled_production_date=earliest,
             expected_delivery_date=latest,
+            is_pinned=is_pinned,
+            pinned_production_date=pinned_map.get(order_id),
         )
         if order is None:
             logger.warning(
@@ -437,11 +474,13 @@ def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
             )
             continue
         applied += 1
-        new_value = {
+        new_value: dict[str, Any] = {
             "scheduled_production_date": str(earliest),
             "expected_delivery_date": str(latest),
             "status": OrderStatus.scheduled.value,
         }
+        if is_pinned:
+            new_value["pinned_production_date"] = str(pinned_map[order_id])
         # Persist to audit_logs DB table — required by PRD §1.6 so the
         # scheduling history is queryable from Postgres, not only from log
         # shippers. user_id=None marks this as system-driven.

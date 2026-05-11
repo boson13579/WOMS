@@ -152,17 +152,28 @@ def get_scheduled(db: Session) -> list[Order]:
 
 
 def clear_scheduled_dates(db: Session) -> int:
-    """Bulk-clear `scheduled_production_date` and `expected_delivery_date`.
+    """Bulk-clear scheduling-state columns on every active scheduled order.
 
-    Used by the scheduler before writing the new assignment so any stale
-    per-order dates are wiped in one round-trip. Returns the number of
-    rows touched.
+    Wipes ``scheduled_production_date`` / ``expected_delivery_date`` (so
+    stale dates don't leak past a re-run) AND the two pin columns
+    ``is_pinned`` / ``pinned_production_date`` (so an order that was
+    pinned and then advance_day-ed out of state doesn't keep a stale
+    is_pinned=true forever — its scheduling state is gone, the pin flag
+    should be too). ``set_schedule_dates`` rewrites the appropriate values
+    per-row immediately after, so the bulk clear is safe to be wide.
+
+    Returns the number of rows touched.
     """
     stmt = (
         update(Order)
         .where(Order.is_deleted.is_(False))
         .where(Order.status == OrderStatus.scheduled)
-        .values(scheduled_production_date=None, expected_delivery_date=None)
+        .values(
+            scheduled_production_date=None,
+            expected_delivery_date=None,
+            is_pinned=False,
+            pinned_production_date=None,
+        )
     )
     # ``Session.execute`` is typed as ``Result[Any]`` but for an UPDATE it
     # actually returns a ``CursorResult`` which carries ``rowcount``.
@@ -176,8 +187,16 @@ def set_schedule_dates(
     order_id: uuid.UUID,
     scheduled_production_date: date,
     expected_delivery_date: date,
+    is_pinned: bool = False,
+    pinned_production_date: date | None = None,
 ) -> Order | None:
     """Mark an order as scheduled with explicit production / delivery dates.
+
+    Also rewrites the pin columns: when ``is_pinned`` is true the row is
+    locked to ``pinned_production_date``; otherwise both pin columns are
+    cleared. ``is_processing_locked`` is always cleared here — landing in
+    ``apply_schedule`` means the worker has finished its op for this order
+    and the frontend may unlock the row for editing again.
 
     Returns the refreshed entity, or `None` if the order is missing or
     soft-deleted (caller decides how to react).
@@ -189,6 +208,9 @@ def set_schedule_dates(
     order.scheduled_production_date = scheduled_production_date
     order.expected_delivery_date = expected_delivery_date
     order.status = OrderStatus.scheduled
+    order.is_pinned = is_pinned
+    order.pinned_production_date = pinned_production_date if is_pinned else None
+    order.is_processing_locked = False
     db.flush()
     db.refresh(order)
     return order

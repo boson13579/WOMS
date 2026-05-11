@@ -32,14 +32,26 @@ class ScheduleOperationRequest(BaseModel):
     The Order CRUD layer fires one of these for every create / cancel, and a
     pair (``remove`` then ``add``) for every quantity / deadline edit.
 
+    Op kinds:
+
+    - ``"add"`` / ``"remove"`` — standard schedule mutation (used by Order
+      CRUD). Compound updates push ``remove`` then ``add`` with matching
+      group tags.
+    - ``"pin"`` — lock an order to a specific ``fake_deadline`` (must be
+      ≤ real deadline). Worker calls ``pin_order``; on success the order
+      moves from pq to ``pinned_orders``; on failure WS
+      ``schedule.pin_failed`` notifies ``requested_by``.
+    - ``"unpin"`` — release a pinned order back to the pq.
+      ``fake_deadline`` is not required.
+
     The ``group`` field decides processing order in the worker:
 
     - ``"shrink"`` — ops that *free* capacity: pure ``remove`` (delete), the
-      remove+add pair for a deadline deferral, or the remove+add pair for a
-      quantity decrease.
+      remove+add pair for a deadline deferral, the remove+add pair for a
+      quantity decrease, and ``unpin`` (returns capacity earlier-in-time).
     - ``"grow"`` — ops that *consume* capacity: pure ``add``, the remove+add
-      pair for a deadline advance, or the remove+add pair for a quantity
-      increase.
+      pair for a deadline advance, the remove+add pair for a quantity
+      increase, and ``pin`` (commits earlier-in-time capacity).
 
     Worker drains all shrink-group ops first (FIFO), then all grow-group ops
     (FIFO). This keeps each compound update atomic *within* its group and
@@ -47,17 +59,18 @@ class ScheduleOperationRequest(BaseModel):
     shrinking-half of a different update.
 
     For compound updates the producer must tag *both* the remove and the add
-    with the same group; for single ops (pure add / pure remove) ``group``
-    can be omitted and the ``mode="before"`` validator fills in the obvious
-    default before field validation, so the field type itself is non-Optional.
+    with the same group; for single ops (``add``/``remove``/``pin``/
+    ``unpin``) ``group`` can be omitted and the ``mode="before"`` validator
+    fills in the obvious default before field validation.
     """
 
-    op: Literal["add", "remove"]
+    op: Literal["add", "remove", "pin", "unpin"]
     group: Literal["shrink", "grow"]
     order_id: uuid.UUID
     order_number: str
     wafer_quantity: int = Field(gt=0)
     deadline: date
+    fake_deadline: date | None = None
     requested_by: uuid.UUID
 
     @model_validator(mode="before")
@@ -72,11 +85,22 @@ class ScheduleOperationRequest(BaseModel):
         """
         if isinstance(data, dict) and data.get("group") is None:
             op = data.get("op")
-            if op == "remove":
+            if op in ("remove", "unpin"):
                 data = {**data, "group": "shrink"}
-            elif op == "add":
+            elif op in ("add", "pin"):
                 data = {**data, "group": "grow"}
         return data
+
+    @model_validator(mode="after")
+    def _pin_requires_fake_deadline(self) -> ScheduleOperationRequest:
+        """``pin`` ops MUST include ``fake_deadline``; other ops should not."""
+        if self.op == "pin" and self.fake_deadline is None:
+            raise ValueError("op='pin' requires fake_deadline")
+        if self.op != "pin" and self.fake_deadline is not None:
+            raise ValueError(
+                f"op={self.op!r} must NOT include fake_deadline; only 'pin' uses it"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------

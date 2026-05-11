@@ -14,15 +14,18 @@ from datetime import date, timedelta
 from app.services.scheduling import (
     DAILY_CAPACITY,
     HORIZON_DAYS,
+    PinnedOrder,
     SchedulerState,
     SchedulingOrder,
     abs_to_rel,
     add_order,
     advance_day,
     compute_schedule,
+    pin_order,
     rebuild_state,
     rel_to_abs,
     remove_order,
+    unpin_order,
 )
 
 # ---------------------------------------------------------------------------
@@ -385,3 +388,336 @@ def test_rebuild_state_skips_orders_past_horizon() -> None:
     assert skipped[0].order_id == outside.order_id
     assert skipped[0].order_number == "outside"
     assert skipped[0].reason == "deadline_too_far"
+
+
+# ---------------------------------------------------------------------------
+# Membership guards (PR-review 第三輪 — 防止重複 add / 對非 pq 訂單 remove)
+# ---------------------------------------------------------------------------
+
+
+def test_add_order_rejects_duplicate_already_in_pq() -> None:
+    """Re-adding an order that's already in pq must be rejected, otherwise
+    the segment trees would double-count its capacity / deadline contribution
+    and silently corrupt state.
+
+    Realistic trigger: producer sends a stale ``add`` op (e.g. retry after
+    a partial network failure where the first attempt actually succeeded).
+    """
+    state = SchedulerState.initial(_BASE)
+    order = _make_order(qty=1000, deadline=_BASE + timedelta(days=2))
+    first = add_order(state, order)
+    assert first.status == "success"
+
+    cap_before = state.capacity_tree.to_array()
+    dead_before = state.deadline_tree.to_array()
+    pq_len_before = len(state.priority_queue)
+
+    second = add_order(state, order)
+    assert second.status == "capacity_exceeded"
+    # Critical: state is UNCHANGED by the rejected duplicate.
+    assert state.capacity_tree.to_array() == cap_before
+    assert state.deadline_tree.to_array() == dead_before
+    assert len(state.priority_queue) == pq_len_before
+
+
+def test_add_order_rejects_when_already_pinned() -> None:
+    """Pinned orders live in ``pinned_orders`` (not pq); the trees index
+    them at ``fake_deadline``. Allowing add to slip through would add the
+    same order's wafers to the trees a second time at the real deadline
+    index — total corruption.
+    """
+    state = SchedulerState.initial(_BASE)
+    deadline = _BASE + timedelta(days=4)
+    order = _make_order(qty=500, deadline=deadline)
+    add_order(state, order)
+    pin_order(state, order, fake_deadline=_BASE + timedelta(days=1))
+
+    # Now the order is in pinned_orders, not pq.
+    assert not any(o.order_id == order.order_id for o in state.priority_queue)
+
+    second = add_order(state, order)
+    assert second.status == "capacity_exceeded"
+    assert "pinned" in (second.message or "").lower()
+
+
+def test_remove_order_rejects_not_in_pq() -> None:
+    """``remove_order`` blindly running ``_apply_remove_to_trees`` on an
+    order it never added would inject phantom capacity. Most realistic
+    trigger: producer sends ``remove`` for a pinned order without
+    prepending ``unpin``. The guard surfaces this as a clear failure
+    instead of silently corrupting trees.
+    """
+    state = SchedulerState.initial(_BASE)
+    add_order(state, _make_order(order_number="a", qty=1000, deadline=_BASE + timedelta(days=2)))
+
+    cap_before = state.capacity_tree.to_array()
+    dead_before = state.deadline_tree.to_array()
+    pq_before = list(state.priority_queue)
+
+    phantom = _make_order(order_number="phantom", qty=500, deadline=_BASE + timedelta(days=2))
+    result = remove_order(state, phantom)
+    assert result.status == "capacity_exceeded"
+    # State unchanged.
+    assert state.capacity_tree.to_array() == cap_before
+    assert state.deadline_tree.to_array() == dead_before
+    assert state.priority_queue == pq_before
+
+
+def test_remove_order_on_pinned_order_gives_pinned_hint() -> None:
+    """When the order being remove'd is currently pinned (so it's in
+    pinned_orders, not pq), the failure message should hint that the
+    producer needs to prepend an ``unpin`` op. This is the single most
+    common producer mistake the guard catches in real usage.
+    """
+    state = SchedulerState.initial(_BASE)
+    order = _make_order(qty=500, deadline=_BASE + timedelta(days=4))
+    add_order(state, order)
+    pin_order(state, order, fake_deadline=_BASE + timedelta(days=1))
+
+    result = remove_order(state, order)
+    assert result.status == "capacity_exceeded"
+    assert "unpin" in (result.message or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# pin_order / unpin_order
+# ---------------------------------------------------------------------------
+
+
+def test_pin_order_rejected_when_capacity_insufficient_at_pin_day() -> None:
+    """Spec example 1: existing (a 9000 dl=1) + (b 2000 dl=2). Pin b to day 1
+    must fail because day 1 only has 10000-9000=1000 free, b needs 2000.
+
+    Critically: state must be UNCHANGED after rejection. The pin path
+    speculatively removes the order from pq+trees and re-adds at the fake
+    day; on capacity failure it has to undo cleanly. Without that undo, a
+    rejected pin would silently drop the order.
+    """
+    state = SchedulerState.initial(_BASE)
+    a = _make_order(order_number="a", qty=9000, deadline=_BASE + timedelta(days=0))
+    b = _make_order(order_number="b", qty=2000, deadline=_BASE + timedelta(days=1))
+    add_order(state, a)
+    add_order(state, b)
+
+    # Snapshot trees + pq for post-rejection comparison.
+    cap_before = state.capacity_tree.to_array()
+    dead_before = state.deadline_tree.to_array()
+    pq_ids_before = [o.order_id for o in state.priority_queue]
+
+    result = pin_order(state, b, fake_deadline=_BASE)
+    assert result.status == "capacity_exceeded"
+
+    assert state.capacity_tree.to_array() == cap_before
+    assert state.deadline_tree.to_array() == dead_before
+    assert [o.order_id for o in state.priority_queue] == pq_ids_before
+    assert state.pinned_orders == []
+
+
+def test_pin_order_success_matches_spec_example_2() -> None:
+    """Spec example 2 numbers: (a 9000 dl=3), (b 1000 dl=3), (c 1000 dl=3),
+    pin b to day 1 then c to day 1. After both pins:
+
+      * 假deadline 產能前綴和 = [8000, 18000, 19000]
+      * deadline 前綴和 = [2000, 2000, 11000]
+      * pq holds {a}; pinned_orders holds {b, c}
+
+    These exact numbers come from the user's spec; if the algorithm drifts
+    even by a few wafers the rebuild path or compute_schedule will produce
+    wrong answers downstream, so we lock the prefix sums explicitly.
+    """
+    state = SchedulerState.initial(_BASE)
+    deadline_3 = _BASE + timedelta(days=2)  # rel = 3
+    a = _make_order(order_number="a", qty=9000, deadline=deadline_3)
+    b = _make_order(order_number="b", qty=1000, deadline=deadline_3)
+    c = _make_order(order_number="c", qty=1000, deadline=deadline_3)
+    add_order(state, a)
+    add_order(state, b)
+    add_order(state, c)
+
+    pin_b = pin_order(state, b, fake_deadline=_BASE)
+    assert pin_b.status == "success"
+    pin_c = pin_order(state, c, fake_deadline=_BASE)
+    assert pin_c.status == "success"
+
+    # Capacity prefix sum exactly matches the spec.
+    assert state.capacity_tree.query(1) == 8000
+    assert state.capacity_tree.query(2) == 18000
+    assert state.capacity_tree.query(3) == 19000
+    # Deadline prefix sum: pinned orders' contribution at day 1 (b+c=2000),
+    # a's 9000 at day 3.
+    assert state.deadline_tree.query(1) == 2000
+    assert state.deadline_tree.query(2) == 2000
+    assert state.deadline_tree.query(3) == 11000
+
+    pq_ids = {o.order_id for o in state.priority_queue}
+    pinned_ids = {p.order_id for p in state.pinned_orders}
+    assert pq_ids == {a.order_id}
+    assert pinned_ids == {b.order_id, c.order_id}
+
+
+def test_unpin_order_restores_state_to_pre_pin() -> None:
+    """Spec example 3: starting from example-2's pinned-{b,c} state, unpin c.
+    After unpin: c is back in pq with deadline=3; pinned_orders holds only b.
+    Capacity prefix sum should match [9000, 19000, 19000] and deadline prefix
+    sum [1000, 1000, 11000] per the spec.
+    """
+    state = SchedulerState.initial(_BASE)
+    deadline_3 = _BASE + timedelta(days=2)
+    a = _make_order(order_number="a", qty=9000, deadline=deadline_3)
+    b = _make_order(order_number="b", qty=1000, deadline=deadline_3)
+    c = _make_order(order_number="c", qty=1000, deadline=deadline_3)
+    for o in (a, b, c):
+        add_order(state, o)
+    pin_order(state, b, fake_deadline=_BASE)
+    pin_order(state, c, fake_deadline=_BASE)
+
+    result = unpin_order(state, c.order_id)
+    assert result.status == "success"
+
+    assert state.capacity_tree.query(1) == 9000
+    assert state.capacity_tree.query(2) == 19000
+    assert state.capacity_tree.query(3) == 19000
+    assert state.deadline_tree.query(1) == 1000
+    assert state.deadline_tree.query(2) == 1000
+    assert state.deadline_tree.query(3) == 11000
+
+    pq_ids = {o.order_id for o in state.priority_queue}
+    pinned_ids = {p.order_id for p in state.pinned_orders}
+    assert pq_ids == {a.order_id, c.order_id}
+    assert pinned_ids == {b.order_id}
+
+
+def test_unpin_order_unknown_id_returns_error_without_mutating_state() -> None:
+    """Calling unpin on an id not in ``pinned_orders`` is a logic error from
+    the producer side; treat as a soft failure so the worker's failure-notify
+    path runs, and leave the pq + trees alone.
+    """
+    state = SchedulerState.initial(_BASE)
+    add_order(state, _make_order(order_number="a", qty=1000, deadline=_BASE + timedelta(days=2)))
+
+    cap_before = state.capacity_tree.to_array()
+    pq_before = list(state.priority_queue)
+    pinned_before = list(state.pinned_orders)
+
+    result = unpin_order(state, uuid.uuid4())
+    assert result.status == "capacity_exceeded"
+    assert state.capacity_tree.to_array() == cap_before
+    assert state.priority_queue == pq_before
+    assert state.pinned_orders == pinned_before
+
+
+def test_compute_schedule_places_pinned_first_then_fills_pq() -> None:
+    """Example 2 daily breakdown — first day produces b1000 + c1000 + a8000;
+    second day produces a1000. Validates the two-phase fill: pinned consume
+    fake_deadline first, then EDF fills the post-pin remaining.
+    """
+    state = SchedulerState.initial(_BASE)
+    deadline_3 = _BASE + timedelta(days=2)
+    a = _make_order(order_number="a", qty=9000, deadline=deadline_3)
+    b = _make_order(order_number="b", qty=1000, deadline=deadline_3)
+    c = _make_order(order_number="c", qty=1000, deadline=deadline_3)
+    for o in (a, b, c):
+        add_order(state, o)
+    pin_order(state, b, fake_deadline=_BASE)
+    pin_order(state, c, fake_deadline=_BASE)
+
+    schedule = compute_schedule(state)
+
+    by_day = {(r.scheduled_date, r.order_id): r.quantity for r in schedule}
+    # Day 1: b1000 + c1000 + a8000 (pinned first, then a fills the rest).
+    assert by_day[(_BASE, b.order_id)] == 1000
+    assert by_day[(_BASE, c.order_id)] == 1000
+    assert by_day[(_BASE, a.order_id)] == 8000
+    # Day 2: a's remaining 1000.
+    assert by_day[(_BASE + timedelta(days=1), a.order_id)] == 1000
+
+
+def test_advance_day_completes_pinned_today_and_fills_remainder_from_pq() -> None:
+    """``fake_deadline == today`` means the pinned order is produced today.
+
+    Setup: pinned x with qty=2000 at day 1, pq order y with qty=15000 dl=day3.
+    advance_day's day-1 output should produce 2000(x) + 8000(y) = 10000;
+    y carries 7000 wafers into the new pq, and pinned_orders empties.
+    Crucial guard: the pq accumulator must use ``DAILY_CAPACITY - pinned_today``
+    as its ceiling, not the full DAILY_CAPACITY (would over-produce by 2000).
+    """
+    state = SchedulerState.initial(_BASE)
+    x = _make_order(order_number="x", qty=2000, deadline=_BASE + timedelta(days=2))
+    y = _make_order(order_number="y", qty=15000, deadline=_BASE + timedelta(days=2))
+    add_order(state, x)
+    add_order(state, y)
+    pin_order(state, x, fake_deadline=_BASE)
+
+    new_state = advance_day(state)
+
+    # Pinned x is gone — produced today.
+    assert new_state.pinned_orders == []
+    # y remains in pq with qty reduced by 8000 (the pq budget after pinned-today).
+    assert len(new_state.priority_queue) == 1
+    assert new_state.priority_queue[0].order_id == y.order_id
+    assert new_state.priority_queue[0].wafer_quantity == 15000 - 8000
+    # base_date advanced by 1 day.
+    assert new_state.base_date == _BASE + timedelta(days=1)
+
+
+def test_rebuild_state_separates_pinned_from_pq() -> None:
+    """When DB has both pinned and unpinned scheduled orders, rebuild_state
+    must put the pinned ones in ``pinned_orders`` (not in pq) and reproduce
+    the same trees a live pin would have produced.
+    """
+    deadline_3 = _BASE + timedelta(days=2)
+    a = SchedulingOrder(
+        order_id=uuid.uuid4(),
+        order_number="a",
+        wafer_quantity=9000,
+        deadline=deadline_3,
+    )
+    b = SchedulingOrder(
+        order_id=uuid.uuid4(),
+        order_number="b",
+        wafer_quantity=1000,
+        deadline=deadline_3,
+        pinned_production_date=_BASE,  # marks this for the pinned path
+    )
+    state, skipped = rebuild_state([a, b], _BASE)
+
+    assert skipped == []
+    pq_ids = {o.order_id for o in state.priority_queue}
+    pinned_ids = {p.order_id for p in state.pinned_orders}
+    assert pq_ids == {a.order_id}
+    assert pinned_ids == {b.order_id}
+    # Pinned order is recorded with both real + fake deadlines for unpin.
+    pinned_b = next(p for p in state.pinned_orders if p.order_id == b.order_id)
+    assert pinned_b.deadline == deadline_3
+    assert pinned_b.fake_deadline == _BASE
+
+
+def test_scheduler_state_roundtrip_preserves_pinned_orders() -> None:
+    """``to_json`` / ``from_json`` must include ``pinned_orders`` so Redis
+    persistence survives a worker restart with pins intact. Backward compat
+    is also covered: a state blob written before the pin feature shipped
+    (i.e. without ``pinned_orders`` key) must deserialize as empty list.
+    """
+    state = SchedulerState.initial(_BASE)
+    state.pinned_orders.append(
+        PinnedOrder(
+            order_id=uuid.uuid4(),
+            order_number="b",
+            wafer_quantity=1000,
+            deadline=_BASE + timedelta(days=2),
+            fake_deadline=_BASE,
+        )
+    )
+    raw = state.to_json()
+    revived = SchedulerState.from_json(raw)
+    assert len(revived.pinned_orders) == 1
+    assert revived.pinned_orders[0].fake_deadline == _BASE
+
+    # Backward-compat: an old blob without "pinned_orders" key.
+    import json as _json
+
+    legacy = _json.loads(raw)
+    legacy.pop("pinned_orders")
+    legacy_raw = _json.dumps(legacy)
+    revived_legacy = SchedulerState.from_json(legacy_raw)
+    assert revived_legacy.pinned_orders == []

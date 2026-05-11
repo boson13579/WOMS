@@ -131,14 +131,17 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 **Request body**（見 §2.2 `ScheduleOperationRequest`）：
 ```json
 {
-  "op": "add" | "remove",
+  "op": "add" | "remove" | "pin" | "unpin",
   "order_id": "uuid",
   "order_number": "ORD-20260505-0001",
   "wafer_quantity": 200,
   "deadline": "2026-06-15",
+  "fake_deadline": "2026-06-12",   // 只 op="pin" 才需要、其他 op 必須省略
   "requested_by": "uuid"
 }
 ```
+
+> `fake_deadline` 是「強制把訂單做在這天」的目標生產日，必須 ≤ `deadline`。schema 端的 validator 會在 `op="pin"` 沒填、或其他 op 多填的時候直接 422。
 
 **Response 202** (`ScheduleOperationResponse`)：
 ```json
@@ -152,11 +155,15 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 |---|---|
 | `POST /api/v1/orders` 新增訂單 | 1 筆 `add`（用新訂單的 quantity / deadline） |
 | `DELETE /api/v1/orders/{id}` 軟刪除 | 1 筆 `remove`（用刪除**前**的 quantity / deadline） |
-| `PATCH /api/v1/orders/{id}` 改 `wafer_quantity` 或 `requested_delivery_date` | **1 筆 `remove`（舊值）+ 1 筆 `add`（新值）**，順序不能反 |
-| `PATCH /api/v1/orders/batch-update` 批次改交期 | 對每筆 update 成功的訂單各推一對 `remove` + `add` |
+| `PATCH /api/v1/orders/{id}` 改 `wafer_quantity` 或 `requested_delivery_date` | **1 筆 `remove`（舊值）+ 1 筆 `add`（新值）**，順序不能反；若訂單目前 `is_pinned=true`，**前面再多推一筆 `unpin`**（先解 pin、再走 remove+add） |
+| `PATCH /api/v1/orders/batch-update` 批次改交期 | 對每筆 update 成功的訂單各推一對 `remove` + `add`（pinned 的順手 prepend 一筆 `unpin`） |
+| 「把這筆訂單鎖到某天做」 | 1 筆 `pin`，`fake_deadline` 設目標日 |
+| 「解除某筆訂單的 pin」 | 1 筆 `unpin` |
 | 修改不影響排程的欄位（`notes`、`assigned_to`、`customer_name` 等） | 不用推 |
 
-> `requested_by` 必填。worker 處理 `add` 時若回 `capacity_exceeded` 或 `deadline_too_far`，會用這個 user id 透過 `websocket.notify_user(...)` 通知對應使用者。
+> `requested_by` 必填。worker 處理 op 失敗時用這個 user id 推對應的 `schedule.{op}_failed` 通知（`add` / `remove` / `pin` / `unpin` 四條失敗路徑都統一格式）。
+>
+> Producer 端對 pinned 訂單下 PATCH 時必須先 `unpin` 再 `remove+add`，原因是 worker 看到舊狀態的 `remove` 會在 pq 裡找不到該訂單（pinned 不在 pq）。`unpin` 跑完之後該訂單會回到 pq，後面的 `remove`+`add` 才能正常執行。
 
 ---
 
@@ -326,6 +333,8 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 | 排程完成、結果有更新 | `broadcast` | `{"type": "schedule.updated"}` |
 | `add` 失敗（產能不夠 / deadline 超 30 天） | `notify_user` | `{"type": "schedule.add_failed", "order_id": "...", "order_number": "...", "reason": "capacity_exceeded"\|"deadline_too_far", "detail": "..."}` |
 | `remove` 失敗（pq 找不到該訂單，通常代表狀態已不一致） | `notify_user` | `{"type": "schedule.remove_failed", "order_id": "...", "order_number": "...", "reason": "...", "detail": "..."}` |
+| `pin` 失敗（pin 日 capacity 不足、超 horizon、或訂單不在 pq） | `notify_user` | `{"type": "schedule.pin_failed", "order_id": "...", "order_number": "...", "reason": "capacity_exceeded"\|"deadline_too_far", "detail": "..."}` |
+| `unpin` 失敗（訂單不在 pinned_orders；通常是 producer 重複送了 unpin） | `notify_user` | `{"type": "schedule.unpin_failed", "order_id": "...", "order_number": "...", "reason": "...", "detail": "..."}` |
 | rebuild 時某筆 scheduled 訂單塞不回去（通常是 deadline 已被 `base_date` 越過） | `notify_user` | `{"type": "schedule.rebuild_skipped", "order_id": "...", "order_number": "...", "reason": "deadline_too_far"\|"capacity_exceeded"}` |
 
 **前端怎麼接**：
@@ -530,9 +539,53 @@ run_scheduling_task.delay()
 
 - 兩棵 30 天線段樹：`capacity_tree`（每日剩餘產能）、`deadline_tree`（每天 deadline 上的訂單總和）
 - `priority_queue`：deadline 早 → wafer\_quantity 大 → order\_number 字母順序
-- `add_order` / `remove_order` / `compute_schedule` / `advance_day` / **`rebuild_state`** 五個入口
+- `pinned_orders`：**強制日期** list（PinnedOrder = order\_id, order\_number, qty, deadline, fake\_deadline）。pq 跟 pinned\_orders 互斥 — 一筆訂單同時間只能在其中一邊。
+- `add_order` / `remove_order` / `pin_order` / `unpin_order` / `compute_schedule` / `advance_day` / **`rebuild_state`** 七個入口
 - **Producer ↔ consumer 契約**：Redis key 常數（`STATE_KEY` / `STATUS_KEY` / `PENDING_OPS_KEY` / `PENDING_OPS_SEQ_KEY`）跟 `score_for_op` 編碼也住在這個檔，因為兩端（API 跟 worker）都要對得上，把契約放在共同上游避免 api → workers 反向依賴（RULES.md §3）。
 - 演算法詳細推導見 [`backend/CLAUDE.md`](../backend/CLAUDE.md) §業務規則
+
+#### 4.1.1 Pin 機制：把訂單鎖到特定生產日
+
+「pin」分兩種，DB 用兩支獨立 boolean 表示，演算法只認其中一種：
+
+| DB 欄位 | 由誰寫 | 對 scheduler state 的影響 | 對前端的意義 |
+|---|---|---|---|
+| `is_pinned` + `pinned_production_date` | worker 透過 `apply_schedule` | 訂單從 pq 搬到 `pinned_orders`，trees 改用 `fake_deadline` 索引 | 該訂單的實際生產日是 `pinned_production_date`，不會被 EDF 推遲 |
+| `is_processing_locked` | order CRUD service（create / update / batch-update 設 true）+ scheduler `apply_schedule`（清 false） | **無**（這個 flag 不影響演算法） | 「目前有 op 在排程器佇列裡」，前端據此 disable 該列的 inline edit |
+
+**Production pin 接受條件**：跟 add\_order 一樣 — 把 `fake_deadline` 當成新 deadline 看，問「現在的 trees 容得下嗎？」更精確：
+
+1. 把訂單從 pq 跟 trees 暫時移除（先 free 掉它在 real deadline 的占用），這樣等於把「需要 X wafers」這件事重新放到桌上。
+2. 看 `capacity_tree.query(fake_deadline) >= wafer_quantity`。若不通過 → undo（把訂單還回 pq + trees 還原）→ 回 `capacity_exceeded`。
+3. 通過 → 把訂單以 `fake_deadline` 當 deadline 寫進 trees、加進 `pinned_orders`。Real deadline 跟 fake deadline 都記在 `PinnedOrder` 上以便日後 unpin。
+
+**為什麼接受條件這樣設**：因為 trees 一律以「目前每筆訂單的有效 deadline」為索引（pq 訂單是 real deadline，pinned 訂單是 fake deadline），`add_order` 用的容量檢查邏輯就能不變地套用到 pin 上 — 同一個 `capacity_tree.query(rel) >= qty` 公式。實作上甚至直接重用 `_apply_remove_to_trees` / `_apply_add_to_trees`。
+
+**Compute schedule 的兩階段填法**：
+
+1. **先放 pinned**：每筆 `PinnedOrder` 在 `fake_deadline` 那天直接吃 `wafer_quantity` 的容量。沒有跨日切分。
+2. **再 EDF 填 pq**：用「pinned 扣完之後」的剩餘容量，按 pq 順序逐筆從第 1 天往後 forward fill 到 real deadline 那天為止。
+
+**Advance\_day 跟 pinned 的關係**：base\_date 推進時，`fake_deadline == 今天` 的 pinned 訂單視同「今天就會做掉」 —
+- 從 `pinned_orders` 移走、tree 上的占用也撤掉。
+- 它們吃掉的 wafer 數量算進 day-1 的 10000 額度裡，所以 pq 累加器的上限變成 `DAILY_CAPACITY - sum(pinned_today.wafer_quantity)`，不是 10000。
+- 處理完 pinned\_today 之後 pq 用剩下的額度走原本的「累加到上限就停」邏輯。
+
+**Unpin**：基本上是 pin 的反向 — 先以 `fake_deadline` 當 deadline 把訂單從 trees 移除，從 `pinned_orders` 拿走；再以 real deadline 重新 add\_order 進 pq + trees。
+
+**Rebuild\_state 跟 pinned 的關係**：DB 列裡 `is_pinned=true` 的訂單在 `list_for_scheduler` 回傳時會把 `pinned_production_date` 填進 `SchedulingOrder.pinned_production_date`，`rebuild_state` 看到不是 None 的就走 add+pin 雙步驟，把該訂單最終放進 `pinned_orders`。pin 失敗（典型原因：`fake_deadline` 已經被 base\_date 越過）會列在 `skipped`，訂單仍會留在 pq 當 fallback。
+
+**範例**（呼應 spec 用的數字）：
+
+設 base\_date = day 1，已存在訂單 a (qty=9000, dl=day3)、b (qty=1000, dl=day3)、c (qty=1000, dl=day3)。
+
+- Pin b、c 到 day 1 都成功之後：
+  - `capacity_tree` prefix sum = `[8000, 18000, 19000]`（day 1 因為 b+c 占了 2000，剩 8000；day 3 因為 a 占了 9000，剩 1000，prefix = 8000+10000+1000）
+  - `deadline_tree` prefix sum = `[2000, 2000, 11000]`（day 1 上有 b+c=2000、day 3 上 a 加 b+c 全部累積 11000）
+  - `compute_schedule` 出來：day 1 做 b1000+c1000+a8000、day 2 做 a1000
+- 接著 unpin c：
+  - `capacity_tree` prefix sum = `[9000, 19000, 19000]`、`deadline_tree` prefix sum = `[1000, 1000, 11000]`
+  - `compute_schedule` 出來：day 1 做 b1000+a9000、day 2 做 c1000
 
 ### 4.2 Worker 一輪在做什麼（`backend/app/workers/scheduling.py`）
 
@@ -871,7 +924,7 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 
 ---
 
-#### `backend/tests/services/test_scheduling.py` — 純演算法（14 個）
+#### `backend/tests/services/test_scheduling.py` — 純演算法（22 個）
 
 這組測試完全沒有 DB、Redis、FastAPI，只對 `app/services/scheduling.py` 裡的函式呼叫。這樣設計的原因是：演算法是整個模組最難推理的部分，若它本身有 bug 而且只能透過整合測試才能發現，除錯成本會很高。把純邏輯隔離出來、毫秒就能跑完，讓每次修演算法都能快速得到回饋。
 
@@ -1120,7 +1173,7 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 
 ---
 
-#### `backend/tests/workers/test_scheduling_task.py` — Celery task body（18 個）
+#### `backend/tests/workers/test_scheduling_task.py` — Celery task body（22 個）
 
 這組測試在驗「Celery task 的編排邏輯」，也就是 `run_scheduling_task`、`advance_day_task`、`rebuild_schedule_task` 這三個函式的「主體行為」，而不是演算法本身（演算法已在 services 那組測了）。
 

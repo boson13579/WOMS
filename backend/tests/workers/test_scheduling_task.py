@@ -122,6 +122,7 @@ def _make_op(
     order_number: str = "ORD-T",
     wafer_quantity: int = 1000,
     deadline: str = "2026-05-07",
+    fake_deadline: str | None = None,
     requested_by: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -134,6 +135,8 @@ def _make_op(
     }
     if group is not None:
         payload["group"] = group
+    if fake_deadline is not None:
+        payload["fake_deadline"] = fake_deadline
     return payload
 
 
@@ -170,10 +173,13 @@ def _enqueue(fake_redis: _FakeRedis, op: dict[str, Any]) -> None:
         score_for_op,
     )
 
-    group = op.get("group") or ("shrink" if op["op"] == "remove" else "grow")
+    explicit = op.get("group")
+    if explicit is None:
+        op_kind = op["op"]
+        explicit = "shrink" if op_kind in ("remove", "unpin") else "grow"
     seq = fake_redis.incr(PENDING_OPS_SEQ_KEY)
     payload = {**op, "_seq": seq}
-    fake_redis.zadd(PENDING_OPS_KEY, {json.dumps(payload): score_for_op(group=group, seq=seq)})
+    fake_redis.zadd(PENDING_OPS_KEY, {json.dumps(payload): score_for_op(group=explicit, seq=seq)})
 
 
 def _patch_common(
@@ -196,6 +202,12 @@ def _patch_common(
     remove_mock = MagicMock(return_value=ScheduleResult(status="success"))
     monkeypatch.setattr("app.workers.scheduling.remove_order", remove_mock)
 
+    pin_mock = MagicMock(return_value=ScheduleResult(status="success"))
+    monkeypatch.setattr("app.workers.scheduling.pin_order", pin_mock)
+
+    unpin_mock = MagicMock(return_value=ScheduleResult(status="success"))
+    monkeypatch.setattr("app.workers.scheduling.unpin_order", unpin_mock)
+
     compute_mock = compute_schedule or (lambda state: [])
     monkeypatch.setattr("app.workers.scheduling.compute_schedule", compute_mock)
 
@@ -215,6 +227,8 @@ def _patch_common(
     return {
         "add_order": add_mock,
         "remove_order": remove_mock,
+        "pin_order": pin_mock,
+        "unpin_order": unpin_mock,
         "apply_schedule": apply_mock,
         "broadcast": broadcast_mock,
         "notify_user": notify_mock,
@@ -1126,3 +1140,164 @@ def test_rebuild_task_uses_today_when_no_existing_state(
 
     assert len(captured) == 1
     assert captured[0] == _dt.now(tz=UTC).date()
+
+
+# ---------------------------------------------------------------------------
+# Pin / Unpin op dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_run_scheduling_dispatches_pin_op_with_fake_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queued ``op="pin"`` must reach ``pin_order(state, order, fake_deadline)``
+    with the fake_deadline parsed back into a ``date``. This is the contract
+    that lets the API encode pin requests as a normal ScheduleOperationRequest.
+    """
+    fake_redis = _FakeRedis()
+    op = _make_op(
+        op="pin",
+        group="grow",
+        order_number="PIN-ME",
+        deadline="2026-05-15",
+        fake_deadline="2026-05-12",
+    )
+    _enqueue(fake_redis, op)
+
+    mocks = _patch_common(monkeypatch, fake_redis)
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    assert mocks["pin_order"].call_count == 1
+    args, _ = mocks["pin_order"].call_args
+    # signature: pin_order(state, order, fake_deadline)
+    _, order_arg, fake_arg = args
+    assert order_arg.order_number == "PIN-ME"
+    assert fake_arg == date(2026, 5, 12)
+
+
+def test_run_scheduling_pin_failure_notifies_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``pin_order`` returns capacity_exceeded, the worker must:
+       (1) keep processing the rest of the queue; and
+       (2) notify the requester via ``schedule.pin_failed``.
+    """
+    fake_redis = _FakeRedis()
+    pin_user = uuid.uuid4()
+    pin_op = _make_op(
+        op="pin",
+        group="grow",
+        order_number="PIN-FAIL",
+        deadline="2026-05-15",
+        fake_deadline="2026-05-12",
+        requested_by=pin_user,
+    )
+    follow_op = _make_op(order_number="ORD-OK")
+    _enqueue(fake_redis, pin_op)
+    _enqueue(fake_redis, follow_op)
+
+    pin_mock = MagicMock(
+        return_value=ScheduleResult(
+            status="capacity_exceeded",
+            message="Need 1000 wafers, only 0 available.",
+        )
+    )
+    mocks = _patch_common(monkeypatch, fake_redis)
+    monkeypatch.setattr("app.workers.scheduling.pin_order", pin_mock)
+    mocks["pin_order"] = pin_mock
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # Pin failed but follow-up add was still processed.
+    assert pin_mock.call_count == 1
+    assert mocks["add_order"].call_count == 1
+
+    # WS notify went to the pin requester with type=schedule.pin_failed.
+    pin_calls = [
+        c for c in mocks["notify_user"].call_args_list
+        if c.kwargs["message"]["type"] == "schedule.pin_failed"
+    ]
+    assert len(pin_calls) == 1
+    payload = pin_calls[0].kwargs["message"]
+    assert pin_calls[0].kwargs["user_id"] == pin_user
+    assert payload["order_number"] == "PIN-FAIL"
+    assert payload["reason"] == "capacity_exceeded"
+
+
+def test_run_scheduling_dispatches_unpin_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``op="unpin"`` calls ``unpin_order(state, order_id)`` — no fake_deadline
+    needed. Confirms the unpin path doesn't accidentally route through pin or
+    remove (a regression that would silently corrupt state).
+    """
+    fake_redis = _FakeRedis()
+    target_id = uuid.uuid4()
+    op = _make_op(
+        op="unpin",
+        group="shrink",
+        order_id=target_id,
+        order_number="UNPIN-ME",
+        deadline="2026-05-20",
+    )
+    _enqueue(fake_redis, op)
+
+    mocks = _patch_common(monkeypatch, fake_redis)
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    assert mocks["unpin_order"].call_count == 1
+    # signature: unpin_order(state, order_id)
+    args, _ = mocks["unpin_order"].call_args
+    _, order_id_arg = args
+    assert order_id_arg == target_id
+
+    # Did NOT route to remove or pin.
+    assert mocks["remove_order"].call_count == 0
+    assert mocks["pin_order"].call_count == 0
+
+
+def test_finalize_run_passes_pinned_map_to_apply_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_finalize_run`` derives ``{order_id: fake_deadline}`` from
+    ``state.pinned_orders`` and threads it into ``apply_schedule`` so DB
+    rows get ``is_pinned=true`` / ``pinned_production_date=fake_deadline``.
+
+    Pre-fix apply_schedule was called with positional ``scheduled`` only,
+    so even with the new ``pinned`` parameter the worker had to be wired
+    to actually pass it. This locks that wiring.
+    """
+    from app.services.scheduling import PinnedOrder
+
+    fake_redis = _FakeRedis()
+    _enqueue(fake_redis, _make_op(order_number="GROW-1"))
+
+    pinned_id = uuid.uuid4()
+    pinned_day = date(2026, 5, 12)
+
+    def fake_load_state() -> SchedulerState:
+        s = SchedulerState.initial(date(2026, 5, 5))
+        s.pinned_orders.append(
+            PinnedOrder(
+                order_id=pinned_id,
+                order_number="PINNED",
+                wafer_quantity=500,
+                deadline=date(2026, 5, 15),
+                fake_deadline=pinned_day,
+            )
+        )
+        return s
+
+    monkeypatch.setattr("app.workers.scheduling._load_state", fake_load_state)
+    mocks = _patch_common(monkeypatch, fake_redis)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # apply_schedule was called with the pinned map (3rd positional arg).
+    args, _ = mocks["apply_schedule"].call_args
+    _, _scheduled_arg, pinned_arg = args
+    assert pinned_arg == {pinned_id: pinned_day}

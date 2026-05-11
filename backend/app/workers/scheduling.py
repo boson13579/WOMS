@@ -50,8 +50,10 @@ from app.services.scheduling import (
     add_order,
     advance_day,
     compute_schedule,
+    pin_order,
     rebuild_state,
     remove_order,
+    unpin_order,
 )
 from app.workers.celery_app import celery_app
 
@@ -231,59 +233,106 @@ def _op_to_scheduling_order(op: dict[str, Any]) -> SchedulingOrder:
 # ---------------------------------------------------------------------------
 
 
+def _notify_op_failure(
+    *,
+    op_kind: str,
+    order: SchedulingOrder,
+    op: dict[str, Any],
+    result_status: str,
+    result_message: str | None,
+) -> None:
+    """Log + WS-notify a failed pending-op application.
+
+    Centralized so add / remove / pin / unpin use the same envelope shape
+    (``schedule.{op_kind}_failed``) and the same ``requested_by``-or-skip
+    fallback. Every failure is logged at WARNING; only ops with a
+    ``requested_by`` field generate a notify_user call.
+    """
+    logger.warning(
+        f"schedule.run.{op_kind}_failed",
+        order_id=str(order.order_id),
+        status=result_status,
+        message=result_message,
+    )
+    requested_by = op.get("requested_by")
+    if not requested_by:
+        return
+    websocket.notify_user(
+        user_id=uuid.UUID(requested_by),
+        message={
+            "type": f"schedule.{op_kind}_failed",
+            "order_id": str(order.order_id),
+            "order_number": order.order_number,
+            "reason": result_status,
+            "detail": result_message,
+        },
+    )
+
+
 def _process_one(state: SchedulerState, op: dict[str, Any]) -> None:
-    """Run a single ``add`` or ``remove`` against *state* with logging."""
+    """Run a single ``add``/``remove``/``pin``/``unpin`` against *state*."""
     op_type = op.get("op")
-    if op_type not in ("add", "remove"):
+    if op_type not in ("add", "remove", "pin", "unpin"):
         logger.warning("schedule.pending_op.unknown", op=op_type)
         return
 
     order = _op_to_scheduling_order(op)
+
     if op_type == "remove":
         result = remove_order(state, order)
-        if result.status == "success":
-            return
-        logger.warning(
-            "schedule.run.remove_failed",
-            order_id=str(order.order_id),
-            status=result.status,
-            message=result.message,
-        )
-        requested_by = op.get("requested_by")
-        if requested_by:
-            websocket.notify_user(
-                user_id=uuid.UUID(requested_by),
-                message={
-                    "type": "schedule.remove_failed",
-                    "order_id": str(order.order_id),
-                    "order_number": order.order_number,
-                    "reason": result.status,
-                    "detail": result.message,
-                },
+        if result.status != "success":
+            _notify_op_failure(
+                op_kind="remove",
+                order=order,
+                op=op,
+                result_status=result.status,
+                result_message=result.message,
             )
         return
 
-    # op_type == "add"
-    result = add_order(state, order)
-    if result.status == "success":
+    if op_type == "add":
+        result = add_order(state, order)
+        if result.status != "success":
+            _notify_op_failure(
+                op_kind="add",
+                order=order,
+                op=op,
+                result_status=result.status,
+                result_message=result.message,
+            )
         return
-    logger.warning(
-        "schedule.run.add_failed",
-        order_id=str(order.order_id),
-        status=result.status,
-        message=result.message,
-    )
-    requested_by = op.get("requested_by")
-    if requested_by:
-        websocket.notify_user(
-            user_id=uuid.UUID(requested_by),
-            message={
-                "type": "schedule.add_failed",
-                "order_id": str(order.order_id),
-                "order_number": order.order_number,
-                "reason": result.status,
-                "detail": result.message,
-            },
+
+    if op_type == "pin":
+        fake_raw = op.get("fake_deadline")
+        if fake_raw is None:
+            # Schema validation should have caught this in enqueue_operation;
+            # treat a missing fake_deadline at consumer time as a malformed op.
+            logger.warning(
+                "schedule.run.pin_missing_fake_deadline",
+                order_id=str(order.order_id),
+            )
+            return
+        fake = date.fromisoformat(fake_raw)
+        result = pin_order(state, order, fake)
+        if result.status != "success":
+            _notify_op_failure(
+                op_kind="pin",
+                order=order,
+                op=op,
+                result_status=result.status,
+                result_message=result.message,
+            )
+        return
+
+    # op_type == "unpin"
+    result = unpin_order(state, order.order_id)
+    if result.status != "success":
+        _notify_op_failure(
+            op_kind="unpin",
+            order=order,
+            op=op,
+            result_status=result.status,
+            result_message=result.message,
         )
 
 
@@ -301,13 +350,18 @@ def _finalize_run(state: SchedulerState) -> int:
     the only writer of ``schedule:state`` in its body, so calling this once
     at the end is correct.
 
+    The pinned-orders map is derived from ``state.pinned_orders`` and
+    threaded through to ``apply_schedule`` so DB rows for pinned orders end
+    up with ``is_pinned=true`` and ``pinned_production_date=fake_deadline``.
+
     Returns the number of scheduled rows written, for logging.
     """
     scheduled = compute_schedule(state)
+    pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders}
 
     db: Session = SessionLocal()
     try:
-        order_service.apply_schedule(db, scheduled)
+        order_service.apply_schedule(db, scheduled, pinned_map)
     finally:
         db.close()
 
