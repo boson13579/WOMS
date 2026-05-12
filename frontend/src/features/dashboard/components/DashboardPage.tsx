@@ -1,110 +1,151 @@
 /**
- * Main dashboard composition — assembles the four tiers of widgets.
+ * Dashboard composition — role-gated, real-API edition.
  *
- * Tier 1 (top):    4 service-health cards (API / DB / Redis / Celery)
- * Tier 2:          4 resource-utilization cards with sparklines
- * Tier 3 (charts): Request rate + Latency, side-by-side
- * Tier 4 (bottom): Orders snapshot + Recent activity
+ * Layout (per `notes/dashboard-implementation-plan.md`):
+ *   * Tier 1: ScheduleControlBar (scheduler+) + ScheduleStatusCard
+ *   * Tier 2: CapacityChart (full width)
+ *   * Tier 3: PendingOpsTable + OrdersSnapshotCard
+ *   * Tier 4: ServiceHealthGrid
  *
- * Server-state via `useDashboardData()` (React Query). The widget components
- * themselves are presentational — they take their data via props — so they
- * can be tested in isolation without a QueryClient.
+ * Viewer-role users get the simplified {@link ViewerDashboard}; new
+ * registrations default to viewer until root promotes them.
+ *
+ * All server state is React Query — components stay pure presentational.
+ * WebSocket-driven invalidation lands in a follow-up PR; for now we poll
+ * (see hook files for cadence).
  */
 import { useQueryClient } from '@tanstack/react-query';
-import { AlertCircle } from 'lucide-react';
 
 import { Header } from '@/components/layout/Header';
-import { Card, CardContent } from '@/components/ui/card';
-import { Skeleton } from '@/components/ui/skeleton';
-import { cn } from '@/lib/utils';
+import { useCurrentRole } from '@/lib/auth';
 
-import { DASHBOARD_QUERY_KEY, useDashboardData } from '../api/useDashboardData';
+import { useOrdersSnapshot } from '../api/useOrdersSnapshot';
+import { usePendingOps } from '../api/usePendingOps';
+import { useScheduleCapacity } from '../api/useScheduleCapacity';
+import { useScheduleStatus } from '../api/useScheduleStatus';
+import { useSystemHealth } from '../api/useSystemHealth';
 
-import { ActivityFeed } from './ActivityFeed';
-import { LatencyChart } from './LatencyChart';
-import { MetricCard } from './MetricCard';
+import { CapacityChart } from './CapacityChart';
 import { OrdersSnapshotCard } from './OrdersSnapshotCard';
-import { RequestRateChart } from './RequestRateChart';
-import { StatusCard } from './StatusCard';
+import { PendingOpsTable } from './PendingOpsTable';
+import { ScheduleControlBar } from './ScheduleControlBar';
+import { ScheduleStatusCard } from './ScheduleStatusCard';
+import { ServiceHealthGrid } from './ServiceHealthGrid';
+import { ViewerDashboard } from './ViewerDashboard';
+
+const DASHBOARD_INVALIDATE_PREFIXES = [
+  ['system', 'health'],
+  ['schedule', 'status'],
+  ['schedule', 'capacity'],
+  ['schedule', 'pending-ops'],
+  ['orders', 'snapshot'],
+];
 
 export function DashboardPage(): JSX.Element {
+  const role = useCurrentRole();
   const queryClient = useQueryClient();
-  const { data, isLoading, isError, error, isFetching, dataUpdatedAt, refetch } =
-    useDashboardData();
 
+  const systemHealth = useSystemHealth();
+  const scheduleStatus = useScheduleStatus();
+  const capacity = useScheduleCapacity();
+  const pendingOps = usePendingOps();
+  const ordersSnapshot = useOrdersSnapshot();
+
+  const isFetching =
+    systemHealth.isFetching ||
+    scheduleStatus.isFetching ||
+    capacity.isFetching ||
+    pendingOps.isFetching ||
+    ordersSnapshot.isLoading;
+
+  // ``onRefresh`` triggers a refetch on every dashboard query at once.
+  // React Query's ``invalidate`` flips the `isFetching` flag synchronously
+  // so the Header's spinner state updates without a frame delay.
   const onRefresh = (): void => {
-    // `invalidate` triggers a refetch and shows the spinner via `isFetching`.
-    void queryClient.invalidateQueries({ queryKey: DASHBOARD_QUERY_KEY });
-    void refetch();
+    DASHBOARD_INVALIDATE_PREFIXES.forEach((queryKey) => {
+      void queryClient.invalidateQueries({ queryKey });
+    });
   };
 
-  const lastLabel = dataUpdatedAt ? formatRelative(new Date(dataUpdatedAt)) : '—';
-
-  const renderBody = (): JSX.Element | null => {
-    if (isLoading) return <DashboardSkeleton />;
-    if (isError) {
-      return <DashboardError message={error instanceof Error ? error.message : 'Unknown error'} />;
-    }
-    if (!data) return null;
-    return (
-      <>
-        {/* Tier 1 — service health */}
-        <section aria-label="Service health">
-          <SectionLabel>Services</SectionLabel>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            {data.services.map((s) => (
-              <StatusCard key={s.id} service={s} />
-            ))}
-          </div>
-        </section>
-
-        {/* Tier 2 — resource utilization */}
-        <section aria-label="Resource utilization">
-          <SectionLabel>Resources</SectionLabel>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            {data.resources.map((m) => (
-              <MetricCard key={m.id} metric={m} />
-            ))}
-          </div>
-        </section>
-
-        {/* Tier 3 — application metrics */}
-        <section aria-label="Application metrics">
-          <SectionLabel>Application</SectionLabel>
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <RequestRateChart series={data.requestRate} />
-            <LatencyChart series={data.latency} />
-          </div>
-        </section>
-
-        {/* Tier 4 — orders + activity */}
-        <section aria-label="Business metrics" className="pb-6">
-          <SectionLabel>Orders &amp; activity</SectionLabel>
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-            <div className="lg:col-span-1">
-              <OrdersSnapshotCard snapshot={data.orders} />
-            </div>
-            <div className="lg:col-span-2">
-              <ActivityFeed items={data.activity} />
-            </div>
-          </div>
-        </section>
-      </>
-    );
-  };
+  // Viewer (the default for new registrations) gets a simplified page.
+  // We render the full Header below so layout is consistent across roles.
+  const showViewerView = role === 'viewer' || role === null;
 
   return (
     <>
-      <Header
-        title="Dashboard"
-        subtitle="System health and utilization · Phase 1 mock"
-        lastUpdatedLabel={lastLabel}
-        onRefresh={onRefresh}
-        refreshing={isFetching}
-      />
+      {showViewerView ? (
+        <Header title="Dashboard" subtitle="Read-only view" />
+      ) : (
+        <Header
+          title="Dashboard"
+          subtitle="Real-time scheduler operations"
+          onRefresh={onRefresh}
+          refreshing={isFetching}
+        />
+      )}
 
       <div className="flex-1 overflow-y-auto px-6 py-6">
-        <div className="mx-auto flex max-w-[1400px] flex-col gap-6">{renderBody()}</div>
+        <div className="mx-auto flex max-w-[1400px] flex-col gap-6">
+          {showViewerView ? (
+            <ViewerDashboard />
+          ) : (
+            <>
+              {/* Tier 1 — schedule controls + status badge */}
+              <section
+                aria-label="Schedule control"
+                className="flex flex-col gap-4 lg:flex-row lg:items-stretch"
+              >
+                <div className="lg:flex-1">
+                  <ScheduleStatusCard
+                    data={scheduleStatus.data}
+                    isLoading={scheduleStatus.isLoading}
+                    isError={scheduleStatus.isError}
+                  />
+                </div>
+                <div className="lg:flex-1">
+                  <ScheduleControlBar />
+                </div>
+              </section>
+
+              {/* Tier 2 — capacity prefix sum */}
+              <section aria-label="Capacity">
+                <CapacityChart
+                  data={capacity.data}
+                  isLoading={capacity.isLoading}
+                  isError={capacity.isError}
+                />
+              </section>
+
+              {/* Tier 3 — pending ops + orders snapshot */}
+              <section aria-label="Queue and orders">
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+                  <div className="lg:col-span-2">
+                    <PendingOpsTable
+                      data={pendingOps.data}
+                      isLoading={pendingOps.isLoading}
+                      isError={pendingOps.isError}
+                    />
+                  </div>
+                  <OrdersSnapshotCard
+                    data={ordersSnapshot.data}
+                    isLoading={ordersSnapshot.isLoading}
+                    isError={ordersSnapshot.isError}
+                  />
+                </div>
+              </section>
+
+              {/* Tier 4 — service health */}
+              <section aria-label="Service health">
+                <SectionLabel>Services</SectionLabel>
+                <ServiceHealthGrid
+                  data={systemHealth.data}
+                  isLoading={systemHealth.isLoading}
+                  isError={systemHealth.isError}
+                />
+              </section>
+            </>
+          )}
+        </div>
       </div>
     </>
   );
@@ -120,59 +161,4 @@ function SectionLabel({ children }: { children: React.ReactNode }): JSX.Element 
       {children}
     </h2>
   );
-}
-
-function DashboardSkeleton(): JSX.Element {
-  return (
-    <div data-testid="dashboard-skeleton" className="flex flex-col gap-6">
-      {/* Match the four-tier layout so the page doesn't reflow on data arrival. */}
-      <SkeletonRow count={4} cardClass="h-32" />
-      <SkeletonRow count={4} cardClass="h-32" />
-      <SkeletonRow count={2} cardClass="h-72" />
-      <SkeletonRow count={2} cardClass="h-64" />
-    </div>
-  );
-}
-
-/**
- * Skeleton row using only Tailwind classes (no inline style — RULES.md §2).
- * Only `count = 2 | 4` are used by the dashboard skeleton; we encode each
- * column layout explicitly so Tailwind's purger keeps the classes.
- */
-function SkeletonRow({ count, cardClass }: { count: 2 | 4; cardClass: string }): JSX.Element {
-  return (
-    <div
-      className={cn(
-        'grid gap-4',
-        count === 4 && 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-4',
-        count === 2 && 'grid-cols-1 sm:grid-cols-2',
-      )}
-    >
-      {Array.from({ length: count }, (_, i) => (
-        <Skeleton key={i} className={cardClass} />
-      ))}
-    </div>
-  );
-}
-
-function DashboardError({ message }: { message: string }): JSX.Element {
-  return (
-    <Card className="border-destructive/40">
-      <CardContent className="flex items-start gap-3 p-6">
-        <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
-        <div>
-          <p className="font-medium">Failed to load dashboard.</p>
-          <p className="mt-1 text-sm text-muted-foreground">{message}</p>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function formatRelative(d: Date): string {
-  const seconds = Math.max(1, Math.round((Date.now() - d.getTime()) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const mins = Math.round(seconds / 60);
-  if (mins < 60) return `${mins} min ago`;
-  return `${Math.round(mins / 60)} h ago`;
 }
