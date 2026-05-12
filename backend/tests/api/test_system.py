@@ -345,9 +345,7 @@ def test_system_usernames_requires_authentication(client: TestClient) -> None:
     assert res.status_code == 401
 
 
-def test_system_usernames_returns_username_map(
-    client: TestClient, db_session: Session
-) -> None:
+def test_system_usernames_returns_username_map(client: TestClient, db_session: Session) -> None:
     """Happy path: pass a list of UUIDs, get back {uuid: username}."""
     alice = _make_user(db_session, username="lookup_alice", role=UserRole.scheduler)
     bob = _make_user(db_session, username="lookup_bob", role=UserRole.viewer)
@@ -387,9 +385,7 @@ def test_system_usernames_returns_null_for_unknown_uuid(
     assert res.json()["usernames"] == {str(unknown): None}
 
 
-def test_system_usernames_dedupes_repeated_uuids(
-    client: TestClient, db_session: Session
-) -> None:
+def test_system_usernames_dedupes_repeated_uuids(client: TestClient, db_session: Session) -> None:
     """If a UUID appears twice in ``ids``, it appears once in the response.
 
     The frontend's typical usage is "collect distinct requested_by from
@@ -407,9 +403,7 @@ def test_system_usernames_dedupes_repeated_uuids(
     assert res.json()["usernames"] == {str(user.id): "lookup_dup"}
 
 
-def test_system_usernames_rejects_empty_ids(
-    client: TestClient, db_session: Session
-) -> None:
+def test_system_usernames_rejects_empty_ids(client: TestClient, db_session: Session) -> None:
     """``?ids=`` (empty string) is a programming error on the caller side;
     a 422 makes the bug surface immediately rather than silently returning
     ``{}``."""
@@ -420,9 +414,7 @@ def test_system_usernames_rejects_empty_ids(
     assert res.status_code == 422
 
 
-def test_system_usernames_caps_request_size(
-    client: TestClient, db_session: Session
-) -> None:
+def test_system_usernames_caps_request_size(client: TestClient, db_session: Session) -> None:
     """A huge ``ids`` list is an abuse / programming-error signal — cap at
     100 per request and 422 anything larger. Frontend chunks requests if
     it ever needs more (it never does today)."""
@@ -436,9 +428,7 @@ def test_system_usernames_caps_request_size(
     assert res.status_code == 422
 
 
-def test_system_usernames_rejects_malformed_uuid(
-    client: TestClient, db_session: Session
-) -> None:
+def test_system_usernames_rejects_malformed_uuid(client: TestClient, db_session: Session) -> None:
     """Garbage in the ``ids`` query → 422 with the unified error envelope.
 
     Don't try to silently skip — caller should fix the bug at the source.

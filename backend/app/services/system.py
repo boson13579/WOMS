@@ -175,9 +175,7 @@ def _redis_port_open(timeout_seconds: float = 0.5) -> bool:
     """
     host, port = _redis_socket_target()
     try:
-        addrs = socket.getaddrinfo(
-            host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
-        )
+        addrs = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
         if not addrs:
             return False
         family, socktype, proto, _, sockaddr = addrs[0]
