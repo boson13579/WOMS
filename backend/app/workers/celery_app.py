@@ -34,8 +34,16 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,  # re-deliver if a worker dies mid-task
     worker_prefetch_multiplier=1,  # prevents one slow task from blocking others
+    # Explicit import of task modules. ``autodiscover_tasks`` only finds
+    # tasks declared in a per-package ``tasks.py``; our scheduling tasks
+    # live in ``app/workers/scheduling.py`` so they'd silently fail to
+    # register in a real worker process (the in-process test suite still
+    # works because pytest imports the module directly, but a deployed
+    # ``celery -A ... worker`` wouldn't). Listing the module here forces
+    # Celery to import it at worker startup so the @task decorators fire.
+    imports=("app.workers.scheduling",),
 )
 
-# Auto-discovery hook for future task modules. Add modules to this list as
-# Phase 2 features land (e.g., `"app.workers.scheduling"`).
+# Auto-discovery hook kept for future per-package tasks.py modules. The
+# explicit ``imports`` above is the source of truth for current tasks.
 celery_app.autodiscover_tasks(packages=["app.workers"])

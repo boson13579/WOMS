@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from fastapi import HTTPException, status
@@ -30,7 +30,14 @@ from app.schemas.order import (
     OrderResponse,
     UpdateOrderRequest,
 )
-from app.schemas.schedule import DailyAssignment, ScheduleResultResponse
+from app.schemas.schedule import (
+    CompoundDbAction,
+    DailyAssignment,
+    ScheduleCompoundRequest,
+    ScheduleOpInCompound,
+    ScheduleResultResponse,
+)
+from app.services.schedule_queue import enqueue_compound
 from app.services.scheduling import ScheduledResult, SchedulingOrder
 
 logger = structlog.get_logger(__name__)
@@ -53,6 +60,22 @@ _IMMUTABLE_STATUS_ERROR = HTTPException(
     detail="Order cannot be modified in its current status.",
 )
 
+# N-3 (PR-14 round-2 review): producer-side concurrency guard. After the first
+# write of ``is_processing_locked=True``, the row already has an in-flight
+# compound waiting for the worker. A second PATCH / DELETE from the same user
+# (e.g. double-click) or a concurrent client would otherwise enqueue another
+# compound on top of the first — worker still processes them serially so DB
+# stays consistent, but the audit log gets two diff rows in misleading order
+# and the frontend's lock UI is silently bypassed (the row is "locked" but
+# the second PATCH succeeded with 200). Better: 409 fast, let the user see
+# why their action didn't take.
+_LOCKED_ORDER_ERROR = HTTPException(
+    status_code=status.HTTP_409_CONFLICT,
+    detail=(
+        "Order is being processed by the scheduler; please wait for the in-flight action to finish."
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -65,6 +88,222 @@ def _generate_order_number(db: Session) -> str:
     count = order_repo.get_today_order_count(db, today)
     seq = count + 1
     return f"ORD-{today.strftime('%Y%m%d')}-{seq:04d}"
+
+
+def _build_create_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoundRequest:
+    """Compound for a newly-created order: just an ``add``.
+
+    Group=grow because the order is consuming new capacity. If a producer
+    has a pending ``remove`` for an earlier version of this order_id (only
+    possible if there's a race with delete), shrink-first ordering ensures
+    the remove runs first; the add then either succeeds or fails-with-
+    rollback on a clean state.
+
+    The attached ``db_action`` tells the worker to **soft-delete the row
+    on failure** — the producer pre-created the row (locked, status=
+    pending), so on add failure (deadline_too_far / capacity_exceeded)
+    the worker must clean up the orphan. On success the worker leaves
+    the row alone; ``apply_schedule`` will fill its scheduling columns.
+    """
+    ops = [
+        ScheduleOpInCompound(
+            op="add",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=order.wafer_quantity,
+            deadline=order.requested_delivery_date,
+        ),
+    ]
+    return ScheduleCompoundRequest(
+        group="grow",
+        op_count=len(ops),
+        ops=ops,
+        requested_by=actor_id,
+        db_action=CompoundDbAction(
+            kind="create",
+            actor_id=actor_id,
+            new_wafer_quantity=order.wafer_quantity,
+            new_requested_delivery_date=order.requested_delivery_date,
+            new_notes_set=True,
+            new_notes=order.notes,
+            new_assigned_to_set=True,
+            new_assigned_to=order.assigned_to,
+        ),
+    )
+
+
+def _build_delete_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoundRequest:
+    """Compound for a soft-deleted order: ``unpin`` (if pinned) then ``remove``.
+
+    Group=shrink because the order frees capacity. If the order was never
+    actually scheduled (still status=pending when delete fires), the
+    worker-side membership guard catches the no-op gracefully and emits
+    ``schedule.compound_failed`` — producer can ignore or surface.
+
+    The attached ``db_action.kind='delete'`` defers the actual soft-delete
+    (``is_deleted=True`` / ``status=cancelled``) to the worker. Producer
+    only commits ``is_processing_locked=True``; on success worker
+    soft-deletes + audits, on failure worker just clears the lock.
+    """
+    ops: list[ScheduleOpInCompound] = []
+    if order.is_pinned:
+        ops.append(
+            ScheduleOpInCompound(
+                op="unpin",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=order.wafer_quantity,
+                deadline=order.requested_delivery_date,
+            )
+        )
+    ops.append(
+        ScheduleOpInCompound(
+            op="remove",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=order.wafer_quantity,
+            deadline=order.requested_delivery_date,
+        )
+    )
+    return ScheduleCompoundRequest(
+        group="shrink",
+        op_count=len(ops),
+        ops=ops,
+        requested_by=actor_id,
+        db_action=CompoundDbAction(
+            kind="delete",
+            actor_id=actor_id,
+            # Old values captured so the worker can audit-log the prior
+            # state alongside ``is_deleted: False -> True``.
+            old_wafer_quantity=order.wafer_quantity,
+            old_requested_delivery_date=order.requested_delivery_date,
+            old_notes=order.notes,
+            old_assigned_to=order.assigned_to,
+        ),
+    )
+
+
+def _build_patch_compound(
+    *,
+    order: Order,
+    new_qty: int,
+    new_deadline: date,
+    actor_id: uuid.UUID,
+    notes_set: bool = False,
+    new_notes: str | None = None,
+    assigned_to_set: bool = False,
+    new_assigned_to: uuid.UUID | None = None,
+) -> ScheduleCompoundRequest | None:
+    """Build the schedule compound for a PATCH that may touch qty / deadline.
+
+    Implements the **case-8 smart-routing rules** from
+    ``docs/scheduling.md``:
+
+    * No qty/deadline change → returns ``None``, caller skips the enqueue.
+    * Order not pinned → ``[remove(old), add(new)]``.
+    * Order pinned:
+      * Always prepend ``unpin`` (worker can't process ``remove`` on a
+        pinned order — membership guard would reject it).
+      * Auto-re-pin to the same day **only when both** conditions hold:
+        ``new_deadline >= old_pin_day`` AND ``new_qty <= old_qty``. Either
+        condition failing means the pin day's capacity might be exceeded
+        if we forced the re-pin; we silent-drop the pin (per case 13/14).
+
+    Group selection: ``shrink`` if any of (qty smaller, deadline later);
+    otherwise ``grow``. This matches the existing CRUD-to-op rules for
+    non-pinned PATCH and falls through cleanly when pin/unpin ops are
+    prepended/appended — every op in a compound shares one group anyway.
+    """
+    old_qty = order.wafer_quantity
+    old_deadline = order.requested_delivery_date
+
+    qty_changed = new_qty != old_qty
+    deadline_changed = new_deadline != old_deadline
+    if not (qty_changed or deadline_changed):
+        # PATCH affected only notes / immaterial fields — no need to bother
+        # the scheduler.
+        return None
+
+    qty_smaller = new_qty < old_qty
+    deadline_later = new_deadline > old_deadline
+    group: Literal["shrink", "grow"] = "shrink" if (qty_smaller or deadline_later) else "grow"
+
+    is_pinned_before = order.is_pinned
+    pin_day = order.pinned_production_date
+
+    ops: list[ScheduleOpInCompound] = []
+
+    if is_pinned_before:
+        ops.append(
+            ScheduleOpInCompound(
+                op="unpin",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=old_qty,
+                deadline=old_deadline,
+            )
+        )
+
+    ops.append(
+        ScheduleOpInCompound(
+            op="remove",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=old_qty,
+            deadline=old_deadline,
+        )
+    )
+    ops.append(
+        ScheduleOpInCompound(
+            op="add",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=new_qty,
+            deadline=new_deadline,
+        )
+    )
+
+    # Case 14 auto-re-pin gate. ALL of these must hold:
+    #   - order was pinned before the PATCH;
+    #   - the PATCH didn't make the new deadline cross the pin day
+    #     (otherwise pin can't satisfy "fake_deadline ≤ deadline");
+    #   - qty didn't grow (otherwise the pin day's capacity might overflow).
+    # Failing any → silent drop pin (case 13 semantics extended to all
+    # incompatible PATCHes, not just the deadline-before-pin one).
+    if is_pinned_before and pin_day is not None:
+        can_repin = new_deadline >= pin_day and new_qty <= old_qty
+        if can_repin:
+            ops.append(
+                ScheduleOpInCompound(
+                    op="pin",
+                    order_id=order.id,
+                    order_number=order.order_number,
+                    wafer_quantity=new_qty,
+                    deadline=new_deadline,
+                    fake_deadline=pin_day,
+                )
+            )
+
+    return ScheduleCompoundRequest(
+        group=group,
+        op_count=len(ops),
+        ops=ops,
+        requested_by=actor_id,
+        db_action=CompoundDbAction(
+            kind="update",
+            actor_id=actor_id,
+            new_wafer_quantity=new_qty,
+            new_requested_delivery_date=new_deadline,
+            new_notes_set=notes_set,
+            new_notes=new_notes,
+            new_assigned_to_set=assigned_to_set,
+            new_assigned_to=new_assigned_to,
+            old_wafer_quantity=old_qty,
+            old_requested_delivery_date=old_deadline,
+            old_notes=order.notes,
+            old_assigned_to=order.assigned_to,
+        ),
+    )
 
 
 def _write_audit(
@@ -101,7 +340,13 @@ def _write_audit(
 
 
 def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResponse:
-    """Create an order, write audit log, and return the response schema."""
+    """Create an order, write audit log, and return the response schema.
+
+    Newly-created orders enter the pending pool, so ``is_processing_locked``
+    is set immediately — the frontend uses it to disable inline edits until
+    the scheduler has applied the pending op (``apply_schedule`` clears it
+    via ``set_schedule_dates``).
+    """
     order_number = _generate_order_number(db)
     order = order_repo.create(
         db,
@@ -113,6 +358,7 @@ def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResp
         assigned_to=req.assigned_to,
         notes=req.notes,
     )
+    order.is_processing_locked = True
     new_val: dict[str, Any] = {
         "customer_name": order.customer_name,
         "wafer_quantity": order.wafer_quantity,
@@ -124,6 +370,12 @@ def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResp
     _write_audit(db, action="order.created", actor=actor, order=order, new_value=new_val)
     db.commit()
     db.refresh(order)
+
+    # Push the [add] compound to the scheduler queue. DB commit must
+    # succeed first so the worker (which can read order state from DB on
+    # rebuild) doesn't see ops for an order that hasn't landed yet.
+    enqueue_compound(_build_create_compound(order, actor.id))
+
     logger.info("order.created", order_number=order.order_number, actor_id=str(actor.id))
     return OrderResponse.model_validate(order)
 
@@ -169,13 +421,33 @@ def get_order(db: Session, order_id: uuid.UUID) -> OrderResponse:
 def update_order(
     db: Session, order_id: uuid.UUID, req: UpdateOrderRequest, actor: User
 ) -> OrderResponse:
-    """Update a mutable order with optimistic-lock and status guard."""
+    """Update a mutable order with optimistic-lock and status guard.
+
+    **Producer-side responsibilities only** (per P1-2): validate, write
+    ``is_processing_locked=True`` (and ``status=pending``) to claim the
+    row, and enqueue a compound whose ``db_action`` carries the new
+    values. The actual write of new ``wafer_quantity`` /
+    ``requested_delivery_date`` / ``notes`` / ``assigned_to`` happens
+    inside ``run_scheduling_task`` after the algorithm state has
+    accepted the change. This eliminates the prior failure mode where
+    a rejected compound (capacity_exceeded etc.) would leave DB with
+    new values while ``SchedulerState`` rolled back to the old ones.
+
+    For PATCHes that don't touch scheduling fields (notes / assigned_to
+    only), we short-circuit — write everything directly in the producer
+    since there's no compound to defer to.
+    """
     order = order_repo.get_by_id(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
     if order.status not in MUTABLE_STATUSES:
         raise _IMMUTABLE_STATUS_ERROR
+
+    # N-3 round-2 guard: if a previous compound is still in flight, refuse
+    # to stack another one on top. See ``_LOCKED_ORDER_ERROR`` docstring.
+    if order.is_processing_locked:
+        raise _LOCKED_ORDER_ERROR
 
     # Application-level optimistic lock: reject stale client versions before
     # making any changes. SQLAlchemy's DB-level check fires on flush(), but this
@@ -186,36 +458,74 @@ def update_order(
             detail="Order was modified by another user. Refresh and try again.",
         )
 
-    old_val: dict[str, Any] = {
-        "wafer_quantity": order.wafer_quantity,
-        "requested_delivery_date": str(order.requested_delivery_date),
-        "notes": order.notes,
-        "status": order.status.value,
-    }
-
-    if req.wafer_quantity is not None:
-        order.wafer_quantity = req.wafer_quantity
-    if req.requested_delivery_date is not None:
-        order.requested_delivery_date = req.requested_delivery_date
-    if "notes" in req.model_fields_set:
-        order.notes = req.notes
-    order.status = OrderStatus.pending
-
-    new_val: dict[str, Any] = {
-        "wafer_quantity": order.wafer_quantity,
-        "requested_delivery_date": str(order.requested_delivery_date),
-        "notes": order.notes,
-        "status": order.status.value,
-    }
-
-    _write_audit(
-        db,
-        action="order.updated",
-        actor=actor,
-        order=order,
-        old_value=old_val,
-        new_value=new_val,
+    # Decide payload first — what fields did the user actually touch?
+    new_qty = req.wafer_quantity if req.wafer_quantity is not None else order.wafer_quantity
+    new_deadline = (
+        req.requested_delivery_date
+        if req.requested_delivery_date is not None
+        else order.requested_delivery_date
     )
+    notes_set = "notes" in req.model_fields_set
+    new_notes = req.notes if notes_set else order.notes
+    # ``UpdateOrderRequest`` doesn't currently expose assigned_to; reserve the
+    # plumbing so the worker carries it forward unchanged.
+    assigned_to_set = False
+    new_assigned_to = order.assigned_to
+
+    scheduling_changed = (
+        new_qty != order.wafer_quantity or new_deadline != order.requested_delivery_date
+    )
+
+    if not scheduling_changed:
+        # Non-scheduling PATCH (notes / etc.) — no worker round-trip needed.
+        # Write directly and audit here; the producer remains the single
+        # writer because no compound is ever enqueued.
+        old_val: dict[str, Any] = {"notes": order.notes}
+        if notes_set:
+            order.notes = req.notes
+        new_val_simple: dict[str, Any] = {"notes": order.notes}
+        _write_audit(
+            db,
+            action="order.updated",
+            actor=actor,
+            order=order,
+            old_value=old_val,
+            new_value=new_val_simple,
+        )
+        try:
+            db.commit()
+        except StaleDataError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Order was modified by another user. Refresh and try again.",
+            ) from exc
+        db.refresh(order)
+        return OrderResponse.model_validate(order)
+
+    # Scheduling change — pre-build the compound on the *pre-PATCH* order
+    # snapshot so its ``db_action`` carries the right new/old values.
+    compound = _build_patch_compound(
+        order=order,
+        new_qty=new_qty,
+        new_deadline=new_deadline,
+        actor_id=actor.id,
+        notes_set=notes_set,
+        new_notes=new_notes,
+        assigned_to_set=assigned_to_set,
+        new_assigned_to=new_assigned_to,
+    )
+    # ``_build_patch_compound`` returns ``None`` only when no qty/deadline
+    # change was detected; we already guarded above (``scheduling_changed``
+    # short-circuit), so this branch is unreachable. Narrow the type for
+    # mypy without using an ``assert`` (banned by ruff S101).
+    if compound is None:  # pragma: no cover — defensive
+        raise RuntimeError("compound builder returned None for a scheduling-changed PATCH")
+
+    # Producer-side write: only the in-flight lock. DO NOT mutate the
+    # business columns — worker writes those on accept.
+    order.status = OrderStatus.pending
+    order.is_processing_locked = True
 
     try:
         db.commit()
@@ -225,63 +535,105 @@ def update_order(
             status_code=status.HTTP_409_CONFLICT,
             detail="Order was modified by another user. Refresh and try again.",
         ) from exc
-
     db.refresh(order)
+
+    enqueue_compound(compound)
     return OrderResponse.model_validate(order)
 
 
 def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse:
-    """Soft-delete an order by setting is_deleted=True and status=cancelled."""
+    """Soft-delete an order by deferring DB writes to the worker.
+
+    **Producer-side responsibilities only** (per P1-2): claim the row
+    with ``is_processing_locked=True`` and enqueue a delete compound
+    whose ``db_action.kind="delete"`` instructs the worker to perform
+    the soft-delete (``is_deleted=True`` / ``status=cancelled``) plus
+    audit log on accept. On compound failure (the worker's membership
+    guard rejects a never-scheduled order's ``remove``, etc.) the worker
+    clears the lock without deleting; the order remains alive.
+    """
     order = order_repo.get_by_id(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
-    old_val: dict[str, Any] = {"status": order.status.value, "is_deleted": False}
-    order.is_deleted = True
-    order.status = OrderStatus.cancelled
+    # N-3 round-2 guard: refuse to stack another compound on top of an
+    # already-locked row. See ``_LOCKED_ORDER_ERROR``.
+    if order.is_processing_locked:
+        raise _LOCKED_ORDER_ERROR
 
-    _write_audit(db, action="order.cancelled", actor=actor, order=order, old_value=old_val)
+    # Build the compound from the *current* row state (the values the
+    # worker will use to soft-delete + audit on accept).
+    compound = _build_delete_compound(order, actor.id)
+
+    # Producer-side write: only the in-flight lock. The actual
+    # ``is_deleted`` / ``status=cancelled`` write happens in the worker.
+    order.is_processing_locked = True
+
     try:
         db.commit()
-        db.refresh(order)
     except StaleDataError as exc:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Order was modified by another user. Refresh and try again.",
         ) from exc
+    db.refresh(order)
 
-    logger.info("order.cancelled", order_id=str(order_id), actor_id=str(actor.id))
+    enqueue_compound(compound)
+
+    logger.info("order.cancel_requested", order_id=str(order_id), actor_id=str(actor.id))
     return OrderResponse.model_validate(order)
 
 
 def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> BatchUpdateResponse:
-    """Bulk-update delivery dates; silently skip immutable-status orders."""
+    """Bulk-update delivery dates; silently skip immutable-status orders.
+
+    Per P1-2: producer commits only the ``is_processing_locked=True`` /
+    ``status=pending`` flags on each successfully-claimed row. The new
+    ``requested_delivery_date`` value rides in each compound's
+    ``db_action`` and is written by the worker on accept (or rolled back
+    via lock-clear on reject). Compounds are staged in memory and only
+    enqueued after the outer commit succeeds — a commit failure rolls
+    back DB changes and leaves no orphan compounds in Redis.
+    """
     updated: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []
+    pending_compounds: list[ScheduleCompoundRequest] = []
 
     for order_id in req.order_ids:
         order = order_repo.get_by_id(db, order_id)
         if order is None or order.status not in MUTABLE_STATUSES:
             skipped.append(order_id)
             continue
+        # N-3: same in-flight guard as ``update_order``. Skip (not raise)
+        # since this is a best-effort batch — the caller's
+        # ``BatchUpdateResponse.skipped_ids`` already documents partial
+        # failures.
+        if order.is_processing_locked:
+            skipped.append(order_id)
+            continue
 
         savepoint = db.begin_nested()
         try:
-            old_date = str(order.requested_delivery_date)
-            order.requested_delivery_date = req.requested_delivery_date
-            order.status = OrderStatus.pending
-            _write_audit(
-                db,
-                action="order.updated",
-                actor=actor,
+            # Build the compound BEFORE the lock-only write so the
+            # ``db_action.old_*`` audit fields capture pre-PATCH values.
+            compound = _build_patch_compound(
                 order=order,
-                old_value={"requested_delivery_date": old_date},
-                new_value={"requested_delivery_date": str(req.requested_delivery_date)},
+                new_qty=order.wafer_quantity,
+                new_deadline=req.requested_delivery_date,
+                actor_id=actor.id,
             )
+
+            # Producer-side write: only the in-flight lock. Worker
+            # writes ``requested_delivery_date`` on accept.
+            order.status = OrderStatus.pending
+            order.is_processing_locked = True
             db.flush()
             savepoint.commit()
             updated.append(order_id)
+
+            if compound is not None:
+                pending_compounds.append(compound)
         except StaleDataError:
             savepoint.rollback()
             db.expire_all()
@@ -306,6 +658,10 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
             status_code=status.HTTP_409_CONFLICT,
             detail="One or more orders were modified by another request. Please retry.",
         ) from exc
+
+    # Outer commit succeeded — now flush the staged compounds.
+    for compound in pending_compounds:
+        enqueue_compound(compound)
 
     logger.info(
         "order.batch_updated",
@@ -339,41 +695,53 @@ def get_audit_log(db: Session, order_id: uuid.UUID, current_user: User) -> list[
 # ---------------------------------------------------------------------------
 
 
-def list_scheduled_orders(
-    db: Session,
-    *,
-    breakdown: list[ScheduledResult] | None = None,
-) -> list[ScheduleResultResponse]:
+def list_scheduled_orders(db: Session) -> list[ScheduleResultResponse]:
     """Return every order currently in ``scheduled`` status, sorted by start date.
 
-    When *breakdown* is supplied (typically the live result of
-    ``compute_schedule(state)`` for the current Redis-backed
-    ``SchedulerState``), each response gets a per-day ``daily_breakdown``
-    list showing how the order's wafers are split across days. With no
-    breakdown the field defaults to an empty list — useful for the very
-    first deploy or when Redis state has been wiped.
+    Reads the per-day breakdown straight from the DB column
+    ``orders.daily_breakdown`` (JSONB) that the materializer keeps in sync.
+    No live Redis state is consulted on this read path — the column IS the
+    source of truth for "what will this order's day-by-day production look
+    like under the most recent accepted schedule". A NULL column degrades
+    to an empty ``daily_breakdown`` list in the response.
     """
     rows = order_repo.get_scheduled(db)
-
-    by_order: dict[uuid.UUID, list[DailyAssignment]] = {}
-    if breakdown:
-        for sr in sorted(breakdown, key=lambda x: x.scheduled_date):
-            by_order.setdefault(sr.order_id, []).append(
-                DailyAssignment(date=sr.scheduled_date, quantity=sr.quantity)
+    out: list[ScheduleResultResponse] = []
+    for r in rows:
+        breakdown_payload: list[DailyAssignment] = []
+        if r.daily_breakdown:
+            for entry in r.daily_breakdown:
+                breakdown_payload.append(
+                    DailyAssignment(
+                        date=date.fromisoformat(str(entry["date"])),
+                        quantity=int(entry["quantity"]),
+                    )
+                )
+        # Build the response directly instead of model_validate(r) →
+        # model_copy: pydantic's ``from_attributes`` would otherwise try to
+        # validate the raw ``Order.daily_breakdown`` (JSONB or None) against
+        # ``list[DailyAssignment]`` and fail on the NULL case. Constructing
+        # the schema explicitly lets us drop in our parsed breakdown_payload.
+        out.append(
+            ScheduleResultResponse(
+                id=r.id,
+                order_number=r.order_number,
+                customer_name=r.customer_name,
+                wafer_quantity=r.wafer_quantity,
+                requested_delivery_date=r.requested_delivery_date,
+                scheduled_production_date=r.scheduled_production_date,
+                expected_delivery_date=r.expected_delivery_date,
+                status=r.status,
+                daily_breakdown=breakdown_payload,
             )
-
-    return [
-        ScheduleResultResponse.model_validate(r).model_copy(
-            update={"daily_breakdown": by_order.get(r.id, [])}
         )
-        for r in rows
-    ]
+    return out
 
 
 def list_for_scheduler(
     db: Session,
 ) -> tuple[list[SchedulingOrder], dict[uuid.UUID, uuid.UUID]]:
-    """Return scheduled orders as ``SchedulingOrder`` plus a creators map.
+    """Return *future* (scheduled) orders as ``SchedulingOrder`` plus a creators map.
 
     The second element is a ``order_id -> created_by`` mapping used by the
     rebuild flow to push ``schedule.rebuild_skipped`` WebSocket messages
@@ -383,14 +751,32 @@ def list_for_scheduler(
     queue from DB truth after a migration or state corruption. The deadline
     maps to ``requested_delivery_date``, consistent with how ops are enqueued
     via ``POST /schedule/operations``.
+
+    **In-production orders are intentionally excluded** (via
+    :func:`repositories.order.get_scheduled_for_rebuild`). They represent
+    physical wafers being processed today whose remaining quantity isn't
+    knowable from DB columns alone — replaying them at full
+    ``wafer_quantity`` would corrupt the segment trees and risk silently
+    flipping them to ``completed`` on the next ``advance_day_task``. The
+    rebuild therefore reconstructs only the future timeline; today's
+    in-flight production keeps its existing DB state until physical
+    production wraps up and ``advance_day_task::mark_completed_outside_set``
+    transitions it normally.
     """
-    rows = order_repo.get_scheduled(db)
+    rows = order_repo.get_scheduled_for_rebuild(db)
     orders = [
         SchedulingOrder(
             order_id=r.id,
             order_number=r.order_number,
             wafer_quantity=r.wafer_quantity,
             deadline=r.requested_delivery_date,
+            # Pin info is read at rebuild time so pinned orders land back
+            # in pinned_orders rather than the pq. Only populate when the
+            # row has both flags set — defends against a stale DB row with
+            # is_pinned=true but no pinned_production_date.
+            pinned_production_date=(
+                r.pinned_production_date if r.is_pinned and r.pinned_production_date else None
+            ),
         )
         for r in rows
     ]
@@ -398,7 +784,11 @@ def list_for_scheduler(
     return orders, creators
 
 
-def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
+def apply_schedule(
+    db: Session,
+    scheduled: list[ScheduledResult],
+    pinned: dict[uuid.UUID, date] | None = None,
+) -> int:
     """Persist a freshly-computed schedule to the orders table.
 
     A single order can split across multiple days in `scheduled`; we collapse
@@ -406,29 +796,43 @@ def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
     schedule wholesale, then write the new dates and flip status to
     `scheduled`. One system-level audit record is emitted per order.
 
+    ``pinned`` (optional) maps ``order_id -> fake_deadline`` and reflects the
+    current ``state.pinned_orders``. Orders present in this map land in DB
+    with ``is_pinned=true`` and ``pinned_production_date=fake_deadline``;
+    orders absent from it have both pin columns cleared. Pass ``None`` (or
+    omit) when no pin information is available — equivalent to "no orders
+    are pinned".
+
     Returns the number of orders that were marked as scheduled.
     """
     order_repo.clear_scheduled_dates(db)
+    pinned_map = pinned or {}
 
-    per_order: dict[uuid.UUID, tuple[date, date]] = {}
+    # Group ScheduledResults by order_id and remember per-day quantities so
+    # we can persist the full breakdown (not just earliest/latest summary)
+    # to the JSONB column. Sort each per-order list by date so the stored
+    # JSON is chronological — saves the read-path from re-sorting.
+    per_order: dict[uuid.UUID, list[ScheduledResult]] = {}
     for sr in scheduled:
-        cur = per_order.get(sr.order_id)
-        if cur is None:
-            per_order[sr.order_id] = (sr.scheduled_date, sr.scheduled_date)
-        else:
-            earliest, latest = cur
-            per_order[sr.order_id] = (
-                min(earliest, sr.scheduled_date),
-                max(latest, sr.scheduled_date),
-            )
+        per_order.setdefault(sr.order_id, []).append(sr)
 
     applied = 0
-    for order_id, (earliest, latest) in per_order.items():
+    for order_id, results in per_order.items():
+        results.sort(key=lambda x: x.scheduled_date)
+        earliest = results[0].scheduled_date
+        latest = results[-1].scheduled_date
+        daily_breakdown_payload: list[dict[str, str | int]] = [
+            {"date": sr.scheduled_date.isoformat(), "quantity": int(sr.quantity)} for sr in results
+        ]
+        is_pinned = order_id in pinned_map
         order = order_repo.set_schedule_dates(
             db,
             order_id=order_id,
             scheduled_production_date=earliest,
             expected_delivery_date=latest,
+            daily_breakdown=daily_breakdown_payload,
+            is_pinned=is_pinned,
+            pinned_production_date=pinned_map.get(order_id),
         )
         if order is None:
             logger.warning(
@@ -437,11 +841,18 @@ def apply_schedule(db: Session, scheduled: list[ScheduledResult]) -> int:
             )
             continue
         applied += 1
-        new_value = {
+        # Read status from the refreshed row, not a hard-coded constant —
+        # ``set_schedule_dates`` preserves ``in_production`` (see its
+        # docstring for why), so an in-production order being re-materialized
+        # for tomorrow's boundary portion will audit-log status=in_production,
+        # not status=scheduled.
+        new_value: dict[str, Any] = {
             "scheduled_production_date": str(earliest),
             "expected_delivery_date": str(latest),
-            "status": OrderStatus.scheduled.value,
+            "status": order.status.value,
         }
+        if is_pinned:
+            new_value["pinned_production_date"] = str(pinned_map[order_id])
         # Persist to audit_logs DB table — required by PRD §1.6 so the
         # scheduling history is queryable from Postgres, not only from log
         # shippers. user_id=None marks this as system-driven.

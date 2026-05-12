@@ -18,6 +18,8 @@ process and vice versa).
 from __future__ import annotations
 
 import json
+import uuid
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, cast
 
@@ -30,26 +32,38 @@ from app.core.db import get_db
 from app.core.security import require_roles
 from app.models.user import User, UserRole
 from app.schemas.schedule import (
-    ScheduleOperationRequest,
+    CapacityPrefixEntry,
+    PendingOpsEntry,
+    ScheduleCapacityResponse,
+    ScheduleCompoundRequest,
+    ScheduleCompoundResponse,
     ScheduleRebuildResponse,
     ScheduleResultResponse,
     ScheduleStatusResponse,
     ScheduleTriggerResponse,
 )
 from app.services import order as order_service
-from app.services.scheduling import (
-    ScheduledResult,
-    SchedulerState,
-    compute_schedule,
+from app.services.schedule_queue import (
+    CancelResult,
+    cancel_compound,
+    enqueue_compound,
+    list_pending_ops,
 )
-from app.workers.scheduling import (
-    PENDING_OPS_KEY,
-    PENDING_OPS_SEQ_KEY,
+from app.services.scheduling import (
+    DAILY_CAPACITY,
     STATE_KEY,
     STATUS_KEY,
+    SchedulerState,
+    capacity_prefix_sums,
+)
+
+# Workers are a peer of services; api → workers is allowed *only* for
+# dispatching Celery task objects (``.delay()``). Anything else (Redis keys,
+# encoding helpers, internal flags) lives in ``app.services.scheduling`` or
+# ``app.services.schedule_queue``.
+from app.workers.scheduling import (
     rebuild_schedule_task,
     run_scheduling_task,
-    score_for_op,
 )
 
 router = APIRouter()
@@ -118,42 +132,96 @@ def trigger_scheduling(
 
 @router.post(
     "/operations",
+    response_model=ScheduleCompoundResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
 def enqueue_operation(
-    request: ScheduleOperationRequest,
+    request: ScheduleCompoundRequest,
     current_user: User = Depends(_WRITE_ROLES),
-) -> dict[str, str]:
-    """Queue an order op for the next scheduling run.
+) -> ScheduleCompoundResponse:
+    """Queue a scheduler compound for the next ``run_scheduling_task``.
 
-    Order CRUD calls this after persisting create / update / delete. Modifying
-    a quantity or deadline must be split into ``remove`` (old values) followed
-    by ``add`` (new values) — the algorithm has no native ``modify``.
+    A compound is an atomic business action containing one or more leaf
+    ops (add / remove / pin / unpin). See :class:`ScheduleCompoundRequest`
+    for the full contract; in brief:
 
-    Backend writes to a Redis **sorted set** keyed by score
-    ``score_for_op(group, seq)`` — shrink ops sort before grow, FIFO inside
-    each group. ``seq`` is a per-op monotonic ``INCR`` so duplicate payloads
-    don't collide on the sorted-set member key, and so the worker's
-    ``ZPOPMIN`` is O(log n) regardless of queue depth.
+    - Ops within a compound may target one or more order_ids — typical
+      single-order flows (PATCH / DELETE / CREATE) generate one order
+      per compound, while a multi-order batch business action is also
+      a legal shape.
+    - The compound has a single ``group`` (shrink or grow). Shrink
+      compounds sort before grow compounds in the worker queue; FIFO
+      within each group.
+    - Worker processes the compound atomically — any leaf-op failure
+      triggers a snapshot rollback of ``SchedulerState`` and a
+      ``schedule.compound_failed`` WebSocket message to ``requested_by``.
 
-    A new run fires only if the worker is currently idle; if it is already
-    running, the in-flight task will pick up this op when it loops back to
-    drain ``pending_ops`` at the end of its cycle.
+    Backed by a Redis **sorted set** scored by ``score_for_op(group, seq)``
+    where ``seq`` is the next value of ``schedule:pending_ops:seq``.
+    Worker ``ZPOPMIN``s one compound per ``run_scheduling_task``
+    invocation. All Redis I/O is delegated to
+    ``services.schedule_queue.enqueue_compound``.
+
+    A new ``run_scheduling_task`` fires only if the worker is currently
+    idle; if it is already running, the in-flight task will pick up this
+    compound when it loops back to drain ``pending_ops`` at the end of
+    its cycle.
 
     Permission: scheduler+.
     """
-    rds = _redis()
-    seq = cast("int", rds.incr(PENDING_OPS_SEQ_KEY))
-    payload = request.model_dump(mode="json")
-    payload["_seq"] = seq  # uniqueness guarantee for the sorted-set member
-    score = score_for_op(group=request.group, seq=seq)
-    rds.zadd(PENDING_OPS_KEY, {json.dumps(payload): score})
+    enqueue_compound(request)
+    return ScheduleCompoundResponse(
+        compound_id=request.compound_id,
+        message="Compound queued",
+    )
 
-    status_doc = _read_status()
-    if status_doc is None or status_doc.get("state") != "running":
-        run_scheduling_task.delay()
 
-    return {"message": "Operation queued"}
+# ---------------------------------------------------------------------------
+# DELETE /operations/{compound_id}
+# ---------------------------------------------------------------------------
+
+
+@router.delete(
+    "/operations/{compound_id}",
+    response_model=ScheduleCompoundResponse,
+)
+def cancel_compound_endpoint(
+    compound_id: uuid.UUID,
+    current_user: User = Depends(_WRITE_ROLES),
+) -> ScheduleCompoundResponse:
+    """Cancel a still-queued scheduler compound.
+
+    Looks up the compound by id in the
+    ``schedule:pending_ops:by_compound_id`` secondary index, ``ZREM``s it
+    from the sorted set, and fires ``schedule.compound_cancelled`` to the
+    compound's ``requested_by``.
+
+    Returns:
+        ``200`` — compound was in queue and got removed.
+        ``409`` — compound was in the index but the worker popped it
+                 between our lookup and our ``ZREM`` (already in flight).
+                 The frontend should fall back to waiting for the regular
+                 ``schedule.updated`` / ``schedule.compound_failed`` outcome.
+        ``404`` — compound id is unknown (never enqueued, or processed
+                 long enough ago that the index entry was cleaned).
+
+    Permission: scheduler+.
+    """
+    result = cancel_compound(compound_id)
+    if result is CancelResult.cancelled:
+        return ScheduleCompoundResponse(
+            compound_id=compound_id,
+            message="Compound cancelled",
+        )
+    if result is CancelResult.in_progress:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Compound is already in progress; cancellation lost the race.",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Compound not found in the pending queue.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -197,20 +265,101 @@ def get_schedule_result(
     """Return every order currently in ``scheduled`` status, with per-day breakdown.
 
     Sorted by ``scheduled_production_date`` ascending so the timeline is
-    natural for the UI. ``daily_breakdown`` is derived from the live
-    ``SchedulerState`` in Redis via ``compute_schedule(state)`` — it
-    reflects the same forward-fill assignment that produced the persisted
-    ``scheduled_production_date`` / ``expected_delivery_date`` summary
-    fields. Empty when no scheduler run has happened yet.
+    natural for the UI. Both the summary dates and the ``daily_breakdown``
+    list come straight from Postgres — the columns are kept fresh by
+    ``materialize_schedule_task``, which re-computes the schedule after
+    every accepted compound and writes the per-day split into
+    ``orders.daily_breakdown`` (JSONB). The Redis ``SchedulerState`` is
+    NOT consulted on this read path; it stays a pure algorithm cache.
+
+    Empty when no scheduler run has happened yet (column NULL → empty
+    list).
 
     Permission: order_manager+.
     """
-    breakdown: list[ScheduledResult] = []
+    return order_service.list_scheduled_orders(db)
+
+
+# ---------------------------------------------------------------------------
+# GET /pending-ops
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/pending-ops",
+    response_model=list[PendingOpsEntry],
+)
+def get_pending_ops(
+    current_user: User = Depends(_READ_ROLES),
+) -> list[PendingOpsEntry]:
+    """Snapshot the worker's pending-compound queue with drain ranks.
+
+    Each entry is one ``ScheduleCompoundRequest`` currently sitting in
+    ``schedule:pending_ops`` (the Redis sorted set the worker drains via
+    ``ZPOPMIN``). ``rank`` is 1-indexed and matches the order the worker
+    will process them — rank=1 is "next to be processed".
+
+    A compound may touch one OR more orders (a batch business action is
+    legal); ``ops`` on each entry keeps the per-op order linkage. The
+    dashboard answers "where is order X in line?" by scanning entries
+    whose ``ops`` contain ``order_id == X`` and reading the smallest
+    ``rank`` (an order can appear in multiple compounds if PATCHes pile
+    up faster than the worker drains).
+
+    Empty list when the queue is idle. Returns 200 either way so the
+    dashboard can poll without special-casing "no data".
+
+    Permission: order_manager+.
+    """
+    return list_pending_ops()
+
+
+# ---------------------------------------------------------------------------
+# GET /capacity
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/capacity",
+    response_model=ScheduleCapacityResponse,
+)
+def get_schedule_capacity(
+    current_user: User = Depends(_READ_ROLES),
+) -> ScheduleCapacityResponse:
+    """Per-day prefix sum of remaining wafer capacity across the 30-day horizon.
+
+    Reads the live ``SchedulerState`` from Redis and queries
+    ``capacity_tree`` for each of the 30 day-indices. ``entries[i]``
+    holds the prefix sum from ``base_date`` through ``base_date + i``
+    days — i.e., how many wafers' worth of spare capacity exist
+    cumulatively up to that day. Same source the segment tree itself
+    uses to make feasibility decisions, so the number the dashboard
+    shows always matches the scheduler's own view.
+
+    No DB hit on this path: capacity is an algorithm-internal quantity
+    and lives only in Redis. If the Redis state is missing (first
+    deploy or a flush), we fabricate a fresh ``SchedulerState.initial``
+    keyed on today so the dashboard still gets a usable 30-entry
+    response (every day = ``DAILY_CAPACITY``, cumulative sum scaled
+    accordingly) instead of an empty payload or 500.
+
+    Permission: order_manager+.
+    """
     raw = cast("str | None", _redis().get(STATE_KEY))
-    if raw is not None:
+    if raw is None:
+        state = SchedulerState.initial(datetime.now(tz=UTC).date())
+    else:
         state = SchedulerState.from_json(raw)
-        breakdown = compute_schedule(state)
-    return order_service.list_scheduled_orders(db, breakdown=breakdown)
+
+    entries = [
+        CapacityPrefixEntry(date=d, cumulative_remaining=prefix)
+        for d, prefix in capacity_prefix_sums(state)
+    ]
+    return ScheduleCapacityResponse(
+        base_date=state.base_date,
+        daily_capacity=DAILY_CAPACITY,
+        entries=entries,
+    )
 
 
 # ---------------------------------------------------------------------------

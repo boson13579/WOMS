@@ -21,11 +21,33 @@ from __future__ import annotations
 import os
 from collections.abc import Generator, Iterator
 
+# ---------------------------------------------------------------------------
+# Module-level env-var defaults
+# ---------------------------------------------------------------------------
+# ``app.core.config.Settings`` declares ``DATABASE_URL`` / ``REDIS_URL`` /
+# ``JWT_SECRET`` as required fields. Any module that calls ``get_settings()``
+# at import-time (e.g. ``app/services/scheduling.py:_settings = get_settings()``)
+# would otherwise fail config validation during test collection — well before
+# the session-scoped container fixtures get a chance to inject the real URLs.
+#
+# We seed safe placeholders here so collection always succeeds; the actual
+# container fixtures below overwrite them with reachable URLs (and bust
+# ``get_settings()``'s lru_cache so the override is picked up).
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+psycopg://test:test@localhost/test",
+)
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault("JWT_SECRET", "test-secret-do-not-use-in-prod")
+
+
 import pytest
 from fastapi.testclient import TestClient
+from redis import Redis
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
+from testcontainers.redis import RedisContainer
 
 # --- 1. Postgres container (session-wide) ------------------------------------
 
@@ -38,15 +60,85 @@ def postgres_container() -> Iterator[PostgresContainer]:
     provided by the per-test transaction rollback in `db_session` below.
     """
     with PostgresContainer("postgres:15-alpine") as pg:
-        # Some downstream code calls `get_settings()` which requires DATABASE_URL
-        # in the environment. Inject the container URL before any test imports
-        # `app.core.config`.
         os.environ["DATABASE_URL"] = pg.get_connection_url().replace(
             "postgresql+psycopg2", "postgresql+psycopg"
         )
-        os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
-        os.environ.setdefault("JWT_SECRET", "test-secret-do-not-use-in-prod")
+        _bust_settings_cache()
         yield pg
+
+
+# --- 1b. Redis container (session-wide) --------------------------------------
+
+
+@pytest.fixture(scope="session")
+def redis_container() -> Iterator[RedisContainer]:
+    """Boot a real Redis 7 container for the full test session.
+
+    Same rationale as ``postgres_container``: docs/RULES.md §5 mandates that
+    integration tests mirror production. A hand-rolled ``_FakeRedis`` only
+    covers the subset of commands we happened to use today, so adding a new
+    Redis command silently passes tests until production blows up. A real
+    container is the only honest stand-in.
+
+    Isolation between tests is handled by the ``_redis_flushdb`` autouse
+    fixture below — every test starts with an empty keyspace.
+    """
+    with RedisContainer("redis:7-alpine") as r:
+        host = r.get_container_host_ip()
+        port = r.get_exposed_port(6379)
+        # Point the entire app at the container by overriding the env var
+        # the ``Settings`` model reads, then busting ``get_settings()`` and
+        # the per-module ``_redis()`` lru_caches so the new URL takes effect.
+        os.environ["REDIS_URL"] = f"redis://{host}:{port}/0"
+        _bust_settings_cache()
+        yield r
+
+
+@pytest.fixture(scope="session")
+def redis_client(redis_container: RedisContainer) -> Iterator[Redis]:
+    """Reusable Redis client bound to the test container.
+
+    Tests should depend on this fixture (not call ``Redis.from_url`` themselves)
+    so the connection pool is shared and FLUSHDB hits the right instance.
+    """
+    client = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+@pytest.fixture(autouse=True)
+def _redis_flushdb(redis_client: Redis) -> Iterator[None]:
+    """Wipe the Redis keyspace before each test.
+
+    Replaces the old per-test ``_FakeRedis()`` instantiation pattern — one
+    process-wide container with a clean keyspace per test gives the same
+    isolation guarantee at a fraction of the boilerplate. autouse so every
+    test gets the wipe without opting in.
+    """
+    redis_client.flushdb()
+    yield
+
+
+def _bust_settings_cache() -> None:
+    """Invalidate every lru_cached settings / redis-client accessor.
+
+    Called whenever a fixture mutates one of the env vars (``DATABASE_URL``
+    / ``REDIS_URL``) so the next ``get_settings()`` / ``_redis()`` call
+    re-reads the updated environment. Without this, the first import of
+    ``app.core.config`` would freeze the placeholder URL in the cache and
+    no amount of os.environ surgery would change it for subsequent code.
+    """
+    from app.api.v1 import schedule as api_schedule
+    from app.core.config import get_settings
+    from app.services import schedule_queue
+    from app.workers import scheduling as worker_scheduling
+
+    get_settings.cache_clear()
+    api_schedule._redis.cache_clear()
+    schedule_queue._redis.cache_clear()
+    worker_scheduling._get_redis.cache_clear()
 
 
 # --- 2. Engine + schema (session-wide) ---------------------------------------

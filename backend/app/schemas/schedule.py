@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.order import OrderStatus
 
 __all__ = [
+    "CompoundDbAction",
     "DailyAssignment",
-    "ScheduleOperationRequest",
+    "ScheduleCompoundFailedDetail",
+    "ScheduleCompoundRequest",
+    "ScheduleCompoundResponse",
+    "ScheduleOpInCompound",
     "ScheduleRebuildResponse",
     "ScheduleResultResponse",
     "ScheduleStatusResponse",
@@ -21,61 +25,171 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Request schemas
+# Request schemas — compound flow
 # ---------------------------------------------------------------------------
 
 
-class ScheduleOperationRequest(BaseModel):
-    """One pending op to push onto the scheduler queue.
+class ScheduleOpInCompound(BaseModel):
+    """One leaf op inside a :class:`ScheduleCompoundRequest`.
 
-    The Order CRUD layer fires one of these for every create / cancel, and a
-    pair (``remove`` then ``add``) for every quantity / deadline edit.
+    Op kinds:
 
-    The ``group`` field decides processing order in the worker:
+    - ``"add"`` / ``"remove"`` — push an order into / out of the pq.
+    - ``"pin"`` — lock an order to a specific ``fake_deadline`` (must be
+      ≤ real deadline). Requires ``fake_deadline``.
+    - ``"unpin"`` — release a pinned order back to the pq.
+      ``fake_deadline`` must NOT be supplied.
 
-    - ``"shrink"`` — ops that *free* capacity: pure ``remove`` (delete), the
-      remove+add pair for a deadline deferral, or the remove+add pair for a
-      quantity decrease.
-    - ``"grow"`` — ops that *consume* capacity: pure ``add``, the remove+add
-      pair for a deadline advance, or the remove+add pair for a quantity
-      increase.
-
-    Worker drains all shrink-group ops first (FIFO), then all grow-group ops
-    (FIFO). This keeps each compound update atomic *within* its group and
-    avoids growing-half ops failing on capacity that's still occupied by the
-    shrinking-half of a different update.
-
-    For compound updates the producer must tag *both* the remove and the add
-    with the same group; for single ops (pure add / pure remove) ``group``
-    can be omitted and the ``mode="before"`` validator fills in the obvious
-    default before field validation, so the field type itself is non-Optional.
+    ``group`` and ``requested_by`` live at the compound level (not here) —
+    every op in a compound shares them, so duplicating them on each leaf
+    would just create chances for them to disagree.
     """
 
-    op: Literal["add", "remove"]
-    group: Literal["shrink", "grow"]
+    op: Literal["add", "remove", "pin", "unpin"]
     order_id: uuid.UUID
     order_number: str
     wafer_quantity: int = Field(gt=0)
     deadline: date
+    fake_deadline: date | None = None
+
+    @model_validator(mode="after")
+    def _pin_requires_fake_deadline(self) -> ScheduleOpInCompound:
+        """``pin`` ops MUST include ``fake_deadline``; other ops MUST NOT."""
+        if self.op == "pin" and self.fake_deadline is None:
+            raise ValueError("op='pin' requires fake_deadline")
+        if self.op != "pin" and self.fake_deadline is not None:
+            raise ValueError(f"op={self.op!r} must NOT include fake_deadline; only 'pin' uses it")
+        return self
+
+
+class CompoundDbAction(BaseModel):
+    """DB-write payload the worker executes after a compound is accepted.
+
+    Owns the user-facing column writes (``wafer_quantity`` /
+    ``requested_delivery_date`` / ``notes`` / ``assigned_to`` / soft-delete)
+    that **used to** be committed by the producer (``update_order`` /
+    ``create_order`` / ``delete_order``) before the compound was even
+    enqueued. With this field set, the producer commits only the
+    ``is_processing_locked=True`` flag (lock the row from concurrent
+    edits) and lets the worker apply the actual data change inside the
+    same transaction that mutates ``SchedulerState``. The motivation is
+    P1-2 in the PR-14 review: pre-existing flow could leave DB and
+    Redis state permanently out of sync when the compound failed
+    (DB had the new value, state had the old). With this field, DB
+    only takes the new value when state actually accepts the compound.
+
+    Failure semantics:
+
+    - ``kind="create"``: producer pre-creates a minimal row (status=
+      pending, is_processing_locked=True). Worker on success leaves
+      the row in place; worker on failure soft-deletes it (orphan
+      cleanup). The ``new_*`` fields hold the create payload for
+      audit-log construction inside the worker.
+    - ``kind="update"``: producer only writes the lock flag. Worker on
+      success writes the ``new_*`` columns + audit-logs the diff.
+      Worker on failure clears the lock; DB still holds the pre-PATCH
+      values (which is the correct rollback outcome).
+    - ``kind="delete"``: producer only writes the lock flag. Worker on
+      success sets ``is_deleted=True`` + ``status=cancelled`` + audit.
+      Worker on failure clears the lock; the order remains alive.
+    """
+
+    kind: Literal["create", "update", "delete"]
+    actor_id: uuid.UUID
+
+    # New values to write (None = field absent from the PATCH).
+    # ``notes`` and ``assigned_to`` use a paired "set" boolean because
+    # ``None`` is a legal user-visible value (= "clear the field").
+    new_wafer_quantity: int | None = None
+    new_requested_delivery_date: date | None = None
+    new_notes_set: bool = False
+    new_notes: str | None = None
+    new_assigned_to_set: bool = False
+    new_assigned_to: uuid.UUID | None = None
+
+    # Pre-PATCH values for audit log diffing. Worker reads ``old_*`` to
+    # construct the ``audit_logs.old_value`` JSON. Absent on create.
+    old_wafer_quantity: int | None = None
+    old_requested_delivery_date: date | None = None
+    old_notes: str | None = None
+    old_assigned_to: uuid.UUID | None = None
+
+
+class ScheduleCompoundRequest(BaseModel):
+    """One atomic business action against the scheduler.
+
+    A compound is a list of N leaf ops (no upper bound; producer drives the
+    count to match the business action's complexity) that the worker
+    processes as a single atomic unit. The full sequence of ops either
+    completes successfully or the worker snapshot-rollbacks
+    ``SchedulerState`` to its pre-compound state and emits
+    ``schedule.compound_failed`` over WebSocket — no partial successes
+    leaking past the compound boundary.
+
+    Why compound instead of per-op:
+
+    - **Atomic from the outside**: ``schedule:status`` stays ``running`` for
+      the full compound. ``advance_day_task`` / ``rebuild_schedule_task``
+      can't slip in mid-compound, eliminating the per-op race where a
+      compound's [unpin, remove, add] sequence got split across an
+      advance_day boundary.
+    - **Saga rollback on failure**: producer never has to deal with
+      "remove succeeded but add failed, the order is now destroyed";
+      worker undoes earlier successes so state matches the pre-compound
+      world.
+    - **Aligns with how producers think**: a PATCH that defers a pinned
+      order is one business action containing 3-4 worker ops; modelling it
+      as one Redis member matches that reality. A more elaborate batch
+      action might fan out to dozens of ops — that's fine too.
+
+    Producer responsibility:
+
+    - Pick a single ``group`` for the whole compound. The compound is
+      scored as shrink (sorted before grow) or grow (sorted after shrink)
+      and worker pops one compound per ``run_scheduling_task`` invocation.
+    - **Set ``op_count`` to exactly ``len(ops)``**. The field is required
+      and the schema validator rejects a mismatch — that's the contract
+      the user spec calls out so producers can't silently send a partial
+      compound payload (e.g. truncated by a network hiccup). Worker also
+      double-checks at consumption time and rolls back if a stale member
+      in Redis somehow has a wrong count.
+    - Order the ops correctly: pin/unpin lifecycle ops must precede the
+      modify ops they bracket. E.g. modifying a pinned order's deadline:
+      ``[unpin, remove(old), add(new), pin(same day)]`` — wrong order will
+      fail at one of the membership guards (worker rolls back, WS fires).
+    - Ensure ``compound_id`` is unique. Cancellations / status queries
+      use it to address a specific in-flight compound.
+    - Ops in a compound may target one or more distinct ``order_id`` —
+      single-order flows (PATCH / DELETE / CREATE) make one order per
+      compound, batch business actions are free to mix. No schema-level
+      uniqueness constraint; worker applies each op independently.
+    """
+
+    compound_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    group: Literal["shrink", "grow"]
+    op_count: int = Field(gt=0)
+    ops: list[ScheduleOpInCompound] = Field(min_length=1)
     requested_by: uuid.UUID
+    # Optional DB write the worker performs after the compound is accepted.
+    # ``None`` means "no DB write needed" — used for internally-generated
+    # compounds (e.g. ``rebuild_state``-fed adds) where the row already
+    # reflects truth. See :class:`CompoundDbAction` for the failure-path
+    # rollback contract.
+    db_action: CompoundDbAction | None = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def _default_group_from_op(cls, data: Any) -> Any:
-        """Inject the degenerate ``group`` when caller omits it.
+    @model_validator(mode="after")
+    def _op_count_matches_ops_length(self) -> ScheduleCompoundRequest:
+        """``op_count`` MUST equal ``len(ops)``.
 
-        Runs before per-field validation so the field can be declared as
-        ``Literal["shrink", "grow"]`` (non-Optional). Only meaningful for
-        single ops; compound updates MUST tag ``group`` explicitly on both
-        halves — the default is wrong for them.
+        Tamper / truncation guard: if a producer sends a compound saying
+        "I'm 4 ops" but ``ops`` only contains 3, we reject at the schema
+        boundary. The worker also re-checks at consumption time (in case
+        the Redis member got corrupted post-enqueue), but blocking it
+        here is the cheapest layer.
         """
-        if isinstance(data, dict) and data.get("group") is None:
-            op = data.get("op")
-            if op == "remove":
-                data = {**data, "group": "shrink"}
-            elif op == "add":
-                data = {**data, "group": "grow"}
-        return data
+        if self.op_count != len(self.ops):
+            raise ValueError(f"op_count={self.op_count} does not match len(ops)={len(self.ops)}")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +202,44 @@ class ScheduleTriggerResponse(BaseModel):
 
     task_id: str
     message: str
+
+
+class ScheduleCompoundResponse(BaseModel):
+    """Returned by ``POST /schedule/operations`` after a compound is enqueued.
+
+    The compound runs async (worker drains the queue), so this response just
+    confirms the compound landed in Redis. The caller observes outcome via:
+    - ``schedule.updated`` WebSocket broadcast on success.
+    - ``schedule.compound_failed`` WebSocket (``schedule:notify_user`` to
+      ``requested_by``) on failure-with-rollback.
+    """
+
+    compound_id: uuid.UUID
+    message: str
+
+
+class ScheduleCompoundFailedDetail(BaseModel):
+    """Payload of the ``schedule.compound_failed`` WebSocket event.
+
+    Documented as a schema so the frontend has a structured contract to
+    code against. The worker constructs an instance and serializes it into
+    the WS envelope's ``message`` field; the field names below match.
+    """
+
+    type: Literal["schedule.compound_failed"] = "schedule.compound_failed"
+    compound_id: uuid.UUID
+    # 0-indexed position inside ``ops``. ``ops[failed_op_index]`` is the
+    # one that returned non-success.
+    failed_op_index: int
+    failed_op: Literal["add", "remove", "pin", "unpin"]
+    order_id: uuid.UUID
+    order_number: str
+    # ``ScheduleResult.status`` of the failed leaf op.
+    reason: str
+    detail: str | None = None
+    # Always ``True`` for compound failures — present so the frontend can
+    # surface "your previous state has been restored" reliably.
+    rolled_back: Literal[True] = True
 
 
 class ScheduleStatusResponse(BaseModel):
@@ -120,6 +272,71 @@ class ScheduleRebuildResponse(BaseModel):
 
     task_id: str
     message: str
+
+
+class PendingOpsOpView(BaseModel):
+    """One leaf op surfaced inside a :class:`PendingOpsEntry`.
+
+    Trimmed projection of :class:`ScheduleOpInCompound` — only the fields
+    the dashboard actually needs to render queue state. ``wafer_quantity``
+    / ``deadline`` / ``fake_deadline`` are dropped because the dashboard
+    has them via ``/schedule/result`` already.
+    """
+
+    op: Literal["add", "remove", "pin", "unpin"]
+    order_id: uuid.UUID
+    order_number: str
+
+
+class PendingOpsEntry(BaseModel):
+    """One queued compound's drain-position snapshot.
+
+    Returned by ``GET /schedule/pending-ops``. ``rank`` is 1-indexed and
+    matches the order ``run_scheduling_task`` will pop compounds via
+    ``ZPOPMIN`` — so rank=1 is "next to be processed".
+
+    A compound may touch one OR more orders (batch business actions are
+    legal); ``ops`` keeps the per-op order linkage so the dashboard can
+    answer "where is order X in line?" by filtering ``ops`` for that
+    ``order_id`` and reading the compound's ``rank``. Distinct order
+    ids can be derived as ``{op.order_id for op in ops}`` — we don't
+    duplicate that derived view on this schema.
+    """
+
+    compound_id: uuid.UUID
+    rank: int = Field(ge=1)
+    group: Literal["shrink", "grow"]
+    op_count: int = Field(ge=1)
+    ops: list[PendingOpsOpView]
+    requested_by: uuid.UUID
+
+
+class CapacityPrefixEntry(BaseModel):
+    """One day in the 30-day capacity-prefix-sum series.
+
+    ``cumulative_remaining`` is the prefix sum of remaining wafer capacity
+    from ``base_date`` (the horizon's day 1) up to and including ``date``.
+    The dashboard typically renders this as a step / area chart to show
+    how much spare production capacity exists in the next N days combined.
+    """
+
+    date: date
+    cumulative_remaining: int = Field(ge=0)
+
+
+class ScheduleCapacityResponse(BaseModel):
+    """Snapshot of the segment-tree ``capacity_tree`` projected to absolute dates.
+
+    Returned by ``GET /schedule/capacity``. The list always has exactly
+    ``HORIZON_DAYS`` entries (30) in ascending date order — the dashboard
+    can rely on a fixed-length series even before any scheduling run.
+    ``daily_capacity`` is included so the frontend can derive "used per
+    day" without hard-coding the constant.
+    """
+
+    base_date: date
+    daily_capacity: int = Field(gt=0)
+    entries: list[CapacityPrefixEntry]
 
 
 class ScheduleResultResponse(BaseModel):

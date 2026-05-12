@@ -198,9 +198,18 @@ async def event_consumer_loop() -> None:
     """Subscribe to the events channel and fan-out into the local manager.
 
     Runs as a background ``asyncio.Task`` for the FastAPI app's lifespan;
-    cancelled cleanly on shutdown. Connection / decode errors are logged
-    but never crash the loop — losing a single message is preferable to
-    bringing the whole notification path down.
+    cancelled cleanly on shutdown. Per-message decode errors stay confined
+    to ``_handle_event`` (logged + dropped). A *loop-level* error — failed
+    subscribe, broken pubsub iterator, Redis connection death — is
+    **terminal**: the loop exits and the lifespan does not restart it, so
+    every subsequent ``broadcast`` / ``notify_user`` becomes a silent no-op
+    until the FastAPI process is restarted.
+
+    For that reason a terminal failure is logged at ``ERROR`` (with
+    ``exc_info``) — operator-grade so log-based alerting fires. Auto-restart
+    isn't built in here on purpose: in tests without a live Redis the
+    consumer would loop forever burning CPU, and the right operational
+    response is "restart the pod" so a healthy lifespan re-runs.
     """
     settings = get_settings()
     redis: AsyncRedis | None = None
@@ -218,10 +227,14 @@ async def event_consumer_loop() -> None:
         logger.info("websocket.consumer.cancelled")
         raise
     except Exception as exc:
-        # Log and exit — the lifespan will not restart us. In production
-        # missing-Redis is an alert-worthy condition; in tests without a
-        # live Redis we just stay quiet.
-        logger.warning("websocket.consumer.failed", error=str(exc))
+        # Terminal — see docstring. ERROR + exc_info so monitoring picks it
+        # up; without this every WS notification silently disappears for
+        # the rest of the process's life.
+        logger.error(
+            "websocket.consumer.failed",
+            error=str(exc),
+            exc_info=True,
+        )
     finally:
         if pubsub is not None:
             with contextlib.suppress(Exception):

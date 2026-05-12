@@ -30,115 +30,153 @@
 
 **強烈建議用 A**，除非你確定要省那一次 RTT 而且能接受耦合。
 
+> **Phase 2 變更**：endpoint shape 從「一次接一筆 op」改成「一次接一個 compound」。一個 compound = 一組 1-4 筆 leaf ops，worker 端 **atomic 執行 + snapshot rollback**（任何一筆 op 失敗就把整個 compound 連已成功的部分一起 undo）。Order CRUD service 內部已自動 build 對應 compound（見 `app/services/order.py::_build_*_compound`），多數情況**前端 / 第三方服務只在「手動 pin / unpin」**時需要直接戳這支 endpoint。
+
 ### 2.2 方法 A — HTTP（推薦）
 
 ```python
 import httpx
+import uuid
 
-# 建立訂單後
+# 建立訂單後（如果 backend Order CRUD 已自動處理，這段可以略）
 def on_order_created(order, actor):
-    httpx.post(
-        "http://backend/api/v1/schedule/operations",
-        json={
+    ops = [
+        {
             "op": "add",
             "order_id": str(order.id),
             "order_number": order.order_number,
             "wafer_quantity": order.wafer_quantity,
             "deadline": order.requested_delivery_date.isoformat(),
+        },
+    ]
+    httpx.post(
+        "http://backend/api/v1/schedule/operations",
+        json={
+            "compound_id": str(uuid.uuid4()),
+            "group": "grow",
+            "op_count": len(ops),  # 必須等於 len(ops)，schema 會驗
             "requested_by": str(actor.id),
+            "ops": ops,
         },
         headers={"Authorization": f"Bearer {service_token}"},
     )
 
-# 取消訂單時
-def on_order_cancelled(order, actor):
-    httpx.post(
-        "http://backend/api/v1/schedule/operations",
-        json={
-            "op": "remove",
+# 手動把訂單 pin 到 5/12
+def on_user_pinned(order, actor, pin_day):
+    ops = [
+        {
+            "op": "pin",
             "order_id": str(order.id),
             "order_number": order.order_number,
             "wafer_quantity": order.wafer_quantity,
             "deadline": order.requested_delivery_date.isoformat(),
+            "fake_deadline": pin_day.isoformat(),
+        },
+    ]
+    httpx.post(
+        "http://backend/api/v1/schedule/operations",
+        json={
+            "compound_id": str(uuid.uuid4()),
+            "group": "grow",
+            "op_count": len(ops),
             "requested_by": str(actor.id),
+            "ops": ops,
         },
         headers={"Authorization": f"Bearer {service_token}"},
     )
 ```
 
-**Response 202**：`{"message": "Operation queued"}`，無同步結果。
+**Response 202**：`{"compound_id": "...", "message": "Compound queued"}`。實際結果走 WS：
+- 成功 → `schedule.updated` broadcast。
+- 失敗 → `schedule.compound_failed` notify\_user 給 `requested_by`，state 已 rollback。
 
-### 2.3 方法 B — 直連 Redis
+### 2.3 方法 B — 直連 Redis（不推薦，僅在無法走 HTTP 時用）
 
 ```python
-import json
-from redis import Redis
-from app.core.config import get_settings
-from app.workers.scheduling import (
-    PENDING_OPS_KEY,
-    PENDING_OPS_SEQ_KEY,
-    run_scheduling_task,
-    score_for_op,
-)
-
-_redis = Redis.from_url(str(get_settings().REDIS_URL), decode_responses=True)
-
-def enqueue_op(payload: dict, group: str) -> None:
-    seq = _redis.incr(PENDING_OPS_SEQ_KEY)
-    payload["_seq"] = seq
-    _redis.zadd(
-        PENDING_OPS_KEY,
-        {json.dumps(payload): score_for_op(group=group, seq=seq)},
-    )
-    run_scheduling_task.delay()
+from app.services.schedule_queue import enqueue_compound
+from app.schemas.schedule import ScheduleCompoundRequest, ScheduleOpInCompound
+# ↑ 這條路徑只有同進程 Python 才走得通；微服務之間請用 HTTP。
 ```
 
-### 2.4 修改訂單（複合更新）— ⚠️ 注意事項
+直接戳 Redis 不會 self-validate（schema 跳過），請避免。
 
-排程演算法只認 `add` / `remove` 兩種原子操作。**修 quantity 或 deadline 必須拆成兩筆**：先 remove 舊值、再 add 新值。
+### 2.4 修改訂單 — Order CRUD 已自動處理
 
-而且這兩筆必須由你**明確標 `group` 欄位**（值要一致），否則 add 那半會跑錯 phase 拿不到 remove 釋放的產能：
+Phase 2 之後，**只要呼叫 backend 的 Order CRUD endpoint，scheduler compound 會自動建好推進佇列**，不需要第三方服務 / 前端額外打 `/schedule/operations`：
 
-| 業務動作 | 兩筆 op 的 group |
+| Order CRUD | service 自動 build 的 compound |
 |---|---|
-| **Defer**（deadline 往後延） | 兩筆都 `"shrink"` |
-| **Advance**（deadline 提前） | 兩筆都 `"grow"` |
-| **Qty 變小** | 兩筆都 `"shrink"` |
-| **Qty 變大** | 兩筆都 `"grow"` |
-| **Qty + deadline 一起改** | 保守標 `"grow"`（讓所有 shrink 先跑完再動） |
+| `POST /api/v1/orders` | `[add(新)]` |
+| `PATCH /api/v1/orders/{id}` 改 qty / deadline（非 pinned） | `[remove(舊), add(新)]` |
+| `PATCH /api/v1/orders/{id}`（pinned，新 deadline ≥ pin 日 AND 新 qty ≤ 舊 qty） | `[unpin, remove, add, pin(原 pin 日)]` — 自動 re-pin |
+| `PATCH /api/v1/orders/{id}`（pinned，其他情況） | `[unpin, remove, add]` — silent drop pin |
+| `PATCH /orders/batch-update` | 每筆訂單獨立 compound，內部規則同上 |
+| `DELETE /api/v1/orders/{id}`（非 pinned） | `[remove]` |
+| `DELETE /api/v1/orders/{id}`（pinned） | `[unpin, remove]` |
 
-```python
-# Defer：把訂單從 5/10 延到 5/15
-def on_order_deadline_extended(order_old, order_new, actor):
-    base = {
-        "order_id": str(order_old.id),
-        "order_number": order_old.order_number,
-        "requested_by": str(actor.id),
-    }
-    # 1. 先推 remove（舊值）
-    httpx.post(URL, json={
-        **base,
-        "op": "remove",
-        "group": "shrink",  # ← 必須帶
-        "wafer_quantity": order_old.wafer_quantity,
-        "deadline": order_old.requested_delivery_date.isoformat(),
-    })
-    # 2. 再推 add（新值）
-    httpx.post(URL, json={
-        **base,
-        "op": "add",
-        "group": "shrink",  # ← 一定要跟上面一樣
-        "wafer_quantity": order_new.wafer_quantity,
-        "deadline": order_new.requested_delivery_date.isoformat(),
-    })
-```
+「`group` 是 shrink 還是 grow」由 service 端按 `defer / qty 變小 → shrink`、`advance / qty 變大 → grow` 自動推導，所有 ops 都標同一個 group 進 compound。
+
+**直接戳 `/schedule/operations` 的場景**只剩兩種：
+1. **手動 pin / unpin**（user 在 UI 上按「鎖到 5/12」按鈕） — 前端送 1-op compound 帶 `pin` 或 `unpin`。
+2. **第三方非標準業務 op**（譬如另一條 service 想直接動排程）。
 
 ### 2.5 注意事項
 
-- **`requested_by` 一定要填**：排程失敗（產能不夠 / deadline 超 30 天）會透過 WebSocket 推 `schedule.add_failed` 給這個 user_id。沒填的話通知不會送出。
-- **不需要等排程跑完**：endpoint 回 202 就可以接著做事，排程是 async。前端會透過 WebSocket 收到 `schedule.updated` 知道結果。
-- **單純的 `add` / `remove` 可以省略 `group`**：schema validator 會用 `op` 推預設（`remove → shrink`、`add → grow`）。**但複合更新一定要顯式帶**，不然會出錯。
+- **`requested_by` 一定要填**：compound 失敗時用這個 user id 推 `schedule.compound_failed` 通知。
+- **`op_count` 必須等於 `len(ops)`**：schema 跟 worker 都會驗，不一致直接 422 / `schedule.compound_failed`。這是 producer 對 payload 自我宣告長度的契約，網路截斷或人工改 payload 漏掉一筆 op 都能立刻被偵測到。
+- **`ops` 沒上限**：compound 可以是 1 筆 op（pin 單筆訂單）也可以是 30 筆 op（複雜的 batch 改動）— 業務動作要做幾步就放幾步。worker atomic 處理整個 compound。
+- **不需要等排程跑完**：endpoint 回 202 就可以接著做事，排程是 async。
+- **同 compound 內 ops 必須同 `order_id`**：schema 自帶 validator，多 order 一次直接 422。
+- **Compound 內 ops 順序由 producer 決定**（worker 不重排）；service 內建 builder 已經把順序排好。手動戳的話注意 `unpin → remove → add → pin`（如有）的拓樸。
 - **權限**：`POST /schedule/operations` 要 `scheduler+`。從 Order CRUD 內部呼叫時要帶 scheduler 等級的 service token。
+
+### 2.6 Pin / Unpin 手動操作
+
+```python
+import httpx
+import uuid
+
+# UI 按「把訂單 pin 到 5/12」按鈕
+def pin_order(order, actor, pin_day):
+    ops = [{
+        "op": "pin",
+        "order_id": str(order.id),
+        "order_number": order.order_number,
+        "wafer_quantity": order.wafer_quantity,
+        "deadline": order.requested_delivery_date.isoformat(),
+        "fake_deadline": pin_day.isoformat(),
+    }]
+    httpx.post(URL, json={
+        "compound_id": str(uuid.uuid4()),
+        "group": "grow",
+        "op_count": len(ops),
+        "requested_by": str(actor.id),
+        "ops": ops,
+    })
+
+# 解 pin
+def unpin_order(order, actor):
+    ops = [{
+        "op": "unpin",
+        "order_id": str(order.id),
+        "order_number": order.order_number,
+        "wafer_quantity": order.wafer_quantity,
+        "deadline": order.requested_delivery_date.isoformat(),
+    }]
+    httpx.post(URL, json={
+        "compound_id": str(uuid.uuid4()),
+        "group": "shrink",
+        "op_count": len(ops),
+        "requested_by": str(actor.id),
+        "ops": ops,
+    })
+```
+
+失敗時拿到 `schedule.compound_failed`（`failed_op="pin"` 或 `"unpin"`），**state 已 rollback** — pin 失敗的訂單仍保持原樣（未 pinned）；unpin 失敗的訂單仍是原 pin 狀態。
+
+`is_pinned` / `pinned_production_date` 由 worker 處理完 compound 之後 `apply_schedule` 寫回 DB；compound 失敗就不會寫，DB 維持舊值。
+
+`is_processing_locked` 是獨立的「UI 編輯鎖」flag — Order CRUD 時設 true、`apply_schedule` 跑完設 false。前端拿來在那段時間 disable 該列的 inline edit。
 
 ---
 
@@ -154,9 +192,12 @@ def on_order_deadline_extended(order_old, order_new, actor):
 |---|---|---|---|
 | `POST` | `/trigger` | scheduler+ | 手動補觸發排程任務 |
 | `GET` | `/status` | order_manager+ | 排程 worker 的 lifecycle snapshot（`idle`/`running`/`failed`） |
-| `GET` | `/result` | order_manager+ | 目前已排定的訂單清單（含每筆訂單的逐日數量 `daily_breakdown`） |
+| `GET` | `/result` | order_manager+ | 目前已排定 / 進行中的訂單清單（含每筆訂單的逐日數量 `daily_breakdown`，包含 `scheduled` 跟 `in_production` 兩種 status） |
+| `GET` | `/capacity` | order_manager+ | 未來 30 天剩餘產能的**前綴和**序列，dashboard 畫產能圖用 |
+| `GET` | `/pending-ops` | order_manager+ | 排隊中 compound 的 drain 順位快照（rank=1 = 下一個會被 worker 處理） |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建排程 state（async；不會 block） |
-| `POST` | `/operations` | scheduler+ | 推訂單 op（**這條 frontend 通常不需要碰**，由 Order CRUD 後端內部呼叫） |
+| `POST` | `/operations` | scheduler+ | 推 compound 進佇列（Phase 2 後 Order CRUD 自動處理大部分情況，前端只在「手動 pin / unpin」時直接打） |
+| `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound（前端「取消」按鈕）。200 = 取消成功；409 = worker 已開始處理，無法取消；404 = compound id 未知 |
 
 錯誤回應一律走 unified envelope：
 ```json
@@ -191,9 +232,79 @@ const orders = await res.json();
 // ]
 ```
 
-訂單按 `scheduled_production_date` 升冪排序。`daily_breakdown` 為空表示 Redis state 還沒被建起來（首次部署或 Redis 被清過）。
+訂單按 `scheduled_production_date` 升冪排序。`daily_breakdown` 來自 DB 的 `orders.daily_breakdown` JSONB 欄位（由 `materialize_schedule_task` 寫入），不再即時從 Redis 算 — 所以 Redis 被清過不影響這個欄位的內容。`daily_breakdown` 為空表示這筆訂單還沒被 materializer 寫過（首次部署、或欄位是 NULL）。
 
-#### 3.2.2 `GET /api/v1/schedule/status` — 顯示排程狀態
+#### 3.2.2 `GET /api/v1/schedule/capacity` — 30 天剩餘產能（dashboard 用）
+
+```ts
+const res = await fetch("/api/v1/schedule/capacity", {
+    headers: { Authorization: `Bearer ${token}` },
+});
+const cap = await res.json();
+// {
+//   base_date: "2026-05-12",
+//   daily_capacity: 10000,
+//   entries: [
+//     { date: "2026-05-12", cumulative_remaining: 6000 },   // day 1: 還剩 6,000 (今天用了 4,000)
+//     { date: "2026-05-13", cumulative_remaining: 16000 },  // day 1+2 累計
+//     // ... 共 30 筆
+//   ]
+// }
+```
+
+`cumulative_remaining` 是**前綴和**（從 `base_date` 累計到該天），不是當日剩餘。要單日剩餘自己做差就好：
+
+```ts
+const dailyRemaining = cap.entries.map((e, i) =>
+    i === 0 ? e.cumulative_remaining
+            : e.cumulative_remaining - cap.entries[i - 1].cumulative_remaining
+);
+// 單日已用 = daily_capacity - dailyRemaining[i]
+```
+
+跟 `/schedule/result` 不同，這條 endpoint **讀的是 Redis 中的 `SchedulerState`**（不是 DB），所以反映的是 scheduler 演算法當前的 in-memory 視角；Redis 被清掉時會 fallback 到「30 天都還是空的」（每天 10,000 全可用）。要重新對齊就按 `POST /rebuild`。
+
+收到 WebSocket `schedule.materialized` / `schedule.updated` 時前端可以跟 `/result` 並行 refetch 這條，把產能圖一起更新。
+
+#### 3.2.3 `GET /api/v1/schedule/pending-ops` — 排隊中 compound 順位
+
+```ts
+const res = await fetch("/api/v1/schedule/pending-ops", {
+    headers: { Authorization: `Bearer ${token}` },
+});
+const queued = await res.json();
+// [
+//   { compound_id, rank: 1, group: "shrink", op_count: 2,
+//     ops: [
+//       { op: "unpin",  order_id: "uuid-a", order_number: "ORD-A" },
+//       { op: "remove", order_id: "uuid-a", order_number: "ORD-A" }
+//     ],
+//     requested_by },
+//   { compound_id, rank: 2, ... },
+//   ...
+// ]
+```
+
+`rank=1` 代表 worker 下一個會處理的 compound。**一個 compound 可能跨多筆訂單**（batch 業務動作的合法形狀），所以 `ops[]` 每筆 leaf 都各自帶 `order_id` / `order_number`。同一筆訂單在 list 中也可能出現多次（連續 PATCH 快過 worker 消化速度、或多個 compound 都碰到它）；前端通常掃 `ops` 找出含該 `order_id` 的 compound、取最小 rank：
+
+```ts
+const rankByOrder = new Map<string, number>();
+for (const it of queued) {
+    for (const o of it.ops) {
+        const cur = rankByOrder.get(o.order_id);
+        if (cur === undefined || it.rank < cur) {
+            rankByOrder.set(o.order_id, it.rank);
+        }
+    }
+}
+// rankByOrder.get(orderId) → 該訂單下一個動作排第幾、或 undefined 代表沒在排隊
+```
+
+跟 `/capacity` 一樣讀的是 Redis（不是 DB），所以這個視角是「scheduler 的 in-flight 工作清單」。佇列空時回 `[]`。
+
+收到 `schedule.compound_accepted` / `schedule.compound_cancelled` / `schedule.updated` 時都可以順便 refetch 這條更新「N 個動作等著被處理」的徽章。
+
+#### 3.2.4 `GET /api/v1/schedule/status` — 顯示排程狀態
 
 ```ts
 const res = await fetch("/api/v1/schedule/status", {
@@ -205,9 +316,9 @@ const status = await res.json();
 
 通常拿來在 dashboard 顯示「排程中⋯」/「上次跑於 XX」/「失敗了，error 是 …」。
 
-#### 3.2.3 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
+#### 3.2.5 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
 
-當 `daily_breakdown` 一直是空、或者懷疑排程跟現實不同步時，叫管理員按這個按鈕。
+當懷疑排程跟現實不同步（例如 DB 跟 Redis state 對不起來，或者 `daily_breakdown` 看起來明顯錯誤）時，叫管理員按這個按鈕：rebuild 會從 DB 重建 Redis state，再跑一輪 materializer 把 `orders.daily_breakdown` 改寫回正確值。
 
 ```ts
 const res = await fetch("/api/v1/schedule/rebuild", {
@@ -230,16 +341,43 @@ ws.addEventListener("message", (e) => {
     const msg = JSON.parse(e.data);
     switch (msg.type) {
         case "schedule.updated":
-            // 排程結果有更新（包含換天、rebuild、單筆 op 處理完）
+            // 系統動作（換天 advance_day / 重建 rebuild）廣播給所有連線 client
             queryClient.invalidateQueries(["schedule", "result"]);
             break;
-        case "schedule.add_failed":
-            // 自己創的訂單排不進去（產能不夠或 deadline 超 30 天）
-            toast.error(`訂單 ${msg.order_number} 排不進去：${msg.reason}`);
+        case "schedule.compound_accepted":
+            // Phase 4 fast-path：你的 compound 通過了，但 DB 還在 deferred materializer 排隊。
+            // 通常拿來把 UI 上的 "處理中" badge 換成 "已接受、等 DB 寫入"。
+            toast.success(`操作已接受，正在更新排程資料`);
             break;
-        case "schedule.remove_failed":
-            // 自己創的訂單在排程裡找不到（通常是狀態已不一致，建議刷新）
-            toast.warning(`訂單 ${msg.order_number} 移除失敗：${msg.reason}`);
+        case "schedule.materialized":
+            // Phase 4 slow-path：materializer 已經把你提交的修改寫進 DB。
+            // 觸發 refetch 看到最新數字。
+            queryClient.invalidateQueries(["schedule", "result"]);
+            queryClient.invalidateQueries(["orders"]);
+            break;
+        case "schedule.compound_failed":
+            // 自己送的 compound 失敗 + 已 saga-rollback。
+            // failed_op 可以是 "add" / "remove" / "pin" / "unpin"，按需要分流。
+            switch (msg.failed_op) {
+                case "add":
+                    toast.error(`訂單 ${msg.order_number} 排不進去：${msg.reason}`);
+                    break;
+                case "pin":
+                    toast.error(`訂單 ${msg.order_number} 鎖定生產日失敗：${msg.reason}`);
+                    break;
+                case "remove":
+                    toast.warning(`訂單 ${msg.order_number} 移除失敗：${msg.reason}（狀態可能已不一致，建議刷新）`);
+                    break;
+                case "unpin":
+                    toast.warning(`訂單 ${msg.order_number} 解除鎖定失敗：${msg.reason}`);
+                    break;
+            }
+            // state 已 rollback，前端不用主動還原 UI；下次刷 /schedule/result 看到的就是失敗前的狀態。
+            break;
+        case "schedule.compound_cancelled":
+            // 自己按了取消、後端確認成功。可以收回 optimistic UI 的「取消中」標記。
+            toast.success(`已取消排隊中的操作`);
+            queryClient.invalidateQueries(["schedule", "result"]);
             break;
         case "schedule.rebuild_skipped":
             // 自己創的訂單在 rebuild 時被跳過（通常是 deadline 已過期）
@@ -265,8 +403,10 @@ ws.addEventListener("close", (e) => {
 | `type` | 觸發時機 | 收件對象 | payload |
 |---|---|---|---|
 | `schedule.updated` | 任何排程結果有變動（單筆 op 處理完、換天、rebuild） | **所有連線的 client**（broadcast） | `{ type: "schedule.updated" }` |
-| `schedule.add_failed` | `add_order` 失敗（產能 / horizon） | 訂單的 `requested_by` user | `{ type, order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail }` |
-| `schedule.remove_failed` | `remove_order` 失敗（一般是訂單已不在 pq、典型場景是 race 或重複的 cancel op） | 訂單的 `requested_by` user | `{ type, order_id, order_number, reason: "deadline_too_far", detail }` |
+| `schedule.compound_accepted` | Phase 4 fast-path：compound 通過 saga，trees / pq / pinned 都更新好，accept/reject 結果出來。**DB 還沒寫入**（materializer 排隊中） | compound 的 `requested_by` user | `{ type, compound_id }` |
+| `schedule.compound_failed` | Compound 內任一 op 失敗（add / remove / pin / unpin），整個 compound 已 saga-rollback 至 pre-compound 狀態 | compound 的 `requested_by` user | `{ type, compound_id, failed_op_index, failed_op: "add"\|"remove"\|"pin"\|"unpin", order_id, order_number, reason: "capacity_exceeded"\|"deadline_too_far", detail, rolled_back: true }` |
+| `schedule.materialized` | Phase 4 slow-path：materializer 一批 DB 寫完，這個 user 有 compound 在這批裡 | 那批 compound 對應的 `requested_by` user | `{ type }` — payload 沒額外欄位，前端收到就 invalidate cache + refetch `/schedule/result` |
+| `schedule.compound_cancelled` | `DELETE /operations/{compound_id}` 取消成功 | compound 的 `requested_by` user | `{ type, compound_id }` |
 | `schedule.rebuild_skipped` | rebuild 時某筆 scheduled 訂單塞不回去（通常 deadline 已被 base_date 越過） | 訂單的 `created_by` user | `{ type, order_id, order_number, reason: "deadline_too_far"\|"capacity_exceeded" }` |
 
 ### 3.4 前端注意事項
@@ -361,16 +501,19 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 | 症狀 | 怎麼辦 |
 |---|---|
 | `schedule:state` key 不見 / Redis 被 flush | `POST /api/v1/schedule/rebuild` |
-| 前端 `daily_breakdown` 一直是空 | 同上 |
+| 前端 `daily_breakdown` 一直是空 | 表示 `orders.daily_breakdown` 欄位是 NULL — 通常代表 materializer 還沒跑過或寫入失敗。觸發一次 `POST /api/v1/schedule/trigger` 讓 worker 跑完整流程；如果還是空就 `POST /api/v1/schedule/rebuild` 強制重建。 |
 | `schedule:status` 卡在 `running` 但 worker 已經死了 | 重啟 worker；如果還是卡，手動 `redis-cli set schedule:status '{"state":"idle"}'` |
+| `schedule:status.state == "failed"`、`error` 欄位有訊息 | 三支 task（`run_scheduling` / `advance_day` / `rebuild_schedule`）任一條失敗都會留這個記錄，先看 `error` + Celery traceback 找根因。`failed` 不會擋 `/trigger`（409 只擋 `running`），下次成功的 task 會把 status 蓋回 `idle`，不需要先手動清。 |
 | `schedule:waiter_pending` 卡住超過 10 分鐘 | TTL 會自己過期；如果 TTL 被改大可以手動 `redis-cli del schedule:waiter_pending` |
 | 排程結果跟 DB 不同步 | `POST /api/v1/schedule/rebuild` |
+| 前端 WebSocket 通知突然全停 | 看 backend log 有沒有 `websocket.consumer.failed`（ERROR）— 這代表 Redis pub/sub 中斷或訂閱失敗，consumer 已退出且**不會自我重啟**。重啟 FastAPI process 即可（lifespan 會重新建一個 consumer task）。 |
 
 ### 4.7 Ops 注意事項
 
 - **生產 deploy 不要清 `schedule:pending_ops:seq`**：清掉的話新進來的 op 會跟舊的同 score 撞 member。要清的話**也要一起清 `schedule:pending_ops`**。
 - **scaling**：`run_scheduling_task` 設計成同時只能跑一個（靠 `schedule:status` 守）。即使開多 worker container，concurrent 的這個 task 也只會有一個在做事。pending_ops 自然 serialize。
 - **logs**：worker 的關鍵事件用 `structlog` 寫，可以 grep `schedule.run.start` / `schedule.run.success` / `schedule.advance_day.success` / `schedule.rebuild.success` / `schedule.run.yield_to_waiter`（最後這個代表 race fix 起作用了）
+- **alert-worthy log lines**（建議在 log shipper 設告警）：`schedule.run.failed` / `schedule.advance_day.failed` / `schedule.rebuild.failed` / `websocket.consumer.failed` — 這四個都是 ERROR 級別，前三個對應 `schedule:status.state == "failed"`，最後一個代表 WebSocket 通知通道斷掉（需要重啟 FastAPI）
 - **WebSocket 在多 instance 部署下**：每個 FastAPI worker 各自持有自己的連線，靠 Redis pub/sub fan-out 同步事件。橫向擴展不需要 sticky session。
 
 ---

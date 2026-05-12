@@ -77,6 +77,10 @@ class OrderResponse(BaseModel):
     assigned_to: uuid.UUID | None
     created_by: uuid.UUID
     notes: str | None
+    # Pin fields (see app/models/order.py for semantic).
+    pinned_production_date: date | None
+    is_pinned: bool
+    is_processing_locked: bool
     version_id: int
     created_at: datetime
     updated_at: datetime

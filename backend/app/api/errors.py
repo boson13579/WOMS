@@ -26,6 +26,7 @@ from typing import Any
 
 import structlog
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -75,13 +76,20 @@ async def validation_exception_handler(
 
     Pydantic produces structured details (loc, msg, type) which we forward
     verbatim — they're invaluable for frontend form-field highlighting.
+
+    ``exc.errors()`` can include non-JSON-safe objects inside ``ctx`` (e.g.
+    pydantic stuffs the raw ``ValueError`` instance under ``ctx["error"]``
+    when a custom validator raises). ``jsonable_encoder`` recursively
+    converts those to JSON-safe types — without it, ``JSONResponse.render``
+    blows up with ``TypeError: Object of type ValueError is not JSON
+    serializable`` and the handler ends up tripping the 500 catch-all.
     """
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content=_envelope(
             code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             message="Request validation failed.",
-            details=list(exc.errors()),
+            details=jsonable_encoder(exc.errors()),
         ),
     )
 

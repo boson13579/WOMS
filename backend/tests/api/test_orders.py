@@ -253,6 +253,15 @@ def test_list_orders_by_order_manager_succeeds(client: TestClient, db_session: S
 
 
 def test_update_order_success(client: TestClient, db_session: Session) -> None:
+    """PATCH returns 200 with the row locked but **values unchanged**.
+
+    Per P1-2 the producer only writes ``is_processing_locked=True`` and
+    flips ``status=pending``. The new ``wafer_quantity`` rides in the
+    enqueued compound's ``db_action`` and is written by
+    ``run_scheduling_task`` after the in-memory state accepts. Frontend
+    distinguishes "queued, waiting for worker" from "applied" via the
+    ``schedule.compound_accepted`` WebSocket event and then refetches.
+    """
     user = _make_user(db_session, username="sched_upd", role=UserRole.scheduler)
     token = _login(client, "sched_upd")
     order = _make_order(db_session, created_by=user.id, wafer_quantity=100)
@@ -265,8 +274,10 @@ def test_update_order_success(client: TestClient, db_session: Session) -> None:
 
     assert res.status_code == 200
     body = res.json()
-    assert body["wafer_quantity"] == 200
+    # Pre-PATCH value still in the response — worker hasn't applied yet.
+    assert body["wafer_quantity"] == 100
     assert body["status"] == "pending"
+    assert body["is_processing_locked"] is True
 
 
 def test_update_order_version_conflict_returns_409(client: TestClient, db_session: Session) -> None:
@@ -288,6 +299,53 @@ def test_update_order_version_conflict_returns_409(client: TestClient, db_sessio
         json={"wafer_quantity": 200, "version_id": old_version_id},
         headers=_auth(token),
     )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_update_order_returns_409_when_row_already_locked(
+    client: TestClient, db_session: Session
+) -> None:
+    """N-3 round-2: stacking a second PATCH on an in-flight row must 409.
+
+    First PATCH commits ``is_processing_locked=True`` and enqueues a
+    compound; before the worker accepts, the row is "in flight". A
+    second PATCH would otherwise enqueue another compound — DB stays
+    serialized via the worker's single-flight processing, but the
+    frontend's lock UI gets bypassed (the lock indicator means
+    "don't edit", but the second PATCH succeeded) and the audit-log
+    diff sequence becomes misleading. Cheaper to reject 409 fast.
+    """
+    user = _make_user(db_session, username="sched_double_patch", role=UserRole.scheduler)
+    token = _login(client, "sched_double_patch")
+    order = _make_order(db_session, created_by=user.id, wafer_quantity=100)
+    # Simulate first PATCH having already locked the row.
+    order.is_processing_locked = True
+    db_session.commit()
+    db_session.refresh(order)
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"wafer_quantity": 200, "version_id": order.version_id},
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_delete_order_returns_409_when_row_already_locked(
+    client: TestClient, db_session: Session
+) -> None:
+    """N-3: same producer-side concurrency guard for DELETE."""
+    user = _make_user(db_session, username="sched_double_delete", role=UserRole.scheduler)
+    token = _login(client, "sched_double_delete")
+    order = _make_order(db_session, created_by=user.id)
+    order.is_processing_locked = True
+    db_session.commit()
+
+    res = client.delete(f"/api/v1/orders/{order.id}", headers=_auth(token))
 
     assert res.status_code == 409
     assert res.json()["error"]["code"] == 409
@@ -362,6 +420,9 @@ def test_update_order_partial_fields(client: TestClient, db_session: Session) ->
 
 
 def test_update_order_only_delivery_date(client: TestClient, db_session: Session) -> None:
+    """As above — deadline change is deferred until the worker accepts the
+    compound. PATCH 200 returns the locked-but-pre-PATCH state.
+    """
     user = _make_user(db_session, username="sched_delivery", role=UserRole.scheduler)
     token = _login(client, "sched_delivery")
     order = _make_order(
@@ -379,10 +440,12 @@ def test_update_order_only_delivery_date(client: TestClient, db_session: Session
 
     assert res.status_code == 200
     body = res.json()
-    assert body["requested_delivery_date"] == "2026-09-30"
+    # Pre-PATCH date still in the response — worker hasn't applied yet.
+    assert body["requested_delivery_date"] == "2026-08-01"
     assert body["wafer_quantity"] == 100
     assert body["notes"] is None
     assert body["status"] == "pending"
+    assert body["is_processing_locked"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -390,12 +453,20 @@ def test_update_order_only_delivery_date(client: TestClient, db_session: Session
 # ---------------------------------------------------------------------------
 
 
-def test_delete_order_sets_cancelled_and_soft_deleted(
-    client: TestClient, db_session: Session
-) -> None:
+def test_delete_order_locks_row_pending_worker(client: TestClient, db_session: Session) -> None:
+    """DELETE returns 204 with the row **only locked**, not soft-deleted.
+
+    Per P1-2 the actual ``is_deleted=True`` / ``status=cancelled`` write
+    is performed by ``run_scheduling_task`` inside the compound's
+    ``db_action.kind="delete"`` handler. The producer's job is just to
+    claim the row (``is_processing_locked=True``) and enqueue the
+    compound; the worker writes the visible state changes once the
+    in-memory state has accepted the remove (+optional unpin).
+    """
     user = _make_user(db_session, username="sched_del", role=UserRole.scheduler)
     token = _login(client, "sched_del")
     order = _make_order(db_session, created_by=user.id)
+    pre_status = order.status
 
     res = client.delete(f"/api/v1/orders/{order.id}", headers=_auth(token))
 
@@ -403,12 +474,15 @@ def test_delete_order_sets_cancelled_and_soft_deleted(
     assert res.content == b""
 
     db_session.refresh(order)
-    assert order.is_deleted is True
-    assert order.status == OrderStatus.cancelled
+    # Soft-delete and status flip are deferred to the worker.
+    assert order.is_deleted is False
+    assert order.status == pre_status
+    # Lock is what the producer wrote.
+    assert order.is_processing_locked is True
 
-    # Soft-deleted order is invisible via the normal GET endpoint
+    # Order is still visible via GET — deletion hasn't physically happened.
     get_res = client.get(f"/api/v1/orders/{order.id}", headers=_auth(token))
-    assert get_res.status_code == 404
+    assert get_res.status_code == 200
 
 
 def test_delete_nonexistent_order_returns_404(client: TestClient, db_session: Session) -> None:
@@ -512,7 +586,15 @@ def test_audit_log_recorded_on_create(client: TestClient, db_session: Session) -
     assert any(log.action == "order.created" for log in logs)
 
 
-def test_audit_log_recorded_on_update(client: TestClient, db_session: Session) -> None:
+def test_audit_log_for_update_deferred_to_worker(client: TestClient, db_session: Session) -> None:
+    """Producer no longer writes the ``order.updated`` audit row at PATCH
+    time — that responsibility moved into ``run_scheduling_task``'s
+    ``_perform_compound_db_action`` so the audit timestamp matches when
+    the change was actually committed (and so a rejected compound
+    doesn't leave a misleading "updated to X" log of a write that never
+    happened). Verified end-to-end in
+    ``tests/workers/test_scheduling_task.py``.
+    """
     user = _make_user(db_session, username="sched_audit_upd", role=UserRole.scheduler)
     token = _login(client, "sched_audit_upd")
     order = _make_order(db_session, created_by=user.id)
@@ -523,13 +605,17 @@ def test_audit_log_recorded_on_update(client: TestClient, db_session: Session) -
         headers=_auth(token),
     )
 
+    # No ``order.updated`` audit row yet — worker hasn't run.
     logs = db_session.scalars(
         select(AuditLog).where(AuditLog.resource_id == order.id, AuditLog.action == "order.updated")
     ).all()
-    assert len(logs) >= 1
+    assert len(logs) == 0
 
 
-def test_audit_log_recorded_on_cancel(client: TestClient, db_session: Session) -> None:
+def test_audit_log_for_cancel_deferred_to_worker(client: TestClient, db_session: Session) -> None:
+    """Same as the update test, but for DELETE: the ``order.cancelled``
+    audit row is written by the worker on accept, not by the producer.
+    """
     user = _make_user(db_session, username="sched_audit_cancel", role=UserRole.scheduler)
     token = _login(client, "sched_audit_cancel")
     order = _make_order(db_session, created_by=user.id)
@@ -541,7 +627,7 @@ def test_audit_log_recorded_on_cancel(client: TestClient, db_session: Session) -
             AuditLog.resource_id == order.id, AuditLog.action == "order.cancelled"
         )
     ).all()
-    assert len(logs) >= 1
+    assert len(logs) == 0
 
 
 def test_get_audit_log_by_order_id(client: TestClient, db_session: Session) -> None:
@@ -582,15 +668,28 @@ def test_get_audit_log_not_found_returns_404(client: TestClient, db_session: Ses
     assert res.json()["error"]["code"] == 404
 
 
-def test_get_audit_log_after_cancel_still_returns_logs(
+def test_get_audit_log_still_queryable_for_soft_deleted_order(
     client: TestClient, db_session: Session
 ) -> None:
-    _make_user(db_session, username="sched_audit_cancel2", role=UserRole.scheduler)
+    """The audit-log GET endpoint must continue to serve rows even for an
+    order whose ``is_deleted`` flag is set.
+
+    Pre-P1-2 this scenario was created via ``client.delete`` (which
+    soft-deleted on the producer side and wrote both ``order.created``
+    and ``order.cancelled`` audit rows in one request). With P1-2 the
+    soft-delete + cancel audit are deferred to ``run_scheduling_task``
+    — the producer DELETE call leaves ``is_deleted=False`` until the
+    worker runs. To keep this test focused on the audit-log endpoint
+    contract (not the deferred-write flow) we soft-delete the row
+    directly via ORM after the create, then assert the GET endpoint
+    still returns the ``order.created`` audit row.
+    """
+    sched_user = _make_user(db_session, username="sched_audit_cancel2", role=UserRole.scheduler)
     _make_user(db_session, username="mgr_audit_cancel2", role=UserRole.order_manager)
     sched_token = _login(client, "sched_audit_cancel2")
     mgr_token = _login(client, "mgr_audit_cancel2")
 
-    # Create order via API (writes order.created audit log)
+    # Create order via API (producer writes order.created audit log inline).
     res = client.post(
         "/api/v1/orders",
         json={
@@ -601,22 +700,28 @@ def test_get_audit_log_after_cancel_still_returns_logs(
         headers=_auth(sched_token),
     )
     assert res.status_code == 201
-    order_id = res.json()["id"]
+    order_id = uuid.UUID(res.json()["id"])
 
-    # Cancel the order (soft-delete, writes order.cancelled audit log)
-    res = client.delete(f"/api/v1/orders/{order_id}", headers=_auth(sched_token))
-    assert res.status_code == 204
+    # Force the order into the soft-deleted state directly (bypassing the
+    # P1-2 worker round-trip the DELETE endpoint now requires) so the
+    # audit-log endpoint's behavior on a soft-deleted resource is what's
+    # under test.
+    from app.models.order import Order
 
-    # Audit log must still be queryable even though the order is soft-deleted
+    db_session.refresh(sched_user)
+    target = db_session.scalars(select(Order).where(Order.id == order_id)).one()
+    target.is_deleted = True
+    target.status = OrderStatus.cancelled
+    db_session.commit()
+
+    # Audit log must still be queryable even though the order is soft-deleted.
     res = client.get(f"/api/v1/orders/{order_id}/audit-log", headers=_auth(mgr_token))
 
     assert res.status_code == 200
     logs = res.json()
     assert isinstance(logs, list)
-    assert len(logs) >= 2
-    actions = [log["action"] for log in logs]
+    actions = {log["action"] for log in logs}
     assert "order.created" in actions
-    assert "order.cancelled" in actions
 
 
 # ---------------------------------------------------------------------------
