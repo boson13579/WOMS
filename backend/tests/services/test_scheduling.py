@@ -884,3 +884,388 @@ def test_scheduler_state_roundtrip_preserves_pinned_orders() -> None:
     legacy_raw = _json.dumps(legacy)
     revived_legacy = SchedulerState.from_json(legacy_raw)
     assert revived_legacy.pinned_orders == {}
+
+
+# ---------------------------------------------------------------------------
+# pin_order / unpin_order failure paths
+# ---------------------------------------------------------------------------
+
+
+def test_pin_order_rejects_fake_deadline_outside_horizon() -> None:
+    """Pin with ``fake_deadline`` beyond the 30-day window must return
+    ``deadline_too_far`` without mutating state."""
+    state = SchedulerState.initial(_BASE)
+    order = _make_order(qty=500, deadline=_BASE + timedelta(days=HORIZON_DAYS - 1))
+    assert add_order(state, order).status == "success"
+    snapshot = state.to_json()
+
+    far_pin_day = _BASE + timedelta(days=HORIZON_DAYS)  # one past the horizon
+    result = pin_order(state, order, fake_deadline=far_pin_day)
+
+    assert result.status == "deadline_too_far"
+    # State is unchanged — the early-return branch never touched the trees.
+    assert state.to_json() == snapshot
+
+
+def test_pin_order_rejects_order_not_in_pq() -> None:
+    """Pinning an order that isn't currently in the pq must return
+    ``capacity_exceeded`` (worker-uniform failure status) without touching
+    the trees. Most realistic trigger: a duplicated ``pin`` op for an
+    already-pinned order, or a ``pin`` for an order that was never
+    ``add``-ed."""
+    state = SchedulerState.initial(_BASE)
+    phantom = _make_order(qty=100, deadline=_BASE + timedelta(days=5))
+    snapshot = state.to_json()
+
+    result = pin_order(state, phantom, fake_deadline=_BASE + timedelta(days=3))
+
+    assert result.status == "capacity_exceeded"
+    assert state.to_json() == snapshot
+
+
+def test_unpin_order_drops_when_real_deadline_already_passed() -> None:
+    """If the pinned order's *real* deadline has been overtaken by
+    ``base_date`` (e.g. it sat pinned across several advance_day rolls
+    until its real deadline fell off the back of the horizon), unpin
+    can't put it back in the pq. The function returns
+    ``deadline_too_far`` after removing the pinned tree contribution —
+    the order is dropped from both pq and pinned_orders.
+    """
+    state = SchedulerState.initial(_BASE)
+    pinned = PinnedOrder(
+        order_id=uuid.uuid4(),
+        order_number="ORD-OVERDUE",
+        wafer_quantity=500,
+        # Real deadline IS before base_date (rel index would be < 1).
+        deadline=_BASE - timedelta(days=1),
+        # Fake deadline still inside horizon so the inverse remove-from-
+        # trees step doesn't crash.
+        fake_deadline=_BASE + timedelta(days=1),
+    )
+    state.pinned_orders[pinned.order_id] = pinned
+    # Reflect the pinned contribution in the trees, matching what
+    # ``pin_order`` would have set up.
+    pinned_view = SchedulingOrder(
+        order_id=pinned.order_id,
+        order_number=pinned.order_number,
+        wafer_quantity=pinned.wafer_quantity,
+        deadline=pinned.fake_deadline,
+    )
+    from app.services.scheduling import _apply_add_to_trees, unpin_order
+
+    _apply_add_to_trees(state, pinned_view)
+
+    result = unpin_order(state, pinned.order_id)
+
+    assert result.status == "deadline_too_far"
+    # Pinned record is gone (pop happened earlier in unpin_order).
+    assert pinned.order_id not in state.pinned_orders
+    # pq is empty — the order was dropped, not re-added.
+    assert pinned.order_id not in {o.order_id for o in state.priority_queue}
+
+
+# ---------------------------------------------------------------------------
+# compute_schedule edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_compute_schedule_skips_pinned_with_overdue_fake_deadline() -> None:
+    """If a pinned order's ``fake_deadline`` has been overtaken by
+    ``base_date`` (out-of-band scenario; advance_day should have cleaned
+    it up first), ``compute_schedule`` logs and skips it rather than
+    crashing on a negative index."""
+    state = SchedulerState.initial(_BASE)
+    overdue = PinnedOrder(
+        order_id=uuid.uuid4(),
+        order_number="ORD-PIN-OVERDUE",
+        wafer_quantity=300,
+        deadline=_BASE + timedelta(days=2),
+        # In the past — should not happen in production, but be defensive.
+        fake_deadline=_BASE - timedelta(days=1),
+    )
+    state.pinned_orders[overdue.order_id] = overdue
+
+    results = compute_schedule(state)
+
+    # No ScheduledResult emitted for the overdue order.
+    assert not any(r.order_id == overdue.order_id for r in results)
+
+
+def test_compute_schedule_logs_pin_overcommitted_but_still_emits() -> None:
+    """If two pinned orders both reserve more than ``DAILY_CAPACITY`` on
+    the same day (admission control should have rejected this, so it
+    means upstream state corruption), ``compute_schedule`` still emits
+    what fits — second pinned order gets ``min(remaining, requested)``
+    rather than overflowing the daily ledger."""
+    state = SchedulerState.initial(_BASE)
+    pin_day = _BASE + timedelta(days=2)
+    p1 = PinnedOrder(
+        order_id=uuid.uuid4(),
+        order_number="P1",
+        wafer_quantity=DAILY_CAPACITY,  # fills the day entirely
+        deadline=pin_day,
+        fake_deadline=pin_day,
+    )
+    p2 = PinnedOrder(
+        order_id=uuid.uuid4(),
+        order_number="P2",
+        wafer_quantity=500,  # would overflow if both honored fully
+        deadline=pin_day,
+        fake_deadline=pin_day,
+    )
+    state.pinned_orders[p1.order_id] = p1
+    state.pinned_orders[p2.order_id] = p2
+
+    results = compute_schedule(state)
+
+    p1_total = sum(r.quantity for r in results if r.order_id == p1.order_id)
+    p2_total = sum(r.quantity for r in results if r.order_id == p2.order_id)
+    # p1 inserted first into dict, so consumes the full day; p2 is
+    # over-committed and gets 0 (the ``assigned > 0`` guard skips it).
+    assert p1_total == DAILY_CAPACITY
+    assert p2_total == 0
+
+
+def test_compute_schedule_silently_skips_pq_order_with_invalid_deadline() -> None:
+    """pq order with a deadline outside [base_date, base_date + 29] —
+    e.g. advance_day overtook a boundary order that never got moved out
+    of pq — must NOT crash compute_schedule. Skips silently (already
+    logged by advance_day on the way in)."""
+    state = SchedulerState.initial(_BASE)
+    # Order's deadline is yesterday — abs_to_rel returns None.
+    ghost = SchedulingOrder(
+        order_id=uuid.uuid4(),
+        order_number="GHOST",
+        wafer_quantity=100,
+        deadline=_BASE - timedelta(days=1),
+    )
+    # Bypass add_order's guard — directly insert into pq to simulate the
+    # state-corruption scenario this branch defends against.
+    from app.services.scheduling import _pq_add
+
+    _pq_add(state, ghost)
+
+    results = compute_schedule(state)
+    assert not any(r.order_id == ghost.order_id for r in results)
+
+
+# ---------------------------------------------------------------------------
+# rebuild_state failure-mode fallback
+# ---------------------------------------------------------------------------
+
+
+def test_rebuild_state_falls_back_to_pq_when_pin_capacity_exceeded() -> None:
+    """During rebuild, if the pinned-phase ``add_order`` succeeds but the
+    follow-up ``pin_order`` fails (e.g. the pin day already has another
+    pinned order consuming the same capacity), the order stays in pq as
+    a safe fallback (better to schedule it within its real deadline
+    than drop it) and is surfaced via ``skipped`` so ops can react."""
+    # Pin both orders to ``base_date`` (rel=1) so the prefix-sum guard
+    # in ``pin_order`` actually bites — for fake_rel=1, capacity_tree's
+    # prefix sum is just day-1's capacity, which the first pin can
+    # exhaust. For larger fake_rel, the prefix sum spans multiple days
+    # and the second pin would still fit.
+    pin_day = _BASE
+    first = SchedulingOrder(
+        order_id=uuid.uuid4(),
+        order_number="REBUILD-PIN-A",
+        wafer_quantity=DAILY_CAPACITY,  # fills day-1 entirely after pin
+        deadline=_BASE + timedelta(days=5),
+        pinned_production_date=pin_day,
+    )
+    second = SchedulingOrder(
+        order_id=uuid.uuid4(),
+        order_number="REBUILD-PIN-B",
+        wafer_quantity=1000,
+        deadline=_BASE + timedelta(days=5),
+        pinned_production_date=pin_day,
+    )
+
+    new_state, skipped = rebuild_state([first, second], _BASE)
+
+    # First pin succeeded → it's in pinned_orders.
+    assert first.order_id in new_state.pinned_orders
+    # Second order's pin failed but its add succeeded → it stays in pq
+    # (not pinned_orders) and shows up in skipped with the pin failure
+    # reason.
+    pq_ids = {o.order_id for o in new_state.priority_queue}
+    assert second.order_id in pq_ids
+    assert second.order_id not in new_state.pinned_orders
+    skipped_ids = {s.order_id for s in skipped}
+    assert second.order_id in skipped_ids
+
+
+# ---------------------------------------------------------------------------
+# SegmentTree boundary guards
+# ---------------------------------------------------------------------------
+
+
+def test_segment_tree_query_raises_index_error_outside_range() -> None:
+    """The 1-indexed segment tree must reject out-of-range queries — the
+    internal recursion assumes ``1 <= i <= n``. Defensive raise gives a
+    clear error instead of silently returning 0 or corrupting the
+    recursion's partial sums."""
+    import pytest
+    from app.services.scheduling import SegmentTree
+
+    tree = SegmentTree(n=HORIZON_DAYS, initial=DAILY_CAPACITY)
+    with pytest.raises(IndexError):
+        tree.query(0)
+    with pytest.raises(IndexError):
+        tree.query(HORIZON_DAYS + 1)
+
+
+def test_segment_tree_range_set_raises_on_invalid_bounds() -> None:
+    import pytest
+    from app.services.scheduling import SegmentTree
+
+    tree = SegmentTree(n=HORIZON_DAYS, initial=DAILY_CAPACITY)
+    with pytest.raises(IndexError):
+        tree.range_set(0, 5, 0)  # left out of range
+    with pytest.raises(IndexError):
+        tree.range_set(5, HORIZON_DAYS + 1, 0)  # right out of range
+    with pytest.raises(IndexError):
+        tree.range_set(5, 3, 0)  # left > right
+
+
+def test_segment_tree_point_update_raises_outside_range() -> None:
+    import pytest
+    from app.services.scheduling import SegmentTree
+
+    tree = SegmentTree(n=HORIZON_DAYS, initial=DAILY_CAPACITY)
+    with pytest.raises(IndexError):
+        tree.point_update(0, 100)
+    with pytest.raises(IndexError):
+        tree.point_update(HORIZON_DAYS + 1, 100)
+
+
+def test_segment_tree_from_array_rejects_wrong_length() -> None:
+    """``from_array`` is the deserialization entry — a wrong-length input
+    means the Redis blob is corrupted or written by a build with a
+    different ``HORIZON_DAYS``. Better to raise loud than silently
+    truncate / pad."""
+    import pytest
+    from app.services.scheduling import SegmentTree
+
+    with pytest.raises(ValueError, match="expected"):
+        SegmentTree.from_array([0] * (HORIZON_DAYS - 1))
+    with pytest.raises(ValueError, match="expected"):
+        SegmentTree.from_array([0] * (HORIZON_DAYS + 1))
+
+
+# ---------------------------------------------------------------------------
+# score_for_op unknown group
+# ---------------------------------------------------------------------------
+
+
+def test_score_for_op_rejects_unknown_group() -> None:
+    """Defensive: prevents a typo / fabricated payload from picking a
+    silently-wrong score region (would mis-order shrink vs grow without
+    raising)."""
+    import pytest
+    from app.services.scheduling import score_for_op
+
+    with pytest.raises(ValueError, match="unknown pending-op group"):
+        score_for_op(group="cosmic", seq=1)
+
+
+def test_score_for_op_shrink_sorts_before_grow() -> None:
+    """The happy path: shrink-group scores must compare below grow-group
+    scores for any same-seq pair, encoding the «shrink first» invariant
+    that ``ZPOPMIN`` then enforces."""
+    from app.services.scheduling import score_for_op
+
+    assert score_for_op(group="shrink", seq=99) < score_for_op(group="grow", seq=1)
+    # Within a group, score is monotonic in seq.
+    assert score_for_op(group="shrink", seq=1) < score_for_op(group="shrink", seq=2)
+
+
+# ---------------------------------------------------------------------------
+# remove_order / _pq_remove_by_id defensive paths
+# ---------------------------------------------------------------------------
+
+
+def test_remove_order_rejects_deadline_outside_horizon() -> None:
+    """If the order being removed has a deadline that's drifted out of
+    the 30-day window (e.g. several advance_day cycles passed and the
+    order was never cleaned out of pq), ``remove_order`` must return
+    ``deadline_too_far`` instead of crashing on the tree math."""
+    state = SchedulerState.initial(_BASE)
+    ghost = SchedulingOrder(
+        order_id=uuid.uuid4(),
+        order_number="GHOST-REMOVE",
+        wafer_quantity=100,
+        deadline=_BASE - timedelta(days=1),
+    )
+
+    result = remove_order(state, ghost)
+    assert result.status == "deadline_too_far"
+
+
+# ---------------------------------------------------------------------------
+# capacity_prefix_sums
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_prefix_sums_returns_30_day_series() -> None:
+    """``capacity_prefix_sums`` is the data source for ``GET
+    /schedule/capacity`` — verify it returns exactly HORIZON_DAYS entries
+    with monotonically increasing prefix sums and the right base-date
+    alignment."""
+    from app.services.scheduling import capacity_prefix_sums
+
+    state = SchedulerState.initial(_BASE)
+    series = capacity_prefix_sums(state)
+
+    assert len(series) == HORIZON_DAYS
+    # Empty state ⇒ prefix sum at day k is k * DAILY_CAPACITY.
+    for i, (d, prefix) in enumerate(series, start=1):
+        assert d == _BASE + timedelta(days=i - 1)
+        assert prefix == i * DAILY_CAPACITY
+
+
+# ---------------------------------------------------------------------------
+# advance_day with future-day pin (covers the not-today pinned branch)
+# ---------------------------------------------------------------------------
+
+
+def test_advance_day_keeps_future_pinned_orders_with_shifted_rel() -> None:
+    """A pin whose ``fake_deadline`` is NOT today must survive
+    advance_day unchanged in identity, but reference a date that's now
+    one day closer to the new base_date.
+
+    Covers the ``pinned_remaining`` else-branch in ``advance_day`` —
+    everything-today pin tests don't reach it.
+    """
+    state = SchedulerState.initial(_BASE)
+    # Need an order in pq first so pin_order's precondition holds.
+    pq_holder = _make_order(qty=500, deadline=_BASE + timedelta(days=10))
+    add_order(state, pq_holder)
+    pin_day = _BASE + timedelta(days=3)
+    pin_result = pin_order(state, pq_holder, fake_deadline=pin_day)
+    assert pin_result.status == "success"
+
+    new_state = advance_day(state)
+
+    # Pin survived; base advanced by 1; fake_deadline stays absolute.
+    assert pq_holder.order_id in new_state.pinned_orders
+    surviving = new_state.pinned_orders[pq_holder.order_id]
+    assert surviving.fake_deadline == pin_day
+    assert new_state.base_date == _BASE + timedelta(days=1)
+
+
+def test_advance_day_handles_empty_pq_and_no_pins() -> None:
+    """Boundary case: completely idle state. advance_day must still
+    shift base_date by one and shift trees left without raising.
+    Covers the ``boundary_order is None`` branch (line 1134) + the
+    ``pinned_today_total == 0`` ceiling computation."""
+    state = SchedulerState.initial(_BASE)
+
+    new_state = advance_day(state)
+
+    assert new_state.base_date == _BASE + timedelta(days=1)
+    assert len(new_state.priority_queue) == 0
+    assert new_state.pinned_orders == {}
+    # Trees shifted: day 30 of the new state should be a fresh
+    # DAILY_CAPACITY (the rolled-in tail day).
+    assert new_state.capacity_tree.query(HORIZON_DAYS) == HORIZON_DAYS * DAILY_CAPACITY
