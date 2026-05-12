@@ -8,7 +8,6 @@ import { LogOut, RefreshCcw, Search } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 import { ThemeToggle } from '@/components/layout/ThemeToggle';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useAuthStore } from '@/features/auth/stores/authStore';
 
@@ -41,12 +40,7 @@ export function Header({
   return (
     <header className="flex h-14 shrink-0 items-center gap-4 border-b border-border bg-background px-6">
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <h1 className="truncate text-lg font-semibold tracking-tight">{title}</h1>
-          <Badge variant="outline" className="border-dashed">
-            mock data
-          </Badge>
-        </div>
+        <h1 className="truncate text-lg font-semibold tracking-tight">{title}</h1>
         {subtitle ? <p className="truncate text-xs text-muted-foreground">{subtitle}</p> : null}
       </div>
 

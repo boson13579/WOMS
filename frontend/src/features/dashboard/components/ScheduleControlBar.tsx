@@ -78,6 +78,12 @@ export function ScheduleControlBar(): JSX.Element | null {
         type="button"
         variant="default"
         size="sm"
+        // ``variant="default"`` resolves to ``bg-primary`` which is
+        // near-white in dark mode — visually jarring next to the dark
+        // cards beside it. Pin an explicit blue tone so the action
+        // button reads "actionable & primary" in both themes without
+        // riding on the global primary token.
+        className="bg-sky-500 text-white hover:bg-sky-600 dark:bg-sky-700 dark:hover:bg-sky-800"
         onClick={() => {
           triggerMutation.mutate();
         }}

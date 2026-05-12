@@ -183,26 +183,33 @@ def test_system_health_redis_error_when_probe_raises(
     assert redis_entry["status"] == "error"
 
 
-def test_system_health_celery_warning_when_queue_deep(
+def test_system_health_celery_healthy_when_queue_deep_but_draining(
     client: TestClient,
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Celery probe returns ``warning`` when the scheduler queue is deeper
-    than the configured threshold — dashboard should flag operator attention
-    even if the worker itself is running."""
-    _make_user(db_session, username="sys_cel_warn", role=UserRole.viewer)
-    token = _login(client, "sys_cel_warn")
+    """Deep queue alone is NOT a warning signal. Bombard / burst workflows
+    legitimately push hundreds of compounds in seconds — what matters is
+    whether the worker is actually draining them, which the stall detector
+    (below) covers. Pins the design decision so a future refactor doesn't
+    re-add a queue-depth warning rule without revisiting it.
+    """
+    from datetime import UTC, datetime
 
+    _make_user(db_session, username="sys_cel_deep", role=UserRole.viewer)
+    token = _login(client, "sys_cel_deep")
+
+    just_now = datetime.now(tz=UTC).isoformat()
     fake_redis = MagicMock()
-    fake_redis.zcard.return_value = 999  # > threshold
-    fake_redis.get.return_value = None  # no status doc → treat as idle
+    fake_redis.zcard.return_value = 999  # very deep
+    # state=idle but finished_at is fresh → worker is alive between tasks.
+    fake_redis.get.return_value = f'{{"state": "idle", "finished_at": "{just_now}"}}'
     monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
 
     res = client.get("/api/v1/system/health", headers=_auth(token))
     assert res.status_code == 200
     celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
-    assert celery_entry["status"] == "warning"
+    assert celery_entry["status"] == "healthy"
 
 
 def test_system_health_celery_warning_when_status_failed(
@@ -269,3 +276,53 @@ def test_system_health_celery_error_when_redis_unreachable(
     assert res.status_code == 200
     celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
     assert celery_entry["status"] == "error"
+
+
+def test_system_health_celery_warning_when_idle_with_stale_queue(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker dead but queue still has items + idle status + stale finish
+    → warning. Pins the "stall detection" rule the dashboard relies on
+    (frontend ``deriveScheduleDisplay`` uses the same 30s threshold)."""
+    from datetime import UTC, datetime, timedelta
+
+    _make_user(db_session, username="sys_cel_stall", role=UserRole.viewer)
+    token = _login(client, "sys_cel_stall")
+
+    long_ago = (datetime.now(tz=UTC) - timedelta(seconds=120)).isoformat()
+    fake_redis = MagicMock()
+    fake_redis.zcard.return_value = 5  # queue non-empty but ≤ 50 threshold
+    fake_redis.get.return_value = f'{{"state": "idle", "finished_at": "{long_ago}"}}'
+    monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
+
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
+    assert celery_entry["status"] == "warning"
+    assert "stuck" in celery_entry["summary"].lower()
+
+
+def test_system_health_celery_healthy_when_idle_with_fresh_finish(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same setup but ``finished_at`` is fresh → still healthy (we're just
+    in the between-task gap, worker is alive)."""
+    from datetime import UTC, datetime, timedelta
+
+    _make_user(db_session, username="sys_cel_fresh", role=UserRole.viewer)
+    token = _login(client, "sys_cel_fresh")
+
+    just_now = (datetime.now(tz=UTC) - timedelta(seconds=2)).isoformat()
+    fake_redis = MagicMock()
+    fake_redis.zcard.return_value = 5
+    fake_redis.get.return_value = f'{{"state": "idle", "finished_at": "{just_now}"}}'
+    monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
+
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
+    assert celery_entry["status"] == "healthy"

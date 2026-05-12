@@ -100,6 +100,7 @@ export function DashboardPage(): JSX.Element {
                     data={scheduleStatus.data}
                     isLoading={scheduleStatus.isLoading}
                     isError={scheduleStatus.isError}
+                    queueDepth={pendingOps.data?.length ?? 0}
                   />
                 </div>
                 <div className="lg:flex-1">

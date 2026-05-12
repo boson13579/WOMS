@@ -3,9 +3,28 @@
  *
  * One-glance view of `schedule:status` — what state the worker is in,
  * which task is most recently in flight, and (on failure) the exception
- * string that came out of the worker. Pure presentation; the calling
- * page owns the React Query lifecycle and threads loading / error /
- * data through props.
+ * string that came out of the worker.
+ *
+ * **Derived status logic (UX vs. raw API)**:
+ * The raw ``schedule:status.state`` reflects "is a Celery task body
+ * currently running" — but the per-compound architecture (PR-14)
+ * flips state back to ``idle`` between every compound, even when the
+ * queue still has work. A naive badge of "idle" + 400-deep queue feels
+ * contradictory to operators. We derive a richer display:
+ *
+ *   - state=running                                    → Running (blue)
+ *   - state=failed                                     → Failed (red)
+ *   - state=idle, queue=0                              → Idle (green)
+ *   - state=idle, queue>0, finished_at < STALL_S ago   → Working (blue)
+ *                                                        (between-task gap)
+ *   - state=idle, queue>0, finished_at >= STALL_S ago  → Stalled (orange)
+ *                                                        (no task progress
+ *                                                         in STALL_S — likely
+ *                                                         worker crashed
+ *                                                         mid-cycle)
+ *
+ * STALL_S = 30s is well above a normal between-task gap (~100–500ms)
+ * and well below the operator-visible MTTR for restarting Celery.
  */
 import { Activity, AlertTriangle, CheckCircle2, Loader2 } from 'lucide-react';
 
@@ -19,21 +38,63 @@ interface ScheduleStatusCardProps {
   data: ScheduleStatusResponse | undefined;
   isLoading: boolean;
   isError: boolean;
+  /** Current pending-ops queue depth (from /schedule/pending-ops). */
+  queueDepth?: number;
 }
 
-// ``running`` uses ``info`` (blue) so it reads as "in progress" rather
-// than success or warning. ``failed`` is ``destructive`` (red) to match
-// the rest of the app's failure semantics.
-const STATE_CFG = {
-  idle: { label: 'Idle', variant: 'success' as const, Icon: CheckCircle2 },
-  running: { label: 'Running', variant: 'info' as const, Icon: Loader2 },
-  failed: { label: 'Failed', variant: 'destructive' as const, Icon: AlertTriangle },
-};
+interface Display {
+  label: string;
+  variant: 'success' | 'info' | 'warning' | 'destructive';
+  Icon: typeof CheckCircle2;
+  hint?: string;
+}
+
+const STALL_THRESHOLD_SECONDS = 30;
+
+/**
+ * Compute the user-facing badge from raw scheduler state + queue depth.
+ *
+ * Pure function — easy to unit-test independently of the React component.
+ */
+export function deriveScheduleDisplay(
+  data: ScheduleStatusResponse,
+  queueDepth: number | undefined,
+  now: number = Date.now(),
+): Display {
+  if (data.state === 'failed') {
+    return { label: 'Failed', variant: 'destructive', Icon: AlertTriangle };
+  }
+  if (data.state === 'running') {
+    return { label: 'Running', variant: 'info', Icon: Loader2 };
+  }
+  // state === 'idle' below.
+  if (!queueDepth || queueDepth <= 0) {
+    return { label: 'Idle', variant: 'success', Icon: CheckCircle2 };
+  }
+  // idle + queue>0 → between-task gap or stalled.
+  const finishedMs = data.finished_at ? Date.parse(data.finished_at) : NaN;
+  const secondsSinceFinish = Number.isFinite(finishedMs) ? (now - finishedMs) / 1000 : Infinity;
+  if (secondsSinceFinish < STALL_THRESHOLD_SECONDS) {
+    return {
+      label: 'Working',
+      variant: 'info',
+      Icon: Loader2,
+      hint: 'Between compounds — next task firing soon',
+    };
+  }
+  return {
+    label: 'Stalled',
+    variant: 'warning',
+    Icon: AlertTriangle,
+    hint: `Queue has work but no task has run in ${Math.round(secondsSinceFinish)}s — worker may be stuck`,
+  };
+}
 
 export function ScheduleStatusCard({
   data,
   isLoading,
   isError,
+  queueDepth,
 }: ScheduleStatusCardProps): JSX.Element {
   if (isLoading) {
     return (
@@ -56,19 +117,37 @@ export function ScheduleStatusCard({
     );
   }
 
-  const cfg = STATE_CFG[data.state];
-  const { Icon } = cfg;
+  const display = deriveScheduleDisplay(data, queueDepth);
+  const { Icon } = display;
+  const spin = display.label === 'Running' || display.label === 'Working';
 
   return (
     <Card>
       <CardContent className="space-y-3 p-5">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <Activity className="h-4 w-4 text-muted-foreground" aria-hidden />
           <h3 className="text-sm font-semibold">Scheduler</h3>
-          <Badge variant={cfg.variant}>
-            <Icon className="h-3 w-3" aria-hidden /> {cfg.label}
+          <Badge variant={display.variant}>
+            <Icon className={`h-3 w-3 ${spin ? 'animate-spin' : ''}`} aria-hidden /> {display.label}
           </Badge>
+          {queueDepth !== undefined && queueDepth > 0 ? (
+            <Badge variant="outline" className="font-mono tabular-nums">
+              queue: {queueDepth}
+            </Badge>
+          ) : null}
         </div>
+
+        {display.hint ? (
+          <p
+            className={`text-xs ${
+              display.variant === 'warning'
+                ? 'text-amber-700 dark:text-amber-300'
+                : 'text-muted-foreground'
+            }`}
+          >
+            {display.hint}
+          </p>
+        ) : null}
 
         {data.message ? (
           <p className="text-xs text-muted-foreground">{data.message}</p>

@@ -57,8 +57,17 @@ export function useSystemHealth(): UseQueryResult<SystemHealthResponse> {
   return useQuery<SystemHealthResponse>({
     queryKey: systemHealthQueryKey,
     queryFn: () =>
-      apiFetch('/api/v1/system/health', { credentials: 'include' }, (d) =>
-        systemHealthResponseSchema.parse(d),
+      apiFetch(
+        '/api/v1/system/health',
+        { credentials: 'include' },
+        (d) => systemHealthResponseSchema.parse(d),
+        // Bumped over the apiFetch default (5s) because this endpoint
+        // is *itself* a probe — its job is to report degraded services,
+        // and individual probes can legitimately take 2–3s each when a
+        // dependency is unreachable. 10s gives the backend room to
+        // collect a full per-service status payload without the client
+        // giving up first.
+        10_000,
       ),
     enabled: Boolean(user),
     refetchInterval: REFETCH_INTERVAL_MS,

@@ -22,13 +22,18 @@ Design contract:
 from __future__ import annotations
 
 import json
+import socket
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 import structlog
 from redis import Redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -57,11 +62,19 @@ __all__ = ["gather_system_health"]
 # dashboard component can be told to ignore it. Promote to ``Settings`` if
 # we ever grow a real reason to vary per-environment.
 
-# Pending compound count above which Celery's status flips to "warning".
-# 50 is well above the queue depth a healthy worker chews through in a
-# minute even at production load and well below "something is genuinely
-# stuck" depths (hundreds-to-thousands).
-_CELERY_QUEUE_WARNING_THRESHOLD = 50
+# Seconds since the last finished task above which a non-empty queue is
+# treated as a stall (worker likely died mid-cycle). Mirrors the threshold
+# the dashboard frontend uses in ``deriveScheduleDisplay`` — keeping the
+# two layers consistent matters because the dashboard's Service Health
+# pill and Schedule Status pill draw from these two probes and should
+# agree about "stalled vs. healthy".
+#
+# Note: queue depth itself is NOT a warning signal. A burst-load workflow
+# can legitimately push hundreds of compounds into the queue in a few
+# seconds, and that's expected throughput — what matters is whether the
+# worker is actually draining (state=running OR finished_at fresh). The
+# stall check below covers the genuinely bad case.
+_CELERY_STALL_THRESHOLD_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +89,24 @@ def _get_redis_client() -> Redis:
     Separate accessor (not reusing ``schedule_queue._redis()``) so tests can
     monkeypatch ``app.services.system._get_redis_client`` to inject a fake
     without touching every other Redis-using module.
+
+    Connect / socket timeouts are tight (2s) AND retries disabled
+    because this client is only used by the dashboard's health probe.
+    Default redis-py retries 3 times on connection error with backoff —
+    when Redis is dead that adds ~10s of latency before the probe can
+    answer ``status=error``, by which time the frontend's request
+    timeout has already fired and the dashboard renders "Failed to
+    load" instead of the (correct) degraded payload. ``Retry(NoBackoff(),
+    0)`` keeps the retry machinery in the call stack (some redis-py
+    code-paths still expect it) but performs zero additional attempts.
     """
-    return Redis.from_url(str(get_settings().REDIS_URL), decode_responses=True)
+    return Redis.from_url(
+        str(get_settings().REDIS_URL),
+        decode_responses=True,
+        socket_connect_timeout=2,
+        socket_timeout=2,
+        retry=Retry(NoBackoff(), 0),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +149,47 @@ def _probe_postgres(db: Session) -> ServiceHealthEntry:
     )
 
 
+def _redis_socket_target() -> tuple[str, int]:
+    """Parse REDIS_URL into (host, port) for raw socket reachability tests."""
+    parsed = urlparse(str(get_settings().REDIS_URL))
+    return parsed.hostname or "localhost", parsed.port or 6379
+
+
+def _redis_port_open(timeout_seconds: float = 0.5) -> bool:
+    """Cheap pre-flight: is the Redis port even accepting connections?
+
+    redis-py's retry / health-check machinery (and the OS-level connect
+    retries on Windows in particular) inflates a single failed Redis
+    call from "instant" to ~10 seconds. A one-shot socket connect with
+    a tight timeout lets the probe fast-fail when Redis is down.
+
+    Why explicit IPv4: on Windows ``localhost`` resolves to both
+    ``::1`` (IPv6) and ``127.0.0.1`` (IPv4). ``socket.create_connection``
+    tries IPv6 first; the Docker-published Redis binds only to IPv4, so
+    IPv6 hits the full timeout (no RST, no listener) before falling
+    back to IPv4. Explicitly using ``AF_INET`` skips the wasted IPv6
+    attempt and keeps the probe under 200ms on a refused port.
+    """
+    host, port = _redis_socket_target()
+    try:
+        addrs = socket.getaddrinfo(
+            host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
+        )
+        if not addrs:
+            return False
+        family, socktype, proto, _, sockaddr = addrs[0]
+        with socket.socket(family, socktype, proto) as sock:
+            sock.settimeout(timeout_seconds)
+            sock.connect(sockaddr)
+            return True
+    except OSError:
+        return False
+
+
 def _probe_redis() -> ServiceHealthEntry:
     """Probe Redis with ``PING`` and report latency."""
+    if not _redis_port_open():
+        raise ConnectionError("Redis port not reachable")
     rds = _get_redis_client()
     start = time.perf_counter()
     rds.ping()
@@ -144,16 +212,35 @@ def _probe_celery() -> ServiceHealthEntry:
     the two Redis surfaces it writes:
 
     * ``schedule:status`` — lifecycle JSON (``idle`` / ``running`` /
-      ``failed``). ``failed`` flips us to warning so the dashboard
-      surfaces it immediately.
-    * ``schedule:pending_ops`` — sorted set of queued compounds. A deep
-      queue (over ``_CELERY_QUEUE_WARNING_THRESHOLD``) flips us to
-      warning even if status is otherwise fine, since that's the symptom
-      of a worker not keeping up.
+      ``failed`` + ``finished_at``). ``failed`` flips us to warning so the
+      dashboard surfaces it immediately.
+    * ``schedule:pending_ops`` — sorted set of queued compounds. Used
+      only as one of the inputs to the stall detector below; deep queue
+      by itself is **not** a warning signal (burst loads of 100s of
+      compounds are normal; what matters is whether the worker is
+      draining them).
+
+    Stall detection (the case ``state=idle`` + ``queue>0`` + worker
+    actually dead — see frontend ``deriveScheduleDisplay`` for the
+    matching UX logic): if there's queued work but the last task
+    finished more than ``_CELERY_STALL_THRESHOLD_SECONDS`` ago, flip
+    to warning. This catches a crashed worker with backlog regardless
+    of queue size.
 
     Any Redis exception → ``error``: better to flag "we have no signal"
     than to silently report healthy.
     """
+    # Same pre-flight as ``_probe_redis``: if the port is dead we want
+    # to surface ``error`` in ~1s, not wait for redis-py's connect /
+    # retry machinery to give up.
+    if not _redis_port_open():
+        return ServiceHealthEntry(
+            id="celery",
+            name="Celery Worker",
+            status="error",
+            summary="Unable to read scheduler state from Redis (port not reachable)",
+            details=[ServiceHealthDetail(label="Error", value="Redis port not reachable")],
+        )
     rds = _get_redis_client()
     try:
         queue_depth = cast("int", rds.zcard("schedule:pending_ops"))
@@ -178,13 +265,23 @@ def _probe_celery() -> ServiceHealthEntry:
             logger.warning("system.health.celery.bad_status_doc", raw=status_raw)
 
     worker_state = (status_doc or {}).get("state", "idle")
+    finished_at_raw = (status_doc or {}).get("finished_at")
+    seconds_since_finish = _seconds_since(finished_at_raw)
+
     status: HealthStatus
     if worker_state == "failed":
         status = "warning"
         summary = "Scheduler reports state=failed"
-    elif queue_depth > _CELERY_QUEUE_WARNING_THRESHOLD:
+    elif (
+        worker_state == "idle"
+        and queue_depth > 0
+        and seconds_since_finish >= _CELERY_STALL_THRESHOLD_SECONDS
+    ):
         status = "warning"
-        summary = f"Queue depth {queue_depth} above threshold"
+        summary = (
+            f"Queue has {queue_depth} pending but no task in "
+            f"{int(seconds_since_finish)}s — worker may be stuck"
+        )
     else:
         status = "healthy"
         summary = f"Scheduler state={worker_state}"
@@ -199,6 +296,27 @@ def _probe_celery() -> ServiceHealthEntry:
             ServiceHealthDetail(label="Queue depth", value=str(queue_depth)),
         ],
     )
+
+
+def _seconds_since(iso_timestamp: str | None) -> float:
+    """Seconds between *iso_timestamp* and now (UTC).
+
+    Returns ``+inf`` for missing / unparseable input so callers naturally
+    treat "no signal" as the worst case.
+    """
+    if not iso_timestamp:
+        return float("inf")
+    try:
+        # ``fromisoformat`` handles both naive and aware ISO strings on
+        # Python 3.11+; the trailing 'Z' shorthand is normalised to
+        # ``+00:00`` for older interpreter support.
+        normalized = iso_timestamp.replace("Z", "+00:00")
+        finished = datetime.fromisoformat(normalized)
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=UTC)
+        return max(0.0, (datetime.now(tz=UTC) - finished).total_seconds())
+    except ValueError:
+        return float("inf")
 
 
 # ---------------------------------------------------------------------------
