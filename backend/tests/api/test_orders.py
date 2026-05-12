@@ -304,6 +304,53 @@ def test_update_order_version_conflict_returns_409(client: TestClient, db_sessio
     assert res.json()["error"]["code"] == 409
 
 
+def test_update_order_returns_409_when_row_already_locked(
+    client: TestClient, db_session: Session
+) -> None:
+    """N-3 round-2: stacking a second PATCH on an in-flight row must 409.
+
+    First PATCH commits ``is_processing_locked=True`` and enqueues a
+    compound; before the worker accepts, the row is "in flight". A
+    second PATCH would otherwise enqueue another compound — DB stays
+    serialized via the worker's single-flight processing, but the
+    frontend's lock UI gets bypassed (the lock indicator means
+    "don't edit", but the second PATCH succeeded) and the audit-log
+    diff sequence becomes misleading. Cheaper to reject 409 fast.
+    """
+    user = _make_user(db_session, username="sched_double_patch", role=UserRole.scheduler)
+    token = _login(client, "sched_double_patch")
+    order = _make_order(db_session, created_by=user.id, wafer_quantity=100)
+    # Simulate first PATCH having already locked the row.
+    order.is_processing_locked = True
+    db_session.commit()
+    db_session.refresh(order)
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"wafer_quantity": 200, "version_id": order.version_id},
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_delete_order_returns_409_when_row_already_locked(
+    client: TestClient, db_session: Session
+) -> None:
+    """N-3: same producer-side concurrency guard for DELETE."""
+    user = _make_user(db_session, username="sched_double_delete", role=UserRole.scheduler)
+    token = _login(client, "sched_double_delete")
+    order = _make_order(db_session, created_by=user.id)
+    order.is_processing_locked = True
+    db_session.commit()
+
+    res = client.delete(f"/api/v1/orders/{order.id}", headers=_auth(token))
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
 def test_update_order_in_production_returns_422(client: TestClient, db_session: Session) -> None:
     user = _make_user(db_session, username="sched_prod", role=UserRole.scheduler)
     token = _login(client, "sched_prod")

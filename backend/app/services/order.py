@@ -60,6 +60,22 @@ _IMMUTABLE_STATUS_ERROR = HTTPException(
     detail="Order cannot be modified in its current status.",
 )
 
+# N-3 (PR-14 round-2 review): producer-side concurrency guard. After the first
+# write of ``is_processing_locked=True``, the row already has an in-flight
+# compound waiting for the worker. A second PATCH / DELETE from the same user
+# (e.g. double-click) or a concurrent client would otherwise enqueue another
+# compound on top of the first — worker still processes them serially so DB
+# stays consistent, but the audit log gets two diff rows in misleading order
+# and the frontend's lock UI is silently bypassed (the row is "locked" but
+# the second PATCH succeeded with 200). Better: 409 fast, let the user see
+# why their action didn't take.
+_LOCKED_ORDER_ERROR = HTTPException(
+    status_code=status.HTTP_409_CONFLICT,
+    detail=(
+        "Order is being processed by the scheduler; please wait for the in-flight action to finish."
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -428,6 +444,11 @@ def update_order(
     if order.status not in MUTABLE_STATUSES:
         raise _IMMUTABLE_STATUS_ERROR
 
+    # N-3 round-2 guard: if a previous compound is still in flight, refuse
+    # to stack another one on top. See ``_LOCKED_ORDER_ERROR`` docstring.
+    if order.is_processing_locked:
+        raise _LOCKED_ORDER_ERROR
+
     # Application-level optimistic lock: reject stale client versions before
     # making any changes. SQLAlchemy's DB-level check fires on flush(), but this
     # early guard gives a clearer error and avoids unnecessary DB work.
@@ -535,6 +556,11 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
+    # N-3 round-2 guard: refuse to stack another compound on top of an
+    # already-locked row. See ``_LOCKED_ORDER_ERROR``.
+    if order.is_processing_locked:
+        raise _LOCKED_ORDER_ERROR
+
     # Build the compound from the *current* row state (the values the
     # worker will use to soft-delete + audit on accept).
     compound = _build_delete_compound(order, actor.id)
@@ -577,6 +603,13 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
     for order_id in req.order_ids:
         order = order_repo.get_by_id(db, order_id)
         if order is None or order.status not in MUTABLE_STATUSES:
+            skipped.append(order_id)
+            continue
+        # N-3: same in-flight guard as ``update_order``. Skip (not raise)
+        # since this is a best-effort batch — the caller's
+        # ``BatchUpdateResponse.skipped_ids`` already documents partial
+        # failures.
+        if order.is_processing_locked:
             skipped.append(order_id)
             continue
 

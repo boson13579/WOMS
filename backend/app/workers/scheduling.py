@@ -757,7 +757,22 @@ def _apply_db_action_accept(
         return
 
     if kind == "delete":
-        old_value = {"status": order.status.value, "is_deleted": False}
+        # N-5: capture the full pre-delete view in the audit row.
+        # ``_build_delete_compound`` already snapshotted these into
+        # ``db_action.old_*`` at producer time; before round-2 the worker
+        # didn't read them and just logged ``status`` + ``is_deleted``,
+        # making it impossible to answer "what was the qty / deadline /
+        # notes when this order got cancelled?" without consulting the
+        # full row history. Pulling the snapshot into the audit row makes
+        # the history self-contained.
+        old_value = {
+            "status": order.status.value,
+            "is_deleted": False,
+            "wafer_quantity": db_action.get("old_wafer_quantity"),
+            "requested_delivery_date": db_action.get("old_requested_delivery_date"),
+            "notes": db_action.get("old_notes"),
+            "assigned_to": db_action.get("old_assigned_to"),
+        }
         order.is_deleted = True
         order.status = OrderStatus.cancelled
         order.is_processing_locked = False
@@ -779,6 +794,16 @@ def _apply_db_action_reject(order: Order, kind: str) -> None:
     the lock and snapping ``status`` back to whatever the row's actual
     schedule presence implies (scheduled vs pending). For create the
     producer DID write a stub row, so we soft-delete it.
+
+    N-4 round-2 guard: never demote ``in_production`` here. Today the
+    producer-side ``MUTABLE_STATUSES`` check already blocks PATCH /
+    DELETE on an in-production row, so this branch is unreachable in
+    practice. But if a future change opens up partial mutation (e.g.
+    "you can change notes on a row that's mid-production"), the
+    unconditional ``order.status = scheduled`` write below would
+    silently demote the row mid-shift and break the same downstream
+    invariant ``set_schedule_dates`` defends against (§4.4). Cheaper
+    to defend here than to forget when MUTABLE_STATUSES is relaxed.
     """
     if kind == "create":
         order.is_deleted = True
@@ -788,6 +813,9 @@ def _apply_db_action_reject(order: Order, kind: str) -> None:
 
     # update / delete: just unlock and restore status.
     order.is_processing_locked = False
+    if order.status == OrderStatus.in_production:
+        # Defensive — see docstring.
+        return
     if order.scheduled_production_date is not None:
         order.status = OrderStatus.scheduled
     else:
@@ -1042,7 +1070,7 @@ _MATERIALIZE_RUNNING_TTL_SECONDS = 300  # 5 min safety window for crash recovery
 
 
 @celery_app.task(name="scheduling.materialize")  # type: ignore[untyped-decorator]
-def materialize_schedule_task() -> None:
+def materialize_schedule_task() -> None:  # noqa: PLR0912, PLR0915 — coherent loop body
     """Drain pending notifications and write the schedule to DB.
 
     Phase 4 slow path. Self-coalescing: many ``run_scheduling_task`` fast-
@@ -1151,14 +1179,45 @@ def materialize_schedule_task() -> None:
                     rds.delete(MATERIALIZE_NOTIFY_PROCESSING_KEY)
                     break
 
-                state = _load_state()
-                scheduled_results = compute_schedule(state)
-                pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders.values()}
-                db: Session = SessionLocal()
+                # N-1 round-2: serialize the state-read + DB-write window
+                # against ``advance_day_task`` / ``rebuild_schedule_task``.
+                # Without this lock, advance_day could ``_save_state`` +
+                # apply_schedule between our ``_load_state`` and our own
+                # apply_schedule, leaving DB with our stale (pre-advance_day)
+                # daily_breakdown / scheduled_production_date until the next
+                # compound triggers another materialize. Lock is per-batch
+                # so advance_day can interleave between batches if it
+                # genuinely needs to run mid-drain.
+                materialize_lock_holder = f"materialize-{uuid.uuid4()}"
+                materialize_lock_acquired = _acquire_state_lock_blocking(
+                    materialize_lock_holder,
+                    timeout_seconds=_RUN_WAIT_TIMEOUT_SECONDS,
+                )
+                if not materialize_lock_acquired:
+                    logger.error(
+                        "schedule.materialize.state_lock_timeout",
+                        notify_users=len(users_raw),
+                    )
+                    # Treat the same as the empty-state branch — put work
+                    # back, give up cleanly, let next trigger try again.
+                    rds.sunionstore(
+                        MATERIALIZE_NOTIFY_PENDING_KEY,
+                        [MATERIALIZE_NOTIFY_PENDING_KEY, MATERIALIZE_NOTIFY_PROCESSING_KEY],
+                    )
+                    rds.delete(MATERIALIZE_NOTIFY_PROCESSING_KEY)
+                    break
+
                 try:
-                    order_service.apply_schedule(db, scheduled_results, pinned_map)
+                    state = _load_state()
+                    scheduled_results = compute_schedule(state)
+                    pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders.values()}
+                    db: Session = SessionLocal()
+                    try:
+                        order_service.apply_schedule(db, scheduled_results, pinned_map)
+                    finally:
+                        db.close()
                 finally:
-                    db.close()
+                    _release_state_lock(materialize_lock_holder)
 
                 for user_raw in users_raw:
                     try:
@@ -1217,7 +1276,24 @@ def _wait_for_idle_run(*, log_event: str) -> None:
     logger.warning(log_event, timeout_seconds=_RUN_WAIT_TIMEOUT_SECONDS)
 
 
-@celery_app.task(name="scheduling.advance_day")  # type: ignore[untyped-decorator]
+@celery_app.task(  # type: ignore[untyped-decorator]
+    name="scheduling.advance_day",
+    # N-2 round-2: if state_writer_lock can't be grabbed within the full
+    # timeout, the body raises ``RuntimeError("could not acquire state-writer
+    # lock within ...s")``. Without autoretry that single failure means the
+    # whole day's ``mark_in_production`` / ``mark_completed_outside_set`` /
+    # apply_schedule never runs — order status workflow stalls until the
+    # next Beat firing 24h later. Three retries with exponential backoff
+    # (60s, 120s, 240s by default — capped at ``retry_backoff_max``) cover
+    # transient contention windows; if it still fails after that, status=
+    # failed surfaces on ``GET /schedule/status`` so ops can intervene
+    # before another 24h tick.
+    autoretry_for=(RuntimeError,),
+    max_retries=3,
+    retry_backoff=60,
+    retry_backoff_max=600,
+    retry_jitter=True,
+)
 def advance_day_task() -> None:
     """Roll the scheduler horizon forward one day at 00:00 UTC.
 
@@ -1372,7 +1448,18 @@ def advance_day_task() -> None:
         _clear_waiter_flag()
 
 
-@celery_app.task(name="scheduling.rebuild")  # type: ignore[untyped-decorator]
+@celery_app.task(  # type: ignore[untyped-decorator]
+    name="scheduling.rebuild",
+    # N-2: same autoretry policy as ``advance_day_task``. Rebuild is
+    # user-triggered (``POST /schedule/rebuild`` from ops) so a lock-
+    # timeout is recoverable by retry — better than handing back a stale
+    # ``status=failed`` and letting ops re-click manually.
+    autoretry_for=(RuntimeError,),
+    max_retries=3,
+    retry_backoff=60,
+    retry_backoff_max=600,
+    retry_jitter=True,
+)
 def rebuild_schedule_task() -> None:
     """Rebuild scheduler state from DB on top of the latest base_date.
 
