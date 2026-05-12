@@ -688,6 +688,13 @@ def test_run_scheduling_processes_shrink_group_before_grow(
         MagicMock(return_value=0),
     )
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    # Silence the Phase-4 slow-path side effects so CI without a real Redis
+    # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
+    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _user_id: None)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
     _install_auto_retrigger_delay(monkeypatch)
 
     result = run_scheduling_task.apply()
@@ -743,6 +750,13 @@ def test_run_scheduling_lets_late_shrink_jump_pending_grow(
         MagicMock(return_value=0),
     )
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    # Silence the Phase-4 slow-path side effects so CI without a real Redis
+    # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
+    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _user_id: None)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
     _install_auto_retrigger_delay(monkeypatch)
 
     result = run_scheduling_task.apply()
@@ -808,6 +822,13 @@ def test_run_scheduling_yields_retrigger_to_waiter(
         MagicMock(return_value=0),
     )
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    # Silence the Phase-4 slow-path side effects so CI without a real Redis
+    # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
+    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _user_id: None)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
     plain_delay = MagicMock()
     monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", plain_delay)
 
