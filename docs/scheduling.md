@@ -520,15 +520,17 @@ ws.addEventListener("close", (e) => {
 **為什麼從 List 換成 Sorted Set**：原本用 `LPUSH` + `LRANGE 0 -1` + `LREM` 的寫法，每次 pop 要把整條 queue 拉出來掃一遍才能挑出 shrink-優先 + 組內 FIFO 的 winner，是 O(n) 而且每個 op 都會這樣做一次（總共 O(n²)）。改成在 producer 端把 group 跟 seq 編成 score，worker 直接 `ZPOPMIN` 拿最小 score 那筆 — ZADD / ZPOPMIN 都是 O(log n)，總成本 O(n log n)。
 
 **為什麼有 `schedule:state_writer_lock`（不靠 `schedule:status` 就好嗎）**：`status` 是 advisory observability key — 多個 reader 看到 `idle` 都會繼續、`_set_status(running)` 跟下一個 `_save_state` 之間的 gap 就是 race window。在 prod `--concurrency >= 2` 或多 worker container 的場景下，兩個 `run_scheduling_task` 可以同時讀同一份 V1 state、各自 mutate、各自 save — 後 save 者蓋掉前者，一個 compound 的影響徹底蒸發。`state_writer_lock` 是 atomic mutex，補上正確性層的缺口：
-- **四支** state-influencing task 都要拿這把 lock：`run_scheduling_task` / `advance_day_task` / `rebuild_schedule_task` 寫 state（必然要鎖），**`materialize_schedule_task` 雖然只寫 DB 不寫 state，但它讀 state + 寫 DB 是個邏輯整體**，跟 advance_day 並行時若沒鎖，會發生「advance_day 已 `_save_state(V')` + apply_schedule(V'_results)，materializer 還拿著舊的 V 視角去 apply_schedule(V_results)，把 advance_day 剛寫的 `daily_breakdown` 蓋成 stale」這個 race。所以 materializer 每個 batch（per-iteration）也用 `_acquire_state_lock_blocking`。
+- **只有真的會寫 `schedule:state` 的三支 task 拿這把 lock**：`run_scheduling_task` / `advance_day_task` / `rebuild_schedule_task`。
 - 進 body 前 `SET NX EX 300 task_id`；finally 用 Lua CAS-delete（只刪 value == 自己 task_id 的 lock）防止「TTL 過期 → 別人接手 → 我們的 finally 誤刪別人 lock → race window 重開」這個二次 race。
-- `run_scheduling_task` 拿不到就 return（holder 在自己 retrigger 時會接手）；`advance_day_task` / `rebuild_schedule_task` / materializer polling 等 lock，超時：
-  - advance_day / rebuild → raise `RuntimeError`，**Celery autoretry 自動 backoff 重試 3 次**（60s/120s/240s）— 因為他們是「必須跑」的 task，單次拿不到 lock 不該讓整天 finalize 沒做（沒 autoretry 的話 advance_day 失敗一次，下次 Beat 觸發要等 24 小時）。
-  - materializer → 把 captured users 推回 `notify_pending` + break loop + ERROR log，下次 trigger 重試。
+- `run_scheduling_task` 拿不到就 return（holder 在自己 retrigger 時會接手）；`advance_day_task` / `rebuild_schedule_task` polling 等 lock，超時 → raise `RuntimeError`，**Celery autoretry 自動 backoff 重試 3 次**（60s/120s/240s）— 因為他們是「必須跑」的 task，單次拿不到 lock 不該讓整天 finalize 沒做（沒 autoretry 的話 advance_day 失敗一次，下次 Beat 觸發要等 24 小時）。
 
 選 SETNX + CAS 而不是 Redlock：單一 Redis 實例的場景用單一 SETNX 就夠，Redlock 是給多 Redis 副本的，會引入不必要的複雜度。也不選「靠 Celery `--concurrency=1` 約束」 — 把正確性壓在 ops 紀律上太脆。`status` + `waiter_pending` 仍保留下來給 observability + cooperative retrigger 用。
 
-> Materializer 一開始（PR-14 round-1）只有自己的 `materialize_running` flag 沒拿 state_writer_lock — 跟 run_task 不會 race（一個讀 state、一個寫 state、又有 `materialize_running` 避免兩個 materializer 同時跑），但跟 advance_day 漏掉了這條。round-2 補上。
+**為什麼 `materialize_schedule_task` 不在 lock 裡** — 早期 round-2 review 為了 advance_day × materializer 的「stale daily_breakdown」race 把 materializer 也加進 lock，但這違反了 `status`（idle / running）的設計初衷：**status 是 `run_scheduling_task` 的 lifecycle key**，讓 slow path（materializer 每筆訂單 ~4ms × N，N=500 跑 2 秒）排在 lock 後面 = 把 user-facing PATCH/DELETE 延遲堆在 materializer 上面，背離 Phase-4 fast/slow split 的核心目的。所以 round-3 拿掉了。`materialize_running` flag 還在用來 self-coalesce 防止兩個 materializer 同時跑。
+
+代價：advance_day（每天 00:00）跟 in-flight materializer 仍可能 race，advance_day `_save_state(V')` 之後 materializer 用 pre-advance_day V 寫 DB → `daily_breakdown` / `scheduled_production_date` 變成 stale 一個 materializer cycle。**`mark_in_production` / `mark_completed_outside_set` 寫的 status 欄不受影響**（materializer 的 `set_schedule_dates` 有 P0-1 防禦不會 demote in_production、也根本不寫 completed），所以 status workflow 安全。
+
+stale 也是有界的 — `advance_day_task` / `rebuild_schedule_task` finally 走完最後 `materialize_schedule_task.delay()` 顯式再派一支 materializer，讀 fresh state 後把 stale 覆寫掉。stale window ≈ 一個 materializer 週期（50ms-2s），不會擴散到「下次 user 動作」。
 
 **為什麼 `schedule:pending_ops:dlq` 存在**：`_pop_next_compound` 從 sorted set 拿到的 member 若 JSON 解析失敗（極罕見：手動 redis-cli 改錯、persistence 半寫入、bit flip），ZPOPMIN 已經把 member 從 queue 拿走 → 沒有 DLQ 的話 compound 就**永遠消失**，對應訂單的 `is_processing_locked=True` 永遠不會被清、`requested_by` 也救不出來 → 訂單卡在「處理中」轉圈圈。改 RPUSH 進 DLQ + ERROR log，ops 看到 DLQ 有東西就介入手動 decode、找到 order_id、unlock。用 List 而不是 Set 是為了保留到達順序（forensic analysis 容易），同一個壞 member 出現多次也都保留。
 
@@ -847,7 +849,9 @@ Self-coalescing celery task，把多個 compound 的累積 state 一次寫進 DB
 
 **post-release 重新派工**：迴圈跳出來、`DEL materialize_running` 之後，再 `EXISTS notify_pending` 看看有沒有「在我們最後一次 empty rename 跟釋放 flag 之間」進來的新 user。有就 `materialize_schedule_task.delay()` 把自己再派一次。這條保證沒有 user 會被卡在 idle window 裡。
 
-**Race-with-advance_day**：materializer 是 read-only 對 state（讀 state、寫 DB）。advance_day 是 read-write 對 state。兩者 DB write 都會通過 `apply_schedule.clear_scheduled_dates` 然後寫新值；如果 concurrent，PostgreSQL transaction 序列化、後 commit 者贏，最終 DB reflects latest schedule。可接受。
+**Race-with-advance_day**：materializer 是 read-only 對 state（讀 state、寫 DB），不參與 `state_writer_lock`（理由見 §2.4）。advance_day / rebuild 是 read-write 對 state，會持 lock。兩者 DB write 都會通過 `apply_schedule.clear_scheduled_dates` 然後寫新值；如果 concurrent，PostgreSQL transaction 序列化、後 commit 者贏。worst case：materializer 用 pre-advance_day state 寫 stale `daily_breakdown`、覆蓋 advance_day 剛寫的新值；status 欄（`in_production` / `completed`）不受影響因為 materializer 的 `set_schedule_dates` 有 P0-1 防禦不會 demote、也根本不寫 `completed`。
+
+stale window 由 **advance_day / rebuild 在 finally 結尾 `materialize_schedule_task.delay()` 顯式再派一支**收尾 — 那支 materializer 讀 fresh state、用 fresh daily_breakdown 把 stale 覆蓋掉，整個 stale 時段 ≈ 一個 materializer cycle（50ms-2s）。沒有這個 finally retrigger 的話 stale 會撐到「下次 user PATCH」，最糟在連假期間整天 stale。
 
 **WS event 對照**：
 
@@ -930,7 +934,7 @@ waiter flag + status claim 兩層解決了「同類型 task 串接 race」（adv
 - finally 用 Lua CAS-delete（只刪 value == 自己 task_id 的 lock）防止「TTL 過期 → 別人接手 → 我們的 finally 誤刪別人 lock → race window 重開」這個二次 race
 - `run_scheduling_task` 拿不到就直接 return（不動 status、不 pop queue）— 持有 lock 的那支結束時會 retrigger，下一個 compound 自然會被處理
 - `advance_day_task` / `rebuild_schedule_task` polling 等 lock（`_acquire_state_lock_blocking`），最多等 `SCHEDULER_RUN_WAIT_TIMEOUT_SECONDS`；超時 → raise `RuntimeError`。`@celery_app.task` decorator 用 `autoretry_for=(RuntimeError,)` + `max_retries=3` + `retry_backoff=60`（exponential，cap 600s）+ jitter 自動重試 — 必須這樣做因為 advance_day 是「每天 00:00 一次」的硬性 schedule，單次失敗讓那整天的 `mark_in_production` / `mark_completed_outside_set` 都不會跑、訂單 status 工作流停滯 24 小時要等下一個 Beat tick。三次仍失敗才走 status=`failed`，讓 ops 透過 `GET /schedule/status` 看見、手動介入。
-- **materializer 也拿這把 lock**：每個 batch（per-iteration of the drain loop）做 `_acquire_state_lock_blocking` → `_load_state` + `compute_schedule` + `apply_schedule` → release。Notify_user 可以在 lock 外。Lock per-batch 而不是 lock-whole-task 是讓 advance_day 在 batch 之間插隊；單個 batch 內仍 serialized 對抗「advance_day 進來改 state 後 materializer 用 stale state 寫 DB」這條 race。拿不到 lock 時把 captured users 推回 `notify_pending` + ERROR log，下次 trigger 重試（同 P3-3 empty-state guard 的處理模式）。
+- **materializer 不拿 lock**：跑 slow path（compute_schedule + per-order DB writes，N=500 約 2 秒）把它鎖進 mutex 等於是把 user-facing PATCH 延遲堆在 materializer 上面 — 跟 Phase-4 fast/slow split 的核心目的相反。改成讓 materializer 自由跑，唯一 trade-off 是跟 advance_day / rebuild 並行時可能寫 stale `daily_breakdown`（status 欄不受影響）；advance_day / rebuild 在 release lock 後**主動再 dispatch 一支 materializer**（`materialize_schedule_task.delay()`），讀 fresh state 把 stale 覆寫，所以 stale window 有界 ≈ 一個 materializer cycle。
 
 選 SETNX + CAS-delete 而不是 Redlock：單一 Redis 實例的場景用單一 SETNX 就夠，Redlock 是給多 Redis 副本的、會引入不必要複雜度。也不選「靠 Celery `--concurrency=1` 約束」把正確性壓在 ops 紀律上太脆，文件講過很容易忘記。`status` + `waiter_pending` 仍然保留，因為它們提供 observability（`GET /schedule/status`）跟 cooperative retrigger（讓 waiter 知道誰要接手 delay）— lock 補的是正確性層的洞，這兩層是 UX / ergonomics 層、互補不互斥。
 

@@ -1832,45 +1832,38 @@ def test_materialize_task_skips_when_state_key_missing(
     assert redis_client.sismember("schedule:materialize_notify_pending", str(requester))
 
 
-def test_materialize_task_holds_state_writer_lock_during_batch(
+def test_materialize_task_runs_independently_of_state_writer_lock(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """N-1 round-2: materializer's read-state → write-DB window must be
-    serialized against ``advance_day_task`` / ``rebuild_schedule_task``.
+    """Materializer must NOT participate in ``state_writer_lock`` —
+    it's a slow path (apply_schedule per N orders, several ms/order)
+    and gating it on the same mutex as ``run_scheduling_task`` would
+    pile user-facing PATCH latency behind it.
 
-    Pre-fix the materializer only held its own ``materialize_running``
-    flag, not ``state_writer_lock``. Sequence that broke it:
-      T=0  advance_day grabs state_writer_lock, ``_load_state`` V
-      T=1  materializer starts (no lock), ``_load_state`` V (stale)
-      T=2  advance_day apply_schedule(V'), commits, releases lock
-      T=3  materializer apply_schedule(V_results) — **overwrites
-           advance_day's freshly-written daily_breakdown with stale V**
-    Now DB shows pre-advance_day schedule until the next compound
-    arrives and triggers another materializer.
+    The previous round-2 design had materializer per-batch acquire
+    ``state_writer_lock``. We rolled that back: materializer runs
+    free, and ``advance_day_task`` / ``rebuild_schedule_task`` instead
+    dispatch a follow-up materializer after their commit to bound any
+    stale write that might race with them.
 
-    Verifies the fix by pre-claiming the lock as advance_day, running
-    the materializer, asserting it could NOT proceed (apply_schedule
-    not called, notify users put back on pending).
+    This test pre-claims the lock as if a long-running task is using
+    it, then runs the materializer and verifies it proceeds normally
+    (apply_schedule called, user notified) — i.e., the lock does NOT
+    block it.
     """
     from app.workers.scheduling import STATE_WRITER_LOCK_KEY, materialize_schedule_task
 
     requester = uuid.uuid4()
     redis_client.sadd("schedule:materialize_notify_pending", str(requester))
-    # STATE_KEY must exist or P3-3's empty-state guard fires first.
     redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
-    # Pre-claim state_writer_lock as another task (advance_day's POV).
+    # Pre-claim state_writer_lock as another task — should NOT affect
+    # the materializer at all under the new design.
     redis_client.set(STATE_WRITER_LOCK_KEY, "other-task-id", ex=300)
-
-    # Make the lock-acquire timeout effectively immediate so the test
-    # doesn't actually wait 300s for the holder to "finish".
-    monkeypatch.setattr(
-        "app.workers.scheduling._acquire_state_lock_blocking",
-        lambda _task_id, timeout_seconds=0: False,
-    )
 
     apply_mock = MagicMock(return_value=0)
     monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
     notify_mock = MagicMock()
     monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
@@ -1882,13 +1875,63 @@ def test_materialize_task_holds_state_writer_lock_during_batch(
     result = materialize_schedule_task.apply()
     assert result.successful(), result.traceback
 
-    # apply_schedule NOT called — the lock guard fired.
-    assert apply_mock.call_count == 0
-    # User not notified — work is preserved for next run.
-    assert notify_mock.call_count == 0
-    assert redis_client.scard("schedule:materialize_notify_pending") == 1
-    # Other task's lock untouched (we never acquired so we didn't release).
+    # Materializer proceeded normally despite the held lock.
+    assert apply_mock.call_count == 1
+    # User was notified.
+    notify_kinds = [c.kwargs["message"]["type"] for c in notify_mock.call_args_list]
+    assert "schedule.materialized" in notify_kinds
+    # We never touched the held lock — still belongs to the other task.
     assert redis_client.get(STATE_WRITER_LOCK_KEY) == "other-task-id"
+
+
+def test_advance_day_dispatches_materializer_after_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """advance_day_task must trigger a fresh ``materialize_schedule_task``
+    after its commit + lock release. Without this, an in-flight
+    materializer that read pre-advance_day state could overwrite
+    advance_day's freshly-written ``daily_breakdown`` /
+    ``scheduled_production_date`` with stale values — and since
+    materializer isn't lock-serialized anymore, advance_day can't
+    block the race directly. Triggering a follow-up materializer
+    bounds the stale window to one materializer cycle.
+    """
+    from app.workers.scheduling import advance_day_task
+
+    redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
+
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr(
+        "app.workers.scheduling.advance_day",
+        lambda s: s,
+    )
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_repo.mark_completed_outside_set",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_repo.mark_in_production",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+    materialize_delay = MagicMock()
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        materialize_delay,
+    )
+
+    result = advance_day_task.apply()
+    assert result.successful(), result.traceback
+
+    # advance_day dispatched at least one materializer at the end.
+    assert materialize_delay.call_count >= 1
 
 
 # ---------------------------------------------------------------------------

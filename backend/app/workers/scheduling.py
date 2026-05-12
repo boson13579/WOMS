@@ -1070,7 +1070,7 @@ _MATERIALIZE_RUNNING_TTL_SECONDS = 300  # 5 min safety window for crash recovery
 
 
 @celery_app.task(name="scheduling.materialize")  # type: ignore[untyped-decorator]
-def materialize_schedule_task() -> None:  # noqa: PLR0912, PLR0915 — coherent loop body
+def materialize_schedule_task() -> None:
     """Drain pending notifications and write the schedule to DB.
 
     Phase 4 slow path. Self-coalescing: many ``run_scheduling_task`` fast-
@@ -1179,45 +1179,40 @@ def materialize_schedule_task() -> None:  # noqa: PLR0912, PLR0915 — coherent 
                     rds.delete(MATERIALIZE_NOTIFY_PROCESSING_KEY)
                     break
 
-                # N-1 round-2: serialize the state-read + DB-write window
-                # against ``advance_day_task`` / ``rebuild_schedule_task``.
-                # Without this lock, advance_day could ``_save_state`` +
-                # apply_schedule between our ``_load_state`` and our own
-                # apply_schedule, leaving DB with our stale (pre-advance_day)
-                # daily_breakdown / scheduled_production_date until the next
-                # compound triggers another materialize. Lock is per-batch
-                # so advance_day can interleave between batches if it
-                # genuinely needs to run mid-drain.
-                materialize_lock_holder = f"materialize-{uuid.uuid4()}"
-                materialize_lock_acquired = _acquire_state_lock_blocking(
-                    materialize_lock_holder,
-                    timeout_seconds=_RUN_WAIT_TIMEOUT_SECONDS,
-                )
-                if not materialize_lock_acquired:
-                    logger.error(
-                        "schedule.materialize.state_lock_timeout",
-                        notify_users=len(users_raw),
-                    )
-                    # Treat the same as the empty-state branch — put work
-                    # back, give up cleanly, let next trigger try again.
-                    rds.sunionstore(
-                        MATERIALIZE_NOTIFY_PENDING_KEY,
-                        [MATERIALIZE_NOTIFY_PENDING_KEY, MATERIALIZE_NOTIFY_PROCESSING_KEY],
-                    )
-                    rds.delete(MATERIALIZE_NOTIFY_PROCESSING_KEY)
-                    break
-
+                # Materializer is deliberately NOT in ``state_writer_lock``.
+                # ``schedule:status`` (idle / running) is the lifecycle key
+                # of ``run_scheduling_task`` — letting a slow path
+                # (apply_schedule per N orders, ~4 ms/order) gate that
+                # would block user-facing PATCH/DELETE latency on
+                # something the user doesn't care about. The lock is
+                # reserved for tasks that actually mutate
+                # ``schedule:state`` (run / advance_day / rebuild).
+                #
+                # The trade-off this re-introduces: if advance_day saves
+                # a new state between our ``_load_state`` and our
+                # ``apply_schedule``, we'll write DB with the pre-
+                # advance_day view → ``daily_breakdown`` /
+                # ``scheduled_production_date`` go stale by one
+                # materializer cycle. ``status`` columns (``in_production``
+                # set by ``mark_in_production``, ``completed`` set by
+                # ``mark_completed_outside_set``) are NOT touched by our
+                # ``apply_schedule`` because ``set_schedule_dates``
+                # preserves ``in_production`` and never writes
+                # ``completed``, so advance_day's status work is safe.
+                #
+                # advance_day_task / rebuild_schedule_task explicitly
+                # dispatch a fresh materializer after their commit so
+                # the stale window is bounded by one materializer cycle
+                # (≈ 50ms-2s) rather than "until the next user
+                # compound", even on a quiet day.
+                state = _load_state()
+                scheduled_results = compute_schedule(state)
+                pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders.values()}
+                db: Session = SessionLocal()
                 try:
-                    state = _load_state()
-                    scheduled_results = compute_schedule(state)
-                    pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders.values()}
-                    db: Session = SessionLocal()
-                    try:
-                        order_service.apply_schedule(db, scheduled_results, pinned_map)
-                    finally:
-                        db.close()
+                    order_service.apply_schedule(db, scheduled_results, pinned_map)
                 finally:
-                    _release_state_lock(materialize_lock_holder)
+                    db.close()
 
                 for user_raw in users_raw:
                     try:
@@ -1446,6 +1441,15 @@ def advance_day_task() -> None:
         if lock_acquired:
             _release_state_lock(lock_holder_id)
         _clear_waiter_flag()
+        # Dispatch a fresh materializer after we release the lock so
+        # any in-flight materializer that read pre-advance_day state
+        # (and is about to write stale ``daily_breakdown`` /
+        # ``scheduled_production_date``) gets overwritten by the next
+        # materialize cycle. Bounds the stale window to one materializer
+        # latency instead of "until the next user compound". See the
+        # comment block inside ``materialize_schedule_task`` for why
+        # we accept the staleness instead of locking against it.
+        materialize_schedule_task.delay()
 
 
 @celery_app.task(  # type: ignore[untyped-decorator]
@@ -1566,3 +1570,8 @@ def rebuild_schedule_task() -> None:
         if lock_acquired:
             _release_state_lock(lock_holder_id)
         _clear_waiter_flag()
+        # Same as advance_day_task: refresh materialized DB columns
+        # to overwrite any racing materializer that read the pre-
+        # rebuild state. See ``materialize_schedule_task`` body for
+        # the staleness trade-off rationale.
+        materialize_schedule_task.delay()
