@@ -450,9 +450,7 @@ def test_update_order_notes_only_skips_compound(
     assert mock_enqueue.call_count == 0
 
 
-def test_create_order_pushes_add_compound(
-    db_session: Session, mock_enqueue: MagicMock
-) -> None:
+def test_create_order_pushes_add_compound(db_session: Session, mock_enqueue: MagicMock) -> None:
     """create_order pushes a 1-op ``[add]`` compound (group=grow).
 
     Also confirms is_processing_locked is set so the frontend can disable

@@ -728,8 +728,7 @@ def apply_schedule(
         earliest = results[0].scheduled_date
         latest = results[-1].scheduled_date
         daily_breakdown_payload: list[dict[str, str | int]] = [
-            {"date": sr.scheduled_date.isoformat(), "quantity": int(sr.quantity)}
-            for sr in results
+            {"date": sr.scheduled_date.isoformat(), "quantity": int(sr.quantity)} for sr in results
         ]
         is_pinned = order_id in pinned_map
         order = order_repo.set_schedule_dates(

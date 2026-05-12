@@ -94,9 +94,7 @@ class _FakeRedis:
         return removed
 
 
-def _make_compound(
-    *, compound_id: uuid.UUID | None = None
-) -> ScheduleCompoundRequest:
+def _make_compound(*, compound_id: uuid.UUID | None = None) -> ScheduleCompoundRequest:
     ops = [
         ScheduleOpInCompound(
             op="add",
@@ -211,9 +209,7 @@ def test_cancel_compound_returns_in_progress_when_index_stale(
     fake, _, notify_mock = _patch_redis_and_taskdispatch(monkeypatch)
     compound_id = uuid.uuid4()
     # Plant a stale index entry without a matching sorted-set member.
-    stale_member = json.dumps(
-        {"compound_id": str(compound_id), "requested_by": str(uuid.uuid4())}
-    )
+    stale_member = json.dumps({"compound_id": str(compound_id), "requested_by": str(uuid.uuid4())})
     fake.hset(BY_COMPOUND_ID_KEY, str(compound_id), stale_member)
 
     result = cancel_compound(compound_id)

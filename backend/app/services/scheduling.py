@@ -501,9 +501,7 @@ def _pq_add(state: SchedulerState, order: SchedulingOrder) -> None:
     state.pq_index[order.order_id] = order
 
 
-def _pq_remove_by_id(
-    state: SchedulerState, order_id: uuid.UUID
-) -> SchedulingOrder | None:
+def _pq_remove_by_id(state: SchedulerState, order_id: uuid.UUID) -> SchedulingOrder | None:
     """Drop the order with ``order_id`` from pq + index; return it or None.
 
     O(1) for the dict pop (which gives us the object reference);
@@ -1050,7 +1048,7 @@ def advance_day(state: SchedulerState) -> SchedulerState:
         deadline_tree=SegmentTree.from_array(state.deadline_tree.to_array()),
         priority_queue=_new_priority_queue(),  # helpers don't read this; rebuilt below
         pq_index={},
-        pinned_orders={},   # rebuilt below
+        pinned_orders={},  # rebuilt below
         base_date=state.base_date,
     )
 

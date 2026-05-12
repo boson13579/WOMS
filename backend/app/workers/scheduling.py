@@ -725,15 +725,10 @@ def materialize_schedule_task() -> None:
             try:
                 state = _load_state()
                 scheduled_results = compute_schedule(state)
-                pinned_map = {
-                    p.order_id: p.fake_deadline
-                    for p in state.pinned_orders.values()
-                }
+                pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders.values()}
                 db: Session = SessionLocal()
                 try:
-                    order_service.apply_schedule(
-                        db, scheduled_results, pinned_map
-                    )
+                    order_service.apply_schedule(db, scheduled_results, pinned_map)
                 finally:
                     db.close()
 
@@ -853,9 +848,7 @@ def advance_day_task() -> None:
             # to be explicit.
             today = state.base_date
             today_locked_in_ids: set[uuid.UUID] = {
-                sr.order_id
-                for sr in compute_schedule(state)
-                if sr.scheduled_date == today
+                sr.order_id for sr in compute_schedule(state) if sr.scheduled_date == today
             }
 
             new_state = advance_day(state)
@@ -863,18 +856,15 @@ def advance_day_task() -> None:
             # Orders still alive in the new state — used by
             # ``mark_completed_outside_set`` to decide which currently-
             # in_production rows are done.
-            new_alive_ids: set[uuid.UUID] = (
-                {o.order_id for o in new_state.priority_queue}
-                | set(new_state.pinned_orders.keys())
+            new_alive_ids: set[uuid.UUID] = {o.order_id for o in new_state.priority_queue} | set(
+                new_state.pinned_orders.keys()
             )
 
             # Combined DB workflow: apply_schedule + status flips. We bypass
             # ``_finalize_run`` here so we can serialize the three DB writes
             # in one session before ``_save_state`` + broadcast.
             scheduled_results = compute_schedule(new_state)
-            pinned_map = {
-                p.order_id: p.fake_deadline for p in new_state.pinned_orders.values()
-            }
+            pinned_map = {p.order_id: p.fake_deadline for p in new_state.pinned_orders.values()}
             db: Session = SessionLocal()
             try:
                 # 1. Set scheduled_production_date / dates / pin columns
@@ -882,15 +872,11 @@ def advance_day_task() -> None:
                 order_service.apply_schedule(db, scheduled_results, pinned_map)
                 # 2. Yesterday's in_production orders that have no remaining
                 #    work in state → completed.
-                completed_count = order_repo.mark_completed_outside_set(
-                    db, new_alive_ids
-                )
+                completed_count = order_repo.mark_completed_outside_set(db, new_alive_ids)
                 # 3. Today's-locked-in (advance_day moved them out of state)
                 #    → in_production. Overrides apply_schedule's
                 #    ``scheduled`` for any boundary order present here.
-                in_prod_count = order_repo.mark_in_production(
-                    db, today_locked_in_ids
-                )
+                in_prod_count = order_repo.mark_in_production(db, today_locked_in_ids)
                 db.commit()
             finally:
                 db.close()

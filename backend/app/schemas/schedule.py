@@ -57,9 +57,7 @@ class ScheduleOpInCompound(BaseModel):
         if self.op == "pin" and self.fake_deadline is None:
             raise ValueError("op='pin' requires fake_deadline")
         if self.op != "pin" and self.fake_deadline is not None:
-            raise ValueError(
-                f"op={self.op!r} must NOT include fake_deadline; only 'pin' uses it"
-            )
+            raise ValueError(f"op={self.op!r} must NOT include fake_deadline; only 'pin' uses it")
         return self
 
 
@@ -130,10 +128,9 @@ class ScheduleCompoundRequest(BaseModel):
         here is the cheapest layer.
         """
         if self.op_count != len(self.ops):
-            raise ValueError(
-                f"op_count={self.op_count} does not match len(ops)={len(self.ops)}"
-            )
+            raise ValueError(f"op_count={self.op_count} does not match len(ops)={len(self.ops)}")
         return self
+
 
 # ---------------------------------------------------------------------------
 # Response schemas

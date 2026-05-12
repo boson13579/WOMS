@@ -292,9 +292,7 @@ def test_operations_rejects_empty_ops(client: TestClient, db_session: Session) -
     assert res.json()["error"]["code"] == 422
 
 
-def test_operations_rejects_op_count_mismatch(
-    client: TestClient, db_session: Session
-) -> None:
+def test_operations_rejects_op_count_mismatch(client: TestClient, db_session: Session) -> None:
     """``op_count`` MUST equal ``len(ops)``. Sending a wrong count triggers
     the schema-level tamper guard, before any Redis interaction.
     """
@@ -428,9 +426,7 @@ def test_cancel_compound_404_when_unknown(
     assert res.json()["error"]["code"] == 404
 
 
-def test_cancel_compound_by_viewer_returns_403(
-    client: TestClient, db_session: Session
-) -> None:
+def test_cancel_compound_by_viewer_returns_403(client: TestClient, db_session: Session) -> None:
     _make_user(db_session, username="viewer_cancel", role=UserRole.viewer)
     token = _login(client, "viewer_cancel")
 
@@ -795,16 +791,8 @@ def test_pending_ops_supports_compounds_spanning_multiple_orders(
     assert {op["order_id"] for op in items[0]["ops"]} == {str(o_a), str(o_b)}
     # The dashboard's per-order lookup pattern: find compounds whose
     # ops contain the order_id of interest.
-    a_rank = min(
-        it["rank"]
-        for it in items
-        if any(op["order_id"] == str(o_a) for op in it["ops"])
-    )
-    b_rank = min(
-        it["rank"]
-        for it in items
-        if any(op["order_id"] == str(o_b) for op in it["ops"])
-    )
+    a_rank = min(it["rank"] for it in items if any(op["order_id"] == str(o_a) for op in it["ops"]))
+    b_rank = min(it["rank"] for it in items if any(op["order_id"] == str(o_b) for op in it["ops"]))
     assert a_rank == 1
     assert b_rank == 1
 
@@ -905,7 +893,10 @@ def test_capacity_with_state_returns_prefix_sums(
     # Last entry — sanity check the closing of the prefix sum.
     last = body["entries"][-1]
     assert last["date"] == (base + timedelta(days=HORIZON_DAYS - 1)).isoformat()
-    assert last["cumulative_remaining"] == (DAILY_CAPACITY - 4_000) + (HORIZON_DAYS - 1) * DAILY_CAPACITY
+    assert (
+        last["cumulative_remaining"]
+        == (DAILY_CAPACITY - 4_000) + (HORIZON_DAYS - 1) * DAILY_CAPACITY
+    )
 
 
 def test_capacity_without_redis_state_returns_full_horizon(

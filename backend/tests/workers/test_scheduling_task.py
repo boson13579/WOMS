@@ -87,7 +87,10 @@ class _FakeRedis:
         return sum(
             1
             for key in keys
-            if key in self._strings or key in self._zsets or key in self._hashes or key in self._sets
+            if key in self._strings
+            or key in self._zsets
+            or key in self._hashes
+            or key in self._sets
         )
 
     def incr(self, key: str) -> int:
@@ -114,6 +117,7 @@ class _FakeRedis:
                 bucket[dst] = bucket.pop(src)
                 return True
         from redis.exceptions import ResponseError
+
         raise ResponseError(f"no such key: {src}")
 
     # ----- Plain set ops (Phase 4 materializer queue) -------------------------
@@ -376,9 +380,7 @@ def _patch_common(
     # so the SADD is observable in tests that want to assert it.
     monkeypatch.setattr(
         "app.workers.scheduling.enqueue_notify_user",
-        lambda user_id: fake_redis.sadd(
-            "schedule:materialize_notify_pending", str(user_id)
-        ),
+        lambda user_id: fake_redis.sadd("schedule:materialize_notify_pending", str(user_id)),
     )
 
     return {
@@ -638,7 +640,9 @@ def test_run_scheduling_retriggers_when_more_ops_arrive(
             injected["done"] = True
         return ScheduleResult(status="success")
 
-    mocks = _patch_common(monkeypatch, fake_redis, add_order=MagicMock(side_effect=add_with_late_injection))
+    mocks = _patch_common(
+        monkeypatch, fake_redis, add_order=MagicMock(side_effect=add_with_late_injection)
+    )
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
@@ -1196,11 +1200,7 @@ def test_advance_day_marks_today_orders_in_production(
     compute_side_effects = iter(
         [
             [ScheduledResult(order_id=order_x, scheduled_date=today, quantity=1000)],
-            [
-                ScheduledResult(
-                    order_id=order_y, scheduled_date=tomorrow, quantity=1000
-                )
-            ],
+            [ScheduledResult(order_id=order_y, scheduled_date=tomorrow, quantity=1000)],
         ]
     )
     monkeypatch.setattr(
@@ -1686,7 +1686,8 @@ def test_run_scheduling_pin_failure_rolls_back_and_notifies(
 
     # WS notify: schedule.compound_failed for the pin compound.
     failed_calls = [
-        c for c in mocks["notify_user"].call_args_list
+        c
+        for c in mocks["notify_user"].call_args_list
         if c.kwargs["message"]["type"] == "schedule.compound_failed"
     ]
     assert len(failed_calls) == 1
@@ -1753,9 +1754,7 @@ def test_materialize_task_drains_pending_users_and_notifies(
     monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
     apply_mock = MagicMock(return_value=0)
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule", apply_mock
-    )
+    monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
     notify_mock = MagicMock()
     monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
     monkeypatch.setattr(
@@ -1770,8 +1769,7 @@ def test_materialize_task_drains_pending_users_and_notifies(
     assert apply_mock.call_count == 1
     # Both users notified with schedule.materialized.
     notified = {
-        c.kwargs["user_id"]: c.kwargs["message"]["type"]
-        for c in notify_mock.call_args_list
+        c.kwargs["user_id"]: c.kwargs["message"]["type"] for c in notify_mock.call_args_list
     }
     assert notified == {
         user_a: "schedule.materialized",
@@ -1798,9 +1796,7 @@ def test_materialize_task_exits_when_already_running(
 
     monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     apply_mock = MagicMock(return_value=0)
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule", apply_mock
-    )
+    monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
     notify_mock = MagicMock()
     monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
     monkeypatch.setattr(
@@ -1833,9 +1829,7 @@ def test_materialize_task_exits_when_no_pending_work(
 
     monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     apply_mock = MagicMock(return_value=0)
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule", apply_mock
-    )
+    monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
     notify_mock = MagicMock()
     monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
     monkeypatch.setattr(
@@ -1890,9 +1884,7 @@ def test_materialize_task_passes_pinned_map_to_apply_schedule(
     monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
     apply_mock = MagicMock(return_value=0)
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule", apply_mock
-    )
+    monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
     monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",

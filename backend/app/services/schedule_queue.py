@@ -65,6 +65,7 @@ class CancelResult(StrEnum):
     in_progress = "in_progress"
     not_found = "not_found"
 
+
 logger = structlog.get_logger(__name__)
 
 __all__ = [
