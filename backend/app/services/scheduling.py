@@ -49,6 +49,7 @@ __all__ = [
     "abs_to_rel",
     "add_order",
     "advance_day",
+    "capacity_prefix_sums",
     "compute_schedule",
     "pin_order",
     "rebuild_state",
@@ -992,6 +993,24 @@ def compute_schedule(state: SchedulerState) -> list[ScheduledResult]:
             remaining -= assigned
 
     return results
+
+
+def capacity_prefix_sums(state: SchedulerState) -> list[tuple[date, int]]:
+    """Snapshot ``capacity_tree`` as a per-day prefix-sum series.
+
+    Walks the 30-day horizon and returns ``[(absolute_date, prefix_sum)]``
+    where each prefix sum is the cumulative remaining wafer capacity from
+    ``state.base_date`` up to and including that day. Pure derivation —
+    ``state`` is not mutated.
+
+    Used by ``GET /schedule/capacity`` so the dashboard can plot how much
+    spare production capacity exists across the upcoming horizon without
+    having to inspect individual orders.
+    """
+    return [
+        (rel_to_abs(rel, state.base_date), state.capacity_tree.query(rel))
+        for rel in range(1, HORIZON_DAYS + 1)
+    ]
 
 
 # ---------------------------------------------------------------------------

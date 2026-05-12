@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, cast
 
@@ -31,6 +32,8 @@ from app.core.db import get_db
 from app.core.security import require_roles
 from app.models.user import User, UserRole
 from app.schemas.schedule import (
+    CapacityPrefixEntry,
+    ScheduleCapacityResponse,
     ScheduleCompoundRequest,
     ScheduleCompoundResponse,
     ScheduleRebuildResponse,
@@ -40,7 +43,13 @@ from app.schemas.schedule import (
 )
 from app.services import order as order_service
 from app.services.schedule_queue import CancelResult, cancel_compound, enqueue_compound
-from app.services.scheduling import STATUS_KEY
+from app.services.scheduling import (
+    DAILY_CAPACITY,
+    STATE_KEY,
+    STATUS_KEY,
+    SchedulerState,
+    capacity_prefix_sums,
+)
 
 # Workers are a peer of services; api → workers is allowed *only* for
 # dispatching Celery task objects (``.delay()``). Anything else (Redis keys,
@@ -260,6 +269,54 @@ def get_schedule_result(
     Permission: order_manager+.
     """
     return order_service.list_scheduled_orders(db)
+
+
+# ---------------------------------------------------------------------------
+# GET /capacity
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/capacity",
+    response_model=ScheduleCapacityResponse,
+)
+def get_schedule_capacity(
+    current_user: User = Depends(_READ_ROLES),
+) -> ScheduleCapacityResponse:
+    """Per-day prefix sum of remaining wafer capacity across the 30-day horizon.
+
+    Reads the live ``SchedulerState`` from Redis and queries
+    ``capacity_tree`` for each of the 30 day-indices. ``entries[i]``
+    holds the prefix sum from ``base_date`` through ``base_date + i``
+    days — i.e., how many wafers' worth of spare capacity exist
+    cumulatively up to that day. Same source the segment tree itself
+    uses to make feasibility decisions, so the number the dashboard
+    shows always matches the scheduler's own view.
+
+    No DB hit on this path: capacity is an algorithm-internal quantity
+    and lives only in Redis. If the Redis state is missing (first
+    deploy or a flush), we fabricate a fresh ``SchedulerState.initial``
+    keyed on today so the dashboard still gets a usable 30-entry
+    response (every day = ``DAILY_CAPACITY``, cumulative sum scaled
+    accordingly) instead of an empty payload or 500.
+
+    Permission: order_manager+.
+    """
+    raw = cast("str | None", _redis().get(STATE_KEY))
+    if raw is None:
+        state = SchedulerState.initial(datetime.now(tz=UTC).date())
+    else:
+        state = SchedulerState.from_json(raw)
+
+    entries = [
+        CapacityPrefixEntry(date=d, cumulative_remaining=prefix)
+        for d, prefix in capacity_prefix_sums(state)
+    ]
+    return ScheduleCapacityResponse(
+        base_date=state.base_date,
+        daily_capacity=DAILY_CAPACITY,
+        entries=entries,
+    )
 
 
 # ---------------------------------------------------------------------------

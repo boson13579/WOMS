@@ -193,6 +193,7 @@ def unpin_order(order, actor):
 | `POST` | `/trigger` | scheduler+ | 手動補觸發排程任務 |
 | `GET` | `/status` | order_manager+ | 排程 worker 的 lifecycle snapshot（`idle`/`running`/`failed`） |
 | `GET` | `/result` | order_manager+ | 目前已排定 / 進行中的訂單清單（含每筆訂單的逐日數量 `daily_breakdown`，包含 `scheduled` 跟 `in_production` 兩種 status） |
+| `GET` | `/capacity` | order_manager+ | 未來 30 天剩餘產能的**前綴和**序列，dashboard 畫產能圖用 |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建排程 state（async；不會 block） |
 | `POST` | `/operations` | scheduler+ | 推 compound 進佇列（Phase 2 後 Order CRUD 自動處理大部分情況，前端只在「手動 pin / unpin」時直接打） |
 | `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound（前端「取消」按鈕）。200 = 取消成功；409 = worker 已開始處理，無法取消；404 = compound id 未知 |
@@ -232,7 +233,39 @@ const orders = await res.json();
 
 訂單按 `scheduled_production_date` 升冪排序。`daily_breakdown` 來自 DB 的 `orders.daily_breakdown` JSONB 欄位（由 `materialize_schedule_task` 寫入），不再即時從 Redis 算 — 所以 Redis 被清過不影響這個欄位的內容。`daily_breakdown` 為空表示這筆訂單還沒被 materializer 寫過（首次部署、或欄位是 NULL）。
 
-#### 3.2.2 `GET /api/v1/schedule/status` — 顯示排程狀態
+#### 3.2.2 `GET /api/v1/schedule/capacity` — 30 天剩餘產能（dashboard 用）
+
+```ts
+const res = await fetch("/api/v1/schedule/capacity", {
+    headers: { Authorization: `Bearer ${token}` },
+});
+const cap = await res.json();
+// {
+//   base_date: "2026-05-12",
+//   daily_capacity: 10000,
+//   entries: [
+//     { date: "2026-05-12", cumulative_remaining: 6000 },   // day 1: 還剩 6,000 (今天用了 4,000)
+//     { date: "2026-05-13", cumulative_remaining: 16000 },  // day 1+2 累計
+//     // ... 共 30 筆
+//   ]
+// }
+```
+
+`cumulative_remaining` 是**前綴和**（從 `base_date` 累計到該天），不是當日剩餘。要單日剩餘自己做差就好：
+
+```ts
+const dailyRemaining = cap.entries.map((e, i) =>
+    i === 0 ? e.cumulative_remaining
+            : e.cumulative_remaining - cap.entries[i - 1].cumulative_remaining
+);
+// 單日已用 = daily_capacity - dailyRemaining[i]
+```
+
+跟 `/schedule/result` 不同，這條 endpoint **讀的是 Redis 中的 `SchedulerState`**（不是 DB），所以反映的是 scheduler 演算法當前的 in-memory 視角；Redis 被清掉時會 fallback 到「30 天都還是空的」（每天 10,000 全可用）。要重新對齊就按 `POST /rebuild`。
+
+收到 WebSocket `schedule.materialized` / `schedule.updated` 時前端可以跟 `/result` 並行 refetch 這條，把產能圖一起更新。
+
+#### 3.2.3 `GET /api/v1/schedule/status` — 顯示排程狀態
 
 ```ts
 const res = await fetch("/api/v1/schedule/status", {
@@ -244,7 +277,7 @@ const status = await res.json();
 
 通常拿來在 dashboard 顯示「排程中⋯」/「上次跑於 XX」/「失敗了，error 是 …」。
 
-#### 3.2.3 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
+#### 3.2.4 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
 
 當懷疑排程跟現實不同步（例如 DB 跟 Redis state 對不起來，或者 `daily_breakdown` 看起來明顯錯誤）時，叫管理員按這個按鈕：rebuild 會從 DB 重建 Redis state，再跑一輪 materializer 把 `orders.daily_breakdown` 改寫回正確值。
 

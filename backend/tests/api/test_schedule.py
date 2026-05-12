@@ -633,6 +633,115 @@ def test_result_without_token_returns_401(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GET /capacity
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_with_state_returns_prefix_sums(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """GET /capacity reads the live SchedulerState and exposes the
+    capacity_tree as a per-day prefix-sum series. Building a known state
+    with one 4,000-wafer order on day 1 must produce:
+        day 1 → 6,000 (10,000 - 4,000)
+        day 2 → 16,000 (day1 + full day2)
+        day n → 6,000 + (n - 1) * 10,000
+    so any off-by-one in the prefix-sum walk surfaces immediately.
+    """
+    from app.services.scheduling import (
+        DAILY_CAPACITY,
+        HORIZON_DAYS,
+        SchedulerState,
+        SchedulingOrder,
+        add_order,
+    )
+
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="mgr_cap_ok", role=UserRole.order_manager)
+    token = _login(client, "mgr_cap_ok")
+
+    base = date(2026, 5, 6)
+    state = SchedulerState.initial(base)
+    add_order(
+        state,
+        SchedulingOrder(
+            order_id=uuid.uuid4(),
+            order_number="ORD-CAP-1",
+            wafer_quantity=4_000,
+            deadline=base,
+        ),
+    )
+    fake_redis.set("schedule:state", state.to_json())
+
+    res = client.get("/api/v1/schedule/capacity", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["base_date"] == base.isoformat()
+    assert body["daily_capacity"] == DAILY_CAPACITY
+    assert len(body["entries"]) == HORIZON_DAYS
+    # Day 1 lost 4,000 wafers; every subsequent day adds DAILY_CAPACITY.
+    assert body["entries"][0] == {
+        "date": base.isoformat(),
+        "cumulative_remaining": DAILY_CAPACITY - 4_000,
+    }
+    assert body["entries"][1] == {
+        "date": (base + timedelta(days=1)).isoformat(),
+        "cumulative_remaining": (DAILY_CAPACITY - 4_000) + DAILY_CAPACITY,
+    }
+    # Last entry — sanity check the closing of the prefix sum.
+    last = body["entries"][-1]
+    assert last["date"] == (base + timedelta(days=HORIZON_DAYS - 1)).isoformat()
+    assert last["cumulative_remaining"] == (DAILY_CAPACITY - 4_000) + (HORIZON_DAYS - 1) * DAILY_CAPACITY
+
+
+def test_capacity_without_redis_state_returns_full_horizon(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """No SchedulerState in Redis (first deploy / cache flush) must NOT
+    500 or return an empty payload — the dashboard should still get a
+    full 30-entry response with capacity = daily_capacity * day_index.
+    """
+    from app.services.scheduling import DAILY_CAPACITY, HORIZON_DAYS
+
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="mgr_cap_empty", role=UserRole.order_manager)
+    token = _login(client, "mgr_cap_empty")
+
+    res = client.get("/api/v1/schedule/capacity", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["daily_capacity"] == DAILY_CAPACITY
+    assert len(body["entries"]) == HORIZON_DAYS
+    # Every day is empty ⇒ prefix sums are exact multiples of DAILY_CAPACITY.
+    for i, entry in enumerate(body["entries"], start=1):
+        assert entry["cumulative_remaining"] == i * DAILY_CAPACITY
+
+
+def test_capacity_by_viewer_returns_403(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="viewer_cap", role=UserRole.viewer)
+    token = _login(client, "viewer_cap")
+
+    res = client.get("/api/v1/schedule/capacity", headers=_auth(token))
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_capacity_without_token_returns_401(client: TestClient) -> None:
+    res = client.get("/api/v1/schedule/capacity")
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
 # POST /rebuild
 # ---------------------------------------------------------------------------
 

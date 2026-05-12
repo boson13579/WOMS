@@ -233,6 +233,34 @@ class ScheduleRebuildResponse(BaseModel):
     message: str
 
 
+class CapacityPrefixEntry(BaseModel):
+    """One day in the 30-day capacity-prefix-sum series.
+
+    ``cumulative_remaining`` is the prefix sum of remaining wafer capacity
+    from ``base_date`` (the horizon's day 1) up to and including ``date``.
+    The dashboard typically renders this as a step / area chart to show
+    how much spare production capacity exists in the next N days combined.
+    """
+
+    date: date
+    cumulative_remaining: int = Field(ge=0)
+
+
+class ScheduleCapacityResponse(BaseModel):
+    """Snapshot of the segment-tree ``capacity_tree`` projected to absolute dates.
+
+    Returned by ``GET /schedule/capacity``. The list always has exactly
+    ``HORIZON_DAYS`` entries (30) in ascending date order — the dashboard
+    can rely on a fixed-length series even before any scheduling run.
+    ``daily_capacity`` is included so the frontend can derive "used per
+    day" without hard-coding the constant.
+    """
+
+    base_date: date
+    daily_capacity: int = Field(gt=0)
+    entries: list[CapacityPrefixEntry]
+
+
 class ScheduleResultResponse(BaseModel):
     """One row of the materialized schedule (an order in ``scheduled`` status).
 
