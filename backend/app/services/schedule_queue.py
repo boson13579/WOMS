@@ -35,7 +35,7 @@ import structlog
 from redis import Redis
 
 from app.core.config import get_settings
-from app.schemas.schedule import ScheduleCompoundRequest
+from app.schemas.schedule import PendingOpsEntry, ScheduleCompoundRequest
 from app.services import websocket
 from app.services.scheduling import (
     MATERIALIZE_NOTIFY_PENDING_KEY,
@@ -69,6 +69,7 @@ __all__ = [
     "cancel_compound",
     "enqueue_compound",
     "enqueue_notify_user",
+    "list_pending_ops",
 ]
 
 
@@ -206,6 +207,55 @@ def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
         compound_id=compound_id_str,
     )
     return CancelResult.cancelled
+
+
+def list_pending_ops() -> list[PendingOpsEntry]:
+    """Return every queued compound with its 1-indexed drain rank.
+
+    Walks ``schedule:pending_ops`` via ``ZRANGE 0 -1``: the sorted set
+    already orders members by ``score_for_op(group, seq)``, so the index
+    in the returned list IS the order in which ``run_scheduling_task``
+    will ``ZPOPMIN`` them. Wraps each member as a :class:`PendingOpsEntry`
+    so the dashboard can render "your order is next in line" /
+    "compound #4 of 12 in the queue" without parsing JSON itself.
+
+    Best-effort against corrupted Redis members: a ``JSONDecodeError``
+    on a single entry is logged and skipped rather than crashing the
+    whole listing (queue could otherwise be unreadable forever if one
+    bad member sneaks in).
+    """
+    rds = _redis()
+    members = cast("list[str]", rds.zrange(PENDING_OPS_KEY, 0, -1))
+    entries: list[PendingOpsEntry] = []
+    for rank, raw in enumerate(members, start=1):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("schedule.pending_ops.bad_member", member=raw)
+            continue
+        ops = payload.get("ops") or []
+        if not ops:
+            # Defensively skip — schema enforces non-empty ops, but a
+            # corrupted member could land us here.
+            logger.warning(
+                "schedule.pending_ops.empty_ops",
+                compound_id=payload.get("compound_id"),
+            )
+            continue
+        first_op = ops[0]
+        entries.append(
+            PendingOpsEntry(
+                compound_id=uuid.UUID(payload["compound_id"]),
+                rank=rank,
+                order_id=uuid.UUID(first_op["order_id"]),
+                order_number=first_op["order_number"],
+                group=payload["group"],
+                op_count=payload["op_count"],
+                ops=[op["op"] for op in ops],
+                requested_by=uuid.UUID(payload["requested_by"]),
+            )
+        )
+    return entries
 
 
 def enqueue_notify_user(user_id: uuid.UUID) -> None:

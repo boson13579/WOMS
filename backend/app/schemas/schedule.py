@@ -233,6 +233,30 @@ class ScheduleRebuildResponse(BaseModel):
     message: str
 
 
+class PendingOpsEntry(BaseModel):
+    """One queued compound's drain-position snapshot.
+
+    Returned by ``GET /schedule/pending_ops``. ``rank`` is 1-indexed and
+    matches the order ``run_scheduling_task`` will pop compounds via
+    ``ZPOPMIN`` — so rank=1 is "next to be processed". Every op inside a
+    compound targets the same ``order_id`` (enforced at enqueue time), so
+    the dashboard can group by ``order_id`` to answer "where is this
+    order in line?".
+    """
+
+    compound_id: uuid.UUID
+    rank: int = Field(ge=1)
+    order_id: uuid.UUID
+    order_number: str
+    group: Literal["shrink", "grow"]
+    op_count: int = Field(ge=1)
+    # Just the op-kind strings in compound order — enough for the
+    # dashboard to label "delete in progress" / "pin in flight" without
+    # pulling the full leaf-op payloads.
+    ops: list[Literal["add", "remove", "pin", "unpin"]]
+    requested_by: uuid.UUID
+
+
 class CapacityPrefixEntry(BaseModel):
     """One day in the 30-day capacity-prefix-sum series.
 

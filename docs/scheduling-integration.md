@@ -194,6 +194,7 @@ def unpin_order(order, actor):
 | `GET` | `/status` | order_manager+ | 排程 worker 的 lifecycle snapshot（`idle`/`running`/`failed`） |
 | `GET` | `/result` | order_manager+ | 目前已排定 / 進行中的訂單清單（含每筆訂單的逐日數量 `daily_breakdown`，包含 `scheduled` 跟 `in_production` 兩種 status） |
 | `GET` | `/capacity` | order_manager+ | 未來 30 天剩餘產能的**前綴和**序列，dashboard 畫產能圖用 |
+| `GET` | `/pending_ops` | order_manager+ | 排隊中 compound 的 drain 順位快照（rank=1 = 下一個會被 worker 處理） |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建排程 state（async；不會 block） |
 | `POST` | `/operations` | scheduler+ | 推 compound 進佇列（Phase 2 後 Order CRUD 自動處理大部分情況，前端只在「手動 pin / unpin」時直接打） |
 | `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound（前端「取消」按鈕）。200 = 取消成功；409 = worker 已開始處理，無法取消；404 = compound id 未知 |
@@ -265,7 +266,36 @@ const dailyRemaining = cap.entries.map((e, i) =>
 
 收到 WebSocket `schedule.materialized` / `schedule.updated` 時前端可以跟 `/result` 並行 refetch 這條，把產能圖一起更新。
 
-#### 3.2.3 `GET /api/v1/schedule/status` — 顯示排程狀態
+#### 3.2.3 `GET /api/v1/schedule/pending_ops` — 排隊中 compound 順位
+
+```ts
+const res = await fetch("/api/v1/schedule/pending_ops", {
+    headers: { Authorization: `Bearer ${token}` },
+});
+const queued = await res.json();
+// [
+//   { compound_id, rank: 1, order_id, order_number, group: "shrink",
+//     op_count: 2, ops: ["unpin", "remove"], requested_by },
+//   { compound_id, rank: 2, ... },
+//   ...
+// ]
+```
+
+`rank=1` 代表 worker 下一個會處理的 compound。同一筆訂單可能在 list 中出現多次（連續 PATCH 快過 worker 消化速度時會堆兩個 compound）；前端通常按 `order_id` group 取最小 rank：
+
+```ts
+const rankByOrder = new Map<string, number>();
+for (const it of queued) {
+    if (!rankByOrder.has(it.order_id)) rankByOrder.set(it.order_id, it.rank);
+}
+// rankByOrder.get(orderId) → 該訂單下一個動作排第幾、或 undefined 代表沒在排隊
+```
+
+跟 `/capacity` 一樣讀的是 Redis（不是 DB），所以這個視角是「scheduler 的 in-flight 工作清單」。佇列空時回 `[]`。
+
+收到 `schedule.compound_accepted` / `schedule.compound_cancelled` / `schedule.updated` 時都可以順便 refetch 這條更新「N 個動作等著被處理」的徽章。
+
+#### 3.2.4 `GET /api/v1/schedule/status` — 顯示排程狀態
 
 ```ts
 const res = await fetch("/api/v1/schedule/status", {
@@ -277,7 +307,7 @@ const status = await res.json();
 
 通常拿來在 dashboard 顯示「排程中⋯」/「上次跑於 XX」/「失敗了，error 是 …」。
 
-#### 3.2.4 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
+#### 3.2.5 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
 
 當懷疑排程跟現實不同步（例如 DB 跟 Redis state 對不起來，或者 `daily_breakdown` 看起來明顯錯誤）時，叫管理員按這個按鈕：rebuild 會從 DB 重建 Redis state，再跑一輪 materializer 把 `orders.daily_breakdown` 改寫回正確值。
 

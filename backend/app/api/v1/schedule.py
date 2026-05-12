@@ -33,6 +33,7 @@ from app.core.security import require_roles
 from app.models.user import User, UserRole
 from app.schemas.schedule import (
     CapacityPrefixEntry,
+    PendingOpsEntry,
     ScheduleCapacityResponse,
     ScheduleCompoundRequest,
     ScheduleCompoundResponse,
@@ -42,7 +43,12 @@ from app.schemas.schedule import (
     ScheduleTriggerResponse,
 )
 from app.services import order as order_service
-from app.services.schedule_queue import CancelResult, cancel_compound, enqueue_compound
+from app.services.schedule_queue import (
+    CancelResult,
+    cancel_compound,
+    enqueue_compound,
+    list_pending_ops,
+)
 from app.services.scheduling import (
     DAILY_CAPACITY,
     STATE_KEY,
@@ -269,6 +275,37 @@ def get_schedule_result(
     Permission: order_manager+.
     """
     return order_service.list_scheduled_orders(db)
+
+
+# ---------------------------------------------------------------------------
+# GET /pending_ops
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/pending_ops",
+    response_model=list[PendingOpsEntry],
+)
+def get_pending_ops(
+    current_user: User = Depends(_READ_ROLES),
+) -> list[PendingOpsEntry]:
+    """Snapshot the worker's pending-compound queue with drain ranks.
+
+    Each entry is one ``ScheduleCompoundRequest`` currently sitting in
+    ``schedule:pending_ops`` (the Redis sorted set the worker drains via
+    ``ZPOPMIN``). ``rank`` is 1-indexed and matches the order the worker
+    will process them — rank=1 is "next to be processed". The dashboard
+    can group by ``order_id`` to answer "where is this order in line?";
+    one order may legitimately have more than one compound queued (e.g.,
+    two rapid PATCHes back-to-back) so the same order_id can appear
+    multiple times.
+
+    Empty list when the queue is idle. Returns 200 either way so the
+    dashboard can poll without special-casing "no data".
+
+    Permission: order_manager+.
+    """
+    return list_pending_ops()
 
 
 # ---------------------------------------------------------------------------
