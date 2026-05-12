@@ -1,0 +1,271 @@
+"""Tests for the ``/api/v1/system/*`` HTTP router.
+
+The endpoint backs the dashboard's Service Health card. Unlike the existing
+``/api/v1/health`` liveness probe (which always returns 200/ok so k8s can
+decide whether to restart the pod), ``/system/health`` actually probes the
+DB / Redis / Celery state and reports per-service status so a human can see
+at a glance whether the cluster is degraded.
+
+Authn is required (any logged-in user — viewers included — can read), but
+the underlying probes can fail in interesting ways, so most of the assertions
+focus on shape + per-service ``status`` values across mock probe outcomes.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import bcrypt
+import pytest
+from app.models.user import User, UserRole
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_user(
+    db: Session,
+    *,
+    username: str,
+    password: str = "password123",
+    role: UserRole = UserRole.viewer,
+) -> User:
+    user = User(
+        username=username,
+        password_hash=bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
+        role=role,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _login(client: TestClient, username: str, password: str = "password123") -> str:
+    res = client.post(
+        "/api/v1/auth/login",
+        json={"username": username, "password": password},
+    )
+    assert res.status_code == 200
+    return res.json()["access_token"]
+
+
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+# ---------------------------------------------------------------------------
+# [RED] auth gates
+# ---------------------------------------------------------------------------
+
+
+def test_system_health_requires_authentication(client: TestClient) -> None:
+    """Unauthenticated request gets a 401 via the unified error envelope."""
+    res = client.get("/api/v1/system/health")
+    assert res.status_code == 401
+    body = res.json()
+    assert "error" in body
+    assert body["error"]["code"] == 401
+
+
+def test_system_health_open_to_viewer(client: TestClient, db_session: Session) -> None:
+    """Service Health is visible to any logged-in role, including viewer.
+
+    Dashboard widget choice (per plan): viewers see Service Health even
+    though they cannot see scheduling data. Confirms we do NOT add a role
+    gate on this endpoint.
+    """
+    _make_user(db_session, username="sys_viewer", role=UserRole.viewer)
+    token = _login(client, "sys_viewer")
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# [RED] response shape — pins the contract the frontend depends on
+# ---------------------------------------------------------------------------
+
+
+def test_system_health_returns_four_services(client: TestClient, db_session: Session) -> None:
+    """Response shape: a single ``services`` array containing 4 entries
+    (api / postgres / redis / celery) in a fixed order so the frontend
+    can index by position if it ever needs to."""
+    _make_user(db_session, username="sys_shape", role=UserRole.viewer)
+    token = _login(client, "sys_shape")
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert "services" in body
+    services = body["services"]
+    assert isinstance(services, list)
+    assert len(services) == 4
+    ids = [s["id"] for s in services]
+    assert ids == ["api", "postgres", "redis", "celery"]
+
+
+def test_system_health_each_service_has_required_fields(
+    client: TestClient, db_session: Session
+) -> None:
+    """Every service entry carries id / name / status / summary / details."""
+    _make_user(db_session, username="sys_fields", role=UserRole.viewer)
+    token = _login(client, "sys_fields")
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    services = res.json()["services"]
+    for entry in services:
+        assert set(entry.keys()) >= {"id", "name", "status", "summary", "details"}
+        assert entry["status"] in {"healthy", "warning", "error"}
+        assert isinstance(entry["details"], list)
+        for detail in entry["details"]:
+            assert set(detail.keys()) == {"label", "value"}
+
+
+def test_system_health_api_service_always_healthy(client: TestClient, db_session: Session) -> None:
+    """API service status is computed locally — if we can answer the request
+    at all, by definition the API is up.
+
+    Pins the invariant so a future refactor can't accidentally introduce
+    a probe that ends up calling ``self`` recursively.
+    """
+    _make_user(db_session, username="sys_api", role=UserRole.viewer)
+    token = _login(client, "sys_api")
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    api_entry = next(s for s in res.json()["services"] if s["id"] == "api")
+    assert api_entry["status"] == "healthy"
+
+
+# ---------------------------------------------------------------------------
+# [RED] probe-outcome branches — postgres / redis / celery via service mocks
+# ---------------------------------------------------------------------------
+
+
+def test_system_health_postgres_error_when_probe_raises(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the Postgres probe raises, its entry reports ``error`` and the
+    overall request still succeeds (degraded mode — one bad service doesn't
+    fail the whole dashboard)."""
+    _make_user(db_session, username="sys_pg_err", role=UserRole.viewer)
+    token = _login(client, "sys_pg_err")
+
+    def _broken_probe(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr("app.services.system._probe_postgres", _broken_probe)
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    pg_entry = next(s for s in res.json()["services"] if s["id"] == "postgres")
+    assert pg_entry["status"] == "error"
+
+
+def test_system_health_redis_error_when_probe_raises(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the Postgres case for Redis."""
+    _make_user(db_session, username="sys_redis_err", role=UserRole.viewer)
+    token = _login(client, "sys_redis_err")
+
+    def _broken_probe() -> None:
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr("app.services.system._probe_redis", _broken_probe)
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    redis_entry = next(s for s in res.json()["services"] if s["id"] == "redis")
+    assert redis_entry["status"] == "error"
+
+
+def test_system_health_celery_warning_when_queue_deep(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Celery probe returns ``warning`` when the scheduler queue is deeper
+    than the configured threshold — dashboard should flag operator attention
+    even if the worker itself is running."""
+    _make_user(db_session, username="sys_cel_warn", role=UserRole.viewer)
+    token = _login(client, "sys_cel_warn")
+
+    fake_redis = MagicMock()
+    fake_redis.zcard.return_value = 999  # > threshold
+    fake_redis.get.return_value = None  # no status doc → treat as idle
+    monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
+
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
+    assert celery_entry["status"] == "warning"
+
+
+def test_system_health_celery_warning_when_status_failed(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``schedule:status.state == 'failed'`` → celery warning, regardless
+    of queue depth. The dashboard's primary value here is making this
+    visible without an ops-side log dive."""
+    _make_user(db_session, username="sys_cel_failed", role=UserRole.viewer)
+    token = _login(client, "sys_cel_failed")
+
+    fake_redis = MagicMock()
+    fake_redis.zcard.return_value = 0
+    fake_redis.get.return_value = '{"state": "failed", "error": "boom"}'
+    monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
+
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
+    assert celery_entry["status"] == "warning"
+
+
+def test_system_health_celery_healthy_when_idle_empty_queue(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Baseline: status=idle, queue=0 → healthy."""
+    _make_user(db_session, username="sys_cel_ok", role=UserRole.viewer)
+    token = _login(client, "sys_cel_ok")
+
+    fake_redis = MagicMock()
+    fake_redis.zcard.return_value = 0
+    fake_redis.get.return_value = '{"state": "idle"}'
+    monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
+
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
+    assert celery_entry["status"] == "healthy"
+
+
+def test_system_health_celery_error_when_redis_unreachable(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Celery probe goes through Redis to read ``schedule:status`` /
+    ``schedule:pending_ops``. If Redis itself raises, celery's probe can't
+    answer — surface as ``error`` so the dashboard makes it clear we have
+    no information about the worker, not a false ``healthy``.
+    """
+    _make_user(db_session, username="sys_cel_err", role=UserRole.viewer)
+    token = _login(client, "sys_cel_err")
+
+    fake_redis = MagicMock()
+    fake_redis.zcard.side_effect = RuntimeError("no redis")
+    fake_redis.get.side_effect = RuntimeError("no redis")
+    monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
+
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
+    assert celery_entry["status"] == "error"
