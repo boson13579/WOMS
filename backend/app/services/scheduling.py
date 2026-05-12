@@ -586,10 +586,25 @@ def _apply_remove_to_trees(state: SchedulerState, order: SchedulingOrder) -> Non
             break
 
     if remaining > 0:
-        logger.warning(
+        # P2-5: residual capacity not given back means the tree state has
+        # diverged from the order's obligation. Pre-fix this only logged a
+        # warning, but the algorithm continuing on a corrupted state would
+        # silently propagate the divergence into compute_schedule and into
+        # DB writes. Raising here lets ``_process_compound``'s saga rollback
+        # restore the pre-compound snapshot, contains the corruption to the
+        # current compound, and surfaces ``schedule.compound_failed`` to the
+        # requester so ops can react. Recovery still goes through
+        # ``POST /schedule/rebuild`` if the residual indicates a deeper
+        # invariant break.
+        logger.error(
             "schedule.remove.unexpected_residual",
             order_id=str(order.order_id),
             residual=remaining,
+        )
+        raise RuntimeError(
+            f"remove_order: {remaining} wafers of order {order.order_id} could "
+            "not be given back to capacity_tree — segment tree invariant broken; "
+            "rolling back compound."
         )
 
 

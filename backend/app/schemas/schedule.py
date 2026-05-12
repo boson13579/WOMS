@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.models.order import OrderStatus
 
 __all__ = [
+    "CompoundDbAction",
     "DailyAssignment",
     "ScheduleCompoundFailedDetail",
     "ScheduleCompoundRequest",
@@ -59,6 +60,59 @@ class ScheduleOpInCompound(BaseModel):
         if self.op != "pin" and self.fake_deadline is not None:
             raise ValueError(f"op={self.op!r} must NOT include fake_deadline; only 'pin' uses it")
         return self
+
+
+class CompoundDbAction(BaseModel):
+    """DB-write payload the worker executes after a compound is accepted.
+
+    Owns the user-facing column writes (``wafer_quantity`` /
+    ``requested_delivery_date`` / ``notes`` / ``assigned_to`` / soft-delete)
+    that **used to** be committed by the producer (``update_order`` /
+    ``create_order`` / ``delete_order``) before the compound was even
+    enqueued. With this field set, the producer commits only the
+    ``is_processing_locked=True`` flag (lock the row from concurrent
+    edits) and lets the worker apply the actual data change inside the
+    same transaction that mutates ``SchedulerState``. The motivation is
+    P1-2 in the PR-14 review: pre-existing flow could leave DB and
+    Redis state permanently out of sync when the compound failed
+    (DB had the new value, state had the old). With this field, DB
+    only takes the new value when state actually accepts the compound.
+
+    Failure semantics:
+
+    - ``kind="create"``: producer pre-creates a minimal row (status=
+      pending, is_processing_locked=True). Worker on success leaves
+      the row in place; worker on failure soft-deletes it (orphan
+      cleanup). The ``new_*`` fields hold the create payload for
+      audit-log construction inside the worker.
+    - ``kind="update"``: producer only writes the lock flag. Worker on
+      success writes the ``new_*`` columns + audit-logs the diff.
+      Worker on failure clears the lock; DB still holds the pre-PATCH
+      values (which is the correct rollback outcome).
+    - ``kind="delete"``: producer only writes the lock flag. Worker on
+      success sets ``is_deleted=True`` + ``status=cancelled`` + audit.
+      Worker on failure clears the lock; the order remains alive.
+    """
+
+    kind: Literal["create", "update", "delete"]
+    actor_id: uuid.UUID
+
+    # New values to write (None = field absent from the PATCH).
+    # ``notes`` and ``assigned_to`` use a paired "set" boolean because
+    # ``None`` is a legal user-visible value (= "clear the field").
+    new_wafer_quantity: int | None = None
+    new_requested_delivery_date: date | None = None
+    new_notes_set: bool = False
+    new_notes: str | None = None
+    new_assigned_to_set: bool = False
+    new_assigned_to: uuid.UUID | None = None
+
+    # Pre-PATCH values for audit log diffing. Worker reads ``old_*`` to
+    # construct the ``audit_logs.old_value`` JSON. Absent on create.
+    old_wafer_quantity: int | None = None
+    old_requested_delivery_date: date | None = None
+    old_notes: str | None = None
+    old_assigned_to: uuid.UUID | None = None
 
 
 class ScheduleCompoundRequest(BaseModel):
@@ -116,6 +170,12 @@ class ScheduleCompoundRequest(BaseModel):
     op_count: int = Field(gt=0)
     ops: list[ScheduleOpInCompound] = Field(min_length=1)
     requested_by: uuid.UUID
+    # Optional DB write the worker performs after the compound is accepted.
+    # ``None`` means "no DB write needed" — used for internally-generated
+    # compounds (e.g. ``rebuild_state``-fed adds) where the row already
+    # reflects truth. See :class:`CompoundDbAction` for the failure-path
+    # rollback contract.
+    db_action: CompoundDbAction | None = None
 
     @model_validator(mode="after")
     def _op_count_matches_ops_length(self) -> ScheduleCompoundRequest:

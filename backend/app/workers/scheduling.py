@@ -35,11 +35,15 @@ from typing import Any, cast
 import structlog
 from celery import Task
 from redis import Redis
-from redis.exceptions import ResponseError
+from redis.exceptions import RedisError, ResponseError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.core.logger import audit_log as emit_audit_log
+from app.models.order import Order, OrderStatus
+from app.repositories import audit_log as audit_log_repo
 from app.repositories import order as order_repo
 from app.services import order as order_service
 from app.services import websocket
@@ -80,6 +84,49 @@ __all__ = ["advance_day_task", "rebuild_schedule_task", "run_scheduling_task"]
 # is not part of the API contract, so it stays here.
 
 WAITER_FLAG_KEY = "schedule:waiter_pending"
+
+# P0-2/P0-3: hard mutex around any write to ``schedule:state``.
+#
+# Pre-existing coordination (``schedule:status`` polling +
+# ``schedule:waiter_pending`` flag) is *advisory* — two ``run_scheduling_task``
+# invocations can both observe ``status='idle'`` and both proceed to write
+# state, losing one compound's effect when their saves race. The status key
+# is great for "is something happening?" observability but it is not an
+# atomic test-and-set, so under prod conditions (``--concurrency >= 2`` or
+# multiple worker containers) the gap between ``_set_status(running)`` and
+# the next ``_save_state`` is enough for a second task to slip in.
+#
+# This lock closes that gap: each state-writing task ``SET NX EX`` s its
+# task_id as the value and holds it for its whole body. ``run_scheduling_task``
+# returns early on contention (the holder will pick up the queued compound
+# on its self-retrigger). ``advance_day_task`` / ``rebuild_schedule_task``
+# poll for the lock for a bounded window (they MUST run, can't skip).
+#
+# TTL is the same 5-min safety window we use elsewhere — long enough that
+# no honest task body exceeds it, short enough that a crashed task's
+# orphaned lock is recovered within an operator-visible timeframe.
+# Dead-letter list for ``pending_ops`` members that fail to JSON-decode.
+# Pre-P1-5 a malformed member would be silently discarded after ZPOPMIN,
+# leaving the affected order's ``is_processing_locked=True`` row stuck
+# forever (no way to recover ``requested_by`` for a compound_failed
+# notify, no way to know which order_id to unlock). The DLQ retains the
+# raw bytes so ops can decode them out-of-band (manual inspection,
+# scripts, sentry-style alerting on key existence) and unlock affected
+# orders by hand. ``RPUSH`` semantics: oldest at the head, newest at
+# the tail — preserves the order of arrival for forensic analysis.
+PENDING_OPS_DLQ_KEY = "schedule:pending_ops:dlq"
+
+STATE_WRITER_LOCK_KEY = "schedule:state_writer_lock"
+_STATE_WRITER_LOCK_TTL_SECONDS = 300
+# Lua compare-and-delete: only release the lock if its value still matches
+# our task_id. Protects against the case where our TTL expired, another task
+# acquired it, and our finally block then naively ``DEL``s — releasing
+# someone else's lock would re-open the race we're trying to close.
+_STATE_WRITER_LOCK_CAS_DELETE = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) "
+    "else return 0 end"
+)
 
 _STATUS_IDLE = "idle"
 _STATUS_RUNNING = "running"
@@ -158,6 +205,69 @@ def _get_status() -> dict[str, Any] | None:
     return cast("dict[str, Any]", json.loads(raw))
 
 
+# ---------------------------------------------------------------------------
+# State-writer lock (P0-2 / P0-3)
+# ---------------------------------------------------------------------------
+
+
+def _try_acquire_state_lock(task_id: str) -> bool:
+    """Try to claim the state-writer lock; return whether we got it.
+
+    ``SET NX EX`` is the atomic primitive we need: only one client wins
+    when many concurrently try the same key. Stamping the value with
+    ``task_id`` lets the release path verify ownership before deleting
+    (see ``_release_state_lock``).
+    """
+    return bool(
+        _get_redis().set(
+            STATE_WRITER_LOCK_KEY,
+            task_id,
+            nx=True,
+            ex=_STATE_WRITER_LOCK_TTL_SECONDS,
+        )
+    )
+
+
+def _acquire_state_lock_blocking(task_id: str, timeout_seconds: float) -> bool:
+    """Poll for the state-writer lock until acquired or timeout elapses.
+
+    Used by ``advance_day_task`` / ``rebuild_schedule_task`` — they
+    can't just skip on contention because they're scheduled / on-demand,
+    not opportunistic. Polling at the same cadence as
+    ``_wait_for_idle_run`` keeps Redis traffic negligible.
+    """
+    poll = _RUN_WAIT_POLL_INTERVAL_SECONDS
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if _try_acquire_state_lock(task_id):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+
+
+def _release_state_lock(task_id: str) -> None:
+    """Best-effort release with compare-and-delete.
+
+    If we held the lock straight through, this just DELs it. If our TTL
+    expired and somebody else took it, the CAS no-ops — we never blow
+    away another task's lock.
+    """
+    try:
+        _get_redis().eval(
+            _STATE_WRITER_LOCK_CAS_DELETE,
+            1,
+            STATE_WRITER_LOCK_KEY,
+            task_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "schedule.state_lock.release_failed",
+            task_id=task_id,
+            error=str(exc),
+        )
+
+
 def _set_waiter_flag() -> None:
     """Mark that a waiter task is in the pipeline.
 
@@ -208,9 +318,15 @@ def _pop_next_compound() -> dict[str, Any] | None:
     that supersedes the per-op "shrink jumps grow" mid-run behavior.
 
     Malformed JSON entries (shouldn't happen given the schema-validated
-    producer, but Redis itself doesn't enforce content) are silently
-    discarded with a warning; the loop continues until it finds a valid
-    compound or empties the queue.
+    producer, but Redis itself doesn't enforce content) are NOT silently
+    discarded — that previous behavior could leave an order's
+    ``is_processing_locked=True`` forever, because once ``ZPOPMIN``
+    removed the member from the queue there was no way to reach the
+    affected ``order_id`` or ``requested_by`` and the row would
+    spin forever. Per P1-5 review: corrupted members are RPUSHed to
+    ``schedule:pending_ops:dlq`` and ERROR-logged so ops can inspect
+    them and recover manually. The loop then continues until a valid
+    compound or an empty queue.
     """
     rds = _get_redis()
     while True:
@@ -221,7 +337,23 @@ def _pop_next_compound() -> dict[str, Any] | None:
         try:
             return cast("dict[str, Any]", json.loads(member))
         except json.JSONDecodeError:
-            logger.warning("schedule.pending_compound.malformed", raw=member)
+            # Persist the raw member to the DLQ so the lost work is
+            # diagnosable; ZPOPMIN already removed it from pending_ops.
+            try:
+                rds.rpush(PENDING_OPS_DLQ_KEY, member)
+            except Exception as exc:
+                logger.error(
+                    "schedule.pending_compound.dlq_push_failed",
+                    raw=member,
+                    score=_score,
+                    error=str(exc),
+                )
+            logger.error(
+                "schedule.pending_compound.malformed_drained_to_dlq",
+                raw=member,
+                score=_score,
+                dlq_key=PENDING_OPS_DLQ_KEY,
+            )
             # Discarded by ZPOPMIN already; loop to try the next one.
 
 
@@ -401,7 +533,34 @@ def _process_compound(
         return False
 
     for i, op in enumerate(ops):
-        result = _apply_op(state, op)
+        try:
+            result = _apply_op(state, op)
+        except RuntimeError as exc:
+            # P2-5: a leaf op raised on a segment-tree invariant break
+            # (e.g. _apply_remove_to_trees residual > 0). State is already
+            # mid-mutation; restore from snapshot to keep the compound's
+            # atomicity guarantee, then surface as a normal compound
+            # failure so the requester gets ``compound_failed`` over WS
+            # and the run_task's accept-path doesn't run.
+            logger.error(
+                "schedule.compound.invariant_break",
+                compound_id=compound.get("compound_id"),
+                failed_op_index=i,
+                failed_op=op.get("op"),
+                error=str(exc),
+            )
+            _restore_state_in_place(state, snapshot)
+            _notify_compound_failure(
+                compound=compound,
+                failed_op_index=i,
+                failed_op=op,
+                result=ScheduleResult(
+                    status="capacity_exceeded",
+                    order_id=uuid.UUID(op["order_id"]) if op.get("order_id") else None,
+                    message=f"Segment-tree invariant broken during {op.get('op')}: {exc}",
+                ),
+            )
+            return False
         if result.status != "success":
             _restore_state_in_place(state, snapshot)
             _notify_compound_failure(
@@ -428,18 +587,244 @@ def _drop_compound_index_entry(compound_id: str | None) -> None:
     ``ZPOPMIN`` a compound, the cancellation window is closed and the
     index entry is stale — best-effort remove keeps Redis from growing
     unboundedly.
+
+    Catches only ``RedisError`` (P3-1): pre-fix this swallowed any
+    ``Exception``, which would hide programming bugs (a TypeError from
+    a refactor would silently go to a warning log instead of crashing
+    the task and surfacing the bug in CI). The only thing we genuinely
+    want to tolerate here is a transient Redis outage / timeout, all of
+    which derive from ``RedisError``.
     """
     if not compound_id:
         return
     try:
         _get_redis().hdel("schedule:pending_ops:by_compound_id", compound_id)
-    except Exception as exc:
+    except RedisError as exc:
         # Logging only; a stale index entry doesn't break correctness.
         logger.warning(
             "schedule.compound.index_cleanup_failed",
             compound_id=compound_id,
             error=str(exc),
         )
+
+
+# ---------------------------------------------------------------------------
+# Compound db_action — write user-facing columns on accept, compensate on reject
+# ---------------------------------------------------------------------------
+#
+# P1-2 (PR-14 review): producers (``create_order`` / ``update_order`` /
+# ``delete_order`` / ``batch_update_orders``) no longer commit the actual
+# user-facing column writes (new ``wafer_quantity`` /
+# ``requested_delivery_date`` / ``notes`` / ``is_deleted`` / etc.). They
+# only write the ``is_processing_locked=True`` flag and embed a
+# ``CompoundDbAction`` in the compound. The worker — which is the single
+# authority on whether the in-memory ``SchedulerState`` accepted the
+# change — executes the matching DB write here.
+#
+# Why: pre-P1-2 a rejected compound (capacity_exceeded / deadline_too_far)
+# would leave DB with new values while state had rolled back to the old —
+# permanently divergent until manual rebuild. With this handler the DB
+# write only happens when state has actually accepted; on reject the
+# producer's lock is cleared and DB columns remain at their pre-PATCH
+# values.
+
+
+def _perform_compound_db_action(
+    compound: dict[str, Any],
+    *,
+    accepted: bool,
+) -> None:
+    """Execute the compound's ``db_action`` after state has settled.
+
+    Idempotent at the row level: if the order disappeared between
+    enqueue and execution (e.g. a follow-up DELETE landed first), this
+    function logs a warning and returns without raising.
+
+    Branch matrix:
+
+    ``kind="create"``:
+      - accepted: no-op (producer pre-created the row; materializer
+        will fill scheduling cols).
+      - rejected: orphan cleanup — set ``is_deleted=True`` and
+        ``status=cancelled`` so the row exits user-visible queries.
+
+    ``kind="update"``:
+      - accepted: write the new ``wafer_quantity`` /
+        ``requested_delivery_date`` / ``notes`` / ``assigned_to`` from
+        ``db_action.new_*``; clear lock; emit ``order.updated`` audit
+        record with the diff.
+      - rejected: clear lock; restore ``status`` to ``scheduled`` if
+        the row has a ``scheduled_production_date`` (which means it
+        was already accepted into the schedule before this PATCH), or
+        ``pending`` otherwise. DB columns themselves stay at pre-PATCH
+        values because the producer never wrote them.
+
+    ``kind="delete"``:
+      - accepted: soft-delete (``is_deleted=True``,
+        ``status=cancelled``); clear lock; emit ``order.cancelled``
+        audit record.
+      - rejected: clear lock; status restoration mirrors update.
+    """
+    db_action_raw = compound.get("db_action")
+    if not db_action_raw:
+        return  # legacy / internally-generated compound
+
+    kind = db_action_raw["kind"]
+    actor_id_raw = db_action_raw["actor_id"]
+    actor_id = uuid.UUID(actor_id_raw) if actor_id_raw else None
+
+    ops = compound.get("ops") or []
+    if not ops:
+        logger.warning("schedule.db_action.no_ops", compound_id=compound.get("compound_id"))
+        return
+    # All ops in a producer-generated compound target the same order_id.
+    order_id = uuid.UUID(ops[0]["order_id"])
+
+    db: Session = SessionLocal()
+    try:
+        order = db.scalars(select(Order).where(Order.id == order_id)).first()
+        if order is None:
+            logger.warning(
+                "schedule.db_action.missing_order",
+                order_id=str(order_id),
+                kind=kind,
+            )
+            return
+
+        if accepted:
+            _apply_db_action_accept(db, order, kind, db_action_raw, actor_id)
+        else:
+            _apply_db_action_reject(order, kind)
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def _apply_db_action_accept(
+    db: Session,
+    order: Order,
+    kind: str,
+    db_action: dict[str, Any],
+    actor_id: uuid.UUID | None,
+) -> None:
+    """Write the success-path DB changes for an accepted compound.
+
+    Audit logs are emitted here (not at producer time) so the audit
+    timestamp reflects when the change was actually committed.
+    """
+    if kind == "create":
+        # Producer already inserted the row + wrote the ``order.created``
+        # audit. Worker only clears the in-flight lock so the row becomes
+        # editable again; the materializer's apply_schedule will set
+        # ``status=scheduled`` and fill the scheduling columns.
+        order.is_processing_locked = False
+        return
+
+    if kind == "update":
+        old_value: dict[str, Any] = {
+            "wafer_quantity": order.wafer_quantity,
+            "requested_delivery_date": str(order.requested_delivery_date),
+            "notes": order.notes,
+            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        }
+        new_qty = db_action.get("new_wafer_quantity")
+        if new_qty is not None:
+            order.wafer_quantity = int(new_qty)
+        new_dl = db_action.get("new_requested_delivery_date")
+        if new_dl is not None:
+            order.requested_delivery_date = date.fromisoformat(str(new_dl))
+        if db_action.get("new_notes_set"):
+            order.notes = db_action.get("new_notes")
+        if db_action.get("new_assigned_to_set"):
+            raw_assignee = db_action.get("new_assigned_to")
+            order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
+        order.is_processing_locked = False
+        new_value: dict[str, Any] = {
+            "wafer_quantity": order.wafer_quantity,
+            "requested_delivery_date": str(order.requested_delivery_date),
+            "notes": order.notes,
+            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        }
+        _worker_audit(
+            db,
+            action="order.updated",
+            actor_id=actor_id,
+            order_id=order.id,
+            old_value=old_value,
+            new_value=new_value,
+        )
+        return
+
+    if kind == "delete":
+        old_value = {"status": order.status.value, "is_deleted": False}
+        order.is_deleted = True
+        order.status = OrderStatus.cancelled
+        order.is_processing_locked = False
+        _worker_audit(
+            db,
+            action="order.cancelled",
+            actor_id=actor_id,
+            order_id=order.id,
+            old_value=old_value,
+        )
+        return
+
+
+def _apply_db_action_reject(order: Order, kind: str) -> None:
+    """Compensate for a rejected compound: clear lock; for create, orphan-cleanup.
+
+    For update/delete the DB columns the user wanted to change were
+    never written by the producer, so "rollback" reduces to clearing
+    the lock and snapping ``status`` back to whatever the row's actual
+    schedule presence implies (scheduled vs pending). For create the
+    producer DID write a stub row, so we soft-delete it.
+    """
+    if kind == "create":
+        order.is_deleted = True
+        order.status = OrderStatus.cancelled
+        order.is_processing_locked = False
+        return
+
+    # update / delete: just unlock and restore status.
+    order.is_processing_locked = False
+    if order.scheduled_production_date is not None:
+        order.status = OrderStatus.scheduled
+    else:
+        order.status = OrderStatus.pending
+
+
+def _worker_audit(
+    db: Session,
+    *,
+    action: str,
+    actor_id: uuid.UUID | None,
+    order_id: uuid.UUID,
+    old_value: dict[str, Any] | None = None,
+    new_value: dict[str, Any] | None = None,
+) -> None:
+    """Write an audit row + ECS stdout record from inside the worker.
+
+    Mirrors ``order_service._write_audit`` but takes an ``actor_id``
+    directly (not a ``User`` row) because the worker doesn't load the
+    user — the id rides in the compound's ``db_action`` payload.
+    """
+    audit_log_repo.create(
+        db,
+        action=action,
+        user_id=actor_id,
+        resource_type="order",
+        resource_id=order_id,
+        old_value=old_value,
+        new_value=new_value,
+    )
+    emit_audit_log(
+        action=action,
+        actor_id=str(actor_id) if actor_id else None,
+        resource_type="order",
+        resource_id=str(order_id),
+        changes={"old": old_value, "new": new_value},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +912,15 @@ def run_scheduling_task(self: Task) -> None:
     """
     started_at = datetime.now(tz=UTC).isoformat()
     task_id = str(self.request.id) if self.request.id else None
+    lock_holder_id = task_id or f"run-{uuid.uuid4()}"
+
+    # P0-2: only one task at a time may mutate ``schedule:state``. If the
+    # lock is held, the holder will pick up our compound on its self-
+    # retrigger — silently skip without touching status.
+    if not _try_acquire_state_lock(lock_holder_id):
+        logger.info("schedule.run.skip_lock_held", task_id=task_id)
+        return
+
     _set_status(state=_STATUS_RUNNING, started_at=started_at, task_id=task_id)
     logger.info("schedule.run.start", task_id=task_id)
 
@@ -561,6 +955,9 @@ def run_scheduling_task(self: Task) -> None:
             # what keeps the producer's accept/reject feedback O(log n)·N
             # instead of being gated on N DB round-trips per compound.
             _save_state(state)
+            # P1-2: producer deferred the user-facing DB columns to us.
+            # Apply them now that state has actually accepted the compound.
+            _perform_compound_db_action(compound, accepted=True)
             requested_by_raw = compound.get("requested_by")
             if requested_by_raw:
                 websocket.notify_user(
@@ -581,7 +978,11 @@ def run_scheduling_task(self: Task) -> None:
         else:
             # Compound rolled back. No state change, no materialize trigger
             # — the WS notify_user (compound_failed) already fired inside
-            # ``_process_compound``.
+            # ``_process_compound``. We still need to compensate the
+            # producer's lock write (and, for create compounds, soft-delete
+            # the orphan row); ``_perform_compound_db_action`` with
+            # accepted=False handles that.
+            _perform_compound_db_action(compound, accepted=False)
             logger.info(
                 "schedule.run.rolled_back",
                 task_id=task_id,
@@ -628,6 +1029,8 @@ def run_scheduling_task(self: Task) -> None:
             exc_info=True,
         )
         raise
+    finally:
+        _release_state_lock(lock_holder_id)
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +1126,31 @@ def materialize_schedule_task() -> None:
             )
 
             try:
+                # P3-3: defensive empty-state guard. If ``schedule:state``
+                # doesn't exist yet (extreme race: fast-path task enqueued
+                # a notify before its ``_save_state`` landed, or Redis was
+                # flushed between fast-path success and our wake-up), we'd
+                # otherwise call ``apply_schedule`` with an empty
+                # ``ScheduledResult`` list — which wipes every order's
+                # daily_breakdown / scheduled_production_date in DB
+                # (``clear_scheduled_dates`` at the top of apply_schedule).
+                # That's a real-data-loss bug. Detecting the missing key
+                # and pushing the captured users back onto pending_notify
+                # is the safe move; the next materializer (triggered by
+                # whichever task eventually writes state) will pick them
+                # up with a real state in hand.
+                if not rds.exists(STATE_KEY):
+                    logger.warning(
+                        "schedule.materialize.skip_no_state",
+                        notify_users=len(users_raw),
+                    )
+                    rds.sunionstore(
+                        MATERIALIZE_NOTIFY_PENDING_KEY,
+                        [MATERIALIZE_NOTIFY_PENDING_KEY, MATERIALIZE_NOTIFY_PROCESSING_KEY],
+                    )
+                    rds.delete(MATERIALIZE_NOTIFY_PROCESSING_KEY)
+                    break
+
                 state = _load_state()
                 scheduled_results = compute_schedule(state)
                 pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders.values()}
@@ -833,8 +1261,27 @@ def advance_day_task() -> None:
     """
     logger.info("schedule.advance_day.start")
     _set_waiter_flag()
+    lock_holder_id = f"advance_day-{uuid.uuid4()}"
+    lock_acquired = False
     try:
         _wait_for_idle_run(log_event="schedule.advance_day.wait_timeout")
+
+        # P0-3: serialize state writes against ``run_scheduling_task``. The
+        # waiter_pending flag is advisory and only guides re-trigger
+        # behavior — it doesn't prevent a fresh run_task from grabbing
+        # the lock between our wait completing and our state mutation.
+        # Bounded wait because we MUST run; if the lock is genuinely held
+        # for the whole TTL, that's already a sign something is wrong and
+        # raising into ``failed`` status is the right escalation.
+        lock_acquired = _acquire_state_lock_blocking(
+            lock_holder_id, timeout_seconds=_RUN_WAIT_TIMEOUT_SECONDS
+        )
+        if not lock_acquired:
+            logger.error("schedule.advance_day.lock_timeout", task_id=lock_holder_id)
+            raise RuntimeError(
+                "advance_day_task could not acquire state-writer lock within "
+                f"{_RUN_WAIT_TIMEOUT_SECONDS}s"
+            )
 
         started_at = datetime.now(tz=UTC).isoformat()
         _set_status(state=_STATUS_RUNNING, started_at=started_at)
@@ -920,6 +1367,8 @@ def advance_day_task() -> None:
             )
             raise
     finally:
+        if lock_acquired:
+            _release_state_lock(lock_holder_id)
         _clear_waiter_flag()
 
 
@@ -945,8 +1394,22 @@ def rebuild_schedule_task() -> None:
     """
     logger.info("schedule.rebuild.start")
     _set_waiter_flag()
+    lock_holder_id = f"rebuild-{uuid.uuid4()}"
+    lock_acquired = False
     try:
         _wait_for_idle_run(log_event="schedule.rebuild.wait_timeout")
+
+        # P0-3: serialize state writes against ``run_scheduling_task``. Same
+        # rationale as ``advance_day_task``.
+        lock_acquired = _acquire_state_lock_blocking(
+            lock_holder_id, timeout_seconds=_RUN_WAIT_TIMEOUT_SECONDS
+        )
+        if not lock_acquired:
+            logger.error("schedule.rebuild.lock_timeout", task_id=lock_holder_id)
+            raise RuntimeError(
+                "rebuild_schedule_task could not acquire state-writer lock within "
+                f"{_RUN_WAIT_TIMEOUT_SECONDS}s"
+            )
 
         started_at = datetime.now(tz=UTC).isoformat()
         _set_status(state=_STATUS_RUNNING, started_at=started_at)
@@ -1013,4 +1476,6 @@ def rebuild_schedule_task() -> None:
             )
             raise
     finally:
+        if lock_acquired:
+            _release_state_lock(lock_holder_id)
         _clear_waiter_flag()

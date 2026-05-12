@@ -255,6 +255,136 @@ def test_apply_schedule_clears_stale_pin_columns_on_orders_no_longer_in_state(
     assert stale.pinned_production_date is None
 
 
+def test_apply_schedule_preserves_in_production_status(db_session: Session) -> None:
+    """A boundary order whose status is already ``in_production`` (advance_day
+    promoted it because its production day arrived) MUST NOT be demoted back
+    to ``scheduled`` when materialize runs another pass.
+
+    Scenario reproducing the bug: boundary order made some wafers today,
+    rest carries into tomorrow. advance_day sets status=in_production and
+    advances base_date; the carried portion is still in pq, so the next
+    accepted compound triggers materialize_schedule_task. ``apply_schedule``
+    will see this order in its ``ScheduledResult`` list (because it still
+    has work scheduled tomorrow) and call ``set_schedule_dates`` — which
+    pre-fix would unconditionally write status=scheduled, breaking:
+
+    1. The UI label flips from "producing now" to "queued".
+    2. ``advance_day_task::mark_completed_outside_set`` only collects
+       rows with ``status='in_production'``, so once demoted the order
+       can never be flipped to ``completed`` and gets stuck in scheduled
+       forever.
+    """
+    creator = _make_user(db_session, username="apply-sched-preserve-status")
+    boundary = Order(
+        order_number="ORD-BOUNDARY",
+        customer_name="ACME",
+        # Quantity respects the ck_orders_wafer_quantity check constraint
+        # (25..2500). Picked so a hypothetical "today portion + tomorrow
+        # portion" split is illustrative without violating the CHECK.
+        wafer_quantity=2_000,
+        requested_delivery_date=date(2026, 5, 14),
+        created_by=creator.id,
+        status=OrderStatus.in_production,
+        scheduled_production_date=date(2026, 5, 12),
+        expected_delivery_date=date(2026, 5, 13),
+        daily_breakdown=[
+            {"date": "2026-05-12", "quantity": 1_500},
+            {"date": "2026-05-13", "quantity": 500},
+        ],
+    )
+    db_session.add(boundary)
+    db_session.commit()
+
+    # Materializer's next pass: only tomorrow's portion remains in state
+    # (today's 1,500 is already produced). Re-materialize for tomorrow.
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(
+                order_id=boundary.id,
+                scheduled_date=date(2026, 5, 13),
+                quantity=500,
+            ),
+        ],
+    )
+
+    db_session.refresh(boundary)
+    # Schedule columns updated to reflect the carried portion.
+    assert boundary.scheduled_production_date == date(2026, 5, 13)
+    assert boundary.expected_delivery_date == date(2026, 5, 13)
+    assert boundary.daily_breakdown == [
+        {"date": "2026-05-13", "quantity": 500},
+    ]
+    # Status preserved — this is the load-bearing assertion of the regression.
+    assert boundary.status == OrderStatus.in_production
+
+
+def test_list_for_scheduler_excludes_in_production_orders(db_session: Session) -> None:
+    """Rebuild reconstructs the algorithm state from DB truth, but cannot
+    represent the "partial production progress" of an in-production order —
+    its remaining wafer_quantity isn't stored anywhere DB-recoverable.
+
+    Replaying an in_production order at its full ``wafer_quantity`` through
+    ``add_order`` during rebuild would (1) double-count today's already-
+    produced wafers in capacity_tree, and (2) on the next advance_day,
+    ``mark_completed_outside_set`` would flag the order as completed
+    because the algorithm couldn't place it (deadline_too_far /
+    capacity_exceeded → skipped from state). The order's physical
+    production progress vanishes into a silent ``completed`` status.
+
+    Fix is at the source: ``list_for_scheduler`` returns only
+    ``status=scheduled`` orders so rebuild's add_order loop never touches
+    in_production rows; their DB state is preserved as-is.
+    """
+    creator = _make_user(db_session, username="list-for-scheduler-skip-inprod")
+
+    # An order currently in physical production today.
+    in_prod = Order(
+        order_number="ORD-INPROD",
+        customer_name="ACME",
+        wafer_quantity=500,
+        requested_delivery_date=date(2026, 5, 14),
+        created_by=creator.id,
+        status=OrderStatus.in_production,
+        scheduled_production_date=date(2026, 5, 12),
+        expected_delivery_date=date(2026, 5, 12),
+    )
+    # A normal future-scheduled order.
+    scheduled = Order(
+        order_number="ORD-SCHED",
+        customer_name="ACME",
+        wafer_quantity=300,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=date(2026, 5, 15),
+        expected_delivery_date=date(2026, 5, 15),
+    )
+    # Completed history — also must be excluded.
+    completed = Order(
+        order_number="ORD-DONE",
+        customer_name="ACME",
+        wafer_quantity=200,
+        requested_delivery_date=date(2026, 5, 10),
+        created_by=creator.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=date(2026, 5, 10),
+        expected_delivery_date=date(2026, 5, 10),
+    )
+    db_session.add_all([in_prod, scheduled, completed])
+    db_session.commit()
+
+    orders, creators = order_service.list_for_scheduler(db_session)
+
+    returned_ids = {o.order_id for o in orders}
+    # Only the future-scheduled order is fed back into rebuild.
+    assert returned_ids == {scheduled.id}
+    assert in_prod.id not in returned_ids
+    assert completed.id not in returned_ids
+    # Creators map mirrors the same filter.
+    assert set(creators.keys()) == {scheduled.id}
+
+
 # ---------------------------------------------------------------------------
 # Case 8 smart-routing in update_order (Phase 2)
 # ---------------------------------------------------------------------------

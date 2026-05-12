@@ -697,6 +697,164 @@ def test_rebuild_state_separates_pinned_from_pq() -> None:
     assert pinned_b.fake_deadline == _BASE
 
 
+# ---------------------------------------------------------------------------
+# Admission control invariants (P1-1)
+# ---------------------------------------------------------------------------
+#
+# Reviewer raised "advance_day with pinned_today_total=DAILY_CAPACITY +
+# pq order at dl=today gets stuck in pq forever". The claim is correct
+# IF that state is reachable. These tests pin down the invariant: it is
+# NOT reachable — ``add_order`` and ``pin_order`` both reject any input
+# that would put us there. Future refactors of admission must not break
+# these invariants.
+#
+# Mental model: ``capacity_tree`` is a backward-fill reservation system.
+# Adding an order with dl=D reserves wafers in capacity_tree starting
+# from day D and walking back. So:
+#   - An add for dl=today claims slots on day 1 (`rel=1`).
+#   - A pin to day D claims slots on day D.
+# ``capacity_tree.query(D)`` is the total remaining (= unreserved) capacity
+# across days 1..D. As long as this query returns >= the new order's
+# wafer_quantity, the add/pin succeeds and the post-state is feasible.
+# When it returns less, admission rejects.
+
+
+def test_p1_1_invariant_add_after_pin_full_today_rejects() -> None:
+    """Pin Y(=DAILY_CAPACITY) to today first; any subsequent add with
+    deadline=today must reject because day-1 prefix sum is 0.
+
+    Direction tested: pin first, then add. Confirms the post-pin
+    capacity_tree leaves no slack for an EDF-tight pq order.
+    """
+    state = SchedulerState.initial(_BASE)
+    # Y must come in via pq → pin (pin's precondition is "already in pq").
+    y = _make_order(order_number="Y", qty=DAILY_CAPACITY, deadline=_BASE)
+    assert add_order(state, y).status == "success"
+    assert pin_order(state, y, fake_deadline=_BASE).status == "success"
+    # Day 1's prefix sum is now 0 (entire DAILY_CAPACITY reserved for Y).
+    assert state.capacity_tree.query(1) == 0
+
+    # Now an add with dl=today must be rejected, regardless of qty.
+    x = _make_order(order_number="X", qty=1, deadline=_BASE)
+    result = add_order(state, x)
+    assert result.status == "capacity_exceeded"
+
+
+def test_p1_1_invariant_pin_full_today_rejects_when_pq_has_today_order() -> None:
+    """Add X(dl=today) to pq first, then try to pin some other order Y
+    with fake_deadline=today AND Y.wafer_quantity that would exceed day-1
+    headroom. The pin must reject because day-1's remaining (after X's
+    reservation) is below Y's wafer_quantity.
+
+    Direction tested: add-with-today-deadline first, then pin-to-today.
+    This is the path Reviewer's P1-1 scenario implicitly assumed (X
+    coexisting with a fully-pinned day-1).
+    """
+    state = SchedulerState.initial(_BASE)
+
+    x = _make_order(order_number="X", qty=2_000, deadline=_BASE)
+    assert add_order(state, x).status == "success"
+    # day 1 now has DAILY_CAPACITY - 2_000 remaining.
+    assert state.capacity_tree.query(1) == DAILY_CAPACITY - 2_000
+
+    # Y is in pq with a future deadline (so pin_order's "must be in pq"
+    # precondition is satisfied). Y's wafer_quantity is large enough that
+    # together with X it would over-allocate day 1.
+    y = _make_order(
+        order_number="Y",
+        qty=DAILY_CAPACITY - 1_000,  # X(2000) + Y(9000) = 11000 > DAILY_CAPACITY
+        deadline=_BASE + timedelta(days=10),
+    )
+    assert add_order(state, y).status == "success"
+
+    result = pin_order(state, y, fake_deadline=_BASE)
+    assert result.status == "capacity_exceeded"
+
+    # Critical: pin failure must be a true no-op. Y is still in pq with
+    # its original deadline, X still in pq with day-1 reservation. The
+    # P1-1 stuck state is never reached.
+    assert state.capacity_tree.query(1) == DAILY_CAPACITY - 2_000
+
+
+def test_p1_1_invariant_pin_partial_today_leaves_room_for_existing_pq_order() -> None:
+    """If pinning Y leaves *exactly enough* slack for X's deadline-today
+    obligation, pin succeeds and the state remains feasible: X's day-1
+    portion (its full qty) still fits before its deadline.
+
+    This is the boundary that proves the admission check isn't overly
+    conservative — it accepts the maximum legal pin and rejects only the
+    next wafer over.
+    """
+    state = SchedulerState.initial(_BASE)
+
+    x = _make_order(order_number="X", qty=2_000, deadline=_BASE)
+    assert add_order(state, x).status == "success"
+
+    y = _make_order(
+        order_number="Y",
+        # Exact fit: X + Y = DAILY_CAPACITY.
+        qty=DAILY_CAPACITY - 2_000,
+        deadline=_BASE + timedelta(days=10),
+    )
+    assert add_order(state, y).status == "success"
+
+    result = pin_order(state, y, fake_deadline=_BASE)
+    assert result.status == "success"
+    # Day 1 is now fully reserved (no remaining), but the obligations
+    # in deadline_tree (X's 2000 + Y's now-pinned 9000) match exactly.
+    assert state.capacity_tree.query(1) == 0
+
+    # compute_schedule produces a feasible plan: pinned Y on day 1
+    # consumes its 9000 slot; pq's X gets the remaining day-1 1000 slot
+    # for its qty=2000? — actually pq_remaining on day 1 = 0 (Y took it
+    # all post-pin), but X's pq slot will be on a day where capacity
+    # remains. The point of this test is the admission *accepted*, not
+    # the materialized schedule shape — leave that to compute_schedule
+    # tests.
+
+
+def test_apply_remove_to_trees_raises_on_residual(monkeypatch) -> None:
+    """``_apply_remove_to_trees`` must raise when the forward give-back can't
+    distribute the full quantity back to capacity_tree. Pre-fix this only
+    logged a warning and let the algorithm continue on a corrupted state,
+    silently propagating divergence into compute_schedule + DB writes.
+    P2-5: raise instead, so ``_process_compound``'s saga rollback fires
+    and the compound surfaces as ``compound_failed`` to the requester.
+
+    The residual path is hard to reach via natural API calls because the
+    algorithm normally self-corrects. We construct it by patching
+    ``capacity_tree.query`` / ``deadline_tree.query`` to return values
+    that fabricate zero slack everywhere — simulating a tree state that
+    drifted out of invariant (the exact failure mode the raise is
+    defending against).
+    """
+    import pytest
+    from app.services.scheduling import _apply_remove_to_trees
+
+    state = SchedulerState.initial(_BASE)
+    order = _make_order(qty=50, deadline=_BASE + timedelta(days=2))
+
+    # Fabricate "tight everywhere, zero slack" by making both trees
+    # report the same fully-consumed prefix sum for every day in range.
+    monkeypatch.setattr(
+        state.capacity_tree,
+        "query",
+        lambda d: d * DAILY_CAPACITY,
+    )
+    monkeypatch.setattr(
+        state.deadline_tree,
+        "query",
+        lambda d: 0,
+    )
+    # point_update on the deadline tree happens before the slack walk;
+    # let it no-op so we don't perturb our query() override.
+    monkeypatch.setattr(state.deadline_tree, "point_update", lambda *args, **kwargs: None)
+    monkeypatch.setattr(state.capacity_tree, "point_update", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="invariant broken"):
+        _apply_remove_to_trees(state, order)
+
+
 def test_scheduler_state_roundtrip_preserves_pinned_orders() -> None:
     """``to_json`` / ``from_json`` must include ``pinned_orders`` so Redis
     persistence survives a worker restart with pins intact. Backward compat

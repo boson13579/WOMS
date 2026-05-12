@@ -21,6 +21,7 @@ __all__ = [
     "get_by_id_including_deleted",
     "get_many",
     "get_scheduled",
+    "get_scheduled_for_rebuild",
     "get_today_order_count",
     "mark_completed_outside_set",
     "mark_in_production",
@@ -160,6 +161,40 @@ def get_scheduled(db: Session) -> list[Order]:
     return list(db.scalars(stmt).all())
 
 
+def get_scheduled_for_rebuild(db: Session) -> list[Order]:
+    """Return only ``status=scheduled`` orders for ``rebuild_state``.
+
+    Sibling of :func:`get_scheduled` with a critically different filter:
+    **``in_production`` orders are EXCLUDED**. Rebuild reconstructs the
+    algorithm state (segment trees + pq) from DB truth by replaying each
+    order through ``add_order`` at its full ``wafer_quantity``. For an
+    in-production order, "full quantity" is wrong — part of it was already
+    produced today; the remainder is what the algorithm should track, but
+    that boundary state lives only in the about-to-be-rebuilt Redis state
+    and can't be recovered from DB columns alone.
+
+    Replaying an in-production order at full qty would (1) double-count
+    its already-produced wafers in capacity_tree / deadline_tree, and (2)
+    on the next ``advance_day``, ``mark_completed_outside_set`` would
+    flip it to ``completed`` because the algorithm never put it back into
+    the pq (either ``deadline_too_far`` or ``capacity_exceeded`` skipped
+    it) — losing the order's physical production progress entirely.
+
+    The contract is: in-production orders keep their existing DB state
+    untouched through a rebuild; the next ``advance_day_task`` will mark
+    them ``completed`` based on real-time production data. The algorithm
+    only tracks the *future* (scheduled) — today's physical reality is
+    DB-owned.
+    """
+    stmt = (
+        select(Order)
+        .where(Order.is_deleted.is_(False))
+        .where(Order.status == OrderStatus.scheduled)
+        .order_by(Order.scheduled_production_date.asc())
+    )
+    return list(db.scalars(stmt).all())
+
+
 def clear_scheduled_dates(db: Session) -> int:
     """Bulk-clear scheduling-state columns on every active scheduled order.
 
@@ -215,6 +250,19 @@ def set_schedule_dates(
     materializer always passes a non-empty list since the order is by
     definition currently scheduled.
 
+    **Status preservation for in_production**: this function flips
+    ``status`` to ``scheduled`` only when the current status is NOT
+    ``in_production``. Once ``advance_day_task::mark_in_production``
+    promotes an order's status to ``in_production``, the materializer
+    can still freely re-write its scheduling columns (the boundary case
+    where today's portion finished and the remainder is rolled into
+    tomorrow) but MUST NOT demote it back to ``scheduled``. Demoting
+    would (1) silently flip the frontend's "currently producing" flag
+    to "queued" mid-shift and (2) cause
+    ``mark_completed_outside_set`` (which only collects rows with
+    ``status='in_production'``) to skip the order on completion,
+    leaving it stuck in ``scheduled`` forever.
+
     Returns the refreshed entity, or `None` if the order is missing or
     soft-deleted (caller decides how to react).
     """
@@ -225,7 +273,8 @@ def set_schedule_dates(
     order.scheduled_production_date = scheduled_production_date
     order.expected_delivery_date = expected_delivery_date
     order.daily_breakdown = daily_breakdown
-    order.status = OrderStatus.scheduled
+    if order.status != OrderStatus.in_production:
+        order.status = OrderStatus.scheduled
     order.is_pinned = is_pinned
     order.pinned_production_date = pinned_production_date if is_pinned else None
     order.is_processing_locked = False

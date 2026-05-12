@@ -131,6 +131,34 @@ def _make_op(
     )
 
 
+def _bypass_state_writer_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the P0-2/P0-3 lock always-succeed for tests that don't exercise it.
+
+    Real-Celery semantics: when ``run_scheduling_task`` self-retriggers via
+    ``.delay()``, the re-fired task runs *after* the outer's ``finally``
+    releases the lock — so the new task acquires successfully. In tests
+    we route ``.delay()`` straight back into ``apply()`` (synchronously,
+    inside the outer's ``try``) which means the outer still holds the
+    lock when the recursive apply tries to acquire it. Without this
+    bypass every "process more than one compound" test would deadlock
+    on the second compound. The dedicated lock-behavior tests
+    (``test_state_writer_lock_*``) skip this bypass so they exercise the
+    real Redis SETNX.
+    """
+    monkeypatch.setattr(
+        "app.workers.scheduling._try_acquire_state_lock",
+        lambda _task_id: True,
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling._acquire_state_lock_blocking",
+        lambda _task_id, timeout_seconds=0: True,
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling._release_state_lock",
+        lambda _task_id: None,
+    )
+
+
 def _install_auto_retrigger_delay(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Wire ``run_scheduling_task.delay`` to synchronously call ``apply()``.
 
@@ -138,7 +166,13 @@ def _install_auto_retrigger_delay(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     ``.delay()``s itself if more remain. Tests want to call ``apply()``
     once and have the whole queue drain — so we route ``.delay()`` straight
     back into ``apply()`` here. A depth cap catches infinite-loop bugs.
+
+    Also bypasses the state-writer lock so the recursive ``apply()`` can
+    re-acquire (in prod the re-trigger fires after lock release, but in
+    tests the recursive apply happens inside the outer's still-running
+    ``try`` block).
     """
+    _bypass_state_writer_lock(monkeypatch)
     delay_mock = MagicMock()
 
     def _side_effect() -> None:
@@ -437,10 +471,18 @@ def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
     """
     _enqueue(redis_client, _make_op(order_number="ORD-BOOM"))
 
-    # add_order is the realistic crash point — bug in segment tree code
-    # would manifest there. Any internal raise has the same contract.
-    failing_add = MagicMock(side_effect=RuntimeError("segment tree corrupted"))
-    mocks = _patch_common(monkeypatch, add_order=failing_add)
+    # Realistic crash point: an unexpected exception from a non-leaf-op
+    # path (Redis outage during ``_save_state``, programming error in
+    # ``_perform_compound_db_action``, etc.) bubbles up through the task
+    # body. Leaf-op RuntimeErrors (segment-tree invariant breaks etc.)
+    # are now caught inside ``_process_compound`` and turn into normal
+    # compound failures instead — those are exercised in
+    # ``test_apply_remove_residual_triggers_compound_rollback``.
+    mocks = _patch_common(monkeypatch)
+    monkeypatch.setattr(
+        "app.workers.scheduling._save_state",
+        MagicMock(side_effect=RuntimeError("segment tree corrupted")),
+    )
 
     result = run_scheduling_task.apply()
     # Celery sees the failure (traceback is in result.traceback).
@@ -1590,6 +1632,12 @@ def test_materialize_task_drains_pending_users_and_notifies(
     user_a = uuid.uuid4()
     user_b = uuid.uuid4()
     redis_client.sadd("schedule:materialize_notify_pending", str(user_a), str(user_b))
+    # P3-3: materializer now bails early if STATE_KEY is missing
+    # (defensive against the race where a fast-path task SADD'd a
+    # notify before its _save_state landed). The test mocks
+    # _load_state so the actual JSON we write here is irrelevant, but
+    # the *existence* of the key is required to pass the new guard.
+    redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
 
     monkeypatch.setattr(
         "app.workers.scheduling._load_state",
@@ -1709,6 +1757,9 @@ def test_materialize_task_passes_pinned_map_to_apply_schedule(
 
     # Seed the materializer's pending notify-user set so it has work to do.
     redis_client.sadd("schedule:materialize_notify_pending", str(requester))
+    # P3-3: STATE_KEY must exist or the materializer's defensive guard
+    # treats the work as "no state to materialize against" and bails.
+    redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
 
     def fake_load_state() -> SchedulerState:
         s = SchedulerState.initial(date(2026, 5, 5))
@@ -1739,3 +1790,585 @@ def test_materialize_task_passes_pinned_map_to_apply_schedule(
     args, _ = apply_mock.call_args
     _, _scheduled_arg, pinned_arg = args
     assert pinned_arg == {pinned_id: pinned_day}
+
+
+def test_materialize_task_skips_when_state_key_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """P3-3 defensive guard: when ``schedule:state`` doesn't exist yet, the
+    materializer must NOT call ``apply_schedule`` with an empty
+    ``ScheduledResult`` list — that would clear daily_breakdown /
+    scheduled_production_date on every order in DB, silently destroying
+    user data. Instead, push the pending notify users back onto the
+    pending set so the next materializer (triggered by whichever task
+    eventually writes state) picks them up.
+    """
+    from app.workers.scheduling import materialize_schedule_task
+
+    requester = uuid.uuid4()
+    redis_client.sadd("schedule:materialize_notify_pending", str(requester))
+    # Deliberately do NOT set STATE_KEY.
+
+    apply_mock = MagicMock(return_value=0)
+    monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    notify_mock = MagicMock()
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+
+    result = materialize_schedule_task.apply()
+    assert result.successful(), result.traceback
+
+    # apply_schedule was NOT called — that's the load-bearing assertion.
+    assert apply_mock.call_count == 0
+    # No user was notified yet — they're back on the pending set.
+    assert notify_mock.call_count == 0
+    # Notify-pending preserved so the next run picks them up.
+    assert redis_client.scard("schedule:materialize_notify_pending") == 1
+    assert redis_client.sismember("schedule:materialize_notify_pending", str(requester))
+
+
+# ---------------------------------------------------------------------------
+# _perform_compound_db_action — P1-2 worker-side DB writes
+# ---------------------------------------------------------------------------
+#
+# These tests pin down the contract: the worker — not the producer — owns
+# the user-facing column writes when a compound is accepted, and runs the
+# rollback compensation when a compound is rejected. Pre-P1-2 the producer
+# committed new wafer_quantity / deadline / soft-delete *before* the
+# scheduler even saw the compound; if the compound then failed (capacity
+# exceeded, deadline too far, …), DB and Redis-state diverged forever.
+# With ``_perform_compound_db_action`` the DB write happens *after* state
+# has accepted, and the rejected branch just unlocks the row (or, for
+# create, soft-deletes the orphan stub the producer pre-inserted).
+
+
+def _stub_compound_with_db_action(
+    *,
+    kind: str,
+    order_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    new_wafer_quantity: int | None = None,
+    new_requested_delivery_date: str | None = None,
+    new_notes_set: bool = False,
+    new_notes: str | None = None,
+) -> dict[str, Any]:
+    """Build a compound dict that mimics what ``schedule_queue.enqueue_compound``
+    stores in Redis — only the fields ``_perform_compound_db_action`` reads."""
+    return {
+        "compound_id": str(uuid.uuid4()),
+        "group": "grow",
+        "op_count": 1,
+        "ops": [
+            {
+                "op": "add",
+                "order_id": str(order_id),
+                "order_number": "ORD-T",
+                "wafer_quantity": 100,
+                "deadline": "2026-08-01",
+            }
+        ],
+        "requested_by": str(actor_id),
+        "db_action": {
+            "kind": kind,
+            "actor_id": str(actor_id),
+            "new_wafer_quantity": new_wafer_quantity,
+            "new_requested_delivery_date": new_requested_delivery_date,
+            "new_notes_set": new_notes_set,
+            "new_notes": new_notes,
+            "new_assigned_to_set": False,
+            "new_assigned_to": None,
+            "old_wafer_quantity": None,
+            "old_requested_delivery_date": None,
+            "old_notes": None,
+            "old_assigned_to": None,
+        },
+    }
+
+
+class _NonClosingSession:
+    """Delegating wrapper that ignores ``.close()``.
+
+    The worker's ``_perform_compound_db_action`` opens its own session
+    via ``SessionLocal()`` and closes it in ``finally``. In tests we
+    want it to use the per-test ``db_session`` (so its commits land in
+    the SAVEPOINT the outer fixture rolls back), but we can't let it
+    close that session — the test still needs it for assertions.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def close(self) -> None:
+        pass
+
+
+def _patch_worker_sessionlocal_to_test_db(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: Any,
+) -> None:
+    """Route ``app.workers.scheduling.SessionLocal()`` to the test session.
+
+    Without this, the worker would call its module-level ``SessionLocal``
+    which is bound to the application's default engine (the placeholder
+    URL from ``conftest`` module-level env defaults), not the
+    testcontainer's engine. The wrapper makes worker commits go through
+    the test's transaction so they're isolated per-test by the outer
+    rollback in ``db_session``.
+    """
+    monkeypatch.setattr(
+        "app.workers.scheduling.SessionLocal",
+        lambda: _NonClosingSession(db_session),
+    )
+
+
+def test_perform_db_action_accept_update_writes_new_values_and_audits(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted update compound: worker writes new wafer_quantity /
+    requested_delivery_date, clears the lock, and emits an
+    ``order.updated`` audit row. This is the central P1-2 contract:
+    producer committed *only* ``is_processing_locked=True`` upfront;
+    everything else lands here.
+    """
+    from app.models.audit_log import AuditLog
+    from app.models.order import Order, OrderStatus
+    from app.models.user import User, UserRole
+    from app.workers.scheduling import _perform_compound_db_action
+
+    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
+
+    import bcrypt
+
+    actor = User(
+        username="worker-dbaction-actor",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+
+    order = Order(
+        order_number="ORD-DBACTION-UPDATE",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+        created_by=actor.id,
+        status=OrderStatus.pending,
+        is_processing_locked=True,  # Producer set this.
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    compound = _stub_compound_with_db_action(
+        kind="update",
+        order_id=order.id,
+        actor_id=actor.id,
+        new_wafer_quantity=250,
+        new_requested_delivery_date="2026-09-15",
+    )
+
+    _perform_compound_db_action(compound, accepted=True)
+
+    db_session.expire_all()
+    db_session.refresh(order)
+    assert order.wafer_quantity == 250
+    assert order.requested_delivery_date == date(2026, 9, 15)
+    assert order.is_processing_locked is False
+
+    from sqlalchemy import select as _sa_select
+
+    audit = db_session.scalars(_sa_select(AuditLog).where(AuditLog.resource_id == order.id)).all()
+    actions = [row.action for row in audit]
+    assert "order.updated" in actions
+
+
+def test_perform_db_action_reject_update_clears_lock_only(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected update compound: DB columns the user *wanted* to change
+    must remain at their pre-PATCH values (producer never wrote them).
+    Worker only clears the lock so the UI unblocks. Status snaps back to
+    ``scheduled`` when ``scheduled_production_date`` is set (= row was
+    already on the schedule pre-PATCH), or ``pending`` otherwise.
+    """
+    from app.models.order import Order, OrderStatus
+    from app.models.user import User, UserRole
+    from app.workers.scheduling import _perform_compound_db_action
+
+    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
+
+    import bcrypt
+
+    actor = User(
+        username="worker-dbaction-reject-update",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+
+    order = Order(
+        order_number="ORD-DBACTION-REJ-UPDATE",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+        created_by=actor.id,
+        status=OrderStatus.pending,
+        scheduled_production_date=date(2026, 7, 15),  # pre-PATCH was scheduled
+        is_processing_locked=True,
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    compound = _stub_compound_with_db_action(
+        kind="update",
+        order_id=order.id,
+        actor_id=actor.id,
+        new_wafer_quantity=999,  # would have been written on accept
+        new_requested_delivery_date="2099-12-31",
+    )
+
+    _perform_compound_db_action(compound, accepted=False)
+
+    db_session.expire_all()
+    db_session.refresh(order)
+    # Pre-PATCH values intact.
+    assert order.wafer_quantity == 100
+    assert order.requested_delivery_date == date(2026, 8, 1)
+    # Lock cleared; status restored to scheduled (had a scheduled date).
+    assert order.is_processing_locked is False
+    assert order.status == OrderStatus.scheduled
+
+
+def test_perform_db_action_accept_delete_soft_deletes_and_audits(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted delete compound: ``is_deleted=True`` + ``status=cancelled``
+    + ``order.cancelled`` audit. Producer wrote *only* the lock; the
+    visible deletion lands here.
+    """
+    from app.models.audit_log import AuditLog
+    from app.models.order import Order, OrderStatus
+    from app.models.user import User, UserRole
+    from app.workers.scheduling import _perform_compound_db_action
+
+    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
+
+    import bcrypt
+
+    actor = User(
+        username="worker-dbaction-delete",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+
+    order = Order(
+        order_number="ORD-DBACTION-DEL",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+        created_by=actor.id,
+        status=OrderStatus.scheduled,
+        is_processing_locked=True,
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    compound = _stub_compound_with_db_action(
+        kind="delete",
+        order_id=order.id,
+        actor_id=actor.id,
+    )
+
+    _perform_compound_db_action(compound, accepted=True)
+
+    db_session.expire_all()
+    db_session.refresh(order)
+    assert order.is_deleted is True
+    assert order.status == OrderStatus.cancelled
+    assert order.is_processing_locked is False
+
+    from sqlalchemy import select as _sa_select
+
+    audit = db_session.scalars(_sa_select(AuditLog).where(AuditLog.resource_id == order.id)).all()
+    actions = [row.action for row in audit]
+    assert "order.cancelled" in actions
+
+
+def test_perform_db_action_reject_create_soft_deletes_orphan_row(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected create compound: producer pre-created a row (status=pending,
+    is_processing_locked=True) before the worker knew if the schedule
+    could accept the new order. When the schedule rejects (capacity
+    exceeded, deadline too far), the row would otherwise live forever as
+    a locked, pending orphan — UI shows it but can't apply any further
+    action because nothing's listening. Worker's compensation is to
+    soft-delete the orphan so it disappears from user views.
+    """
+    from app.models.order import Order, OrderStatus
+    from app.models.user import User, UserRole
+    from app.workers.scheduling import _perform_compound_db_action
+
+    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
+
+    import bcrypt
+
+    actor = User(
+        username="worker-dbaction-rej-create",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+
+    order = Order(
+        order_number="ORD-DBACTION-REJ-CREATE",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+        created_by=actor.id,
+        status=OrderStatus.pending,
+        is_processing_locked=True,
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    compound = _stub_compound_with_db_action(
+        kind="create",
+        order_id=order.id,
+        actor_id=actor.id,
+        new_wafer_quantity=100,
+        new_requested_delivery_date="2026-08-01",
+    )
+
+    _perform_compound_db_action(compound, accepted=False)
+
+    db_session.expire_all()
+    db_session.refresh(order)
+    assert order.is_deleted is True
+    assert order.status == OrderStatus.cancelled
+    assert order.is_processing_locked is False
+
+
+# ---------------------------------------------------------------------------
+# State-writer lock (P0-2 / P0-3)
+# ---------------------------------------------------------------------------
+#
+# These tests deliberately do NOT call ``_bypass_state_writer_lock`` —
+# they exercise the real Redis SETNX behavior to prove the mutex is
+# actually mutually exclusive. Pre-fix, two run_scheduling_task
+# invocations could both write ``schedule:state``, losing one
+# compound's effect; the lock makes the second invocation a no-op so
+# the holder owns state writes uncontested.
+
+
+def test_state_writer_lock_blocks_concurrent_run_scheduling_task(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """When the state-writer lock is held by another task, a freshly-fired
+    ``run_scheduling_task`` must return early without popping the queue
+    or touching state. The held-by task will pick up the queued compound
+    on its own re-trigger after releasing.
+    """
+    from app.workers.scheduling import STATE_WRITER_LOCK_KEY
+
+    # Pre-claim the lock as if another worker were inside its body.
+    redis_client.set(STATE_WRITER_LOCK_KEY, "other-worker-task-id", ex=300)
+
+    _enqueue(redis_client, _make_op(order_number="ORD-LOCK-HELD"))
+
+    add_mock = MagicMock(return_value=ScheduleResult(status="success"))
+    monkeypatch.setattr("app.workers.scheduling.add_order", add_mock)
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _u: None)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # Compound was NOT processed — add_order never called.
+    assert add_mock.call_count == 0
+    # Queue is untouched.
+    assert redis_client.zcard(PENDING_OPS_KEY) == 1
+    # Lock still belongs to the other worker (we didn't try CAS-delete because
+    # we never acquired).
+    assert redis_client.get(STATE_WRITER_LOCK_KEY) == "other-worker-task-id"
+
+
+def test_state_writer_lock_released_on_normal_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """After a successful run_scheduling_task, the lock must be released
+    so the next task can acquire. Without release, every subsequent task
+    would skip forever and the queue would back up.
+    """
+    from app.workers.scheduling import STATE_WRITER_LOCK_KEY
+
+    _enqueue(redis_client, _make_op(order_number="ORD-LOCK-RELEASE"))
+
+    # Don't bypass the lock — let the task actually acquire it.
+    add_mock = MagicMock(return_value=ScheduleResult(status="success"))
+    monkeypatch.setattr("app.workers.scheduling.add_order", add_mock)
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _u: None)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # add_order was actually called this time — lock was acquired.
+    assert add_mock.call_count == 1
+    # Lock is gone — released by finally.
+    assert redis_client.get(STATE_WRITER_LOCK_KEY) is None
+
+
+def test_state_writer_lock_released_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """An exception inside the task body must still release the lock via
+    ``finally``. Otherwise a single failed task would block all
+    subsequent state writes for the lock's TTL (5 minutes).
+    """
+    from app.workers.scheduling import STATE_WRITER_LOCK_KEY
+
+    _enqueue(redis_client, _make_op(order_number="ORD-LOCK-EXC"))
+
+    # Make ``_save_state`` raise so the task body bails into except.
+    # (Leaf-op RuntimeErrors are now caught inside ``_process_compound``
+    # and turned into compound_failed; we need an *outer* exception to
+    # hit the task-level except branch.)
+    monkeypatch.setattr(
+        "app.workers.scheduling.add_order",
+        MagicMock(return_value=ScheduleResult(status="success")),
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling._save_state",
+        MagicMock(side_effect=RuntimeError("simulated body failure")),
+    )
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _u: None)
+
+    result = run_scheduling_task.apply()
+    # Task is expected to fail.
+    assert not result.successful()
+
+    # Lock is still cleaned up despite the exception.
+    assert redis_client.get(STATE_WRITER_LOCK_KEY) is None
+
+
+def test_state_writer_lock_cas_delete_doesnt_release_someone_elses_lock(
+    redis_client: Redis,
+) -> None:
+    """If our TTL expired and a different task acquired the lock, our
+    finally's release must NOT delete their lock. Lua CAS guards this.
+    """
+    from app.workers.scheduling import STATE_WRITER_LOCK_KEY, _release_state_lock
+
+    # Plant another task's lock.
+    redis_client.set(STATE_WRITER_LOCK_KEY, "task-B", ex=300)
+    # Our task-A tries to release. CAS should no-op because the value
+    # belongs to task-B.
+    _release_state_lock("task-A")
+    # Task-B's lock untouched.
+    assert redis_client.get(STATE_WRITER_LOCK_KEY) == "task-B"
+
+
+# ---------------------------------------------------------------------------
+# Pending-ops DLQ (P1-5)
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_pending_op_member_is_drained_to_dlq(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """A corrupted (non-JSON) sorted-set member must land in the DLQ list
+    so the affected order's stuck ``is_processing_locked=True`` row is
+    forensically recoverable, instead of being silently dropped (which
+    pre-P1-5 forced manual DB surgery on a locked, requester-unknown
+    order). After the bad member is drained, ``_pop_next_compound``
+    continues normally with the next member.
+    """
+    from app.services.scheduling import PENDING_OPS_SEQ_KEY, score_for_op
+    from app.workers.scheduling import (
+        PENDING_OPS_DLQ_KEY,
+        _pop_next_compound,
+    )
+
+    bad_seq = redis_client.incr(PENDING_OPS_SEQ_KEY)
+    redis_client.zadd(
+        PENDING_OPS_KEY,
+        {"this is not valid json": score_for_op(group="grow", seq=bad_seq)},
+    )
+    # Follow with a well-formed compound so we can prove the loop
+    # continues to the next member after draining the bad one.
+    good_compound = _make_op(order_number="ORD-AFTER-BAD")
+    _enqueue(redis_client, good_compound)
+
+    popped = _pop_next_compound()
+
+    # Bad member was drained to DLQ.
+    assert redis_client.llen(PENDING_OPS_DLQ_KEY) == 1
+    dlq_member = redis_client.lindex(PENDING_OPS_DLQ_KEY, 0)
+    assert dlq_member == "this is not valid json"
+    # The good compound was returned by the loop's next iteration.
+    assert popped is not None
+    assert popped["ops"][0]["order_number"] == "ORD-AFTER-BAD"
+    # Pending_ops only had two members; both are now gone.
+    assert redis_client.zcard(PENDING_OPS_KEY) == 0

@@ -108,17 +108,24 @@ def _read_status() -> dict[str, Any] | None:
 def enqueue_compound(compound: ScheduleCompoundRequest) -> None:
     """Push a compound onto the pending_ops queue and trigger a run if idle.
 
-    Steps (all atomic from the caller's perspective; no partial Redis state
-    if any single primitive fails):
+    Steps:
 
     1. ``INCR schedule:pending_ops:seq`` → seq number for ordering / member
-       uniqueness.
+       uniqueness. Sequential because we need the seq to build the score
+       and embed it in the member's ``_seq`` field.
     2. Serialize the compound into JSON with ``_seq`` embedded.
-    3. ``ZADD schedule:pending_ops`` at ``score_for_op(group, seq)``.
-    4. ``HSET schedule:pending_ops:by_compound_id`` for cancel-by-id lookups.
-    5. If the worker is not currently running, ``run_scheduling_task.delay()``
-       via ``send_task`` (avoids importing from workers/ to keep the layer
-       direction clean).
+    3. **Atomic pipeline** of ``ZADD schedule:pending_ops`` and
+       ``HSET schedule:pending_ops:by_compound_id`` (P2-1). The two writes
+       have to be all-or-nothing: if ZADD succeeds but HSET fails, the
+       compound sits in the queue but is invisible to ``cancel_compound``
+       (404 on a real-in-flight compound); if HSET succeeds but ZADD
+       fails, the secondary index points at a member that the worker will
+       never see (409 on a phantom compound). Pipelining with
+       ``transaction=True`` wraps them in ``MULTI/EXEC`` so partial
+       outcomes are impossible.
+    4. If the worker is not currently running, ``run_scheduling_task.delay()``
+       via ``send_task``. Kept outside the pipeline because Celery dispatch
+       is a separate broker write, not a Redis operation on our keys.
 
     The endpoint / service caller passes a fully-validated
     :class:`ScheduleCompoundRequest` — this function does no business
@@ -133,8 +140,13 @@ def enqueue_compound(compound: ScheduleCompoundRequest) -> None:
     member = json.dumps(payload)
 
     score = score_for_op(group=compound.group, seq=seq)
-    rds.zadd(PENDING_OPS_KEY, {member: score})
-    rds.hset(BY_COMPOUND_ID_KEY, str(compound.compound_id), member)
+    # MULTI/EXEC: ZADD + HSET land atomically against Redis. If the pipe
+    # raises, neither write took effect — caller can retry or surface
+    # the error; we don't end up with sorted-set/index drift.
+    pipe = rds.pipeline(transaction=True)
+    pipe.zadd(PENDING_OPS_KEY, {member: score})
+    pipe.hset(BY_COMPOUND_ID_KEY, str(compound.compound_id), member)
+    pipe.execute()
 
     logger.info(
         "schedule.compound.enqueued",
