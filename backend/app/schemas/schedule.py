@@ -107,6 +107,10 @@ class ScheduleCompoundRequest(BaseModel):
       fail at one of the membership guards (worker rolls back, WS fires).
     - Ensure ``compound_id`` is unique. Cancellations / status queries
       use it to address a specific in-flight compound.
+    - Ops in a compound may target one or more distinct ``order_id`` —
+      single-order flows (PATCH / DELETE / CREATE) make one order per
+      compound, batch business actions are free to mix. No schema-level
+      uniqueness constraint; worker applies each op independently.
     """
 
     compound_id: uuid.UUID = Field(default_factory=uuid.uuid4)
@@ -130,26 +134,6 @@ class ScheduleCompoundRequest(BaseModel):
                 f"op_count={self.op_count} does not match len(ops)={len(self.ops)}"
             )
         return self
-
-    @model_validator(mode="after")
-    def _ops_target_same_order_within_compound(self) -> ScheduleCompoundRequest:
-        """Best-effort sanity check: ops in a compound usually target one order.
-
-        Not strictly required — a multi-order batch action would in principle
-        be representable as one compound. But in this codebase every compound
-        flows from a single Order-CRUD action, so a multi-order compound is
-        almost certainly a bug. Warn (raise) loudly.
-        """
-        if not self.ops:
-            return self
-        order_ids = {op.order_id for op in self.ops}
-        if len(order_ids) > 1:
-            raise ValueError(
-                "All ops in a compound must target the same order_id; "
-                f"got {len(order_ids)} distinct ids."
-            )
-        return self
-
 
 # ---------------------------------------------------------------------------
 # Response schemas
@@ -233,27 +217,40 @@ class ScheduleRebuildResponse(BaseModel):
     message: str
 
 
+class PendingOpsOpView(BaseModel):
+    """One leaf op surfaced inside a :class:`PendingOpsEntry`.
+
+    Trimmed projection of :class:`ScheduleOpInCompound` — only the fields
+    the dashboard actually needs to render queue state. ``wafer_quantity``
+    / ``deadline`` / ``fake_deadline`` are dropped because the dashboard
+    has them via ``/schedule/result`` already.
+    """
+
+    op: Literal["add", "remove", "pin", "unpin"]
+    order_id: uuid.UUID
+    order_number: str
+
+
 class PendingOpsEntry(BaseModel):
     """One queued compound's drain-position snapshot.
 
     Returned by ``GET /schedule/pending_ops``. ``rank`` is 1-indexed and
     matches the order ``run_scheduling_task`` will pop compounds via
-    ``ZPOPMIN`` — so rank=1 is "next to be processed". Every op inside a
-    compound targets the same ``order_id`` (enforced at enqueue time), so
-    the dashboard can group by ``order_id`` to answer "where is this
-    order in line?".
+    ``ZPOPMIN`` — so rank=1 is "next to be processed".
+
+    A compound may touch one OR more orders (batch business actions are
+    legal); ``ops`` keeps the per-op order linkage so the dashboard can
+    answer "where is order X in line?" by filtering ``ops`` for that
+    ``order_id`` and reading the compound's ``rank``. Distinct order
+    ids can be derived as ``{op.order_id for op in ops}`` — we don't
+    duplicate that derived view on this schema.
     """
 
     compound_id: uuid.UUID
     rank: int = Field(ge=1)
-    order_id: uuid.UUID
-    order_number: str
     group: Literal["shrink", "grow"]
     op_count: int = Field(ge=1)
-    # Just the op-kind strings in compound order — enough for the
-    # dashboard to label "delete in progress" / "pin in flight" without
-    # pulling the full leaf-op payloads.
-    ops: list[Literal["add", "remove", "pin", "unpin"]]
+    ops: list[PendingOpsOpView]
     requested_by: uuid.UUID
 
 

@@ -274,19 +274,28 @@ const res = await fetch("/api/v1/schedule/pending_ops", {
 });
 const queued = await res.json();
 // [
-//   { compound_id, rank: 1, order_id, order_number, group: "shrink",
-//     op_count: 2, ops: ["unpin", "remove"], requested_by },
+//   { compound_id, rank: 1, group: "shrink", op_count: 2,
+//     ops: [
+//       { op: "unpin",  order_id: "uuid-a", order_number: "ORD-A" },
+//       { op: "remove", order_id: "uuid-a", order_number: "ORD-A" }
+//     ],
+//     requested_by },
 //   { compound_id, rank: 2, ... },
 //   ...
 // ]
 ```
 
-`rank=1` 代表 worker 下一個會處理的 compound。同一筆訂單可能在 list 中出現多次（連續 PATCH 快過 worker 消化速度時會堆兩個 compound）；前端通常按 `order_id` group 取最小 rank：
+`rank=1` 代表 worker 下一個會處理的 compound。**一個 compound 可能跨多筆訂單**（batch 業務動作的合法形狀），所以 `ops[]` 每筆 leaf 都各自帶 `order_id` / `order_number`。同一筆訂單在 list 中也可能出現多次（連續 PATCH 快過 worker 消化速度、或多個 compound 都碰到它）；前端通常掃 `ops` 找出含該 `order_id` 的 compound、取最小 rank：
 
 ```ts
 const rankByOrder = new Map<string, number>();
 for (const it of queued) {
-    if (!rankByOrder.has(it.order_id)) rankByOrder.set(it.order_id, it.rank);
+    for (const o of it.ops) {
+        const cur = rankByOrder.get(o.order_id);
+        if (cur === undefined || it.rank < cur) {
+            rankByOrder.set(o.order_id, it.rank);
+        }
+    }
 }
 // rankByOrder.get(orderId) → 該訂單下一個動作排第幾、或 undefined 代表沒在排隊
 ```

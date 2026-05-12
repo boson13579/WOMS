@@ -656,15 +656,15 @@ def _enqueue_payload_directly(
     group: str,
     seq: int,
     compound_id: uuid.UUID,
-    order_id: uuid.UUID,
-    order_number: str,
-    op_kinds: list[str],
+    ops: list[tuple[str, uuid.UUID, str]],
     requested_by: uuid.UUID,
 ) -> None:
     """Write one ScheduleCompoundRequest directly into the fake Redis sorted set.
 
     Bypasses ``enqueue_compound`` (which would also fire a Celery .delay)
-    so we can construct an exact queue state for the assertion.
+    so we can construct an exact queue state for the assertion. ``ops`` is
+    a list of ``(op_kind, order_id, order_number)`` tuples — a compound
+    may legally span multiple order_ids, so each leaf carries its own.
     """
     from app.services.scheduling import score_for_op
 
@@ -676,12 +676,12 @@ def _enqueue_payload_directly(
             "wafer_quantity": 100,
             "deadline": "2026-08-01",
         }
-        for kind in op_kinds
+        for kind, order_id, order_number in ops
     ]
     payload = {
         "compound_id": str(compound_id),
         "group": group,
-        "op_count": len(op_kinds),
+        "op_count": len(ops),
         "ops": ops_payload,
         "requested_by": str(requested_by),
         "_seq": seq,
@@ -715,9 +715,7 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
         group="grow",
         seq=1,
         compound_id=c_grow,
-        order_id=o1,
-        order_number="ORD-GROW",
-        op_kinds=["add"],
+        ops=[("add", o1, "ORD-GROW")],
         requested_by=actor,
     )
     _enqueue_payload_directly(
@@ -725,9 +723,7 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
         group="shrink",
         seq=2,
         compound_id=c_shrink_old,
-        order_id=o2,
-        order_number="ORD-SHRINK-A",
-        op_kinds=["remove"],
+        ops=[("remove", o2, "ORD-SHRINK-A")],
         requested_by=actor,
     )
     _enqueue_payload_directly(
@@ -735,9 +731,7 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
         group="shrink",
         seq=3,
         compound_id=c_shrink_new,
-        order_id=o3,
-        order_number="ORD-SHRINK-B",
-        op_kinds=["unpin", "remove"],
+        ops=[("unpin", o3, "ORD-SHRINK-B"), ("remove", o3, "ORD-SHRINK-B")],
         requested_by=actor,
     )
 
@@ -749,14 +743,70 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
     # Shrink-group compounds come first regardless of seq order; FIFO within
     # group means shrink_old (seq=2) ranks above shrink_new (seq=3).
     assert items[0]["compound_id"] == str(c_shrink_old)
-    assert items[0]["order_id"] == str(o2)
     assert items[0]["group"] == "shrink"
+    assert items[0]["ops"] == [
+        {"op": "remove", "order_id": str(o2), "order_number": "ORD-SHRINK-A"},
+    ]
     assert items[1]["compound_id"] == str(c_shrink_new)
-    assert items[1]["ops"] == ["unpin", "remove"]
     assert items[1]["op_count"] == 2
+    assert [op["op"] for op in items[1]["ops"]] == ["unpin", "remove"]
     # Grow-group ranks last.
     assert items[2]["compound_id"] == str(c_grow)
     assert items[2]["group"] == "grow"
+
+
+def test_pending_ops_supports_compounds_spanning_multiple_orders(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """A compound may legitimately touch >1 order_id (batch business
+    actions). ``ops`` in the response keeps per-leaf order info so the
+    dashboard can answer "where is order X queued?" even when X shares
+    a compound with another order.
+    """
+    fake_redis = _FakeRedis()
+    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _make_user(db_session, username="mgr_pq_multi", role=UserRole.order_manager)
+    token = _login(client, "mgr_pq_multi")
+
+    c_multi = uuid.uuid4()
+    o_a, o_b = uuid.uuid4(), uuid.uuid4()
+    actor = uuid.uuid4()
+
+    _enqueue_payload_directly(
+        fake_redis,
+        group="grow",
+        seq=1,
+        compound_id=c_multi,
+        ops=[
+            ("remove", o_a, "ORD-BATCH-A"),
+            ("add", o_b, "ORD-BATCH-B"),
+        ],
+        requested_by=actor,
+    )
+
+    res = client.get("/api/v1/schedule/pending_ops", headers=_auth(token))
+
+    assert res.status_code == 200
+    items = res.json()
+    assert len(items) == 1
+    assert items[0]["op_count"] == 2
+    # Both order_ids show up in the same compound's ops; ranks for both
+    # are simply the compound's rank (=1).
+    assert {op["order_id"] for op in items[0]["ops"]} == {str(o_a), str(o_b)}
+    # The dashboard's per-order lookup pattern: find compounds whose
+    # ops contain the order_id of interest.
+    a_rank = min(
+        it["rank"]
+        for it in items
+        if any(op["order_id"] == str(o_a) for op in it["ops"])
+    )
+    b_rank = min(
+        it["rank"]
+        for it in items
+        if any(op["order_id"] == str(o_b) for op in it["ops"])
+    )
+    assert a_rank == 1
+    assert b_rank == 1
 
 
 def test_pending_ops_returns_empty_list_when_queue_is_idle(

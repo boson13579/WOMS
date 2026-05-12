@@ -35,7 +35,11 @@ import structlog
 from redis import Redis
 
 from app.core.config import get_settings
-from app.schemas.schedule import PendingOpsEntry, ScheduleCompoundRequest
+from app.schemas.schedule import (
+    PendingOpsEntry,
+    PendingOpsOpView,
+    ScheduleCompoundRequest,
+)
 from app.services import websocket
 from app.services.scheduling import (
     MATERIALIZE_NOTIFY_PENDING_KEY,
@@ -242,16 +246,21 @@ def list_pending_ops() -> list[PendingOpsEntry]:
                 compound_id=payload.get("compound_id"),
             )
             continue
-        first_op = ops[0]
+        op_views = [
+            PendingOpsOpView(
+                op=op["op"],
+                order_id=uuid.UUID(op["order_id"]),
+                order_number=op["order_number"],
+            )
+            for op in ops
+        ]
         entries.append(
             PendingOpsEntry(
                 compound_id=uuid.UUID(payload["compound_id"]),
                 rank=rank,
-                order_id=uuid.UUID(first_op["order_id"]),
-                order_number=first_op["order_number"],
                 group=payload["group"],
                 op_count=payload["op_count"],
-                ops=[op["op"] for op in ops],
+                ops=op_views,
                 requested_by=uuid.UUID(payload["requested_by"]),
             )
         )

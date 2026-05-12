@@ -141,11 +141,14 @@ def enqueue_operation(
 ) -> ScheduleCompoundResponse:
     """Queue a scheduler compound for the next ``run_scheduling_task``.
 
-    A compound is an atomic business action containing 1-4 leaf ops (add /
-    remove / pin / unpin). See :class:`ScheduleCompoundRequest` for the
-    full contract; in brief:
+    A compound is an atomic business action containing one or more leaf
+    ops (add / remove / pin / unpin). See :class:`ScheduleCompoundRequest`
+    for the full contract; in brief:
 
-    - All ops in a compound target the same order_id.
+    - Ops within a compound may target one or more order_ids — typical
+      single-order flows (PATCH / DELETE / CREATE) generate one order
+      per compound, while a multi-order batch business action is also
+      a legal shape.
     - The compound has a single ``group`` (shrink or grow). Shrink
       compounds sort before grow compounds in the worker queue; FIFO
       within each group.
@@ -294,11 +297,14 @@ def get_pending_ops(
     Each entry is one ``ScheduleCompoundRequest`` currently sitting in
     ``schedule:pending_ops`` (the Redis sorted set the worker drains via
     ``ZPOPMIN``). ``rank`` is 1-indexed and matches the order the worker
-    will process them — rank=1 is "next to be processed". The dashboard
-    can group by ``order_id`` to answer "where is this order in line?";
-    one order may legitimately have more than one compound queued (e.g.,
-    two rapid PATCHes back-to-back) so the same order_id can appear
-    multiple times.
+    will process them — rank=1 is "next to be processed".
+
+    A compound may touch one OR more orders (a batch business action is
+    legal); ``ops`` on each entry keeps the per-op order linkage. The
+    dashboard answers "where is order X in line?" by scanning entries
+    whose ``ops`` contain ``order_id == X`` and reading the smallest
+    ``rank`` (an order can appear in multiple compounds if PATCHes pile
+    up faster than the worker drains).
 
     Empty list when the queue is idle. Returns 200 either way so the
     dashboard can poll without special-casing "no data".
