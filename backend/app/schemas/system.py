@@ -15,6 +15,7 @@ __all__ = [
     "ServiceHealthDetail",
     "ServiceHealthEntry",
     "SystemHealthResponse",
+    "UsernamesLookupResponse",
 ]
 
 
@@ -56,3 +57,16 @@ class SystemHealthResponse(BaseModel):
     """
 
     services: list[ServiceHealthEntry]
+
+
+class UsernamesLookupResponse(BaseModel):
+    """UUID → username map returned by ``GET /system/usernames``.
+
+    Keys are stringified UUIDs (so JSON round-trips cleanly); values are
+    the matching ``users.username`` or ``None`` when the UUID is unknown
+    (deleted user, typo, etc.). The frontend's Pending Ops table uses
+    this to render a requester column without needing the root-only
+    ``GET /users`` endpoint.
+    """
+
+    usernames: dict[str, str | None] = Field(default_factory=dict)

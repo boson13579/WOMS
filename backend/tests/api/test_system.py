@@ -326,3 +326,125 @@ def test_system_health_celery_healthy_when_idle_with_fresh_finish(
     assert res.status_code == 200
     celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
     assert celery_entry["status"] == "healthy"
+
+
+# ===========================================================================
+# GET /system/usernames — bulk UUID → username lookup
+# ===========================================================================
+#
+# The dashboard's Pending Ops table needs to render the requester's username
+# next to each compound. ``/users`` is root-only by design (full CRUD), so a
+# slimmer read-only "give me the username for these UUIDs" endpoint lives
+# here in ``/system/*`` and is open to any logged-in user. Same RBAC bar as
+# ``/system/health``.
+
+
+def test_system_usernames_requires_authentication(client: TestClient) -> None:
+    """Unauthenticated → 401 via the unified error envelope."""
+    res = client.get("/api/v1/system/usernames?ids=0e6ff691-0923-47c7-81b4-d5cf6359b004")
+    assert res.status_code == 401
+
+
+def test_system_usernames_returns_username_map(
+    client: TestClient, db_session: Session
+) -> None:
+    """Happy path: pass a list of UUIDs, get back {uuid: username}."""
+    alice = _make_user(db_session, username="lookup_alice", role=UserRole.scheduler)
+    bob = _make_user(db_session, username="lookup_bob", role=UserRole.viewer)
+    viewer = _make_user(db_session, username="lookup_viewer", role=UserRole.viewer)
+    token = _login(client, "lookup_viewer")
+
+    res = client.get(
+        f"/api/v1/system/usernames?ids={alice.id},{bob.id}",
+        headers=_auth(token),
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["usernames"] == {
+        str(alice.id): "lookup_alice",
+        str(bob.id): "lookup_bob",
+    }
+    # Sanity: we did NOT request viewer's id, so it must not be in the map.
+    assert str(viewer.id) not in data["usernames"]
+
+
+def test_system_usernames_returns_null_for_unknown_uuid(
+    client: TestClient, db_session: Session
+) -> None:
+    """Unknown UUIDs map to ``null`` — caller can distinguish missing rows
+    from a 4xx error, and partial results don't block the table render."""
+    import uuid as _uuid
+
+    _make_user(db_session, username="lookup_partial", role=UserRole.viewer)
+    token = _login(client, "lookup_partial")
+
+    unknown = _uuid.uuid4()
+    res = client.get(
+        f"/api/v1/system/usernames?ids={unknown}",
+        headers=_auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json()["usernames"] == {str(unknown): None}
+
+
+def test_system_usernames_dedupes_repeated_uuids(
+    client: TestClient, db_session: Session
+) -> None:
+    """If a UUID appears twice in ``ids``, it appears once in the response.
+
+    The frontend's typical usage is "collect distinct requested_by from
+    pending-ops table"; dedup-on-receive saves the caller from sending a
+    set conversion every time.
+    """
+    user = _make_user(db_session, username="lookup_dup", role=UserRole.viewer)
+    token = _login(client, "lookup_dup")
+
+    res = client.get(
+        f"/api/v1/system/usernames?ids={user.id},{user.id}",
+        headers=_auth(token),
+    )
+    assert res.status_code == 200
+    assert res.json()["usernames"] == {str(user.id): "lookup_dup"}
+
+
+def test_system_usernames_rejects_empty_ids(
+    client: TestClient, db_session: Session
+) -> None:
+    """``?ids=`` (empty string) is a programming error on the caller side;
+    a 422 makes the bug surface immediately rather than silently returning
+    ``{}``."""
+    _make_user(db_session, username="lookup_empty", role=UserRole.viewer)
+    token = _login(client, "lookup_empty")
+
+    res = client.get("/api/v1/system/usernames?ids=", headers=_auth(token))
+    assert res.status_code == 422
+
+
+def test_system_usernames_caps_request_size(
+    client: TestClient, db_session: Session
+) -> None:
+    """A huge ``ids`` list is an abuse / programming-error signal — cap at
+    100 per request and 422 anything larger. Frontend chunks requests if
+    it ever needs more (it never does today)."""
+    import uuid as _uuid
+
+    _make_user(db_session, username="lookup_cap", role=UserRole.viewer)
+    token = _login(client, "lookup_cap")
+
+    too_many = ",".join(str(_uuid.uuid4()) for _ in range(101))
+    res = client.get(f"/api/v1/system/usernames?ids={too_many}", headers=_auth(token))
+    assert res.status_code == 422
+
+
+def test_system_usernames_rejects_malformed_uuid(
+    client: TestClient, db_session: Session
+) -> None:
+    """Garbage in the ``ids`` query → 422 with the unified error envelope.
+
+    Don't try to silently skip — caller should fix the bug at the source.
+    """
+    _make_user(db_session, username="lookup_bad_uuid", role=UserRole.viewer)
+    token = _login(client, "lookup_bad_uuid")
+
+    res = client.get("/api/v1/system/usernames?ids=not-a-uuid", headers=_auth(token))
+    assert res.status_code == 422

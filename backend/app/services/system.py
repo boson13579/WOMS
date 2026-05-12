@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import socket
 import time
-from collections.abc import Callable
+import uuid as uuid_module
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Literal, cast
@@ -34,14 +35,16 @@ import structlog
 from redis import Redis
 from redis.backoff import NoBackoff
 from redis.retry import Retry
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.models.user import User
 from app.schemas.system import (
     ServiceHealthDetail,
     ServiceHealthEntry,
     SystemHealthResponse,
+    UsernamesLookupResponse,
 )
 
 ServiceId = Literal["api", "postgres", "redis", "celery"]
@@ -49,7 +52,7 @@ HealthStatus = Literal["healthy", "warning", "error"]
 
 logger = structlog.get_logger(__name__)
 
-__all__ = ["gather_system_health"]
+__all__ = ["gather_system_health", "lookup_usernames"]
 
 
 # ---------------------------------------------------------------------------
@@ -364,3 +367,40 @@ def gather_system_health(db: Session) -> SystemHealthResponse:
         _safe("celery", "Celery Worker", _probe_celery),
     ]
     return SystemHealthResponse(services=services)
+
+
+# ---------------------------------------------------------------------------
+# Username lookup
+# ---------------------------------------------------------------------------
+
+
+def lookup_usernames(
+    db: Session,
+    user_ids: Iterable[uuid_module.UUID],
+) -> UsernamesLookupResponse:
+    """Resolve each ``user_id`` to its ``username`` or ``None`` if unknown.
+
+    Returns a stable map keyed by the stringified UUID — JSON-friendly
+    and easy for the frontend to index by ``entry.requested_by``.
+
+    Soft-deleted users would normally not appear here, but the existing
+    ``users`` model has no ``is_deleted`` flag (deactivation flips
+    ``is_active`` instead). Inactive users are still returned by name —
+    the dashboard's Pending Ops view legitimately needs to render their
+    historical compounds.
+    """
+    ids = list(user_ids)
+    if not ids:
+        return UsernamesLookupResponse(usernames={})
+
+    rows = db.scalars(select(User).where(User.id.in_(ids))).all()
+    found: dict[str, str | None] = {str(u.id): u.username for u in rows}
+
+    # Fill in nulls for any IDs the DB didn't know about so the response
+    # is shaped consistently — caller can iterate without ``.get(...)``.
+    for user_id in ids:
+        key = str(user_id)
+        if key not in found:
+            found[key] = None
+
+    return UsernamesLookupResponse(usernames=found)
