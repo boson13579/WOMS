@@ -646,7 +646,7 @@ def test_result_without_token_returns_401(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GET /pending_ops
+# GET /pending-ops
 # ---------------------------------------------------------------------------
 
 
@@ -735,7 +735,7 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
         requested_by=actor,
     )
 
-    res = client.get("/api/v1/schedule/pending_ops", headers=_auth(token))
+    res = client.get("/api/v1/schedule/pending-ops", headers=_auth(token))
 
     assert res.status_code == 200
     items = res.json()
@@ -784,7 +784,7 @@ def test_pending_ops_supports_compounds_spanning_multiple_orders(
         requested_by=actor,
     )
 
-    res = client.get("/api/v1/schedule/pending_ops", headers=_auth(token))
+    res = client.get("/api/v1/schedule/pending-ops", headers=_auth(token))
 
     assert res.status_code == 200
     items = res.json()
@@ -818,7 +818,7 @@ def test_pending_ops_returns_empty_list_when_queue_is_idle(
     _make_user(db_session, username="mgr_pq_empty", role=UserRole.order_manager)
     token = _login(client, "mgr_pq_empty")
 
-    res = client.get("/api/v1/schedule/pending_ops", headers=_auth(token))
+    res = client.get("/api/v1/schedule/pending-ops", headers=_auth(token))
 
     assert res.status_code == 200
     assert res.json() == []
@@ -832,14 +832,14 @@ def test_pending_ops_by_viewer_returns_403(
     _make_user(db_session, username="viewer_pq", role=UserRole.viewer)
     token = _login(client, "viewer_pq")
 
-    res = client.get("/api/v1/schedule/pending_ops", headers=_auth(token))
+    res = client.get("/api/v1/schedule/pending-ops", headers=_auth(token))
 
     assert res.status_code == 403
     assert res.json()["error"]["code"] == 403
 
 
 def test_pending_ops_without_token_returns_401(client: TestClient) -> None:
-    res = client.get("/api/v1/schedule/pending_ops")
+    res = client.get("/api/v1/schedule/pending-ops")
     assert res.status_code == 401
     assert res.json()["error"]["code"] == 401
 

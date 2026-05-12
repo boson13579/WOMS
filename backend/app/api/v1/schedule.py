@@ -281,12 +281,12 @@ def get_schedule_result(
 
 
 # ---------------------------------------------------------------------------
-# GET /pending_ops
+# GET /pending-ops
 # ---------------------------------------------------------------------------
 
 
 @router.get(
-    "/pending_ops",
+    "/pending-ops",
     response_model=list[PendingOpsEntry],
 )
 def get_pending_ops(

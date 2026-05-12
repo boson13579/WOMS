@@ -234,7 +234,7 @@ class PendingOpsOpView(BaseModel):
 class PendingOpsEntry(BaseModel):
     """One queued compound's drain-position snapshot.
 
-    Returned by ``GET /schedule/pending_ops``. ``rank`` is 1-indexed and
+    Returned by ``GET /schedule/pending-ops``. ``rank`` is 1-indexed and
     matches the order ``run_scheduling_task`` will pop compounds via
     ``ZPOPMIN`` — so rank=1 is "next to be processed".
 

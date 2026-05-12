@@ -194,7 +194,7 @@ def unpin_order(order, actor):
 | `GET` | `/status` | order_manager+ | 排程 worker 的 lifecycle snapshot（`idle`/`running`/`failed`） |
 | `GET` | `/result` | order_manager+ | 目前已排定 / 進行中的訂單清單（含每筆訂單的逐日數量 `daily_breakdown`，包含 `scheduled` 跟 `in_production` 兩種 status） |
 | `GET` | `/capacity` | order_manager+ | 未來 30 天剩餘產能的**前綴和**序列，dashboard 畫產能圖用 |
-| `GET` | `/pending_ops` | order_manager+ | 排隊中 compound 的 drain 順位快照（rank=1 = 下一個會被 worker 處理） |
+| `GET` | `/pending-ops` | order_manager+ | 排隊中 compound 的 drain 順位快照（rank=1 = 下一個會被 worker 處理） |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建排程 state（async；不會 block） |
 | `POST` | `/operations` | scheduler+ | 推 compound 進佇列（Phase 2 後 Order CRUD 自動處理大部分情況，前端只在「手動 pin / unpin」時直接打） |
 | `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound（前端「取消」按鈕）。200 = 取消成功；409 = worker 已開始處理，無法取消；404 = compound id 未知 |
@@ -266,10 +266,10 @@ const dailyRemaining = cap.entries.map((e, i) =>
 
 收到 WebSocket `schedule.materialized` / `schedule.updated` 時前端可以跟 `/result` 並行 refetch 這條，把產能圖一起更新。
 
-#### 3.2.3 `GET /api/v1/schedule/pending_ops` — 排隊中 compound 順位
+#### 3.2.3 `GET /api/v1/schedule/pending-ops` — 排隊中 compound 順位
 
 ```ts
-const res = await fetch("/api/v1/schedule/pending_ops", {
+const res = await fetch("/api/v1/schedule/pending-ops", {
     headers: { Authorization: `Bearer ${token}` },
 });
 const queued = await res.json();
