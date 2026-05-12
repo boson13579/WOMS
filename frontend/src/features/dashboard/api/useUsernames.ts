@@ -10,6 +10,7 @@
  * caller can pass `useUsernames(maybeIds)` without checking length.
  */
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
+import { useMemo } from 'react';
 import { z } from 'zod';
 
 import { useCurrentUser } from '@/lib/auth';
@@ -32,9 +33,11 @@ const STALE_TIME_MS = 60_000;
 
 export function useUsernames(ids: readonly string[]): UseQueryResult<UsernamesMap> {
   const user = useCurrentUser();
-  // Dedup while preserving stability for the React Query key.
-  const uniqueIds = Array.from(new Set(ids));
-  const queryParam = uniqueIds.join(',');
+  // Dedup while preserving stability for the React Query key. Pending
+  // Ops polls every 10s and re-renders siblings, so memoizing keeps
+  // the Set construction off the hot path.
+  const uniqueIds = useMemo(() => Array.from(new Set(ids)), [ids]);
+  const queryParam = useMemo(() => uniqueIds.join(','), [uniqueIds]);
 
   return useQuery<UsernamesMap>({
     queryKey: usernamesQueryKey(uniqueIds),

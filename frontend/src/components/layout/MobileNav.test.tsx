@@ -117,4 +117,21 @@ describe('MobileNav', () => {
 
     expect(screen.getByRole('link', { name: /users/i })).toBeInTheDocument();
   });
+
+  it('focuses the first nav link on open and restores body scroll on close', () => {
+    renderWithRouter();
+    openDrawer();
+
+    // First focusable inside the drawer (Dashboard link) gets focus —
+    // keyboard users land inside the dialog instead of behind it.
+    expect(document.activeElement).toBe(screen.getByRole('link', { name: /dashboard/i }));
+    // Body scroll is locked while open so touch swipes don't drag the
+    // page underneath.
+    expect(document.body.style.overflow).toBe('hidden');
+
+    act(() => {
+      useMobileNavStore.setState({ open: false });
+    });
+    expect(document.body.style.overflow).toBe('');
+  });
 });

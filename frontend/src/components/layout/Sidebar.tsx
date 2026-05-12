@@ -152,7 +152,7 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
           <Settings className="h-4 w-4" />
           <span className="flex-1">Settings</span>
         </div>
-        <div className="mt-2 px-3 text-[10px] text-muted-foreground">Phase 1 · v0.1.0</div>
+        <div className="mt-2 px-3 text-[10px] text-muted-foreground">Phase 2 · v0.2.0</div>
       </div>
     </div>
   );

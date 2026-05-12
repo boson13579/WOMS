@@ -11,6 +11,7 @@
  * baking that into this card would crowd the dashboard.
  */
 import { AlertTriangle, Inbox, Layers } from 'lucide-react';
+import { useMemo } from 'react';
 
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -46,8 +47,12 @@ export function PendingOpsTable({
   // Resolve the requester UUIDs to usernames in bulk. ``useUsernames``
   // short-circuits on an empty list so this is safe even before data
   // loads — the hook returns ``{}`` and the table renders the raw UUID
-  // as a fallback below.
-  const requesterIds = (data ?? []).slice(0, topN).map((e) => e.requested_by);
+  // as a fallback below. Memoize so polling-driven re-renders don't
+  // recompute the requester array on every tick.
+  const requesterIds = useMemo(
+    () => (data ?? []).slice(0, topN).map((e) => e.requested_by),
+    [data, topN],
+  );
   const usernames = useUsernames(requesterIds);
 
   if (isLoading) {
