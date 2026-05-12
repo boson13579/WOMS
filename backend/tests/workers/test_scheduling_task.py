@@ -1,9 +1,11 @@
 """Tests for ``app.workers.scheduling`` Celery tasks.
 
-Every external dependency is mocked via ``monkeypatch`` — Redis is replaced
-by a small in-memory fake, the SQLAlchemy session is a ``MagicMock``, and
-the algorithm functions / WebSocket placeholders are patched at the worker
-module's binding site so the body under test is exercised in isolation.
+External collaborators (SQLAlchemy session, algorithm primitives, WebSocket
+publish) are mocked at the worker module's binding site so the body under
+test is exercised in isolation. **Redis is real** — the session-wide
+``redis_container`` from the root conftest exposes a Redis 7 instance at
+the URL the app reads from settings, and the autouse ``_redis_flushdb``
+fixture wipes the keyspace between tests for isolation.
 
 Tasks are invoked through ``.apply()``, which runs them synchronously while
 still wiring up the ``self.request`` binding the worker code reads.
@@ -34,165 +36,7 @@ from app.workers.scheduling import (
     rebuild_schedule_task,
     run_scheduling_task,
 )
-
-# ---------------------------------------------------------------------------
-# Fake Redis
-# ---------------------------------------------------------------------------
-
-
-class _FakeRedis:
-    """Minimal in-memory stand-in for the subset of Redis the worker uses.
-
-    Implements the string ops (``get`` / ``set`` / ``incr``) and the sorted-set
-    ops (``zadd`` / ``zpopmin`` / ``zcard``) that ``run_scheduling_task`` and
-    ``rebuild_schedule_task`` exercise.
-    """
-
-    def __init__(self) -> None:
-        self._strings: dict[str, str] = {}
-        # Sorted set: list of (score, member) kept sorted by score ascending,
-        # ties broken by member lex order (matches real Redis semantics
-        # closely enough for our tests).
-        self._zsets: dict[str, list[tuple[float, str]]] = {}
-        # Hash maps for secondary indexes (e.g. by-compound-id).
-        self._hashes: dict[str, dict[str, str]] = {}
-        # Plain sets for the materializer's notify queue (Phase 4).
-        self._sets: dict[str, set[str]] = {}
-
-    # ----- String ops --------------------------------------------------------
-    def get(self, key: str) -> str | None:
-        return self._strings.get(key)
-
-    def set(
-        self,
-        key: str,
-        value: str,
-        ex: int | None = None,
-        nx: bool = False,
-    ) -> bool | None:
-        # ``ex`` (TTL seconds) is accepted for API compatibility — tests
-        # don't actually expire keys; callers that care about TTL behavior
-        # should manually evict via ``delete``.
-        # ``nx`` matches real redis: only set if key doesn't exist; returns
-        # True on success, None on conflict.
-        if nx:
-            if key in self._strings:
-                return None
-            self._strings[key] = value
-            return True
-        self._strings[key] = value
-        return True
-
-    def exists(self, *keys: str) -> int:
-        return sum(
-            1
-            for key in keys
-            if key in self._strings
-            or key in self._zsets
-            or key in self._hashes
-            or key in self._sets
-        )
-
-    def incr(self, key: str) -> int:
-        cur = int(self._strings.get(key, "0")) + 1
-        self._strings[key] = str(cur)
-        return cur
-
-    def delete(self, *keys: str) -> int:
-        n = 0
-        for key in keys:
-            if self._strings.pop(key, None) is not None:
-                n += 1
-            if self._zsets.pop(key, None) is not None:
-                n += 1
-            if self._hashes.pop(key, None) is not None:
-                n += 1
-            if self._sets.pop(key, None) is not None:
-                n += 1
-        return n
-
-    def rename(self, src: str, dst: str) -> bool:
-        for bucket in (self._strings, self._zsets, self._hashes, self._sets):
-            if src in bucket:
-                bucket[dst] = bucket.pop(src)
-                return True
-        from redis.exceptions import ResponseError
-
-        raise ResponseError(f"no such key: {src}")
-
-    # ----- Plain set ops (Phase 4 materializer queue) -------------------------
-    def sadd(self, key: str, *members: str) -> int:
-        bucket = self._sets.setdefault(key, set())
-        added = 0
-        for m in members:
-            if m not in bucket:
-                bucket.add(m)
-                added += 1
-        return added
-
-    def smembers(self, key: str) -> set[str]:
-        return set(self._sets.get(key, set()))
-
-    def scard(self, key: str) -> int:
-        return len(self._sets.get(key, set()))
-
-    def sunionstore(self, dest: str, keys: list[str]) -> int:
-        union: set[str] = set()
-        for k in keys:
-            union |= self._sets.get(k, set())
-        self._sets[dest] = union
-        return len(union)
-
-    # ----- Sorted-set ops ----------------------------------------------------
-    def zadd(self, key: str, mapping: dict[str, float]) -> int:
-        bucket = self._zsets.setdefault(key, [])
-        added = 0
-        for member, score in mapping.items():
-            existing = next((i for i, (_, m) in enumerate(bucket) if m == member), None)
-            if existing is not None:
-                bucket.pop(existing)
-            else:
-                added += 1
-            insert_at = next(
-                (i for i, (s, m) in enumerate(bucket) if (s, m) > (score, member)),
-                len(bucket),
-            )
-            bucket.insert(insert_at, (score, member))
-        return added
-
-    def zpopmin(self, key: str, count: int = 1) -> list[tuple[str, float]]:
-        bucket = self._zsets.get(key)
-        if not bucket:
-            return []
-        out: list[tuple[str, float]] = []
-        for _ in range(min(count, len(bucket))):
-            score, member = bucket.pop(0)
-            out.append((member, score))
-        return out
-
-    def zcard(self, key: str) -> int:
-        return len(self._zsets.get(key, []))
-
-    # ----- Hash ops ----------------------------------------------------------
-    def hset(self, key: str, field: str, value: str) -> int:
-        bucket = self._hashes.setdefault(key, {})
-        is_new = field not in bucket
-        bucket[field] = value
-        return 1 if is_new else 0
-
-    def hdel(self, key: str, *fields: str) -> int:
-        bucket = self._hashes.get(key)
-        if bucket is None:
-            return 0
-        removed = 0
-        for f in fields:
-            if bucket.pop(f, None) is not None:
-                removed += 1
-        return removed
-
-    def hget(self, key: str, field: str) -> str | None:
-        return self._hashes.get(key, {}).get(field)
-
+from redis import Redis
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -307,8 +151,8 @@ def _install_auto_retrigger_delay(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     return delay_mock
 
 
-def _enqueue(fake_redis: _FakeRedis, compound: dict[str, Any]) -> None:
-    """Enqueue *compound* into the fake sorted-set like the real producer.
+def _enqueue(redis_client: Redis, compound: dict[str, Any]) -> None:
+    """Enqueue *compound* into the live Redis sorted-set like the real producer.
 
     Mirrors ``schedule_queue.enqueue_compound``: bumps the seq counter,
     embeds it as ``_seq``, and ZADDs at the score computed by ``score_for_op``
@@ -320,25 +164,26 @@ def _enqueue(fake_redis: _FakeRedis, compound: dict[str, Any]) -> None:
     )
 
     group = compound["group"]
-    seq = fake_redis.incr(PENDING_OPS_SEQ_KEY)
+    seq = redis_client.incr(PENDING_OPS_SEQ_KEY)
     payload = {**compound, "_seq": seq}
-    fake_redis.zadd(PENDING_OPS_KEY, {json.dumps(payload): score_for_op(group=group, seq=seq)})
+    redis_client.zadd(PENDING_OPS_KEY, {json.dumps(payload): score_for_op(group=group, seq=seq)})
 
 
 def _patch_common(
     monkeypatch: pytest.MonkeyPatch,
-    fake_redis: _FakeRedis,
     *,
     add_order: MagicMock | None = None,
     compute_schedule: Any | None = None,
 ) -> dict[str, MagicMock]:
     """Stub out the side-effecting collaborators of ``run_scheduling_task``.
 
+    Redis itself is NOT patched — the session-scoped ``redis_container``
+    fixture supplies a real client at ``settings.REDIS_URL``, so anything
+    the worker reaches into via ``_get_redis()`` hits the live container.
+
     Returns a dict of the installed mocks so individual tests can make
     assertions on them.
     """
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
-
     add_mock = add_order or MagicMock(return_value=ScheduleResult(status="success"))
     monkeypatch.setattr("app.workers.scheduling.add_order", add_mock)
 
@@ -376,12 +221,10 @@ def _patch_common(
         "app.workers.scheduling.materialize_schedule_task.delay",
         materialize_delay_mock,
     )
-    # enqueue_notify_user touches Redis directly; redirect to fake_redis
-    # so the SADD is observable in tests that want to assert it.
-    monkeypatch.setattr(
-        "app.workers.scheduling.enqueue_notify_user",
-        lambda user_id: fake_redis.sadd("schedule:materialize_notify_pending", str(user_id)),
-    )
+    # ``enqueue_notify_user`` does a real SADD against
+    # ``schedule:materialize_notify_pending``. Real Redis handles this
+    # natively, so no patching is needed — tests that want to observe
+    # the queued users just call ``redis_client.smembers(...)``.
 
     return {
         "add_order": add_mock,
@@ -401,15 +244,16 @@ def _patch_common(
 # ---------------------------------------------------------------------------
 
 
-def test_run_scheduling_processes_two_adds(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_redis = _FakeRedis()
+def test_run_scheduling_processes_two_adds(
+    monkeypatch: pytest.MonkeyPatch, redis_client: Redis
+) -> None:
     op1 = _make_op(order_number="ORD-001")
     op2 = _make_op(order_number="ORD-002", wafer_quantity=2000)
     # ZADD with monotonic seq: op1 has smaller score ⇒ ZPOPMIN'd first.
-    _enqueue(fake_redis, op1)
-    _enqueue(fake_redis, op2)
+    _enqueue(redis_client, op1)
+    _enqueue(redis_client, op2)
 
-    mocks = _patch_common(monkeypatch, fake_redis)
+    mocks = _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
 
@@ -433,13 +277,13 @@ def test_run_scheduling_processes_two_adds(monkeypatch: pytest.MonkeyPatch) -> N
     # compound2 (after compound1 sees the second still queued).
     assert mocks["delay"].call_count == 1
     # Final status: idle, with a finished_at timestamp
-    status_doc = json.loads(fake_redis.get(STATUS_KEY))
+    status_doc = json.loads(redis_client.get(STATUS_KEY))
     assert status_doc["state"] == "idle"
     assert status_doc["finished_at"] is not None
     # State persisted by the fast path (cheap O(n) serialize).
-    assert fake_redis.get(STATE_KEY) is not None
+    assert redis_client.get(STATE_KEY) is not None
     # Both requesters got SADD'd into the materializer's notify queue.
-    assert fake_redis.scard("schedule:materialize_notify_pending") == 2
+    assert redis_client.scard("schedule:materialize_notify_pending") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +293,7 @@ def test_run_scheduling_processes_two_adds(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_run_scheduling_notifies_user_on_capacity_exceeded(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Compound containing a failing ``add`` rolls back + WS-notifies.
 
@@ -457,7 +302,6 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
     ``requested_by``. The successful op inside a separate compound runs
     normally on its own turn.
     """
-    fake_redis = _FakeRedis()
 
     failing_id = uuid.uuid4()
     failing_user = uuid.uuid4()
@@ -470,8 +314,8 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
     )
     compound_fail["compound_id"] = str(failing_compound_id)
     compound_ok = _make_op(order_number="ORD-OK", wafer_quantity=1000)
-    _enqueue(fake_redis, compound_fail)
-    _enqueue(fake_redis, compound_ok)
+    _enqueue(redis_client, compound_fail)
+    _enqueue(redis_client, compound_ok)
 
     add_mock = MagicMock(
         side_effect=[
@@ -483,7 +327,7 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
             ScheduleResult(status="success"),
         ]
     )
-    mocks = _patch_common(monkeypatch, fake_redis, add_order=add_mock)
+    mocks = _patch_common(monkeypatch, add_order=add_mock)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
@@ -518,6 +362,7 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
 
 def test_run_scheduling_notifies_user_on_remove_failure(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Compound containing a failing ``remove`` rolls back + WS-notifies.
 
@@ -527,7 +372,6 @@ def test_run_scheduling_notifies_user_on_remove_failure(
     was the only op) and the requester gets ``schedule.compound_failed``
     with ``failed_op="remove"`` so the UI can surface the inconsistency.
     """
-    fake_redis = _FakeRedis()
 
     failing_id = uuid.uuid4()
     failing_user = uuid.uuid4()
@@ -539,7 +383,7 @@ def test_run_scheduling_notifies_user_on_remove_failure(
         requested_by=failing_user,
     )
     compound["compound_id"] = str(failing_compound_id)
-    _enqueue(fake_redis, compound)
+    _enqueue(redis_client, compound)
 
     remove_mock = MagicMock(
         return_value=ScheduleResult(
@@ -548,7 +392,7 @@ def test_run_scheduling_notifies_user_on_remove_failure(
             message="Deadline outside the 30-day scheduling horizon.",
         )
     )
-    mocks = _patch_common(monkeypatch, fake_redis)
+    mocks = _patch_common(monkeypatch)
     monkeypatch.setattr("app.workers.scheduling.remove_order", remove_mock)
     mocks["remove_order"] = remove_mock
 
@@ -575,6 +419,7 @@ def test_run_scheduling_notifies_user_on_remove_failure(
 
 def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """When ``run_scheduling_task`` body raises, it MUST:
 
@@ -590,13 +435,12 @@ def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
     test means a future refactor can't strip the except block without
     flipping a red light.
     """
-    fake_redis = _FakeRedis()
-    _enqueue(fake_redis, _make_op(order_number="ORD-BOOM"))
+    _enqueue(redis_client, _make_op(order_number="ORD-BOOM"))
 
     # add_order is the realistic crash point — bug in segment tree code
     # would manifest there. Any internal raise has the same contract.
     failing_add = MagicMock(side_effect=RuntimeError("segment tree corrupted"))
-    mocks = _patch_common(monkeypatch, fake_redis, add_order=failing_add)
+    mocks = _patch_common(monkeypatch, add_order=failing_add)
 
     result = run_scheduling_task.apply()
     # Celery sees the failure (traceback is in result.traceback).
@@ -604,7 +448,7 @@ def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
     assert "segment tree corrupted" in (result.traceback or "")
 
     # Status doc shows the failure so operators see it via /schedule/status.
-    raw = fake_redis.get(STATUS_KEY)
+    raw = redis_client.get(STATUS_KEY)
     assert raw is not None
     payload = json.loads(raw)
     assert payload["state"] == "failed"
@@ -620,6 +464,7 @@ def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
 
 def test_run_scheduling_retriggers_when_more_ops_arrive(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """A compound arriving mid-processing must be picked up via re-trigger
     instead of waiting for an external dispatch.
@@ -629,20 +474,17 @@ def test_run_scheduling_retriggers_when_more_ops_arrive(
     ``add_order`` (which IS called during compound processing). The
     re-trigger check still happens at the end via ``zcard``.
     """
-    fake_redis = _FakeRedis()
-    _enqueue(fake_redis, _make_op())
+    _enqueue(redis_client, _make_op())
 
     injected = {"done": False}
 
     def add_with_late_injection(_state: SchedulerState, _order: SchedulingOrder) -> ScheduleResult:
         if not injected["done"]:
-            _enqueue(fake_redis, _make_op(order_number="LATE"))
+            _enqueue(redis_client, _make_op(order_number="LATE"))
             injected["done"] = True
         return ScheduleResult(status="success")
 
-    mocks = _patch_common(
-        monkeypatch, fake_redis, add_order=MagicMock(side_effect=add_with_late_injection)
-    )
+    mocks = _patch_common(monkeypatch, add_order=MagicMock(side_effect=add_with_late_injection))
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
@@ -653,10 +495,10 @@ def test_run_scheduling_retriggers_when_more_ops_arrive(
 
 def test_run_scheduling_processes_shrink_group_before_grow(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Compound updates' ops must respect their group: shrink-group runs to
     completion before grow-group, regardless of the queue's RPOP order."""
-    fake_redis = _FakeRedis()
 
     # Producer pushed in order: a defer (shrink remove + shrink add), then an
     # advance (grow remove + grow add). Worker should process all four shrink
@@ -666,7 +508,7 @@ def test_run_scheduling_processes_shrink_group_before_grow(
     advance_remove = _make_op(op="remove", group="grow", order_number="ADVANCE-R")
     advance_add = _make_op(op="add", group="grow", order_number="ADVANCE-A")
     for op in (defer_remove, defer_add, advance_remove, advance_add):
-        _enqueue(fake_redis, op)
+        _enqueue(redis_client, op)
 
     call_order: list[str] = []
 
@@ -680,7 +522,6 @@ def test_run_scheduling_processes_shrink_group_before_grow(
 
     monkeypatch.setattr("app.workers.scheduling.add_order", MagicMock(side_effect=track_add))
     monkeypatch.setattr("app.workers.scheduling.remove_order", MagicMock(side_effect=track_remove))
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
     monkeypatch.setattr(
@@ -690,7 +531,6 @@ def test_run_scheduling_processes_shrink_group_before_grow(
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
     # Silence the Phase-4 slow-path side effects so CI without a real Redis
     # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
-    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _user_id: None)
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",
         MagicMock(),
@@ -711,6 +551,7 @@ def test_run_scheduling_processes_shrink_group_before_grow(
 
 def test_run_scheduling_lets_late_shrink_jump_pending_grow(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """A shrink op LPUSH'd while a grow batch is being processed must be
     picked up *before* the remaining grow ops, not after them.
@@ -719,9 +560,8 @@ def test_run_scheduling_lets_late_shrink_jump_pending_grow(
     effect on the *first* grow's add_order injects a fresh shrink op into
     the queue. The next pop must therefore see the new shrink and run it
     before GROW-2."""
-    fake_redis = _FakeRedis()
-    _enqueue(fake_redis, _make_op(op="add", group="grow", order_number="GROW-1"))
-    _enqueue(fake_redis, _make_op(op="add", group="grow", order_number="GROW-2"))
+    _enqueue(redis_client, _make_op(op="add", group="grow", order_number="GROW-1"))
+    _enqueue(redis_client, _make_op(op="add", group="grow", order_number="GROW-2"))
 
     call_order: list[str] = []
 
@@ -735,14 +575,13 @@ def test_run_scheduling_lets_late_shrink_jump_pending_grow(
         # first grow finishes processing. The next pop should pick it up.
         if order.order_number == "GROW-1":
             _enqueue(
-                fake_redis,
+                redis_client,
                 _make_op(op="remove", group="shrink", order_number="LATE-SHRINK"),
             )
         return ScheduleResult(status="success")
 
     monkeypatch.setattr("app.workers.scheduling.add_order", MagicMock(side_effect=track_add))
     monkeypatch.setattr("app.workers.scheduling.remove_order", MagicMock(side_effect=track_remove))
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
     monkeypatch.setattr(
@@ -752,7 +591,6 @@ def test_run_scheduling_lets_late_shrink_jump_pending_grow(
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
     # Silence the Phase-4 slow-path side effects so CI without a real Redis
     # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
-    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _user_id: None)
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",
         MagicMock(),
@@ -773,10 +611,10 @@ def test_run_scheduling_lets_late_shrink_jump_pending_grow(
 
 def test_run_scheduling_skips_retrigger_when_queue_drained(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
-    fake_redis = _FakeRedis()
     # No pending ops at all.
-    mocks = _patch_common(monkeypatch, fake_redis)
+    mocks = _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
@@ -787,6 +625,7 @@ def test_run_scheduling_skips_retrigger_when_queue_drained(
 
 def test_run_scheduling_yields_retrigger_to_waiter(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """If the waiter flag is set, ``run_scheduling_task`` MUST NOT
     re-trigger itself even when ops remain — the waiter
@@ -799,16 +638,14 @@ def test_run_scheduling_yields_retrigger_to_waiter(
     fires the re-trigger a few microseconds later, both end up running
     concurrently.
     """
-    fake_redis = _FakeRedis()
     # Pre-set the waiter flag: a waiter is waiting on us right now.
-    fake_redis.set("schedule:waiter_pending", "1", ex=600)
+    redis_client.set("schedule:waiter_pending", "1", ex=600)
     # One op processed + one still queued = zcard > 0 at end of task →
     # would normally fire delay() if not for the yield.
-    _enqueue(fake_redis, _make_op(order_number="ORD-A"))
-    _enqueue(fake_redis, _make_op(order_number="ORD-B"))
+    _enqueue(redis_client, _make_op(order_number="ORD-A"))
+    _enqueue(redis_client, _make_op(order_number="ORD-B"))
 
     # Plain delay (no auto-retrigger) — we want to verify it's NOT called.
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     add_mock = MagicMock(return_value=ScheduleResult(status="success"))
     monkeypatch.setattr("app.workers.scheduling.add_order", add_mock)
     monkeypatch.setattr(
@@ -824,7 +661,6 @@ def test_run_scheduling_yields_retrigger_to_waiter(
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
     # Silence the Phase-4 slow-path side effects so CI without a real Redis
     # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
-    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _user_id: None)
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",
         MagicMock(),
@@ -838,7 +674,7 @@ def test_run_scheduling_yields_retrigger_to_waiter(
     # First op was processed (per-op design)…
     assert add_mock.call_count == 1
     # …second op still pending (zcard > 0)…
-    assert fake_redis.zcard(PENDING_OPS_KEY) == 1
+    assert redis_client.zcard(PENDING_OPS_KEY) == 1
     # …but delay was NOT fired because the waiter holds responsibility for
     # the next re-trigger.
     assert plain_delay.call_count == 0
@@ -851,13 +687,12 @@ def test_run_scheduling_yields_retrigger_to_waiter(
 
 def test_advance_day_sets_waiter_flag_then_clears_it(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """advance_day_task must hold the waiter flag for the duration of its
     body so a concurrent ``run_scheduling_task`` finishing during the wait
     yields its re-trigger to us. Cleared in ``finally`` so a clean run
     leaves the flag unset for future re-triggers."""
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr(
         "app.workers.scheduling._get_status",
         lambda: {"state": "idle"},
@@ -873,7 +708,7 @@ def test_advance_day_sets_waiter_flag_then_clears_it(
     flag_during: list[str | None] = []
 
     def observe_advance(_state: SchedulerState) -> SchedulerState:
-        flag_during.append(fake_redis.get("schedule:waiter_pending"))
+        flag_during.append(redis_client.get("schedule:waiter_pending"))
         return advanced
 
     monkeypatch.setattr("app.workers.scheduling.advance_day", observe_advance)
@@ -892,11 +727,12 @@ def test_advance_day_sets_waiter_flag_then_clears_it(
     # Flag was set while the body was running.
     assert flag_during == ["1"]
     # Flag was cleared after the task finished.
-    assert fake_redis.get("schedule:waiter_pending") is None
+    assert redis_client.get("schedule:waiter_pending") is None
 
 
 def test_advance_day_clears_waiter_flag_even_on_exception(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """If the waiter body crashes mid-flight the flag MUST still be cleared,
     otherwise future ``run_scheduling_task`` invocations would yield to a
@@ -904,8 +740,6 @@ def test_advance_day_clears_waiter_flag_even_on_exception(
 
     Guarded by the ``finally`` clause around the body.
     """
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr("app.workers.scheduling._get_status", lambda: {"state": "idle"})
     _patch_rebuild_time(monkeypatch)
 
@@ -924,17 +758,16 @@ def test_advance_day_clears_waiter_flag_even_on_exception(
     result = advance_day_task.apply()
     assert not result.successful()
     # Flag is cleared regardless of the exception.
-    assert fake_redis.get("schedule:waiter_pending") is None
+    assert redis_client.get("schedule:waiter_pending") is None
 
 
 def test_rebuild_clears_waiter_flag_even_on_exception(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Mirror test for ``rebuild_schedule_task``: if any step raises (e.g.
     DB layer down, list_for_scheduler errors), the waiter flag still gets
     cleared so the system recovers without waiting for TTL expiry."""
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr("app.workers.scheduling._get_status", lambda: {"state": "idle"})
     _patch_rebuild_time(monkeypatch)
 
@@ -948,7 +781,7 @@ def test_rebuild_clears_waiter_flag_even_on_exception(
 
     result = rebuild_schedule_task.apply()
     assert not result.successful()
-    assert fake_redis.get("schedule:waiter_pending") is None
+    assert redis_client.get("schedule:waiter_pending") is None
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +791,7 @@ def test_rebuild_clears_waiter_flag_even_on_exception(
 
 def test_advance_day_claims_status_running_during_body_and_clears_to_idle(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Status-claim race fix: between ``_wait_for_idle_run`` returning and
     the body finishing, ``schedule:status`` MUST read ``running`` so a
@@ -969,8 +803,6 @@ def test_advance_day_claims_status_running_during_body_and_clears_to_idle(
     /operations call landed a parallel ``run_scheduling_task`` that wrote
     over the waiter's state.
     """
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr(
         "app.workers.scheduling._get_status",
         lambda: {"state": "idle"},
@@ -986,7 +818,7 @@ def test_advance_day_claims_status_running_during_body_and_clears_to_idle(
     status_during_body: list[str] = []
 
     def observe_advance(_state: SchedulerState) -> SchedulerState:
-        raw = fake_redis.get("schedule:status")
+        raw = redis_client.get("schedule:status")
         assert raw is not None
         status_during_body.append(json.loads(raw)["state"])
         return advanced
@@ -1007,7 +839,7 @@ def test_advance_day_claims_status_running_during_body_and_clears_to_idle(
     # Mid-body: status was "running".
     assert status_during_body == ["running"]
     # Post-body: inner finally restored "idle".
-    raw = fake_redis.get("schedule:status")
+    raw = redis_client.get("schedule:status")
     assert raw is not None
     final = json.loads(raw)
     assert final["state"] == "idle"
@@ -1016,6 +848,7 @@ def test_advance_day_claims_status_running_during_body_and_clears_to_idle(
 
 def test_advance_day_writes_status_failed_on_exception(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """If the body raises after status was claimed, status MUST flip to
     ``failed`` (with the error captured) — NOT ``idle``. Writing ``idle``
@@ -1026,8 +859,6 @@ def test_advance_day_writes_status_failed_on_exception(
     future ``/trigger``). The acceptable terminal states on exception are
     ``failed`` (visible to ops) — never ``running`` and never ``idle``.
     """
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr("app.workers.scheduling._get_status", lambda: {"state": "idle"})
     _patch_rebuild_time(monkeypatch)
 
@@ -1044,7 +875,7 @@ def test_advance_day_writes_status_failed_on_exception(
     result = advance_day_task.apply()
     assert not result.successful()
 
-    raw = fake_redis.get("schedule:status")
+    raw = redis_client.get("schedule:status")
     assert raw is not None
     payload = json.loads(raw)
     assert payload["state"] == "failed"
@@ -1061,6 +892,7 @@ def test_advance_day_writes_status_failed_on_exception(
 
 def test_advance_day_waits_then_advances_finalizes_and_retriggers(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """``advance_day_task`` must wait for any in-flight run, advance the
     horizon, finalize (compute → apply → save → broadcast) directly, and
@@ -1070,11 +902,9 @@ def test_advance_day_waits_then_advances_finalizes_and_retriggers(
     no-pending-ops branch is implicitly covered by checking call count
     against the ``zcard`` decision.
     """
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
 
     # One pending op so the conditional retrigger fires.
-    _enqueue(fake_redis, _make_op(order_number="POST-ADVANCE"))
+    _enqueue(redis_client, _make_op(order_number="POST-ADVANCE"))
 
     # First poll: still running. Second poll: idle ⇒ break.
     states = iter(
@@ -1172,6 +1002,7 @@ def test_advance_day_waits_then_advances_finalizes_and_retriggers(
 
 def test_advance_day_marks_today_orders_in_production(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Phase 3 case 17: advance_day flips ``today's d0`` orders to
     ``in_production`` and ``previously-in_production-now-out-of-state``
@@ -1183,8 +1014,6 @@ def test_advance_day_marks_today_orders_in_production(
     mark_in_production call gets ``{order_X}`` and mark_completed_outside_set
     gets ``{order_Y}`` (the only alive id).
     """
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr(
         "app.workers.scheduling._get_status",
         lambda: {"state": "idle"},
@@ -1289,19 +1118,18 @@ def _patch_rebuild_time(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Full happy path: status flips from running→idle while rebuild_task is
     polling, then it rebuilds, persists, and re-triggers run_scheduling_task.
 
     No skipped orders in this path — the next test covers that branch.
     """
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
 
     base = date(2026, 5, 5)
-    fake_redis.set(STATE_KEY, SchedulerState.initial(base).to_json())
+    redis_client.set(STATE_KEY, SchedulerState.initial(base).to_json())
     # One pending op so the conditional retrigger fires after rebuild.
-    _enqueue(fake_redis, _make_op(order_number="POST-REBUILD"))
+    _enqueue(redis_client, _make_op(order_number="POST-REBUILD"))
 
     statuses = iter([{"state": "running"}, {"state": "idle"}])
     monkeypatch.setattr(
@@ -1360,7 +1188,7 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
     apply_mock.assert_called_once()
     broadcast_mock.assert_called_once_with({"type": "schedule.updated"})
     # New state was persisted (via _save_state inside _finalize_run).
-    saved_raw = fake_redis.get(STATE_KEY)
+    saved_raw = redis_client.get(STATE_KEY)
     assert saved_raw is not None
     assert saved_raw == rebuilt_state.to_json()
     # No skipped → no notify_user calls.
@@ -1371,16 +1199,15 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
 
 def test_rebuild_task_notifies_each_skipped_orders_creator(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """When ``rebuild_state`` returns a non-empty ``skipped`` list, the task
     must push a ``schedule.rebuild_skipped`` WebSocket message to each
     skipped order's creator (looked up via the ``creators`` map). Skipped
     orders without a known creator are silently dropped (defensive)."""
-    fake_redis = _FakeRedis()
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
 
     base = date(2026, 5, 5)
-    fake_redis.set(STATE_KEY, SchedulerState.initial(base).to_json())
+    redis_client.set(STATE_KEY, SchedulerState.initial(base).to_json())
 
     monkeypatch.setattr(
         "app.workers.scheduling._get_status",
@@ -1436,12 +1263,11 @@ def test_rebuild_task_notifies_each_skipped_orders_creator(
 
 def test_rebuild_task_uses_today_when_no_existing_state(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """If Redis has no ``schedule:state`` (first deploy / wiped), rebuild
     falls back to ``datetime.now().date()`` as base_date."""
-    fake_redis = _FakeRedis()
     # Note: do NOT pre-seed STATE_KEY.
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr(
         "app.workers.scheduling._get_status",
         lambda: {"state": "idle"},
@@ -1489,12 +1315,12 @@ def test_rebuild_task_uses_today_when_no_existing_state(
 
 def test_run_scheduling_dispatches_pin_op_with_fake_deadline(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """A queued ``op="pin"`` must reach ``pin_order(state, order, fake_deadline)``
     with the fake_deadline parsed back into a ``date``. This is the contract
     that lets the API encode pin requests as a normal ScheduleOperationRequest.
     """
-    fake_redis = _FakeRedis()
     op = _make_op(
         op="pin",
         group="grow",
@@ -1502,9 +1328,9 @@ def test_run_scheduling_dispatches_pin_op_with_fake_deadline(
         deadline="2026-05-15",
         fake_deadline="2026-05-12",
     )
-    _enqueue(fake_redis, op)
+    _enqueue(redis_client, op)
 
-    mocks = _patch_common(monkeypatch, fake_redis)
+    mocks = _patch_common(monkeypatch)
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
@@ -1518,6 +1344,7 @@ def test_run_scheduling_dispatches_pin_op_with_fake_deadline(
 
 def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Saga rollback invariant: a compound's earlier successful ops are
     undone when a later op fails.
@@ -1534,8 +1361,6 @@ def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
 
     from app.services.scheduling import SchedulingOrder, add_order
 
-    fake_redis = _FakeRedis()
-
     # Pre-seed state in Redis with one order so remove has something real
     # to undo and add can credibly fail.
     state = SchedulerState.initial(_date(2026, 5, 5))
@@ -1549,7 +1374,7 @@ def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
             deadline=_date(2026, 5, 10),
         ),
     )
-    fake_redis.set(STATE_KEY, state.to_json())
+    redis_client.set(STATE_KEY, state.to_json())
 
     failing_user = uuid.uuid4()
     failing_compound_id = uuid.uuid4()
@@ -1574,11 +1399,10 @@ def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
         requested_by=failing_user,
         compound_id=failing_compound_id,
     )
-    _enqueue(fake_redis, compound)
+    _enqueue(redis_client, compound)
 
     # No mocks for add/remove — we want the REAL algorithm to fail on the
     # huge qty, so we can observe true state rollback.
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
     monkeypatch.setattr(
@@ -1594,7 +1418,7 @@ def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
     assert result.successful(), result.traceback
 
     # Compound failed → state in Redis should be UNCHANGED from pre-compound.
-    saved_raw = fake_redis.get(STATE_KEY)
+    saved_raw = redis_client.get(STATE_KEY)
     assert saved_raw is not None
     # State should NOT have been mutated by the failed compound. The
     # cleanest check: the pre-compound snapshot we put in equals what's
@@ -1616,6 +1440,7 @@ def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
 
 def test_run_scheduling_rejects_compound_with_op_count_mismatch(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Worker-side tamper guard: a compound whose declared ``op_count``
     doesn't match ``len(ops)`` is rejected before any leaf op runs.
@@ -1626,7 +1451,6 @@ def test_run_scheduling_rejects_compound_with_op_count_mismatch(
     and fails the whole compound rather than execute a half-truncated
     business action.
     """
-    fake_redis = _FakeRedis()
     failing_user = uuid.uuid4()
     failing_compound_id = uuid.uuid4()
     compound = _make_compound(
@@ -1637,9 +1461,9 @@ def test_run_scheduling_rejects_compound_with_op_count_mismatch(
         compound_id=failing_compound_id,
         op_count=99,  # lies — only 1 op
     )
-    _enqueue(fake_redis, compound)
+    _enqueue(redis_client, compound)
 
-    mocks = _patch_common(monkeypatch, fake_redis)
+    mocks = _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
@@ -1664,6 +1488,7 @@ def test_run_scheduling_rejects_compound_with_op_count_mismatch(
 
 def test_run_scheduling_pin_failure_rolls_back_and_notifies(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """A 1-op pin compound that fails triggers a rollback + WS notify.
 
@@ -1672,7 +1497,6 @@ def test_run_scheduling_pin_failure_rolls_back_and_notifies(
     is the unified ``schedule.compound_failed`` (no more per-op
     ``schedule.pin_failed``), with ``failed_op="pin"`` in the detail.
     """
-    fake_redis = _FakeRedis()
     pin_user = uuid.uuid4()
     pin_compound_id = uuid.uuid4()
     pin_compound = _make_op(
@@ -1685,8 +1509,8 @@ def test_run_scheduling_pin_failure_rolls_back_and_notifies(
     )
     pin_compound["compound_id"] = str(pin_compound_id)
     follow_compound = _make_op(order_number="ORD-OK")
-    _enqueue(fake_redis, pin_compound)
-    _enqueue(fake_redis, follow_compound)
+    _enqueue(redis_client, pin_compound)
+    _enqueue(redis_client, follow_compound)
 
     pin_mock = MagicMock(
         return_value=ScheduleResult(
@@ -1694,7 +1518,7 @@ def test_run_scheduling_pin_failure_rolls_back_and_notifies(
             message="Need 1000 wafers, only 0 available.",
         )
     )
-    mocks = _patch_common(monkeypatch, fake_redis)
+    mocks = _patch_common(monkeypatch)
     monkeypatch.setattr("app.workers.scheduling.pin_order", pin_mock)
     mocks["pin_order"] = pin_mock
 
@@ -1723,12 +1547,12 @@ def test_run_scheduling_pin_failure_rolls_back_and_notifies(
 
 def test_run_scheduling_dispatches_unpin_op(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """``op="unpin"`` calls ``unpin_order(state, order_id)`` — no fake_deadline
     needed. Confirms the unpin path doesn't accidentally route through pin or
     remove (a regression that would silently corrupt state).
     """
-    fake_redis = _FakeRedis()
     target_id = uuid.uuid4()
     op = _make_op(
         op="unpin",
@@ -1737,9 +1561,9 @@ def test_run_scheduling_dispatches_unpin_op(
         order_number="UNPIN-ME",
         deadline="2026-05-20",
     )
-    _enqueue(fake_redis, op)
+    _enqueue(redis_client, op)
 
-    mocks = _patch_common(monkeypatch, fake_redis)
+    mocks = _patch_common(monkeypatch)
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
@@ -1756,18 +1580,17 @@ def test_run_scheduling_dispatches_unpin_op(
 
 def test_materialize_task_drains_pending_users_and_notifies(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Happy path: notify_pending has users → materializer renames it,
     runs apply_schedule, then notify_user(schedule.materialized) per user.
     """
     from app.workers.scheduling import materialize_schedule_task
 
-    fake_redis = _FakeRedis()
     user_a = uuid.uuid4()
     user_b = uuid.uuid4()
-    fake_redis.sadd("schedule:materialize_notify_pending", str(user_a), str(user_b))
+    redis_client.sadd("schedule:materialize_notify_pending", str(user_a), str(user_b))
 
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr(
         "app.workers.scheduling._load_state",
         lambda: SchedulerState.initial(date(2026, 5, 5)),
@@ -1797,25 +1620,24 @@ def test_materialize_task_drains_pending_users_and_notifies(
         user_b: "schedule.materialized",
     }
     # Pending set drained.
-    assert fake_redis.scard("schedule:materialize_notify_pending") == 0
+    assert redis_client.scard("schedule:materialize_notify_pending") == 0
     # Running flag released.
-    assert fake_redis.get("schedule:materialize_running") is None
+    assert redis_client.get("schedule:materialize_running") is None
 
 
 def test_materialize_task_exits_when_already_running(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Self-coalescing: if another materializer already claimed the
     running flag, this invocation exits immediately. No work done.
     """
     from app.workers.scheduling import materialize_schedule_task
 
-    fake_redis = _FakeRedis()
     # Pre-claim the flag — simulating another materializer running.
-    fake_redis.set("schedule:materialize_running", "1", ex=300)
-    fake_redis.sadd("schedule:materialize_notify_pending", str(uuid.uuid4()))
+    redis_client.set("schedule:materialize_running", "1", ex=300)
+    redis_client.sadd("schedule:materialize_notify_pending", str(uuid.uuid4()))
 
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     apply_mock = MagicMock(return_value=0)
     monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
     notify_mock = MagicMock()
@@ -1832,23 +1654,22 @@ def test_materialize_task_exits_when_already_running(
     assert apply_mock.call_count == 0
     assert notify_mock.call_count == 0
     # Pending set untouched.
-    assert fake_redis.scard("schedule:materialize_notify_pending") == 1
+    assert redis_client.scard("schedule:materialize_notify_pending") == 1
     # The flag we pre-set is still there (we didn't clobber another runner's slot).
-    assert fake_redis.get("schedule:materialize_running") == "1"
+    assert redis_client.get("schedule:materialize_running") == "1"
 
 
 def test_materialize_task_exits_when_no_pending_work(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """Empty notify_pending → rename raises ResponseError → loop exits
     immediately. No apply_schedule, no notify. Running flag released.
     """
     from app.workers.scheduling import materialize_schedule_task
 
-    fake_redis = _FakeRedis()
     # No SADD — notify_pending doesn't exist.
 
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     apply_mock = MagicMock(return_value=0)
     monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
     notify_mock = MagicMock()
@@ -1864,11 +1685,12 @@ def test_materialize_task_exits_when_no_pending_work(
     assert apply_mock.call_count == 0
     assert notify_mock.call_count == 0
     # Flag was claimed but released by the finally.
-    assert fake_redis.get("schedule:materialize_running") is None
+    assert redis_client.get("schedule:materialize_running") is None
 
 
 def test_materialize_task_passes_pinned_map_to_apply_schedule(
     monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
 ) -> None:
     """The materializer derives ``{order_id: fake_deadline}`` from
     ``state.pinned_orders`` and threads it into ``apply_schedule`` so DB
@@ -1881,13 +1703,12 @@ def test_materialize_task_passes_pinned_map_to_apply_schedule(
     from app.services.scheduling import PinnedOrder
     from app.workers.scheduling import materialize_schedule_task
 
-    fake_redis = _FakeRedis()
     pinned_id = uuid.uuid4()
     pinned_day = date(2026, 5, 12)
     requester = uuid.uuid4()
 
     # Seed the materializer's pending notify-user set so it has work to do.
-    fake_redis.sadd("schedule:materialize_notify_pending", str(requester))
+    redis_client.sadd("schedule:materialize_notify_pending", str(requester))
 
     def fake_load_state() -> SchedulerState:
         s = SchedulerState.initial(date(2026, 5, 5))
@@ -1900,7 +1721,6 @@ def test_materialize_task_passes_pinned_map_to_apply_schedule(
         )
         return s
 
-    monkeypatch.setattr("app.workers.scheduling._get_redis", lambda: fake_redis)
     monkeypatch.setattr("app.workers.scheduling._load_state", fake_load_state)
     monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())

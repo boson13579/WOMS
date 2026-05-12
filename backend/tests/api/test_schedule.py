@@ -1,8 +1,10 @@
 """Tests for the ``/api/v1/schedule/*`` HTTP router.
 
 Uses the project's `client` fixture (real Postgres via testcontainers) for
-auth + DB, but mocks Redis and the Celery ``.delay()`` so no broker is
-needed.
+auth + DB, and the session-wide ``redis_container`` from the root conftest
+for real Redis behavior. Celery ``.delay()`` is still mocked since there's
+no broker / worker pair running in-process — but everything that touches
+Redis keys hits the live container.
 """
 
 from __future__ import annotations
@@ -16,72 +18,12 @@ import bcrypt
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
 from fastapi.testclient import TestClient
+from redis import Redis
 from sqlalchemy.orm import Session
 
 # ---------------------------------------------------------------------------
 # Helpers (module-level per CLAUDE.md test convention)
 # ---------------------------------------------------------------------------
-
-
-class _FakeRedis:
-    """Minimal in-memory stand-in for the keys the router touches.
-
-    The router writes pending ops to a sorted set (``ZADD`` keyed by
-    ``score_for_op``) and reads ``schedule:state`` / ``schedule:status``
-    via plain string ops.
-    """
-
-    def __init__(self) -> None:
-        self._strings: dict[str, str] = {}
-        self._zsets: dict[str, list[tuple[float, str]]] = {}
-
-    # ----- String ops --------------------------------------------------------
-    def get(self, key: str) -> str | None:
-        return self._strings.get(key)
-
-    def set(self, key: str, value: str, ex: int | None = None) -> None:
-        # ``ex`` (TTL) accepted for API compat; tests don't actually expire.
-        self._strings[key] = value
-
-    def incr(self, key: str) -> int:
-        cur = int(self._strings.get(key, "0")) + 1
-        self._strings[key] = str(cur)
-        return cur
-
-    def delete(self, *keys: str) -> int:
-        n = 0
-        for key in keys:
-            if self._strings.pop(key, None) is not None:
-                n += 1
-            if self._zsets.pop(key, None) is not None:
-                n += 1
-        return n
-
-    # ----- Sorted-set ops ----------------------------------------------------
-    def zadd(self, key: str, mapping: dict[str, float]) -> int:
-        bucket = self._zsets.setdefault(key, [])
-        added = 0
-        for member, score in mapping.items():
-            existing = next((i for i, (_, m) in enumerate(bucket) if m == member), None)
-            if existing is not None:
-                bucket.pop(existing)
-            else:
-                added += 1
-            insert_at = next(
-                (i for i, (s, m) in enumerate(bucket) if (s, m) > (score, member)),
-                len(bucket),
-            )
-            bucket.insert(insert_at, (score, member))
-        return added
-
-    def zcard(self, key: str) -> int:
-        return len(self._zsets.get(key, []))
-
-    def zrange(self, key: str, start: int, stop: int) -> list[str]:
-        bucket = self._zsets.get(key, [])
-        # Redis ZRANGE: stop is inclusive; -1 means "last element".
-        sliced = bucket[start:] if stop == -1 else bucket[start : stop + 1]
-        return [member for _, member in sliced]
 
 
 def _make_user(
@@ -143,16 +85,15 @@ def _make_order(
     return order
 
 
-def _patch_redis_and_delay(monkeypatch, fake_redis: _FakeRedis) -> MagicMock:
-    """Swap both modules' Redis clients + Celery .delay; return the delay mock.
+def _patch_delay(monkeypatch) -> MagicMock:
+    """Stub ``run_scheduling_task.delay`` so tests can assert dispatch without
+    needing a Celery broker / worker pair. Returns the mock so tests can
+    inspect call args + verify the task id wired into the response.
 
-    The api router caches its own Redis client and ``services.schedule_queue``
-    has a separate ``_redis`` for ``enqueue_compound`` / ``list_pending_ops`` —
-    both need to point at the same in-memory fake so a write via one path is
-    visible to a read via the other.
+    Redis itself is NOT patched — the session-scoped ``redis_container``
+    fixture exposes a real Redis at the URL the app reads from settings,
+    so any ``_redis()`` call from production code reaches it natively.
     """
-    monkeypatch.setattr("app.api.v1.schedule._redis", lambda: fake_redis)
-    monkeypatch.setattr("app.services.schedule_queue._redis", lambda: fake_redis)
     delay_mock = MagicMock(return_value=MagicMock(id="task-mock"))
     monkeypatch.setattr("app.api.v1.schedule.run_scheduling_task.delay", delay_mock)
     return delay_mock
@@ -180,8 +121,7 @@ _VALID_COMPOUND_PAYLOAD = {
 
 
 def test_trigger_success_returns_202(client: TestClient, db_session: Session, monkeypatch) -> None:
-    fake_redis = _FakeRedis()
-    delay_mock = _patch_redis_and_delay(monkeypatch, fake_redis)
+    delay_mock = _patch_delay(monkeypatch)
     _make_user(db_session, username="sched_trig_ok", role=UserRole.scheduler)
     token = _login(client, "sched_trig_ok")
 
@@ -195,11 +135,10 @@ def test_trigger_success_returns_202(client: TestClient, db_session: Session, mo
 
 
 def test_trigger_returns_409_when_already_running(
-    client: TestClient, db_session: Session, monkeypatch
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
 ) -> None:
-    fake_redis = _FakeRedis()
-    fake_redis.set("schedule:status", json.dumps({"state": "running"}))
-    delay_mock = _patch_redis_and_delay(monkeypatch, fake_redis)
+    redis_client.set("schedule:status", json.dumps({"state": "running"}))
+    delay_mock = _patch_delay(monkeypatch)
     _make_user(db_session, username="sched_trig_dup", role=UserRole.scheduler)
     token = _login(client, "sched_trig_dup")
 
@@ -213,8 +152,7 @@ def test_trigger_returns_409_when_already_running(
 def test_trigger_by_viewer_returns_403(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="viewer_trig", role=UserRole.viewer)
     token = _login(client, "viewer_trig")
 
@@ -451,10 +389,9 @@ def test_cancel_compound_without_token_returns_401(client: TestClient) -> None:
 
 
 def test_status_returns_redis_doc_when_present(
-    client: TestClient, db_session: Session, monkeypatch
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
 ) -> None:
-    fake_redis = _FakeRedis()
-    fake_redis.set(
+    redis_client.set(
         "schedule:status",
         json.dumps(
             {
@@ -466,7 +403,7 @@ def test_status_returns_redis_doc_when_present(
             }
         ),
     )
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="mgr_status_data", role=UserRole.order_manager)
     token = _login(client, "mgr_status_data")
 
@@ -482,8 +419,7 @@ def test_status_returns_redis_doc_when_present(
 def test_status_returns_idle_default_when_empty(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="mgr_status_empty", role=UserRole.order_manager)
     token = _login(client, "mgr_status_empty")
 
@@ -496,8 +432,7 @@ def test_status_returns_idle_default_when_empty(
 
 
 def test_status_by_viewer_returns_403(client: TestClient, db_session: Session, monkeypatch) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="viewer_status", role=UserRole.viewer)
     token = _login(client, "viewer_status")
 
@@ -521,8 +456,7 @@ def test_status_without_token_returns_401(client: TestClient) -> None:
 def test_result_returns_scheduled_orders_sorted_by_production_date(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     user = _make_user(db_session, username="mgr_result_ok", role=UserRole.order_manager)
     token = _login(client, "mgr_result_ok")
 
@@ -568,8 +502,7 @@ def test_result_includes_daily_breakdown_from_db_column(
     ``orders.daily_breakdown`` in sync, so the endpoint just echoes what's
     in Postgres.
     """
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
 
     user = _make_user(db_session, username="mgr_breakdown", role=UserRole.order_manager)
     token = _login(client, "mgr_breakdown")
@@ -603,8 +536,7 @@ def test_result_includes_daily_breakdown_from_db_column(
 def test_result_excludes_soft_deleted_orders(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     user = _make_user(db_session, username="mgr_result_del", role=UserRole.order_manager)
     token = _login(client, "mgr_result_del")
 
@@ -624,8 +556,7 @@ def test_result_excludes_soft_deleted_orders(
 
 
 def test_result_by_viewer_returns_403(client: TestClient, db_session: Session, monkeypatch) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="viewer_result", role=UserRole.viewer)
     token = _login(client, "viewer_result")
 
@@ -647,7 +578,7 @@ def test_result_without_token_returns_401(client: TestClient) -> None:
 
 
 def _enqueue_payload_directly(
-    fake_redis: _FakeRedis,
+    redis_client: Redis,
     *,
     group: str,
     seq: int,
@@ -655,7 +586,7 @@ def _enqueue_payload_directly(
     ops: list[tuple[str, uuid.UUID, str]],
     requested_by: uuid.UUID,
 ) -> None:
-    """Write one ScheduleCompoundRequest directly into the fake Redis sorted set.
+    """Write one ScheduleCompoundRequest directly into the live Redis sorted set.
 
     Bypasses ``enqueue_compound`` (which would also fire a Celery .delay)
     so we can construct an exact queue state for the assertion. ``ops`` is
@@ -683,17 +614,16 @@ def _enqueue_payload_directly(
         "_seq": seq,
     }
     score = score_for_op(group=group, seq=seq)
-    fake_redis.zadd("schedule:pending_ops", {json.dumps(payload): score})
+    redis_client.zadd("schedule:pending_ops", {json.dumps(payload): score})
 
 
 def test_pending_ops_returns_compounds_ranked_by_drain_order(
-    client: TestClient, db_session: Session, monkeypatch
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
 ) -> None:
     """The endpoint must rank shrink-group compounds before grow-group,
     FIFO within each group — same order ``run_scheduling_task`` pops them.
     """
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="mgr_pq_ok", role=UserRole.order_manager)
     token = _login(client, "mgr_pq_ok")
 
@@ -707,7 +637,7 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
     # ZRANGE's natural order). grow goes in first with a low seq, but
     # shrink must still rank above it.
     _enqueue_payload_directly(
-        fake_redis,
+        redis_client,
         group="grow",
         seq=1,
         compound_id=c_grow,
@@ -715,7 +645,7 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
         requested_by=actor,
     )
     _enqueue_payload_directly(
-        fake_redis,
+        redis_client,
         group="shrink",
         seq=2,
         compound_id=c_shrink_old,
@@ -723,7 +653,7 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
         requested_by=actor,
     )
     _enqueue_payload_directly(
-        fake_redis,
+        redis_client,
         group="shrink",
         seq=3,
         compound_id=c_shrink_new,
@@ -752,15 +682,14 @@ def test_pending_ops_returns_compounds_ranked_by_drain_order(
 
 
 def test_pending_ops_supports_compounds_spanning_multiple_orders(
-    client: TestClient, db_session: Session, monkeypatch
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
 ) -> None:
     """A compound may legitimately touch >1 order_id (batch business
     actions). ``ops`` in the response keeps per-leaf order info so the
     dashboard can answer "where is order X queued?" even when X shares
     a compound with another order.
     """
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="mgr_pq_multi", role=UserRole.order_manager)
     token = _login(client, "mgr_pq_multi")
 
@@ -769,7 +698,7 @@ def test_pending_ops_supports_compounds_spanning_multiple_orders(
     actor = uuid.uuid4()
 
     _enqueue_payload_directly(
-        fake_redis,
+        redis_client,
         group="grow",
         seq=1,
         compound_id=c_multi,
@@ -801,8 +730,7 @@ def test_pending_ops_returns_empty_list_when_queue_is_idle(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
     """No compound enqueued ⇒ 200 with an empty list, not 404 or 500."""
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="mgr_pq_empty", role=UserRole.order_manager)
     token = _login(client, "mgr_pq_empty")
 
@@ -815,8 +743,7 @@ def test_pending_ops_returns_empty_list_when_queue_is_idle(
 def test_pending_ops_by_viewer_returns_403(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="viewer_pq", role=UserRole.viewer)
     token = _login(client, "viewer_pq")
 
@@ -838,7 +765,7 @@ def test_pending_ops_without_token_returns_401(client: TestClient) -> None:
 
 
 def test_capacity_with_state_returns_prefix_sums(
-    client: TestClient, db_session: Session, monkeypatch
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
 ) -> None:
     """GET /capacity reads the live SchedulerState and exposes the
     capacity_tree as a per-day prefix-sum series. Building a known state
@@ -856,8 +783,7 @@ def test_capacity_with_state_returns_prefix_sums(
         add_order,
     )
 
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="mgr_cap_ok", role=UserRole.order_manager)
     token = _login(client, "mgr_cap_ok")
 
@@ -872,7 +798,7 @@ def test_capacity_with_state_returns_prefix_sums(
             deadline=base,
         ),
     )
-    fake_redis.set("schedule:state", state.to_json())
+    redis_client.set("schedule:state", state.to_json())
 
     res = client.get("/api/v1/schedule/capacity", headers=_auth(token))
 
@@ -908,8 +834,7 @@ def test_capacity_without_redis_state_returns_full_horizon(
     """
     from app.services.scheduling import DAILY_CAPACITY, HORIZON_DAYS
 
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="mgr_cap_empty", role=UserRole.order_manager)
     token = _login(client, "mgr_cap_empty")
 
@@ -927,8 +852,7 @@ def test_capacity_without_redis_state_returns_full_horizon(
 def test_capacity_by_viewer_returns_403(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="viewer_cap", role=UserRole.viewer)
     token = _login(client, "viewer_cap")
 
@@ -963,8 +887,7 @@ def test_rebuild_returns_202_and_dispatches_task(
     """Happy path: rebuild dispatches ``rebuild_schedule_task`` and returns
     202 with the new task id. The actual rebuild work happens inside the
     task body (covered in ``tests/workers/test_scheduling_task.py``)."""
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     rebuild_delay_mock = _patch_rebuild_delay(monkeypatch)
 
     _make_user(db_session, username="sched_rebuild_ok", role=UserRole.scheduler)
@@ -980,15 +903,14 @@ def test_rebuild_returns_202_and_dispatches_task(
 
 
 def test_rebuild_dispatches_even_when_run_scheduling_is_running(
-    client: TestClient, db_session: Session, monkeypatch
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
 ) -> None:
     """Rebuild no longer 409s when a scheduling run is in progress — instead
     the task is queued and serializes itself by polling status. This test
     verifies the API layer dispatches unconditionally; the wait-for-idle
     logic is in the task body and tested in the worker suite."""
-    fake_redis = _FakeRedis()
-    fake_redis.set("schedule:status", json.dumps({"state": "running"}))
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    redis_client.set("schedule:status", json.dumps({"state": "running"}))
+    _patch_delay(monkeypatch)
     rebuild_delay_mock = _patch_rebuild_delay(monkeypatch)
 
     _make_user(db_session, username="sched_rebuild_busy", role=UserRole.scheduler)
@@ -1003,8 +925,7 @@ def test_rebuild_dispatches_even_when_run_scheduling_is_running(
 def test_rebuild_by_viewer_returns_403(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:
-    fake_redis = _FakeRedis()
-    _patch_redis_and_delay(monkeypatch, fake_redis)
+    _patch_delay(monkeypatch)
     _make_user(db_session, username="viewer_rebuild", role=UserRole.viewer)
     token = _login(client, "viewer_rebuild")
 
