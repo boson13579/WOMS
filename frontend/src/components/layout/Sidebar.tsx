@@ -7,6 +7,10 @@
  *
  * Dashboard is always wired up. User management is shown for root users; the
  * remaining links are visible but disabled to communicate the planned IA.
+ *
+ * The nav body is split out as `SidebarNavContent` so the mobile drawer
+ * (`MobileNav`) can reuse the same markup at viewport widths where the
+ * persistent sidebar is hidden (`<768px`).
  */
 import {
   Bell,
@@ -42,7 +46,7 @@ const SECONDARY_NAV: readonly NavItem[] = [
   { to: '/notifications', label: 'Notifications', icon: Bell, disabled: true },
 ];
 
-function NavRow({ item }: { item: NavItem }): JSX.Element {
+function NavRow({ item, onNavigate }: { item: NavItem; onNavigate: () => void }): JSX.Element {
   const { to, label, icon: Icon, disabled } = item;
 
   if (disabled) {
@@ -64,6 +68,7 @@ function NavRow({ item }: { item: NavItem }): JSX.Element {
     <NavLink
       to={to}
       end
+      onClick={onNavigate}
       className={({ isActive }) =>
         cn(
           'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
@@ -79,12 +84,23 @@ function NavRow({ item }: { item: NavItem }): JSX.Element {
   );
 }
 
-export function Sidebar(): JSX.Element {
+interface SidebarNavContentProps {
+  /**
+   * Fired when the user activates a nav link. The mobile drawer wires
+   * this to close-on-navigate so a tap on "Orders" both routes AND
+   * dismisses the drawer.
+   */
+  onNavigate?: () => void;
+}
+
+const NOOP = (): void => {};
+
+export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps = {}): JSX.Element {
   const role = useCurrentRole();
   const showUserManagement = role === 'root';
 
   return (
-    <aside className="hidden w-60 shrink-0 flex-col border-r border-border bg-card md:flex">
+    <div className="flex h-full flex-col">
       {/* Brand */}
       <div className="flex h-14 items-center gap-2 px-5">
         <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
@@ -106,10 +122,13 @@ export function Sidebar(): JSX.Element {
           </p>
           <div className="flex flex-col gap-0.5">
             {PRIMARY_NAV.map((item) => (
-              <NavRow key={item.to} item={item} />
+              <NavRow key={item.to} item={item} onNavigate={onNavigate} />
             ))}
             {showUserManagement ? (
-              <NavRow item={{ to: '/users', label: 'Users', icon: Users }} />
+              <NavRow
+                item={{ to: '/users', label: 'Users', icon: Users }}
+                onNavigate={onNavigate}
+              />
             ) : null}
           </div>
         </div>
@@ -120,7 +139,7 @@ export function Sidebar(): JSX.Element {
           </p>
           <div className="flex flex-col gap-0.5">
             {SECONDARY_NAV.map((item) => (
-              <NavRow key={item.to} item={item} />
+              <NavRow key={item.to} item={item} onNavigate={onNavigate} />
             ))}
           </div>
         </div>
@@ -135,6 +154,14 @@ export function Sidebar(): JSX.Element {
         </div>
         <div className="mt-2 px-3 text-[10px] text-muted-foreground">Phase 1 · v0.1.0</div>
       </div>
+    </div>
+  );
+}
+
+export function Sidebar(): JSX.Element {
+  return (
+    <aside className="hidden w-60 shrink-0 flex-col border-r border-border bg-card md:flex">
+      <SidebarNavContent />
     </aside>
   );
 }

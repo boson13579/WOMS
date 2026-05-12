@@ -4,9 +4,10 @@
  * Page title lives on the left; lightweight contextual actions live on the
  * right. The sidebar owns primary navigation.
  */
-import { LogOut, RefreshCcw, Search } from 'lucide-react';
+import { LogOut, Menu, RefreshCcw, Search } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
+import { useMobileNavStore } from '@/components/layout/mobileNavStore';
 import { ThemeToggle } from '@/components/layout/ThemeToggle';
 import { Button } from '@/components/ui/button';
 import { useAuthStore } from '@/features/auth/stores/authStore';
@@ -30,6 +31,7 @@ export function Header({
 }: HeaderProps): JSX.Element {
   const navigate = useNavigate();
   const logout = useAuthStore((state) => state.logout);
+  const openMobileNav = useMobileNavStore((state) => state.setOpen);
 
   const handleLogout = () => {
     void logout().finally(() => {
@@ -38,7 +40,19 @@ export function Header({
   };
 
   return (
-    <header className="flex h-14 shrink-0 items-center gap-4 border-b border-border bg-background px-6">
+    <header className="flex h-14 shrink-0 items-center gap-4 border-b border-border bg-background px-4 md:px-6">
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        onClick={() => {
+          openMobileNav(true);
+        }}
+        aria-label="Open navigation"
+        className="md:hidden"
+      >
+        <Menu className="h-5 w-5" />
+      </Button>
       <div className="min-w-0 flex-1">
         <h1 className="truncate text-lg font-semibold tracking-tight">{title}</h1>
         {subtitle ? <p className="truncate text-xs text-muted-foreground">{subtitle}</p> : null}
