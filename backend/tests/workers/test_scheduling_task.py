@@ -2536,3 +2536,295 @@ def test_malformed_pending_op_member_is_drained_to_dlq(
     assert payload["ops"][0]["order_number"] == "ORD-AFTER-BAD"
     # Pending_ops now has only the good compound (bad was ZREM'd during drain).
     assert redis_client.zcard(PENDING_OPS_KEY) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reject-rate adaptive cap on batch admission
+# ---------------------------------------------------------------------------
+#
+# Heuristic: when ``run_scheduling_task`` reads N pending compounds, it only
+# binary-searches the first ``ceil(1/p)`` of them — where p is the rolling
+# EWMA estimate of per-compound rejection probability persisted at
+# ``schedule:compound_reject_rate``. Saves
+# ``compute_batch_capacity_delta`` work on prefixes too long to be feasible
+# anyway. These tests verify the rate helpers in isolation, then check
+# the drain loop actually honors the cap.
+
+
+def test_reject_rate_defaults_to_initial_when_key_missing(
+    redis_client: Redis,
+) -> None:
+    """No key in Redis ⇒ falls back to ``_REJECT_RATE_INITIAL`` (the prior
+    we picked for fresh deployments / post-flush). Critical because every
+    new worker starts with the key absent."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_INITIAL,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+    )
+
+    # Sanity: autouse flush already wiped it, but make this explicit.
+    assert redis_client.get(COMPOUND_REJECT_RATE_KEY) is None
+
+    assert _get_reject_rate() == _REJECT_RATE_INITIAL
+
+
+def test_reject_rate_clamps_corrupted_value_to_initial(
+    redis_client: Redis,
+) -> None:
+    """If the stored value can't be parsed as float (manual surgery, bit
+    flip, schema change), don't poison the take-count math — fall back to
+    the prior and log a warning."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_INITIAL,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+    )
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "not-a-float")
+
+    assert _get_reject_rate() == _REJECT_RATE_INITIAL
+
+
+def test_reject_rate_clamps_out_of_range_value(
+    redis_client: Redis,
+) -> None:
+    """Values outside ``[MIN, MAX]`` are pulled back to the bound. Future-
+    proofs against a bug that writes wild values."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_MAX,
+        _REJECT_RATE_MIN,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+    )
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "5.0")
+    assert _get_reject_rate() == _REJECT_RATE_MAX
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.0")
+    assert _get_reject_rate() == _REJECT_RATE_MIN
+
+
+def test_reject_rate_ewma_pulls_toward_zero_on_accepted(
+    redis_client: Redis,
+) -> None:
+    """One accepted compound multiplies p by ``(1 - alpha)``. After N
+    accepts in a row, p should monotonically approach 0 (but bounded by
+    MIN). Confirms the EWMA direction matches the documented contract."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_ALPHA,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+        _update_reject_rate,
+    )
+
+    # Seed at a mid-range value so we can see movement.
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.5")
+
+    _update_reject_rate(accepted=1, rejected=0)
+    after_one = _get_reject_rate()
+    # p_new = (1 - alpha) * 0.5
+    assert after_one == pytest.approx((1 - _REJECT_RATE_ALPHA) * 0.5)
+
+    # Many accepts in a row pull p further down.
+    _update_reject_rate(accepted=10, rejected=0)
+    after_eleven = _get_reject_rate()
+    assert after_eleven < after_one
+
+
+def test_reject_rate_ewma_pulls_toward_one_on_rejected(
+    redis_client: Redis,
+) -> None:
+    """One rejected compound applies ``p_new = alpha + (1 - alpha) * p_old``.
+    Sustained rejects push p toward 1 (bounded by MAX)."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_ALPHA,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+        _update_reject_rate,
+    )
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.1")
+
+    _update_reject_rate(accepted=0, rejected=1)
+    after_one = _get_reject_rate()
+    # p_new = alpha + (1 - alpha) * 0.1
+    assert after_one == pytest.approx(_REJECT_RATE_ALPHA + (1 - _REJECT_RATE_ALPHA) * 0.1)
+
+    _update_reject_rate(accepted=0, rejected=10)
+    after_eleven = _get_reject_rate()
+    assert after_eleven > after_one
+
+
+def test_reject_rate_update_persists_to_redis(
+    redis_client: Redis,
+) -> None:
+    """``_update_reject_rate`` must round-trip through Redis so subsequent
+    task invocations (and parallel workers) see the latest value. Without
+    persistence the heuristic would reset every task and never converge."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_INITIAL,
+        COMPOUND_REJECT_RATE_KEY,
+        _update_reject_rate,
+    )
+
+    _update_reject_rate(accepted=0, rejected=1)
+
+    raw = redis_client.get(COMPOUND_REJECT_RATE_KEY)
+    assert raw is not None
+    # Should be ABOVE the initial prior (we observed a reject).
+    assert float(raw) > _REJECT_RATE_INITIAL
+
+
+def test_reject_rate_update_noop_when_no_observations(
+    redis_client: Redis,
+) -> None:
+    """``accepted=0, rejected=0`` is a no-op — the rate Redis key stays
+    untouched. Important because the drain loop calls update once per
+    iteration and the empty-input case happens on every empty-queue tick."""
+    from app.workers.scheduling import COMPOUND_REJECT_RATE_KEY, _update_reject_rate
+
+    _update_reject_rate(accepted=0, rejected=0)
+    assert redis_client.get(COMPOUND_REJECT_RATE_KEY) is None
+
+
+def test_take_count_caps_pending_by_inverse_rate() -> None:
+    """take = min(N, ceil(1/p)). For p ≈ 0.01 the cap is 100; for p = 0.5
+    it's 2; floor of 1 guarantees forward progress even if a buggy update
+    pushes p above 1 momentarily.
+    """
+    from app.workers.scheduling import _take_count_from_rate
+
+    # p = 0.01 ⇒ cap = 100; pending = 1000 ⇒ take = 100
+    assert _take_count_from_rate(pending_count=1000, rate=0.01) == 100
+    # p = 0.5 ⇒ cap = 2
+    assert _take_count_from_rate(pending_count=1000, rate=0.5) == 2
+    # pending < cap ⇒ take = pending (don't try to read past the queue)
+    assert _take_count_from_rate(pending_count=5, rate=0.01) == 5
+    # Floor of 1: even an unstable p > 1 must let the loop progress.
+    assert _take_count_from_rate(pending_count=10, rate=2.0) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reject-rate adaptive cap — drain-loop integration
+# ---------------------------------------------------------------------------
+
+
+def test_run_scheduling_caps_candidates_by_reject_rate(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """With p pre-seeded high (= small cap), the drain loop's binary
+    search MUST only see ``ceil(1/p)`` candidates per iteration even
+    though the queue holds more. Verified by mocking
+    ``_binary_search_feasible_prefix`` to capture the candidate-list size
+    on each call.
+    """
+    from app.workers.scheduling import COMPOUND_REJECT_RATE_KEY
+
+    # p = 0.5 ⇒ cap = ceil(1/0.5) = 2.
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.5")
+
+    for i in range(10):
+        _enqueue(redis_client, _make_op(order_number=f"ORD-{i:02d}"))
+
+    captured_window_sizes: list[int] = []
+
+    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> int:
+        captured_window_sizes.append(len(compounds))
+        return len(compounds)  # accept everything in the window
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._binary_search_feasible_prefix",
+        fake_search,
+    )
+    _patch_common(monkeypatch)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # First iteration: pre-seeded p=0.5 ⇒ cap = ceil(1/0.5) = 2, so the
+    # first binary-search call sees 2 candidates (not 10).
+    assert captured_window_sizes
+    assert captured_window_sizes[0] == 2, captured_window_sizes
+    # Multiple iterations needed to drain all 10 — proves the cap forced
+    # iteration rather than letting one big batch swallow everything.
+    # (Subsequent iterations' window sizes grow as EWMA pulls p down on
+    # each accept; we don't pin those exactly.)
+    assert len(captured_window_sizes) >= 4
+    # All 10 compounds eventually accepted.
+    assert sum(captured_window_sizes) == 10
+
+
+def test_run_scheduling_uses_full_pending_when_rate_is_minimal(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """With p clamped to its minimum, ``ceil(1/p)`` exceeds any realistic
+    queue depth — so the binary-search candidate list IS the full pending
+    list (= same behavior as a non-adaptive design). Confirms the cap
+    doesn't get in the way when reject rate is low.
+    """
+    from app.workers.scheduling import _REJECT_RATE_MIN, COMPOUND_REJECT_RATE_KEY
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, str(_REJECT_RATE_MIN))
+
+    for i in range(5):
+        _enqueue(redis_client, _make_op(order_number=f"ORD-{i:02d}"))
+
+    captured_window_sizes: list[int] = []
+
+    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> int:
+        captured_window_sizes.append(len(compounds))
+        return len(compounds)
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._binary_search_feasible_prefix",
+        fake_search,
+    )
+    _patch_common(monkeypatch)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # First (and only) iteration saw all 5 compounds — cap (= 10_000) was
+    # never the binding constraint.
+    assert captured_window_sizes == [5]
+
+
+def test_run_scheduling_updates_reject_rate_on_accept_and_reject(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """End-to-end: after one accepted compound + one rejected compound,
+    p should have moved (in either direction). We don't pin an exact value
+    because EWMA order matters, but we verify the rate is non-default and
+    persisted."""
+    from app.workers.scheduling import _REJECT_RATE_INITIAL, COMPOUND_REJECT_RATE_KEY
+
+    # Two compounds: first will reject (alone infeasible), second will accept.
+    _enqueue(redis_client, _make_op(order_number="REJ", wafer_quantity=1000))
+    _enqueue(redis_client, _make_op(order_number="OK", wafer_quantity=1000))
+
+    # First [1..N] check (binary search on the WHOLE batch of 2) ⇒ False.
+    # First halving [1..1] (REJ alone) ⇒ False, k=0 ⇒ reject path.
+    # Next iter: pending = [OK]. binary[1..1] ⇒ True ⇒ accept.
+    feasibility_calls: list[int] = []
+
+    def fake_feasible(_state: Any, delta: list[int]) -> bool:
+        feasibility_calls.append(sum(delta))
+        return len(feasibility_calls) >= 3  # 1st = batch of 2 fail, 2nd = REJ alone fail, 3rd = OK alone OK
+
+    _patch_common(monkeypatch, is_batch_feasible=fake_feasible)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # Rate is no longer at default — it was observed-and-written.
+    raw = redis_client.get(COMPOUND_REJECT_RATE_KEY)
+    assert raw is not None
+    final = float(raw)
+    # Both accept and reject events fired exactly once. Order: reject (push
+    # p up from 0.01) → accept (push p back down). Net direction depends on
+    # the magnitudes; what's locked in is that p HAS moved.
+    assert final != _REJECT_RATE_INITIAL

@@ -26,6 +26,7 @@ Three tasks live here:
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from datetime import UTC, date, datetime
@@ -152,6 +153,95 @@ _WAITER_FLAG_TTL_SECONDS = get_settings().SCHEDULER_WAITER_FLAG_TTL_SECONDS
 # ``SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS`` env vars.
 _RUN_WAIT_TIMEOUT_SECONDS = get_settings().SCHEDULER_RUN_WAIT_TIMEOUT_SECONDS
 _RUN_WAIT_POLL_INTERVAL_SECONDS = get_settings().SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Reject-rate adaptive cap for batch admission
+# ---------------------------------------------------------------------------
+#
+# ``_binary_search_feasible_prefix`` halves from ``len(candidates)`` down to
+# the first feasible attempt. When the queue holds N=1000 compounds but the
+# very first compound is the only blocker, halving from 1000 wastes
+# ``log2(N)`` rounds of ``compute_batch_capacity_delta`` (each O(K+D)) on
+# prefixes that were doomed before we built their delta. The "look at the
+# first 1/p compounds" heuristic caps the candidate window at the EXPECTED
+# position of the next reject — so with p=0.01 (1 in 100 compounds rejected)
+# we never test prefixes larger than 100.
+#
+# p is updated per-compound via EWMA (alpha = 0.05 → roughly 20 events to fully
+# adapt) and persisted to Redis so the rate survives worker restarts and is
+# shared across worker replicas (last-writer-wins on concurrent updates;
+# acceptable noise for a tuning heuristic).
+COMPOUND_REJECT_RATE_KEY = "schedule:compound_reject_rate"
+_REJECT_RATE_INITIAL = 0.01
+# Floor: a worker that's seen only accepts would otherwise let p → 0 and
+# take = N (= no cap, same as pre-heuristic behavior). 1e-4 caps take at
+# 10_000 — well above any sane pending-queue depth, so still effectively
+# uncapped but bounded.
+_REJECT_RATE_MIN = 1e-4
+# Ceiling: prevents p > 1 from a buggy update path (would imply take < 1).
+_REJECT_RATE_MAX = 1.0
+# Smoothing factor. alpha small ⇒ p adapts slowly to recent events; alpha large ⇒
+# p over-reacts to one-off rejections. 0.05 gives ~20 events for full
+# adaptation, which is roughly the resolution we want (a sustained shift
+# in reject pattern is noticed within a couple of typical batches; an
+# isolated reject barely moves p).
+_REJECT_RATE_ALPHA = 0.05
+
+
+def _get_reject_rate() -> float:
+    """Read the EWMA reject rate from Redis; fall back to the initial prior.
+
+    Clamps to ``[MIN, MAX]`` defensively in case a corrupted value got into
+    the key (manual surgery, future schema change, etc.) — a wild p would
+    poison the take-count computation otherwise.
+    """
+    raw = cast("str | None", _get_redis().get(COMPOUND_REJECT_RATE_KEY))
+    if raw is None:
+        return _REJECT_RATE_INITIAL
+    try:
+        rate = float(raw)
+    except (ValueError, TypeError):
+        logger.warning("schedule.reject_rate.corrupted_value", raw=raw)
+        return _REJECT_RATE_INITIAL
+    return max(_REJECT_RATE_MIN, min(_REJECT_RATE_MAX, rate))
+
+
+def _update_reject_rate(*, accepted: int, rejected: int) -> None:
+    """Apply per-compound EWMA updates to the persisted reject rate.
+
+    Each accepted compound pulls p toward 0; each rejected compound pulls
+    p toward 1. We apply the updates sequentially (one EWMA step per
+    compound) rather than as a single batched ratio so the same total
+    pattern produces the same final p regardless of whether we observed it
+    as one big batch or many small ones.
+
+    Concurrent writes (multiple workers) race on the SET — last-writer-wins.
+    Acceptable for a tuning heuristic: convergence is slower but still
+    monotonic in the expected direction.
+    """
+    if accepted == 0 and rejected == 0:
+        return
+    rate = _get_reject_rate()
+    # Each accepted observation: target = 0
+    for _ in range(accepted):
+        rate = (1 - _REJECT_RATE_ALPHA) * rate
+    # Each rejected observation: target = 1
+    for _ in range(rejected):
+        rate = _REJECT_RATE_ALPHA + (1 - _REJECT_RATE_ALPHA) * rate
+    rate = max(_REJECT_RATE_MIN, min(_REJECT_RATE_MAX, rate))
+    _get_redis().set(COMPOUND_REJECT_RATE_KEY, repr(rate))
+
+
+def _take_count_from_rate(pending_count: int, rate: float) -> int:
+    """How many leading pending compounds to consider in this iteration.
+
+    ``take = min(pending_count, ceil(1/p))``. Floored at 1 so we always
+    look at at least the head of the queue (otherwise an unstable p that
+    momentarily exceeded 1 would freeze the drain).
+    """
+    cap = max(1, math.ceil(1.0 / rate))
+    return min(pending_count, cap)
 
 
 # ---------------------------------------------------------------------------
@@ -1101,17 +1191,28 @@ def run_scheduling_task(self: Task) -> None:
                 break
 
             state = _load_state()
-            compounds_only = [compound for _, compound in pending]
+            # Reject-rate adaptive cap: only consider the first ``ceil(1/p)``
+            # candidates for binary-search. With p tracking the per-compound
+            # reject rate, this is the expected position of the next reject,
+            # so prefixes beyond it are unlikely to be feasible anyway —
+            # skipping them avoids paying ``compute_batch_capacity_delta``
+            # on doomed candidates. ``_update_reject_rate`` keeps p current
+            # below, so the cap auto-adapts to the workload.
+            rate = _get_reject_rate()
+            take = _take_count_from_rate(len(pending), rate)
+            candidates = pending[:take]
 
-            k = _binary_search_feasible_prefix(state, compounds_only)
+            k = _binary_search_feasible_prefix(state, [c for _, c in candidates])
 
             if k == 0:
                 first_member, first_compound = pending[0]
                 _reject_first_compound(first_member, first_compound)
+                _update_reject_rate(accepted=0, rejected=1)
                 any_compound_rejected = True
                 continue
 
-            _commit_accepted_batch(state, pending[:k])
+            _commit_accepted_batch(state, candidates[:k])
+            _update_reject_rate(accepted=k, rejected=0)
             any_batch_committed = True
 
         if any_batch_committed:
