@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from app.services.scheduling import (
+    MATERIALIZE_NOTIFY_PENDING_KEY,
     PENDING_OPS_KEY,
     STATE_KEY,
     STATUS_KEY,
@@ -1673,6 +1674,57 @@ def test_materialize_task_drains_pending_users_and_notifies(
     assert redis_client.get("schedule:materialize_running") is None
 
 
+def test_materialize_task_tolerates_system_sentinel_in_notify_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """advance_day / rebuild SADD a non-UUID system sentinel into
+    notify_pending before their follow-up ``.delay()`` so this materializer's
+    post-release re-trigger check is guaranteed to see pending work (see
+    the race walkthrough at ``_MATERIALIZE_SYSTEM_SENTINEL``).
+
+    This means the per-member loop will encounter a non-UUID member.
+    ``websocket.notify_user`` is called with ``uuid.UUID(member)`` and the
+    parse raises ``ValueError`` — the materializer must catch, log, and
+    keep draining (no exception escapes, real UUIDs still get notified).
+    """
+    from app.workers.scheduling import _MATERIALIZE_SYSTEM_SENTINEL, materialize_schedule_task
+
+    real_user = uuid.uuid4()
+    redis_client.sadd(
+        "schedule:materialize_notify_pending",
+        str(real_user),
+        _MATERIALIZE_SYSTEM_SENTINEL,
+    )
+    redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._load_state",
+        lambda: SchedulerState.initial(date(2026, 5, 5)),
+    )
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    notify_mock = MagicMock()
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+
+    result = materialize_schedule_task.apply()
+    assert result.successful(), result.traceback
+
+    # Sentinel never reached notify_user — only the real UUID did.
+    notified_ids = [c.kwargs["user_id"] for c in notify_mock.call_args_list]
+    assert notified_ids == [real_user]
+    # Pending fully drained (both real user + sentinel removed).
+    assert redis_client.scard("schedule:materialize_notify_pending") == 0
+
+
 def test_materialize_task_exits_when_already_running(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
@@ -1896,8 +1948,16 @@ def test_advance_day_dispatches_materializer_after_commit(
     materializer isn't lock-serialized anymore, advance_day can't
     block the race directly. Triggering a follow-up materializer
     bounds the stale window to one materializer cycle.
+
+    Also asserts the **sentinel SADD lands before** ``.delay()``: without
+    it, an in-flight materializer (M1) holding ``MATERIALIZE_RUNNING_KEY``
+    would cause our M2 to ``skip_concurrent``, and M1's post-release
+    re-trigger check sees an empty notify_pending and never re-fires —
+    so DB silently keeps the pre-advance state until the next user
+    compound. The sentinel makes M1's post-release check observe pending
+    and dispatch a fresh M3.
     """
-    from app.workers.scheduling import advance_day_task
+    from app.workers.scheduling import _MATERIALIZE_SYSTEM_SENTINEL, advance_day_task
 
     redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
 
@@ -1921,17 +1981,88 @@ def test_advance_day_dispatches_materializer_after_commit(
     )
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
     monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
-    materialize_delay = MagicMock()
+
+    # Capture the state of notify_pending at the moment .delay() is
+    # called — ordering matters: SADD must land BEFORE dispatch so an
+    # in-flight materializer's post-release check is guaranteed to see
+    # pending work.
+    pending_at_dispatch: list[set[str]] = []
+
+    def capture_pending() -> None:
+        members = redis_client.smembers(MATERIALIZE_NOTIFY_PENDING_KEY)
+        pending_at_dispatch.append({m for m in members})
+
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",
-        materialize_delay,
+        capture_pending,
     )
 
     result = advance_day_task.apply()
     assert result.successful(), result.traceback
 
-    # advance_day dispatched at least one materializer at the end.
-    assert materialize_delay.call_count >= 1
+    # advance_day dispatched a materializer at the end…
+    assert len(pending_at_dispatch) >= 1
+    # …and the sentinel was already in notify_pending at that moment, so
+    # any racing in-flight materializer that hits skip_concurrent will
+    # still re-trigger on its post-release check.
+    assert _MATERIALIZE_SYSTEM_SENTINEL in pending_at_dispatch[-1]
+
+
+def test_rebuild_dispatches_materializer_with_sentinel_after_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """Same race-guard contract as advance_day, but for ``rebuild_schedule_task``.
+
+    Rebuild's finally also dispatches a follow-up materializer, and the
+    same in-flight-materializer-loses-the-race scenario applies. Verifies
+    the sentinel is SADD'd into notify_pending before .delay() so M1's
+    post-release re-trigger picks it up if M2 hits skip_concurrent.
+    """
+    from app.workers.scheduling import _MATERIALIZE_SYSTEM_SENTINEL, rebuild_schedule_task
+
+    base = date(2026, 5, 5)
+    redis_client.set(STATE_KEY, SchedulerState.initial(base).to_json())
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._get_status",
+        lambda: {"state": "idle"},
+    )
+    _patch_rebuild_time(monkeypatch)
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.list_for_scheduler",
+        lambda db: ([], {}),
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling.rebuild_state",
+        lambda orders, base_date: (SchedulerState.initial(base_date), []),
+    )
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", MagicMock(return_value=[]))
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+
+    pending_at_dispatch: list[set[str]] = []
+
+    def capture_pending() -> None:
+        members = redis_client.smembers(MATERIALIZE_NOTIFY_PENDING_KEY)
+        pending_at_dispatch.append({m for m in members})
+
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        capture_pending,
+    )
+
+    result = rebuild_schedule_task.apply()
+    assert result.successful(), result.traceback
+
+    assert len(pending_at_dispatch) >= 1
+    assert _MATERIALIZE_SYSTEM_SENTINEL in pending_at_dispatch[-1]
 
 
 # ---------------------------------------------------------------------------

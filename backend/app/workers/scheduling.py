@@ -1068,6 +1068,23 @@ def run_scheduling_task(self: Task) -> None:
 
 _MATERIALIZE_RUNNING_TTL_SECONDS = 300  # 5 min safety window for crash recovery
 
+# System sentinel SADD'd into ``MATERIALIZE_NOTIFY_PENDING_KEY`` by
+# advance_day_task / rebuild_schedule_task before they dispatch their
+# follow-up materializer. Closes the race where an in-flight materializer
+# (M1) is mid-``apply_schedule`` with pre-advance_day state when advance_day
+# commits + dispatches M2 — M2 hits ``skip_concurrent`` (M1 still holds
+# ``MATERIALIZE_RUNNING_KEY``), and M1's post-release re-trigger check at
+# the bottom of ``materialize_schedule_task`` would otherwise see an empty
+# pending set and not fire. With the sentinel present, M1's post-release
+# check sees pending and dispatches a fresh M3 that picks up the post-
+# advance_day state and overwrites the stale ``daily_breakdown``.
+#
+# Materializer's per-member ``uuid.UUID(user_raw)`` parse fails on this
+# value and hits the ``except ValueError`` log-and-skip branch — so the
+# sentinel costs at most one ``schedule.materialize.bad_user_id`` warning
+# per advance_day / rebuild cycle and never reaches ``notify_user``.
+_MATERIALIZE_SYSTEM_SENTINEL = "__system_advance_day__"
+
 
 @celery_app.task(name="scheduling.materialize")  # type: ignore[untyped-decorator]
 def materialize_schedule_task() -> None:
@@ -1449,6 +1466,15 @@ def advance_day_task() -> None:
         # latency instead of "until the next user compound". See the
         # comment block inside ``materialize_schedule_task`` for why
         # we accept the staleness instead of locking against it.
+        #
+        # The SADD before .delay() is load-bearing: if the in-flight
+        # materializer is still holding ``MATERIALIZE_RUNNING_KEY`` when
+        # our M2 wakes up, M2 hits ``skip_concurrent`` and returns. The
+        # sentinel guarantees the in-flight materializer's post-release
+        # check (``rds.exists(MATERIALIZE_NOTIFY_PENDING_KEY)``) sees
+        # work and dispatches a fresh M3. See ``_MATERIALIZE_SYSTEM_SENTINEL``
+        # for the parse-failure path on the materializer side.
+        _get_redis().sadd(MATERIALIZE_NOTIFY_PENDING_KEY, _MATERIALIZE_SYSTEM_SENTINEL)
         materialize_schedule_task.delay()
 
 
@@ -1573,5 +1599,7 @@ def rebuild_schedule_task() -> None:
         # Same as advance_day_task: refresh materialized DB columns
         # to overwrite any racing materializer that read the pre-
         # rebuild state. See ``materialize_schedule_task`` body for
-        # the staleness trade-off rationale.
+        # the staleness trade-off rationale, and the matching block in
+        # advance_day_task for why we SADD a sentinel before .delay().
+        _get_redis().sadd(MATERIALIZE_NOTIFY_PENDING_KEY, _MATERIALIZE_SYSTEM_SENTINEL)
         materialize_schedule_task.delay()

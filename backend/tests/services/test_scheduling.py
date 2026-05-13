@@ -991,12 +991,13 @@ def test_compute_schedule_skips_pinned_with_overdue_fake_deadline() -> None:
     assert not any(r.order_id == overdue.order_id for r in results)
 
 
-def test_compute_schedule_logs_pin_overcommitted_but_still_emits() -> None:
+def test_compute_schedule_pin_overcommitted_first_wins_full_capacity() -> None:
     """If two pinned orders both reserve more than ``DAILY_CAPACITY`` on
     the same day (admission control should have rejected this, so it
-    means upstream state corruption), ``compute_schedule`` still emits
-    what fits — second pinned order gets ``min(remaining, requested)``
-    rather than overflowing the daily ledger."""
+    means upstream state corruption), the first-inserted pin still gets
+    its full requested quantity scheduled — over-commit doesn't corrupt
+    the winner's slot.
+    """
     state = SchedulerState.initial(_BASE)
     pin_day = _BASE + timedelta(days=2)
     p1 = PinnedOrder(
@@ -1019,11 +1020,44 @@ def test_compute_schedule_logs_pin_overcommitted_but_still_emits() -> None:
     results = compute_schedule(state)
 
     p1_total = sum(r.quantity for r in results if r.order_id == p1.order_id)
-    p2_total = sum(r.quantity for r in results if r.order_id == p2.order_id)
-    # p1 inserted first into dict, so consumes the full day; p2 is
-    # over-committed and gets 0 (the ``assigned > 0`` guard skips it).
     assert p1_total == DAILY_CAPACITY
-    assert p2_total == 0
+
+
+def test_compute_schedule_pin_overcommitted_dropped_loser_emits_no_rows() -> None:
+    """Companion to ``..._first_wins_full_capacity``: the second pinned
+    order that doesn't fit gets **dropped entirely** — no ScheduledResult
+    rows for it — because the ``assigned > 0`` guard inside the per-day
+    loop suppresses zero-quantity emissions.
+
+    Locking this in separately so a future change that removed the
+    ``assigned > 0`` guard (and started emitting ``quantity=0`` rows
+    instead) would surface here rather than slipping through under the
+    old "still_emits" name where the assertion was ``p2_total == 0``.
+    """
+    state = SchedulerState.initial(_BASE)
+    pin_day = _BASE + timedelta(days=2)
+    p1 = PinnedOrder(
+        order_id=uuid.uuid4(),
+        order_number="P1",
+        wafer_quantity=DAILY_CAPACITY,
+        deadline=pin_day,
+        fake_deadline=pin_day,
+    )
+    p2 = PinnedOrder(
+        order_id=uuid.uuid4(),
+        order_number="P2",
+        wafer_quantity=500,
+        deadline=pin_day,
+        fake_deadline=pin_day,
+    )
+    state.pinned_orders[p1.order_id] = p1
+    state.pinned_orders[p2.order_id] = p2
+
+    results = compute_schedule(state)
+
+    # No rows at all for p2 — not "one row with quantity=0".
+    p2_rows = [r for r in results if r.order_id == p2.order_id]
+    assert p2_rows == []
 
 
 def test_compute_schedule_silently_skips_pq_order_with_invalid_deadline() -> None:
