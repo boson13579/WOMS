@@ -31,8 +31,8 @@ router = APIRouter()
 
 # Roles allowed to read orders (order_manager and above)
 _READ_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
-# Roles allowed to write orders (scheduler and above)
-_WRITE_ROLES = require_roles(UserRole.scheduler, UserRole.root)
+# Roles allowed to write orders (order_manager and above)
+_WRITE_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
 
 VALID_SORT_FIELDS = frozenset(
     {"order_number", "customer_name", "wafer_quantity", "requested_delivery_date"}

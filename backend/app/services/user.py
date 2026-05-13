@@ -13,7 +13,12 @@ from app.core.logger import audit_log
 from app.models.user import User, UserRole
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import user as user_repo
-from app.schemas.user import UserListResponse, UserResponse, UserUpdateRequest
+from app.schemas.user import (
+    UserListResponse,
+    UserResponse,
+    UserSelfUpdateRequest,
+    UserUpdateRequest,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -53,6 +58,74 @@ def get_user(db: Session, user_id: uuid.UUID) -> UserResponse:
     return UserResponse.model_validate(user)
 
 
+def update_self(
+    db: Session,
+    current_user: User,
+    request: UserSelfUpdateRequest,
+) -> UserResponse:
+    """Let any authenticated user update their own username / email."""
+    if current_user.version_id != request.version_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User was modified by another request. Refresh and try again.",
+        )
+
+    if request.username is not None:
+        existing = user_repo.get_by_username(db, request.username)
+        if existing is not None and existing.id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Username '{request.username}' is already taken.",
+            )
+
+    if request.email is not None:
+        existing_email = user_repo.get_by_email(db, request.email)
+        if existing_email is not None and existing_email.id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Email '{request.email}' is already in use.",
+            )
+
+    old_val = {"username": current_user.username, "email": current_user.email}
+    new_val: dict[str, object] = {}
+
+    try:
+        user_repo.update_self(
+            db,
+            current_user,
+            fields_set=request.model_fields_set,
+            username=request.username,
+            email=request.email,
+        )
+        new_val = {"username": current_user.username, "email": current_user.email}
+        audit_log_repo.create(
+            db,
+            action="user.self_updated",
+            user_id=current_user.id,
+            resource_type="user",
+            resource_id=current_user.id,
+            old_value=old_val,
+            new_value=new_val,
+        )
+        db.commit()
+    except StaleDataError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User was modified by another request. Refresh and try again.",
+        ) from exc
+
+    audit_log(
+        action="user.self_updated",
+        actor_id=str(current_user.id),
+        resource_type="user",
+        resource_id=str(current_user.id),
+        changes={"old": old_val, "new": new_val},
+    )
+
+    return UserResponse.model_validate(current_user)
+
+
 def update_user(
     db: Session,
     user_id: uuid.UUID,
@@ -70,12 +143,26 @@ def update_user(
             detail="User was modified by another request. Refresh and try again.",
         )
 
+    if "email" in request.model_fields_set and request.email is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="email cannot be set to null; omit the field to leave it unchanged.",
+        )
+
     if request.username is not None:
         existing = user_repo.get_by_username(db, request.username)
         if existing is not None and existing.id != user.id:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Username '{request.username}' is already taken.",
+            )
+
+    if request.email is not None:
+        existing_email = user_repo.get_by_email(db, request.email)
+        if existing_email is not None and existing_email.id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Email '{request.email}' is already in use.",
             )
 
     _guard_last_root(db, user, request.role, request.is_active)

@@ -62,13 +62,37 @@ def lock_and_count_other_active_roots(db: Session, exclude_id: uuid.UUID) -> int
     return sum(1 for rid in root_ids if rid != exclude_id)
 
 
+def get_by_email(db: Session, email: str) -> User | None:
+    """Return the User with the given email, or None."""
+    stmt = select(User).where(User.email == email, User.is_deleted.is_(False))
+    return db.scalars(stmt).first()
+
+
+def update_self(
+    db: Session,
+    user: User,
+    *,
+    fields_set: set[str],
+    username: str | None = None,
+    email: str | None = None,
+) -> User:
+    """Apply self-update fields (username, email only) and flush."""
+    if "username" in fields_set and username is not None:
+        user.username = username
+    if "email" in fields_set and email is not None:
+        user.email = email
+    db.flush()
+    db.refresh(user)
+    return user
+
+
 def create(
     db: Session,
     *,
     username: str,
     password_hash: str,
     role: UserRole,
-    email: str | None = None,
+    email: str,
 ) -> User:
     """Insert a new User row and return the persisted instance."""
     user = User(
@@ -96,7 +120,7 @@ def update(
     """Apply partial updates to *user* and flush.  Caller must commit."""
     if "username" in fields_set and username is not None:
         user.username = username
-    if "email" in fields_set:
+    if "email" in fields_set and email is not None:
         user.email = email
     if "role" in fields_set and role is not None:
         user.role = role

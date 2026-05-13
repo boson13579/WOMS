@@ -18,7 +18,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.logger import audit_log as emit_audit_log
 from app.models.order import MUTABLE_STATUSES, Order, OrderStatus
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import order as order_repo
 from app.schemas.order import (
@@ -449,6 +449,12 @@ def update_order(
     if order.is_processing_locked:
         raise _LOCKED_ORDER_ERROR
 
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify orders you created.",
+        )
+
     # Application-level optimistic lock: reject stale client versions before
     # making any changes. SQLAlchemy's DB-level check fires on flush(), but this
     # early guard gives a clearer error and avoids unnecessary DB work.
@@ -561,6 +567,12 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     if order.is_processing_locked:
         raise _LOCKED_ORDER_ERROR
 
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify orders you created.",
+        )
+
     # Build the compound from the *current* row state (the values the
     # worker will use to soft-delete + audit on accept).
     compound = _build_delete_compound(order, actor.id)
@@ -610,6 +622,10 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
         # ``BatchUpdateResponse.skipped_ids`` already documents partial
         # failures.
         if order.is_processing_locked:
+            skipped.append(order_id)
+            continue
+
+        if actor.role == UserRole.order_manager and order.created_by != actor.id:
             skipped.append(order_id)
             continue
 

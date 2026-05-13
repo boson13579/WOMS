@@ -27,10 +27,10 @@ def _make_user(
     """Insert a user directly into the DB for test setup."""
     user = User(
         username=username,
+        email=email or f"{username}@test.internal",
         password_hash=bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
         role=role,
         is_active=is_active,
-        email=email,
     )
     db.add(user)
     db.commit()
@@ -320,7 +320,9 @@ def test_delete_user_without_token_returns_401(client: TestClient, db_session: S
 # ---------------------------------------------------------------------------
 
 
-def test_patch_user_clear_email_with_null_succeeds(client: TestClient, db_session: Session) -> None:
+def test_patch_user_clear_email_with_null_returns_422(
+    client: TestClient, db_session: Session
+) -> None:
     headers = _root_headers(client, db_session)
     target = _make_user(db_session, username="sam", email="sam@example.com")
 
@@ -330,8 +332,8 @@ def test_patch_user_clear_email_with_null_succeeds(client: TestClient, db_sessio
         headers=headers,
     )
 
-    assert res.status_code == 200
-    assert res.json()["email"] is None
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
 
 
 def test_patch_user_omit_email_leaves_it_unchanged(client: TestClient, db_session: Session) -> None:
@@ -409,3 +411,84 @@ def test_delete_user_deactivate_last_root_returns_409(
 
     assert res.status_code == 409
     assert res.json()["error"]["code"] == 409
+
+
+# ---------------------------------------------------------------------------
+# [RED] PATCH /users/me — self-update (any authenticated role)
+# ---------------------------------------------------------------------------
+
+
+def test_self_update_username_success(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="self_upd_u", password="password123")
+    token = _login(client, "self_upd_u", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"username": "self_upd_u_new", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["username"] == "self_upd_u_new"
+
+
+def test_self_update_email_success(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="self_upd_e", password="password123")
+    token = _login(client, "self_upd_e", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"email": "updated@example.com", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["email"] == "updated@example.com"
+
+
+def test_self_update_stale_version_returns_409(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="self_upd_stale", password="password123")
+    token = _login(client, "self_upd_stale", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"username": "wont_matter", "version_id": 9999},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_self_update_duplicate_username_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    _make_user(db_session, username="taken_name")
+    user = _make_user(db_session, username="self_upd_dup", password="password123")
+    token = _login(client, "self_upd_dup", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"username": "taken_name", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_self_update_cannot_change_role(client: TestClient, db_session: Session) -> None:
+    user = _make_user(
+        db_session, username="self_upd_role", role=UserRole.viewer, password="password123"
+    )
+    token = _login(client, "self_upd_role", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"role": "root", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    # role field is not part of UserSelfUpdateRequest → 422 validation error
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
