@@ -2811,7 +2811,9 @@ def test_run_scheduling_updates_reject_rate_on_accept_and_reject(
 
     def fake_feasible(_state: Any, delta: list[int]) -> bool:
         feasibility_calls.append(sum(delta))
-        return len(feasibility_calls) >= 3  # 1st = batch of 2 fail, 2nd = REJ alone fail, 3rd = OK alone OK
+        return (
+            len(feasibility_calls) >= 3
+        )  # 1st = batch of 2 fail, 2nd = REJ alone fail, 3rd = OK alone OK
 
     _patch_common(monkeypatch, is_batch_feasible=fake_feasible)
 

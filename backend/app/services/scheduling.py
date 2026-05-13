@@ -1130,8 +1130,7 @@ def apply_batch_to_capacity(state: SchedulerState, delta: list[int]) -> None:
     """
     if len(delta) != HORIZON_DAYS:
         raise ValueError(
-            f"apply_batch_to_capacity: expected delta of length {HORIZON_DAYS}, "
-            f"got {len(delta)}"
+            f"apply_batch_to_capacity: expected delta of length {HORIZON_DAYS}, got {len(delta)}"
         )
     old_rem = state.capacity_tree.to_array()
     new_rem = [0] * HORIZON_DAYS
@@ -1165,8 +1164,7 @@ def apply_batch_to_deadline(state: SchedulerState, delta: list[int]) -> None:
     """
     if len(delta) != HORIZON_DAYS:
         raise ValueError(
-            f"apply_batch_to_deadline: expected delta of length {HORIZON_DAYS}, "
-            f"got {len(delta)}"
+            f"apply_batch_to_deadline: expected delta of length {HORIZON_DAYS}, got {len(delta)}"
         )
     for i, day_delta in enumerate(delta, start=1):
         if day_delta != 0:
@@ -1371,9 +1369,7 @@ def advance_day(state: SchedulerState) -> SchedulerState:
             break
 
     fully_done_orders: list[SchedulingOrder] = pq_edf[:fully_done_count]
-    boundary_order: SchedulingOrder | None = (
-        pq_edf[fully_done_count] if has_boundary else None
-    )
+    boundary_order: SchedulingOrder | None = pq_edf[fully_done_count] if has_boundary else None
 
     # ----- Step 2: tree updates --------------------------------------------
     for done in fully_done_orders:
