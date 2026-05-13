@@ -1524,7 +1524,7 @@ def advance_day_task() -> None:
 
     1. **``in_production → completed``** for orders that WERE locked in
        on a previous day and are no longer in the new scheduler state's
-       living set (= ``priority_queue + pinned_orders``). Signal: those
+       living set (= ``pq_index + pinned_orders``). Signal: those
        orders' last remaining work was made yesterday, they're done.
     2. **(scheduled | …) → ``in_production``** for orders that have any
        production assigned to "today" (the day-1 of the OLD state, which
@@ -1596,7 +1596,7 @@ def advance_day_task() -> None:
             # Orders still alive in the new state — used by
             # ``mark_completed_outside_set`` to decide which currently-
             # in_production rows are done.
-            new_alive_ids: set[uuid.UUID] = {o.order_id for o in new_state.priority_queue} | set(
+            new_alive_ids: set[uuid.UUID] = set(new_state.pq_index.keys()) | set(
                 new_state.pinned_orders.keys()
             )
 
@@ -1628,7 +1628,7 @@ def advance_day_task() -> None:
                 "schedule.advance_day.success",
                 old_base=state.base_date.isoformat(),
                 new_base=new_state.base_date.isoformat(),
-                carried=len(new_state.priority_queue),
+                carried=len(new_state.pq_index),
                 in_production_count=in_prod_count,
                 completed_count=completed_count,
             )
@@ -1768,7 +1768,7 @@ def rebuild_schedule_task() -> None:
             logger.info(
                 "schedule.rebuild.success",
                 base_date=base_date.isoformat(),
-                orders_added=len(new_state.priority_queue),
+                orders_added=len(new_state.pq_index),
                 orders_skipped=len(skipped),
             )
 

@@ -1116,9 +1116,8 @@ def test_advance_day_marks_today_orders_in_production(
         wafer_quantity=1000,
         deadline=tomorrow + timedelta(days=2),
     )
-    # SortedKeyList uses ``add`` (not append) to maintain sort order; mirror
-    # the index dict so contains-check / lookup paths still work.
-    new_state.priority_queue.add(order_y_obj)
+    # Dict-backed pq: direct assignment to pq_index — EDF order is derived
+    # at iteration time via _iter_pq_edf_sorted, not maintained here.
     new_state.pq_index[order_y] = order_y_obj
 
     monkeypatch.setattr("app.workers.scheduling._load_state", lambda: old_state)
@@ -1239,7 +1238,6 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
 
     # rebuild_state succeeds with no skipped.
     rebuilt_state = SchedulerState.initial(base)
-    rebuilt_state.priority_queue.add(pulled_order)
     rebuilt_state.pq_index[pulled_order.order_id] = pulled_order
     rebuild_mock = MagicMock(return_value=(rebuilt_state, []))
     monkeypatch.setattr("app.workers.scheduling.rebuild_state", rebuild_mock)

@@ -24,7 +24,6 @@ from typing import Literal, NamedTuple
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
-from sortedcontainers import SortedKeyList
 
 from app.core.config import get_settings
 
@@ -343,7 +342,7 @@ class SchedulingOrder(BaseModel):
 class PinnedOrder(BaseModel):
     """An order that is locked to a specific production day.
 
-    Pinned orders are NOT in ``priority_queue`` — they live in
+    Pinned orders are NOT in ``pq_index`` — they live in
     ``SchedulerState.pinned_orders``. Segment trees still account for them,
     but indexed at ``fake_deadline`` (the pin day) rather than the real
     ``deadline``: that's what makes the same ``capacity_tree.query(...)``
@@ -393,32 +392,26 @@ class SkippedOrder(BaseModel):
     reason: Literal["capacity_exceeded", "deadline_too_far"]
 
 
-def _new_priority_queue(
-    orders: list[SchedulingOrder] | None = None,
-) -> SortedKeyList:
-    """Factory for the ``priority_queue`` field.
-
-    Uses ``sortedcontainers.SortedKeyList`` so insert / remove / membership
-    are O(log n) instead of O(n) (the old list-then-resort approach). The
-    key function matches ``SchedulingOrder.sort_key`` — every mutation is
-    sorted in-place.
-    """
-    return SortedKeyList(orders or [], key=lambda o: o.sort_key())
-
-
 class SchedulerState(BaseModel):
     """Live scheduler state; persisted to Redis as JSON between runs.
 
     Data structure choices for the live collections — see also
     ``docs/scheduling.md §4.1.2``:
 
-    - ``priority_queue`` is a ``SortedKeyList`` keyed by
-      ``SchedulingOrder.sort_key``. add / remove are O(log n); in-order
-      iteration is O(n).
-    - ``pq_index`` is a ``dict[order_id, SchedulingOrder]`` that mirrors
-      pq's membership for O(1) ``contains`` / lookup. Mutating helpers
-      (``_pq_add`` / ``_pq_remove``) keep both in sync; ``to_json`` /
-      ``from_json`` rebuilds the index alongside the SortedKeyList.
+    - ``pq_index`` is a ``dict[order_id, SchedulingOrder]`` holding the
+      EDF priority queue (= every order not currently pinned). Pre-refactor
+      this was a `SortedKeyList` kept sorted at every mutation — O(log n)
+      per add / remove. Replaced with a flat dict because:
+        - the only consumers that need EDF order (``compute_schedule`` /
+          ``advance_day``) bucket-sort by ``deadline_rel`` at iteration
+          time (see ``_iter_pq_edf_sorted``), which is O(n) for the bucket
+          pass + O(K_d log K_d) for within-day tie-breaking (typically
+          tiny since K_d is much less than n).
+        - runtime ops (``add_order``, ``remove_order``, ``pin``, ``unpin``,
+          batch admission's per-leaf ``pq_add``/``pq_remove``) drop from
+          O(log n) to O(1).
+        - serialization is just ``dict.values()`` → list, no SortedKeyList
+          to rebuild on load.
     - ``pinned_orders`` is a ``dict[order_id, PinnedOrder]``. Python dicts
       preserve insertion order (3.7+) so iteration order is deterministic
       for tests / WS replay, while still giving O(1) ``contains`` / ``remove``.
@@ -428,7 +421,6 @@ class SchedulerState(BaseModel):
 
     capacity_tree: SegmentTree
     deadline_tree: SegmentTree
-    priority_queue: SortedKeyList = Field(default_factory=_new_priority_queue)
     pq_index: dict[uuid.UUID, SchedulingOrder] = Field(default_factory=dict)
     pinned_orders: dict[uuid.UUID, PinnedOrder] = Field(default_factory=dict)
     base_date: date
@@ -439,19 +431,24 @@ class SchedulerState(BaseModel):
         return cls(
             capacity_tree=SegmentTree(n=HORIZON_DAYS, initial=DAILY_CAPACITY),
             deadline_tree=SegmentTree(n=HORIZON_DAYS, initial=0),
-            priority_queue=_new_priority_queue(),
             pq_index={},
             pinned_orders={},
             base_date=base_date,
         )
 
     def to_json(self) -> str:
-        """Serialize to a JSON string (suitable for Redis)."""
+        """Serialize to a JSON string (suitable for Redis).
+
+        The pq is serialized as a list of orders (insertion order from the
+        dict). ``from_json`` doesn't need a particular order to reconstruct
+        correctly — the canonical EDF ordering is derived at iteration
+        time via ``_iter_pq_edf_sorted``.
+        """
         return json.dumps(
             {
                 "capacity_values": self.capacity_tree.to_array(),
                 "deadline_values": self.deadline_tree.to_array(),
-                "priority_queue": [o.model_dump(mode="json") for o in self.priority_queue],
+                "priority_queue": [o.model_dump(mode="json") for o in self.pq_index.values()],
                 "pinned_orders": [p.model_dump(mode="json") for p in self.pinned_orders.values()],
                 "base_date": self.base_date.isoformat(),
             }
@@ -463,8 +460,8 @@ class SchedulerState(BaseModel):
 
         ``pinned_orders`` defaults to ``[]`` if absent — keeps the loader
         backward-compatible with state blobs persisted before the pin
-        feature shipped. The pq + pinned dict indices are rebuilt from
-        the JSON list payloads, so post-load lookups stay O(1).
+        feature shipped. The ``priority_queue`` JSON list (legacy field
+        name preserved for wire compatibility) is loaded into ``pq_index``.
         """
         data = json.loads(raw)
         pq_orders = [SchedulingOrder.model_validate(o) for o in data["priority_queue"]]
@@ -472,11 +469,46 @@ class SchedulerState(BaseModel):
         return cls(
             capacity_tree=SegmentTree.from_array(data["capacity_values"]),
             deadline_tree=SegmentTree.from_array(data["deadline_values"]),
-            priority_queue=_new_priority_queue(pq_orders),
             pq_index={o.order_id: o for o in pq_orders},
             pinned_orders={p.order_id: p for p in pinned},
             base_date=date.fromisoformat(data["base_date"]),
         )
+
+
+def _iter_pq_edf_sorted(state: SchedulerState) -> list[SchedulingOrder]:
+    """Materialize the pq in EDF order: deadline → -qty → order_number.
+
+    Bucket-sorts by ``deadline_rel`` (30 buckets, one per horizon day),
+    then sorts each bucket by ``sort_key`` for the secondary tie-break.
+
+    Complexity: O(n) for the bucket placement pass + O(Σ K_d log K_d) for
+    within-day sort. Worst case (all orders same deadline) is O(n log n);
+    typical case (uniform spread over D=30 days) is O(n + n log(n/D)),
+    materially better than the SortedKeyList-maintained-at-every-mutation
+    approach we used before.
+
+    Returns a fresh list — callers may index, slice, or iterate it freely.
+    Orders with a deadline outside the horizon (defensive — should be
+    filtered upstream) end up in a synthetic 30-day-out bucket so they
+    still get a deterministic placement rather than being silently
+    dropped here.
+    """
+    if not state.pq_index:
+        return []
+    buckets: list[list[SchedulingOrder]] = [[] for _ in range(HORIZON_DAYS + 1)]
+    for order in state.pq_index.values():
+        rel = abs_to_rel(order.deadline, state.base_date)
+        # Out-of-horizon orders shouldn't exist in pq (callers filter at
+        # admission), but if they do, park them at the last bucket so
+        # iteration still yields them deterministically.
+        idx = rel if rel is not None else HORIZON_DAYS
+        buckets[idx].append(order)
+    flat: list[SchedulingOrder] = []
+    for bucket in buckets:
+        if len(bucket) > 1:
+            bucket.sort(key=lambda o: o.sort_key())
+        flat.extend(bucket)
+    return flat
 
 
 # ---------------------------------------------------------------------------
@@ -497,33 +529,26 @@ def _leftmost_prefix_geq(tree: SegmentTree, target: int, max_idx: int) -> int:
 
 
 def _pq_add(state: SchedulerState, order: SchedulingOrder) -> None:
-    """Insert ``order`` into both pq and its index dict.
+    """Insert ``order`` into the pq dict.
 
-    O(log n) for the SortedKeyList insert (sortedcontainers' chunked
-    array gives effective log-time bisect + insert); O(1) for the dict.
+    O(1). EDF ordering is derived at iteration time
+    (``_iter_pq_edf_sorted``) rather than maintained at every mutation,
+    so no sort overhead here.
+
     Caller is responsible for ensuring the order isn't already present —
     ``add_order`` does this check upfront and returns capacity_exceeded
     on conflict.
     """
-    state.priority_queue.add(order)
     state.pq_index[order.order_id] = order
 
 
 def _pq_remove_by_id(state: SchedulerState, order_id: uuid.UUID) -> SchedulingOrder | None:
-    """Drop the order with ``order_id`` from pq + index; return it or None.
+    """Drop ``order_id`` from the pq dict; return the removed order or None.
 
-    O(1) for the dict pop (which gives us the object reference);
-    O(log n) for the SortedKeyList remove (sortedcontainers does bisect
-    by sort_key + a tiny linear scan within the matching chunk). The
-    indexed dict is what gets us from "I have an order_id" → "remove from
-    pq" in log time — before this refactor it was an O(n) ``list[:] =
-    [o for o in pq if o.order_id != target]`` filter.
+    O(1). ``None`` means the order wasn't in pq (e.g. already pinned —
+    pinned orders live in ``pinned_orders``, not pq).
     """
-    order = state.pq_index.pop(order_id, None)
-    if order is None:
-        return None
-    state.priority_queue.remove(order)
-    return order
+    return state.pq_index.pop(order_id, None)
 
 
 def pq_add(state: SchedulerState, order: SchedulingOrder) -> None:
@@ -811,7 +836,7 @@ def pin_order(
         ``capacity_exceeded`` — no capacity in [base_date, fake_deadline].
 
     Caller is responsible for ensuring the order is currently in
-    ``priority_queue``; if it isn't (e.g. it was already pinned, or never
+    ``pq_index``; if it isn't (e.g. it was already pinned, or never
     added) the function logs and returns ``capacity_exceeded`` so the worker
     has a uniform failure-notify path.
     """
@@ -1210,7 +1235,11 @@ def compute_schedule(state: SchedulerState) -> list[ScheduledResult]:
             daily_remaining[fake_rel] -= assigned
 
     # Phase 2: forward-fill pq orders against the post-pin remaining.
-    for order in state.priority_queue:
+    # ``_iter_pq_edf_sorted`` does a bucket sort (by deadline_rel) +
+    # within-bucket sort (by qty desc, order_number asc) at iteration time
+    # — cheaper than maintaining a SortedKeyList at every mutation,
+    # because compute_schedule is the only ordered-iteration consumer.
+    for order in _iter_pq_edf_sorted(state):
         deadline_rel = abs_to_rel(order.deadline, state.base_date)
         if deadline_rel is None:
             continue  # outside horizon; should have been rejected upstream
@@ -1288,8 +1317,7 @@ def advance_day(state: SchedulerState) -> SchedulerState:
     working = SchedulerState(
         capacity_tree=SegmentTree.from_array(state.capacity_tree.to_array()),
         deadline_tree=SegmentTree.from_array(state.deadline_tree.to_array()),
-        priority_queue=_new_priority_queue(),  # helpers don't read this; rebuilt below
-        pq_index={},
+        pq_index={},  # rebuilt below
         pinned_orders={},  # rebuilt below
         base_date=state.base_date,
     )
@@ -1323,11 +1351,16 @@ def advance_day(state: SchedulerState) -> SchedulerState:
     pq_ceiling = max(0, DAILY_CAPACITY - pinned_today_total)
 
     # ----- Step 1: identify completed and boundary pq orders --------------
+    # Materialize the pq in EDF order once; iterate to find which orders
+    # finish today (cumulative ≤ ceiling) and which one straddles the
+    # boundary (gets partially done).
+    pq_edf = _iter_pq_edf_sorted(state)
+
     cumulative = 0
     fully_done_count = 0
     has_boundary = False
 
-    for order in state.priority_queue:
+    for order in pq_edf:
         if cumulative + order.wafer_quantity <= pq_ceiling:
             cumulative += order.wafer_quantity
             fully_done_count += 1
@@ -1337,27 +1370,27 @@ def advance_day(state: SchedulerState) -> SchedulerState:
             has_boundary = True
             break
 
-    fully_done_orders: list[SchedulingOrder] = list(state.priority_queue[:fully_done_count])
+    fully_done_orders: list[SchedulingOrder] = pq_edf[:fully_done_count]
     boundary_order: SchedulingOrder | None = (
-        state.priority_queue[fully_done_count] if has_boundary else None
+        pq_edf[fully_done_count] if has_boundary else None
     )
 
     # ----- Step 2: tree updates --------------------------------------------
     for done in fully_done_orders:
         _apply_remove_to_trees(working, done)
 
-    # New pq = everything past the fully-done prefix. With the SortedKeyList
-    # backing, slicing returns a list which we re-wrap as a SortedKeyList
-    # (no extra sort cost — input is already in order).
-    carried_orders: list[SchedulingOrder] = list(state.priority_queue[fully_done_count:])
+    # New pq = everything past the fully-done prefix. Sort order doesn't
+    # matter for the dict-backed pq_index — EDF order is rebuilt on
+    # demand by ``_iter_pq_edf_sorted``.
+    carried_orders: list[SchedulingOrder] = pq_edf[fully_done_count:]
 
     # The boundary order's qty drops to ``new_quantity`` for the remaining
     # days. Its sort_key (deadline, -qty, order_number) shifts: smaller qty
-    # → larger -qty → lower priority within the same deadline. Per Phase 3
-    # data-structure refactor we let the SortedKeyList re-sort by the new
-    # key rather than pin the boundary at index 0 of the old position —
-    # the new position is the EDF-correct one and the spec doc has been
-    # updated to match.
+    # → larger -qty → lower priority within the same deadline. We just
+    # swap the boundary entry in ``carried_orders`` for the reduced-qty
+    # copy — the dict has no order to preserve, and the next
+    # ``_iter_pq_edf_sorted`` will place ``new_boundary`` at its new EDF
+    # position by inspecting its updated sort_key.
     if boundary_order is not None:
         done_today = pq_ceiling - cumulative
         new_quantity = boundary_order.wafer_quantity - done_today
@@ -1368,13 +1401,10 @@ def advance_day(state: SchedulerState) -> SchedulerState:
             wafer_quantity=new_quantity,
             deadline=boundary_order.deadline,
         )
-        # Drop old boundary entry and add the reduced-qty one — SortedKeyList
-        # will place new_boundary at its new EDF position.
         carried_orders = [o for o in carried_orders if o.order_id != boundary_order.order_id]
         carried_orders.append(new_boundary)
         _apply_add_to_trees(working, new_boundary)
 
-    new_pq = _new_priority_queue(carried_orders)
     new_pq_index = {o.order_id: o for o in carried_orders}
 
     # ----- Step 4: shift trees left by one day -----------------------------
@@ -1387,7 +1417,6 @@ def advance_day(state: SchedulerState) -> SchedulerState:
     new_state = SchedulerState(
         capacity_tree=SegmentTree.from_array(new_cap_values),
         deadline_tree=SegmentTree.from_array(new_dead_values),
-        priority_queue=new_pq,
         pq_index=new_pq_index,
         pinned_orders=pinned_remaining,
         base_date=state.base_date + timedelta(days=1),
@@ -1399,7 +1428,7 @@ def advance_day(state: SchedulerState) -> SchedulerState:
         new_base=new_state.base_date.isoformat(),
         completed=fully_done_count + (1 if has_boundary else 0),
         pinned_today_done=len(pinned_today),
-        carried=len(new_state.priority_queue),
+        carried=len(new_state.pq_index),
         pinned_carried=len(new_state.pinned_orders),
     )
     return new_state
@@ -1520,7 +1549,7 @@ def rebuild_state(
         total=len(orders),
         skipped=len(skipped),
         pinned=len(state.pinned_orders),
-        pq=len(state.priority_queue),
+        pq=len(state.pq_index),
         base_date=base_date.isoformat(),
     )
     return state, skipped

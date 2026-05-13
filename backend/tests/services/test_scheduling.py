@@ -18,6 +18,7 @@ from app.services.scheduling import (
     PinnedOrder,
     SchedulerState,
     SchedulingOrder,
+    _iter_pq_edf_sorted,
     abs_to_rel,
     add_order,
     advance_day,
@@ -87,7 +88,7 @@ def test_add_order_success_updates_both_trees() -> None:
 
     assert result.status == "success"
     assert result.order_id == order.order_id
-    assert order in state.priority_queue
+    assert order.order_id in state.pq_index
     # capacity_tree: 30 days * 10000 - 2000 consumed
     assert state.capacity_tree.query(3) == 3 * DAILY_CAPACITY - 2000
     assert state.capacity_tree.query(HORIZON_DAYS) == HORIZON_DAYS * DAILY_CAPACITY - 2000
@@ -103,7 +104,7 @@ def test_add_order_capacity_exceeded() -> None:
     result = add_order(state, order)
 
     assert result.status == "capacity_exceeded"
-    assert order not in state.priority_queue
+    assert order.order_id not in state.pq_index
     # Trees untouched
     assert state.capacity_tree.query(1) == DAILY_CAPACITY
     assert state.deadline_tree.query(1) == 0
@@ -119,7 +120,7 @@ def test_add_order_deadline_too_far() -> None:
     result = add_order(state, order)
 
     assert result.status == "deadline_too_far"
-    assert order not in state.priority_queue
+    assert order.order_id not in state.pq_index
     assert state.deadline_tree.query(HORIZON_DAYS) == 0
 
 
@@ -138,7 +139,7 @@ def test_remove_order_restores_capacity_after_single_add() -> None:
 
     remove_order(state, order)
 
-    assert state.priority_queue == []
+    assert state.pq_index == {}
     # Every prefix sum back to the original full-capacity state
     for d in range(1, HORIZON_DAYS + 1):
         assert state.capacity_tree.query(d) == d * DAILY_CAPACITY
@@ -163,7 +164,7 @@ def test_remove_order_leaves_other_orders_intact() -> None:
     # Only a + c remain → 4000 used, 6000 free at day 1
     assert state.capacity_tree.query(1) == 6000
     assert state.deadline_tree.query(1) == 4000
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     assert pq_ids == {a.order_id, c.order_id}
 
 
@@ -222,9 +223,9 @@ def test_remove_order_restores_when_later_add_overlaps_earlier_one() -> None:
     for d in range(3, HORIZON_DAYS + 1):
         assert state.deadline_tree.query(d) == 10_000
 
-    # priority_queue: only first remains
-    assert len(state.priority_queue) == 1
-    assert state.priority_queue[0].order_id == first.order_id
+    # pq_index: only first remains
+    assert len(state.pq_index) == 1
+    assert _iter_pq_edf_sorted(state)[0].order_id == first.order_id
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +291,8 @@ def test_advance_day_processes_pq_and_shifts_trees() -> None:
     assert new_state.base_date == _BASE + timedelta(days=1)
 
     # Only the boundary order f (reduced) and the unprocessed g remain.
-    assert len(new_state.priority_queue) == 2
-    surviving = {o.order_id: o for o in new_state.priority_queue}
+    assert len(new_state.pq_index) == 2
+    surviving = dict(new_state.pq_index)
     assert set(surviving.keys()) == {f.order_id, g.order_id}
 
     # f's quantity was 2000; 1000 ran on day 1; remaining = 1000.
@@ -304,8 +305,9 @@ def test_advance_day_processes_pq_and_shifts_trees() -> None:
     # within the same deadline — g first, then f. This is the EDF-correct
     # ordering; the old per-spec "preserve position" was a deliberate
     # simplification of pre-refactor code and isn't a semantic invariant.
-    assert new_state.priority_queue[0].order_id == g.order_id
-    assert new_state.priority_queue[1].order_id == f.order_id
+    edf = _iter_pq_edf_sorted(new_state)
+    assert edf[0].order_id == g.order_id
+    assert edf[1].order_id == f.order_id
 
     # Capacity prefix after the doc's "步驟 4": 10000, 17000 for the first two
     # days of the new horizon (third day onwards is fresh full-capacity slots).
@@ -319,7 +321,7 @@ def test_advance_day_processes_pq_and_shifts_trees() -> None:
 
     # Original state untouched.
     assert state.base_date == _BASE
-    assert len(state.priority_queue) == 7
+    assert len(state.pq_index) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +333,7 @@ def test_rebuild_state_empty_orders_returns_empty_state() -> None:
     state, skipped = rebuild_state([], _BASE)
 
     assert state.base_date == _BASE
-    assert state.priority_queue == []
+    assert state.pq_index == {}
     assert skipped == []
     # Full capacity on every day, no deadline obligations.
     for d in range(1, HORIZON_DAYS + 1):
@@ -348,8 +350,8 @@ def test_rebuild_state_single_order_matches_fresh_add() -> None:
     rebuilt, skipped = rebuild_state([order], _BASE)
 
     assert skipped == []
-    assert len(rebuilt.priority_queue) == 1
-    assert rebuilt.priority_queue[0].order_id == order.order_id
+    assert len(rebuilt.pq_index) == 1
+    assert _iter_pq_edf_sorted(rebuilt)[0].order_id == order.order_id
     # Trees must match a single fresh add_order call exactly.
     for d in range(1, HORIZON_DAYS + 1):
         assert rebuilt.capacity_tree.query(d) == fresh.capacity_tree.query(d)
@@ -369,8 +371,9 @@ def test_rebuild_state_multiple_orders_adds_in_priority_order() -> None:
 
     assert skipped == []
     # PQ should have b before a (earlier deadline wins).
-    assert rebuilt.priority_queue[0].order_id == b.order_id
-    assert rebuilt.priority_queue[1].order_id == a.order_id
+    edf = _iter_pq_edf_sorted(rebuilt)
+    assert edf[0].order_id == b.order_id
+    assert edf[1].order_id == a.order_id
     # Tree state should be identical to the correctly-ordered fresh sequence.
     for d in range(1, HORIZON_DAYS + 1):
         assert rebuilt.capacity_tree.query(d) == fresh.capacity_tree.query(d)
@@ -389,7 +392,7 @@ def test_rebuild_state_skips_orders_past_horizon() -> None:
 
     state, skipped = rebuild_state([inside, outside], _BASE)
 
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     assert inside.order_id in pq_ids
     assert outside.order_id not in pq_ids
     # Skipped list carries identity + reason so the caller can notify the
@@ -420,14 +423,14 @@ def test_add_order_rejects_duplicate_already_in_pq() -> None:
 
     cap_before = state.capacity_tree.to_array()
     dead_before = state.deadline_tree.to_array()
-    pq_len_before = len(state.priority_queue)
+    pq_len_before = len(state.pq_index)
 
     second = add_order(state, order)
     assert second.status == "capacity_exceeded"
     # Critical: state is UNCHANGED by the rejected duplicate.
     assert state.capacity_tree.to_array() == cap_before
     assert state.deadline_tree.to_array() == dead_before
-    assert len(state.priority_queue) == pq_len_before
+    assert len(state.pq_index) == pq_len_before
 
 
 def test_add_order_rejects_when_already_pinned() -> None:
@@ -443,7 +446,7 @@ def test_add_order_rejects_when_already_pinned() -> None:
     pin_order(state, order, fake_deadline=_BASE + timedelta(days=1))
 
     # Now the order is in pinned_orders, not pq.
-    assert not any(o.order_id == order.order_id for o in state.priority_queue)
+    assert order.order_id not in state.pq_index
 
     second = add_order(state, order)
     assert second.status == "capacity_exceeded"
@@ -462,7 +465,7 @@ def test_remove_order_rejects_not_in_pq() -> None:
 
     cap_before = state.capacity_tree.to_array()
     dead_before = state.deadline_tree.to_array()
-    pq_before = list(state.priority_queue)
+    pq_before = dict(state.pq_index)
 
     phantom = _make_order(order_number="phantom", qty=500, deadline=_BASE + timedelta(days=2))
     result = remove_order(state, phantom)
@@ -470,7 +473,7 @@ def test_remove_order_rejects_not_in_pq() -> None:
     # State unchanged.
     assert state.capacity_tree.to_array() == cap_before
     assert state.deadline_tree.to_array() == dead_before
-    assert state.priority_queue == pq_before
+    assert state.pq_index == pq_before
 
 
 def test_remove_order_on_pinned_order_gives_pinned_hint() -> None:
@@ -512,14 +515,14 @@ def test_pin_order_rejected_when_capacity_insufficient_at_pin_day() -> None:
     # Snapshot trees + pq for post-rejection comparison.
     cap_before = state.capacity_tree.to_array()
     dead_before = state.deadline_tree.to_array()
-    pq_ids_before = [o.order_id for o in state.priority_queue]
+    pq_ids_before = set(state.pq_index.keys())
 
     result = pin_order(state, b, fake_deadline=_BASE)
     assert result.status == "capacity_exceeded"
 
     assert state.capacity_tree.to_array() == cap_before
     assert state.deadline_tree.to_array() == dead_before
-    assert [o.order_id for o in state.priority_queue] == pq_ids_before
+    assert set(state.pq_index.keys()) == pq_ids_before
     assert state.pinned_orders == {}
 
 
@@ -559,7 +562,7 @@ def test_pin_order_success_matches_spec_example_2() -> None:
     assert state.deadline_tree.query(2) == 2000
     assert state.deadline_tree.query(3) == 11000
 
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id}
     assert pinned_ids == {b.order_id, c.order_id}
@@ -591,7 +594,7 @@ def test_unpin_order_restores_state_to_pre_pin() -> None:
     assert state.deadline_tree.query(2) == 1000
     assert state.deadline_tree.query(3) == 11000
 
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id, c.order_id}
     assert pinned_ids == {b.order_id}
@@ -606,13 +609,13 @@ def test_unpin_order_unknown_id_returns_error_without_mutating_state() -> None:
     add_order(state, _make_order(order_number="a", qty=1000, deadline=_BASE + timedelta(days=2)))
 
     cap_before = state.capacity_tree.to_array()
-    pq_before = list(state.priority_queue)
+    pq_before = dict(state.pq_index)
     pinned_before = dict(state.pinned_orders)
 
     result = unpin_order(state, uuid.uuid4())
     assert result.status == "capacity_exceeded"
     assert state.capacity_tree.to_array() == cap_before
-    assert list(state.priority_queue) == pq_before
+    assert state.pq_index == pq_before
     assert state.pinned_orders == pinned_before
 
 
@@ -663,9 +666,10 @@ def test_advance_day_completes_pinned_today_and_fills_remainder_from_pq() -> Non
     # Pinned x is gone — produced today.
     assert new_state.pinned_orders == {}
     # y remains in pq with qty reduced by 8000 (the pq budget after pinned-today).
-    assert len(new_state.priority_queue) == 1
-    assert new_state.priority_queue[0].order_id == y.order_id
-    assert new_state.priority_queue[0].wafer_quantity == 15000 - 8000
+    assert len(new_state.pq_index) == 1
+    edf = _iter_pq_edf_sorted(new_state)
+    assert edf[0].order_id == y.order_id
+    assert edf[0].wafer_quantity == 15000 - 8000
     # base_date advanced by 1 day.
     assert new_state.base_date == _BASE + timedelta(days=1)
 
@@ -692,7 +696,7 @@ def test_rebuild_state_separates_pinned_from_pq() -> None:
     state, skipped = rebuild_state([a, b], _BASE)
 
     assert skipped == []
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id}
     assert pinned_ids == {b.order_id}
@@ -966,7 +970,7 @@ def test_unpin_order_drops_when_real_deadline_already_passed() -> None:
     # Pinned record is gone (pop happened earlier in unpin_order).
     assert pinned.order_id not in state.pinned_orders
     # pq is empty — the order was dropped, not re-added.
-    assert pinned.order_id not in {o.order_id for o in state.priority_queue}
+    assert pinned.order_id not in set(state.pq_index.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1131,7 @@ def test_rebuild_state_falls_back_to_pq_when_pin_capacity_exceeded() -> None:
     # Second order's pin failed but its add succeeded → it stays in pq
     # (not pinned_orders) and shows up in skipped with the pin failure
     # reason.
-    pq_ids = {o.order_id for o in new_state.priority_queue}
+    pq_ids = set(new_state.pq_index.keys())
     assert second.order_id in pq_ids
     assert second.order_id not in new_state.pinned_orders
     skipped_ids = {s.order_id for s in skipped}
@@ -1303,7 +1307,7 @@ def test_advance_day_handles_empty_pq_and_no_pins() -> None:
     new_state = advance_day(state)
 
     assert new_state.base_date == _BASE + timedelta(days=1)
-    assert len(new_state.priority_queue) == 0
+    assert len(new_state.pq_index) == 0
     assert new_state.pinned_orders == {}
     # Trees shifted: day 30 of the new state should be a fresh
     # DAILY_CAPACITY (the rolled-in tail day).
