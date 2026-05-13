@@ -59,6 +59,7 @@ def _make_order(
         requested_delivery_date=date(2026, 8, 1),
         status=OrderStatus.pending,
         created_by=created_by,
+        is_processing_locked=False,
     )
     db.add(order)
     db.commit()

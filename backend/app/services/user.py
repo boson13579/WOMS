@@ -78,6 +78,12 @@ def update_self(
                 detail=f"Username '{request.username}' is already taken.",
             )
 
+    if "email" in request.model_fields_set and request.email is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="email cannot be set to null; omit the field to leave it unchanged.",
+        )
+
     if request.email is not None:
         existing_email = user_repo.get_by_email(db, request.email)
         if existing_email is not None and existing_email.id != current_user.id:
