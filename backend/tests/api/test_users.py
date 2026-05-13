@@ -612,6 +612,7 @@ def test_patch_user_update_email_success(client: TestClient, db_session: Session
     assert res.json()["email"] == "brand_new@example.com"
 
 
+
 # ---------------------------------------------------------------------------
 # IntegrityError race-condition guards (mock-based)
 # ---------------------------------------------------------------------------
