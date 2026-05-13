@@ -14,13 +14,18 @@ from datetime import date, timedelta
 from app.services.scheduling import (
     DAILY_CAPACITY,
     HORIZON_DAYS,
+    BatchOp,
     PinnedOrder,
     SchedulerState,
     SchedulingOrder,
     abs_to_rel,
     add_order,
     advance_day,
+    apply_batch_to_capacity,
+    apply_batch_to_deadline,
+    compute_batch_capacity_delta,
     compute_schedule,
+    is_batch_feasible,
     pin_order,
     rebuild_state,
     rel_to_abs,
@@ -1303,3 +1308,418 @@ def test_advance_day_handles_empty_pq_and_no_pins() -> None:
     # Trees shifted: day 30 of the new state should be a fresh
     # DAILY_CAPACITY (the rolled-in tail day).
     assert new_state.capacity_tree.query(HORIZON_DAYS) == HORIZON_DAYS * DAILY_CAPACITY
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — compute_batch_capacity_delta
+# ---------------------------------------------------------------------------
+
+
+def test_compute_batch_delta_add_only_lands_on_deadline_day() -> None:
+    """A single add op contributes +qty at its deadline's rel index and
+    zero everywhere else."""
+    ops = [BatchOp(kind="add", wafer_quantity=500, deadline=_BASE + timedelta(days=3))]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert len(delta) == HORIZON_DAYS
+    # rel = 3 + 1 = 4 ⇒ index 3.
+    assert delta[3] == 500
+    assert all(d == 0 for i, d in enumerate(delta) if i != 3)
+
+
+def test_compute_batch_delta_remove_negates_quantity() -> None:
+    """Remove contributes ``-wafer_quantity`` at the deadline day."""
+    ops = [BatchOp(kind="remove", wafer_quantity=300, deadline=_BASE + timedelta(days=5))]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert delta[5] == -300
+    assert sum(abs(d) for i, d in enumerate(delta) if i != 5) == 0
+
+
+def test_compute_batch_delta_patch_self_cancels_when_same_day() -> None:
+    """A PATCH (remove old + add new) on the same deadline day with the
+    same quantity nets to zero — the batch is a no-op for capacity
+    accounting even though pq / DB rows still change."""
+    same_day = _BASE + timedelta(days=4)
+    ops = [
+        BatchOp(kind="remove", wafer_quantity=200, deadline=same_day),
+        BatchOp(kind="add", wafer_quantity=200, deadline=same_day),
+    ]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert all(d == 0 for d in delta)
+
+
+def test_compute_batch_delta_deadline_shift_splits_across_days() -> None:
+    """PATCH that shifts a deadline from day A to day B (same qty) lands
+    -qty on day A and +qty on day B — the two cancel in total but the
+    per-day distribution matters for feasibility."""
+    ops = [
+        BatchOp(kind="remove", wafer_quantity=400, deadline=_BASE + timedelta(days=2)),
+        BatchOp(kind="add", wafer_quantity=400, deadline=_BASE + timedelta(days=10)),
+    ]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert delta[2] == -400
+    assert delta[10] == 400
+
+
+def test_compute_batch_delta_drops_ops_outside_horizon() -> None:
+    """Op with deadline before base_date OR ≥ base_date + HORIZON_DAYS is
+    silently skipped — caller is responsible for surfacing these as
+    individual failures before they reach the batch path."""
+    ops = [
+        BatchOp(kind="add", wafer_quantity=500, deadline=_BASE - timedelta(days=1)),  # past
+        BatchOp(
+            kind="add",
+            wafer_quantity=500,
+            deadline=_BASE + timedelta(days=HORIZON_DAYS),  # too far
+        ),
+        BatchOp(kind="add", wafer_quantity=100, deadline=_BASE + timedelta(days=0)),  # rel=1
+    ]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert delta[0] == 100  # only the in-horizon op contributed
+    assert sum(d for i, d in enumerate(delta) if i != 0) == 0
+
+
+def test_compute_batch_delta_multiple_ops_same_day_sum() -> None:
+    """Three ops on the same day all add into the same delta cell."""
+    day = _BASE + timedelta(days=7)
+    ops = [
+        BatchOp(kind="add", wafer_quantity=100, deadline=day),
+        BatchOp(kind="add", wafer_quantity=250, deadline=day),
+        BatchOp(kind="remove", wafer_quantity=50, deadline=day),
+    ]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert delta[7] == 100 + 250 - 50
+
+
+def test_compute_batch_delta_empty_input_returns_zeros() -> None:
+    """No ops ⇒ all-zero delta. Sanity check + degenerate base case."""
+    delta = compute_batch_capacity_delta([], _BASE)
+
+    assert delta == [0] * HORIZON_DAYS
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — is_batch_feasible
+# ---------------------------------------------------------------------------
+
+
+def test_is_batch_feasible_empty_delta_is_feasible() -> None:
+    """All-zero delta is always feasible — no demand to compare against."""
+    state = SchedulerState.initial(_BASE)
+    assert is_batch_feasible(state, [0] * HORIZON_DAYS) is True
+
+
+def test_is_batch_feasible_demand_under_capacity_passes() -> None:
+    """Demand prefix strictly less than capacity prefix on every day ⇒
+    feasible."""
+    state = SchedulerState.initial(_BASE)
+    delta = [100] * HORIZON_DAYS  # 100 wafers due per day, far below DAILY_CAPACITY
+
+    assert is_batch_feasible(state, delta) is True
+
+
+def test_is_batch_feasible_demand_equals_capacity_passes() -> None:
+    """Demand exactly at the prefix-sum boundary is feasible (``≤``, not
+    strict). Validates the inequality direction."""
+    state = SchedulerState.initial(_BASE)
+    delta = [DAILY_CAPACITY] + [0] * (HORIZON_DAYS - 1)  # exactly fills day 1
+
+    assert is_batch_feasible(state, delta) is True
+
+
+def test_is_batch_feasible_single_day_over_capacity_fails() -> None:
+    """One day's prefix sum exceeding the capacity prefix sum is enough
+    to reject the whole batch."""
+    state = SchedulerState.initial(_BASE)
+    # Demand DAILY_CAPACITY + 1 on day 1 — one unit over.
+    delta = [DAILY_CAPACITY + 1] + [0] * (HORIZON_DAYS - 1)
+
+    assert is_batch_feasible(state, delta) is False
+
+
+def test_is_batch_feasible_later_day_violation_caught() -> None:
+    """Demand on a later day pushing cumulative prefix past cumulative
+    capacity prefix should be detected (not just the first day)."""
+    state = SchedulerState.initial(_BASE)
+    # Days 1-4 take all the cumulative cap. Day 5 demand is +1 over.
+    delta = [DAILY_CAPACITY] * 5 + [0] * (HORIZON_DAYS - 5)
+    delta[4] += 1  # day 5 over
+
+    assert is_batch_feasible(state, delta) is False
+
+
+def test_is_batch_feasible_negative_prefix_passes_trivially() -> None:
+    """If the batch nets to a removal (negative cumulative demand at some
+    day), feasibility is automatic at that day. Validates that the
+    inequality stays correct for sign-mixed batches."""
+    state = SchedulerState.initial(_BASE)
+    # Day 3: -500 (the batch removes existing demand)
+    delta = [0, 0, -500] + [0] * (HORIZON_DAYS - 3)
+
+    assert is_batch_feasible(state, delta) is True
+
+
+def test_is_batch_feasible_wrong_length_raises() -> None:
+    """API contract: delta must be exactly HORIZON_DAYS long."""
+    state = SchedulerState.initial(_BASE)
+    import pytest
+
+    with pytest.raises(ValueError, match=str(HORIZON_DAYS)):
+        is_batch_feasible(state, [0] * (HORIZON_DAYS - 1))
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — apply_batch_to_capacity (carry-back)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_batch_to_capacity_noop_for_zero_delta() -> None:
+    """All-zero delta leaves the tree bit-identical."""
+    state = SchedulerState.initial(_BASE)
+    before = state.capacity_tree.to_array()
+
+    apply_batch_to_capacity(state, [0] * HORIZON_DAYS)
+
+    assert state.capacity_tree.to_array() == before
+
+
+def test_apply_batch_to_capacity_single_add_distributes_via_carry_back() -> None:
+    """Adding qty < DAILY_CAPACITY on a single day reduces that day's
+    raw remaining by exactly qty (no spill-back needed). The prefix-sum
+    semantics match: ``prefix(HORIZON_DAYS) decreased by qty``."""
+    state = SchedulerState.initial(_BASE)
+    qty = 1500
+    delta = [0] * HORIZON_DAYS
+    delta[4] = qty  # day 5
+
+    apply_batch_to_capacity(state, delta)
+
+    raw = state.capacity_tree.to_array()
+    # Day 5 absorbed all qty (it had DAILY_CAPACITY available, qty < cap).
+    assert raw[4] == DAILY_CAPACITY - qty
+    # Earlier days untouched (no spill-back).
+    assert all(r == DAILY_CAPACITY for r in raw[:4])
+    # Later days untouched.
+    assert all(r == DAILY_CAPACITY for r in raw[5:])
+
+
+def test_apply_batch_to_capacity_overflow_spills_to_earlier_days() -> None:
+    """If a day's demand exceeds its remaining capacity, the carry-back
+    formula moves the overflow to earlier days. After applying, prefix
+    sums reflect the cumulative demand correctly even when individual
+    days hit zero."""
+    state = SchedulerState.initial(_BASE)
+    # Demand 1.5x DAILY_CAPACITY on day 2 — must spill into day 1.
+    overflow_qty = DAILY_CAPACITY + (DAILY_CAPACITY // 2)
+    delta = [0, overflow_qty] + [0] * (HORIZON_DAYS - 2)
+
+    assert is_batch_feasible(state, delta) is True
+
+    apply_batch_to_capacity(state, delta)
+
+    raw = state.capacity_tree.to_array()
+    # Day 2 absorbed DAILY_CAPACITY (its full slot), day 1 absorbed the rest.
+    assert raw[1] == 0
+    assert raw[0] == DAILY_CAPACITY - (DAILY_CAPACITY // 2)
+    # Prefix sum at day 2 dropped by exactly overflow_qty.
+    assert state.capacity_tree.query(2) == 2 * DAILY_CAPACITY - overflow_qty
+
+
+def test_apply_batch_to_capacity_add_then_remove_round_trips_to_original() -> None:
+    """Add + remove of the same order on the same day must restore the
+    tree to its starting state — this is the critical invariant the
+    two-branch formula is designed to preserve."""
+    state = SchedulerState.initial(_BASE)
+    before = state.capacity_tree.to_array()
+
+    add_delta = [0] * HORIZON_DAYS
+    add_delta[4] = 7000
+    apply_batch_to_capacity(state, add_delta)
+
+    remove_delta = [0] * HORIZON_DAYS
+    remove_delta[4] = -7000
+    apply_batch_to_capacity(state, remove_delta)
+
+    assert state.capacity_tree.to_array() == before
+
+
+def test_apply_batch_to_capacity_remove_after_spillback_restores_state() -> None:
+    """The harder round-trip: add forces spill-back to earlier days, then
+    remove must un-spill correctly so raw values return to the initial
+    configuration. Validates the negative-branch (min-clamp) formula."""
+    state = SchedulerState.initial(_BASE)
+    before = state.capacity_tree.to_array()
+
+    # Add 1.5x cap on day 3 — overflows back into days 1 and 2.
+    add_qty = DAILY_CAPACITY + (DAILY_CAPACITY // 2)
+    add_delta = [0, 0, add_qty] + [0] * (HORIZON_DAYS - 3)
+    apply_batch_to_capacity(state, add_delta)
+
+    # Now remove the same demand.
+    remove_delta = [0, 0, -add_qty] + [0] * (HORIZON_DAYS - 3)
+    apply_batch_to_capacity(state, remove_delta)
+
+    assert state.capacity_tree.to_array() == before
+
+
+def test_apply_batch_to_capacity_preserves_prefix_sum_invariant() -> None:
+    """For any feasible delta, post-apply prefix sum on day i must equal
+    pre-apply prefix sum minus the cumulative delta through day i. This
+    is the contract the feasibility check relies on."""
+    state = SchedulerState.initial(_BASE)
+    delta = [0, 5000, 3000, 0, 7000] + [0] * (HORIZON_DAYS - 5)
+
+    pre_prefix = [state.capacity_tree.query(i) for i in range(1, HORIZON_DAYS + 1)]
+    apply_batch_to_capacity(state, delta)
+    post_prefix = [state.capacity_tree.query(i) for i in range(1, HORIZON_DAYS + 1)]
+
+    cumulative = 0
+    for i in range(HORIZON_DAYS):
+        cumulative += delta[i]
+        assert post_prefix[i] == pre_prefix[i] - cumulative
+
+
+def test_apply_batch_to_capacity_wrong_length_raises() -> None:
+    """API contract."""
+    state = SchedulerState.initial(_BASE)
+    import pytest
+
+    with pytest.raises(ValueError, match=str(HORIZON_DAYS)):
+        apply_batch_to_capacity(state, [0] * (HORIZON_DAYS - 1))
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — apply_batch_to_deadline
+# ---------------------------------------------------------------------------
+
+
+def test_apply_batch_to_deadline_adds_to_corresponding_day() -> None:
+    """Non-zero delta on day i adds delta[i-1] to deadline_tree's day i
+    raw value; zero days untouched. Symmetric for negative delta."""
+    state = SchedulerState.initial(_BASE)
+    delta = [0] * HORIZON_DAYS
+    delta[2] = 800  # day 3
+    delta[7] = -300  # day 8
+
+    apply_batch_to_deadline(state, delta)
+
+    raw = state.deadline_tree.to_array()
+    assert raw[2] == 800
+    assert raw[7] == -300
+    assert all(r == 0 for i, r in enumerate(raw) if i not in (2, 7))
+
+
+def test_apply_batch_to_deadline_zero_delta_is_noop() -> None:
+    """All-zero delta leaves deadline_tree bit-identical (no point_update
+    calls with delta=0 due to the explicit skip)."""
+    state = SchedulerState.initial(_BASE)
+    before = state.deadline_tree.to_array()
+
+    apply_batch_to_deadline(state, [0] * HORIZON_DAYS)
+
+    assert state.deadline_tree.to_array() == before
+
+
+def test_apply_batch_to_deadline_wrong_length_raises() -> None:
+    """API contract."""
+    state = SchedulerState.initial(_BASE)
+    import pytest
+
+    with pytest.raises(ValueError, match=str(HORIZON_DAYS)):
+        apply_batch_to_deadline(state, [0] * (HORIZON_DAYS + 1))
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — end-to-end equivalence with per-op add_order/remove_order
+# ---------------------------------------------------------------------------
+
+
+def test_batch_apply_matches_per_op_add_for_single_order_within_capacity() -> None:
+    """Applying batch updates for a single add op should leave capacity
+    and deadline trees in the same prefix-sum state as calling
+    ``add_order`` directly on that order. (Raw distributions can differ
+    — carry-back fills latest day first whereas ``_apply_add_to_trees``
+    backward-fills from prefix-geq; both are valid EDF-equivalent
+    distributions that produce identical prefix sums.)
+    """
+    order = _make_order(qty=2000, deadline=_BASE + timedelta(days=3))
+
+    # Path A: existing per-op add.
+    state_a = SchedulerState.initial(_BASE)
+    add_order(state_a, order)
+
+    # Path B: batch.
+    state_b = SchedulerState.initial(_BASE)
+    delta = compute_batch_capacity_delta(
+        [BatchOp(kind="add", wafer_quantity=order.wafer_quantity, deadline=order.deadline)],
+        _BASE,
+    )
+    assert is_batch_feasible(state_b, delta) is True
+    apply_batch_to_capacity(state_b, delta)
+    apply_batch_to_deadline(state_b, delta)
+
+    # Prefix sums match on every day.
+    for i in range(1, HORIZON_DAYS + 1):
+        assert state_a.capacity_tree.query(i) == state_b.capacity_tree.query(i)
+        assert state_a.deadline_tree.query(i) == state_b.deadline_tree.query(i)
+
+
+def test_batch_apply_matches_per_op_for_mixed_batch() -> None:
+    """Same equivalence for a mixed add+remove batch (PATCH-style):
+    prefix sums on both trees must match the result of doing each op
+    individually via remove_order + add_order."""
+    base = _BASE
+    # Seed an order so it can be removed.
+    seed = _make_order(qty=1500, deadline=base + timedelta(days=5))
+
+    # Path A: per-op.
+    state_a = SchedulerState.initial(base)
+    add_order(state_a, seed)
+    # Replace seed (remove + add at new deadline) and add a brand-new order.
+    new_seed = _make_order(qty=1500, deadline=base + timedelta(days=10))
+    new_seed = SchedulingOrder(
+        order_id=seed.order_id,
+        order_number=seed.order_number,
+        wafer_quantity=seed.wafer_quantity,
+        deadline=base + timedelta(days=10),
+    )
+    fresh = _make_order(qty=800, deadline=base + timedelta(days=7))
+    remove_order(state_a, seed)
+    add_order(state_a, new_seed)
+    add_order(state_a, fresh)
+
+    # Path B: batch on the same start state.
+    state_b = SchedulerState.initial(base)
+    add_order(state_b, seed)  # seed shared with path A's pre-state
+    batch_ops = [
+        BatchOp(kind="remove", wafer_quantity=seed.wafer_quantity, deadline=seed.deadline),
+        BatchOp(
+            kind="add",
+            wafer_quantity=new_seed.wafer_quantity,
+            deadline=new_seed.deadline,
+        ),
+        BatchOp(kind="add", wafer_quantity=fresh.wafer_quantity, deadline=fresh.deadline),
+    ]
+    delta = compute_batch_capacity_delta(batch_ops, base)
+    assert is_batch_feasible(state_b, delta) is True
+    apply_batch_to_capacity(state_b, delta)
+    apply_batch_to_deadline(state_b, delta)
+
+    for i in range(1, HORIZON_DAYS + 1):
+        assert state_a.capacity_tree.query(i) == state_b.capacity_tree.query(i), (
+            f"capacity prefix mismatch at day {i}"
+        )
+        assert state_a.deadline_tree.query(i) == state_b.deadline_tree.query(i), (
+            f"deadline prefix mismatch at day {i}"
+        )

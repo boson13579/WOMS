@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Iterable
 from datetime import date, timedelta
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
@@ -39,6 +40,7 @@ __all__ = [
     "PENDING_OPS_SEQ_KEY",
     "STATE_KEY",
     "STATUS_KEY",
+    "BatchOp",
     "PinnedOrder",
     "ScheduleResult",
     "ScheduledResult",
@@ -49,9 +51,15 @@ __all__ = [
     "abs_to_rel",
     "add_order",
     "advance_day",
+    "apply_batch_to_capacity",
+    "apply_batch_to_deadline",
     "capacity_prefix_sums",
+    "compute_batch_capacity_delta",
     "compute_schedule",
+    "is_batch_feasible",
     "pin_order",
+    "pq_add",
+    "pq_remove",
     "rebuild_state",
     "rel_to_abs",
     "remove_order",
@@ -518,6 +526,37 @@ def _pq_remove_by_id(state: SchedulerState, order_id: uuid.UUID) -> SchedulingOr
     return order
 
 
+def pq_add(state: SchedulerState, order: SchedulingOrder) -> None:
+    """Public alias for ``_pq_add`` — pq insertion only, no tree side-effects.
+
+    Used by the batch admission path in the worker: ``apply_batch_to_capacity``
+    + ``apply_batch_to_deadline`` apply the tree updates for a whole batch
+    of add/remove ops at once, then the worker iterates each accepted
+    compound and calls ``pq_add`` per ``add`` leaf to insert the order
+    into pq. Decoupling pq mutation from tree mutation is what makes the
+    batch path's tree work O(D log D) per accepted prefix instead of
+    O(K · log D) per K-op batch.
+
+    The caller is responsible for ensuring the order isn't already in pq
+    (the batch feasibility check + producer admission control upstream
+    are the guarantees; PATCH-style compounds put remove before add so pq
+    is cleared first).
+    """
+    _pq_add(state, order)
+
+
+def pq_remove(state: SchedulerState, order_id: uuid.UUID) -> SchedulingOrder | None:
+    """Public alias for ``_pq_remove_by_id`` — pq removal only, no tree side-effects.
+
+    Returns the removed order, or ``None`` if it wasn't in pq (e.g. it
+    was already pinned, sitting in ``state.pinned_orders`` instead).
+    Batch-path callers treat ``None`` as a no-op at the pq level — the
+    compound's db_action still runs because the user-facing column write
+    is independent of pq membership.
+    """
+    return _pq_remove_by_id(state, order_id)
+
+
 def _pq_contains(state: SchedulerState, order_id: uuid.UUID) -> bool:
     """O(1) membership check via the index dict."""
     return order_id in state.pq_index
@@ -919,6 +958,194 @@ def unpin_order(state: SchedulerState, order_id: uuid.UUID) -> ScheduleResult:
         wafer_quantity=target.wafer_quantity,
     )
     return ScheduleResult(status="success", order_id=order_id)
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — feasibility check + tree updates for a contiguous prefix
+# of the pending queue
+# ---------------------------------------------------------------------------
+#
+# Motivation: per-compound processing in run_scheduling_task pays O(log n * D)
+# per op for the segment-tree backward-fill (``_apply_add_to_trees``) plus a
+# saga snapshot/rollback per compound (a full ``SchedulerState`` deepcopy for
+# every compound, allocator-heavy under bursts). For a queue of N compounds,
+# total cost ~= N * (per-compound tree ops + snapshot).
+#
+# Batch admission instead asks "can the next K compounds in queue order be
+# accepted as one unit?" by collapsing all their add/remove ops into a single
+# per-day demand array (``compute_batch_capacity_delta``), then comparing its
+# prefix sum against ``capacity_tree``'s prefix sum
+# (``is_batch_feasible``). If the answer is yes for K=N, accept all of them
+# in a single pair of tree updates: ``apply_batch_to_capacity`` (carry-back
+# distribution) and ``apply_batch_to_deadline`` (direct point updates). If
+# the answer is no, halve and try [1..N/2], [1..N/4], ... until the first
+# feasible prefix is found. Worst case is log N halvings * O(D) per check,
+# vs the old N tree mutations + N snapshots.
+#
+# Pin / unpin ops are intentionally excluded from the delta table — their
+# capacity impact is a swap between real and fake deadlines that the
+# producer's admission control already validated, so the worker treats them
+# as structural moves applied after the batch tree update (see the relevant
+# section of ``run_scheduling_task``).
+
+
+class BatchOp(NamedTuple):
+    """One delta-affecting op for batch feasibility / tree application.
+
+    The worker translates the JSON leaf-op shape into these tuples before
+    handing them to ``compute_batch_capacity_delta`` so the service layer
+    never sees the producer's dict format. Pin / unpin ops do not have a
+    ``BatchOp`` representation because they are excluded from the delta
+    table by design.
+    """
+
+    kind: Literal["add", "remove"]
+    wafer_quantity: int
+    deadline: date
+
+
+def compute_batch_capacity_delta(
+    ops: Iterable[BatchOp],
+    base_date: date,
+) -> list[int]:
+    """Fold a batch of add/remove ops into a per-day net demand array.
+
+    Returns a list of length ``HORIZON_DAYS`` where index ``i`` (0-based)
+    holds the net signed quantity for segment-tree day ``rel = i + 1``.
+
+    Sign convention:
+
+    - ``add`` ⇒ ``+wafer_quantity`` at the order's deadline day
+    - ``remove`` ⇒ ``-wafer_quantity`` at the order's deadline day
+
+    Ops whose deadline falls outside ``[base_date, base_date + HORIZON_DAYS - 1]``
+    are silently dropped — the worker is responsible for catching these
+    upstream (an out-of-horizon add cannot be scheduled and should be
+    surfaced as ``compound_failed`` before reaching the batch path). PATCH
+    compounds where both halves are out-of-horizon would just net to zero
+    and contribute nothing here, which is acceptable.
+
+    Complexity: O(K) for K total ops in the batch. No tree queries.
+    """
+    delta = [0] * HORIZON_DAYS
+    for op in ops:
+        rel = abs_to_rel(op.deadline, base_date)
+        if rel is None:
+            continue
+        signed = op.wafer_quantity if op.kind == "add" else -op.wafer_quantity
+        delta[rel - 1] += signed
+    return delta
+
+
+def is_batch_feasible(state: SchedulerState, delta: list[int]) -> bool:
+    """Whether the batch's per-day demand fits in current remaining capacity.
+
+    The batch is feasible iff the demand prefix sum never exceeds the
+    capacity prefix sum at any horizon day::
+
+        ∀ i ∈ [1, HORIZON_DAYS]:  Σ_{j ≤ i} delta[j-1]  ≤  capacity_tree.query(i)
+
+    A negative cumulative demand (the batch nets to a removal at day ``i``)
+    trivially satisfies the inequality at that day because
+    ``capacity_tree.query(i) ≥ 0`` always holds. The check is symmetric in
+    sign and does not need a separate path for removal-heavy batches.
+
+    Complexity: O(HORIZON_DAYS · log HORIZON_DAYS) due to per-day tree query.
+    """
+    if len(delta) != HORIZON_DAYS:
+        raise ValueError(
+            f"is_batch_feasible: expected delta of length {HORIZON_DAYS}, got {len(delta)}"
+        )
+    cumulative_demand = 0
+    for i, day_demand in enumerate(delta, start=1):
+        cumulative_demand += day_demand
+        if cumulative_demand > state.capacity_tree.query(i):
+            return False
+    return True
+
+
+def apply_batch_to_capacity(state: SchedulerState, delta: list[int]) -> None:
+    """Carry-back rewrite of ``capacity_tree`` raw values for an accepted batch.
+
+    Caller MUST have already checked ``is_batch_feasible(state, delta)`` —
+    this function does not re-validate and an infeasible delta will leave
+    the tree in an inconsistent state (raw values would clamp at 0 / cap
+    while the prefix sums no longer match the underlying demand
+    commitment).
+
+    Two-branch update walking day ``HORIZON_DAYS`` down to ``1`` while
+    maintaining a ``carry`` for demand that did not fit on later days
+    (positive carry, demand pushed earlier) or freed capacity that did not
+    fit at the deadline day (negative carry, free slots pushed later)::
+
+        net = delta[i] + carry
+        if net ≥ 0:                                    # net consumption at day i
+            new_rem[i] = max(0, old_rem[i] - net)
+            carry      = max(0, net - old_rem[i])
+        else:                                          # net restoration at day i
+            new_rem[i] = min(DAILY_CAPACITY, old_rem[i] - net)
+            carry      = min(0, net + (DAILY_CAPACITY - old_rem[i]))
+
+    Carry semantics: positive value = demand still owed to earlier days
+    (EDF spill-back); negative value = freed capacity still owed to later
+    days (so daily-cap clamp respected). The clamps to 0 on each branch
+    keep carry from drifting across sign — a day with no demand consumes
+    or restores nothing and must leave carry exactly where it was rather
+    than letting an unclamped subtraction push it across zero. Raw values
+    stay in ``[0, DAILY_CAPACITY]`` — the segment tree's per-day invariant
+    — while the prefix sum (what feasibility checks look at) shifts by
+    exactly ``-Σ delta``.
+
+    The tree is patched in place via ``point_update`` deltas computed
+    against ``capacity_tree.to_array()`` (one O(n log n) materialization)
+    rather than ``range_set``, so existing query results for unrelated
+    days remain cache-warm.
+
+    Complexity: O(HORIZON_DAYS · log HORIZON_DAYS).
+    """
+    if len(delta) != HORIZON_DAYS:
+        raise ValueError(
+            f"apply_batch_to_capacity: expected delta of length {HORIZON_DAYS}, "
+            f"got {len(delta)}"
+        )
+    old_rem = state.capacity_tree.to_array()
+    new_rem = [0] * HORIZON_DAYS
+    carry = 0
+    for i in range(HORIZON_DAYS - 1, -1, -1):
+        day_old = old_rem[i]
+        net = delta[i] + carry
+        if net >= 0:
+            new_rem[i] = max(0, day_old - net)
+            carry = max(0, net - day_old)
+        else:
+            new_rem[i] = min(DAILY_CAPACITY, day_old - net)
+            carry = min(0, net + (DAILY_CAPACITY - day_old))
+    for i in range(HORIZON_DAYS):
+        diff = new_rem[i] - old_rem[i]
+        if diff != 0:
+            state.capacity_tree.point_update(i + 1, diff)
+
+
+def apply_batch_to_deadline(state: SchedulerState, delta: list[int]) -> None:
+    """Apply the per-day delta straight onto ``deadline_tree``.
+
+    ``deadline_tree`` tracks the sum of orders due on each day, so add /
+    remove ops at day ``rel = i + 1`` map 1:1 to a signed point update.
+    No carry-back needed — ``deadline_tree`` raw values are unbounded (a
+    day can hold any number of orders) and EDF distribution does not
+    apply because deadline is a fixed attribute of each order rather than
+    a placement decision.
+
+    Complexity: O(D · log D) for D non-zero days in the delta.
+    """
+    if len(delta) != HORIZON_DAYS:
+        raise ValueError(
+            f"apply_batch_to_deadline: expected delta of length {HORIZON_DAYS}, "
+            f"got {len(delta)}"
+        )
+    for i, day_delta in enumerate(delta, start=1):
+        if day_delta != 0:
+            state.deadline_tree.point_update(i, day_delta)
 
 
 # ---------------------------------------------------------------------------
