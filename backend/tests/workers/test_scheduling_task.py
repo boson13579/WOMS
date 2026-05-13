@@ -1990,7 +1990,7 @@ def test_advance_day_dispatches_materializer_after_commit(
 
     def capture_pending() -> None:
         members = redis_client.smembers(MATERIALIZE_NOTIFY_PENDING_KEY)
-        pending_at_dispatch.append({m for m in members})
+        pending_at_dispatch.append(set(members))
 
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",
@@ -2051,7 +2051,7 @@ def test_rebuild_dispatches_materializer_with_sentinel_after_commit(
 
     def capture_pending() -> None:
         members = redis_client.smembers(MATERIALIZE_NOTIFY_PENDING_KEY)
-        pending_at_dispatch.append({m for m in members})
+        pending_at_dispatch.append(set(members))
 
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",
