@@ -492,3 +492,118 @@ def test_self_update_cannot_change_role(client: TestClient, db_session: Session)
     # role field is not part of UserSelfUpdateRequest → 422 validation error
     assert res.status_code == 422
     assert res.json()["error"]["code"] == 422
+
+
+def test_self_update_duplicate_email_returns_409(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="taken_email_owner", email="taken@example.com")
+    user = _make_user(db_session, username="self_upd_email_dup", password="password123")
+    token = _login(client, "self_upd_email_dup", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"email": "taken@example.com", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+# ---------------------------------------------------------------------------
+# Additional PATCH /users/{user_id} edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_patch_user_not_found_returns_404(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+
+    res = client.patch(
+        "/api/v1/users/00000000-0000-0000-0000-000000000000",
+        json={"username": "ghost", "version_id": 1},
+        headers=headers,
+    )
+
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == 404
+
+
+def test_patch_user_duplicate_email_returns_409(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+    _make_user(db_session, username="email_owner", email="occupied@example.com")
+    target = _make_user(db_session, username="email_target")
+
+    res = client.patch(
+        f"/api/v1/users/{target.id}",
+        json={"email": "occupied@example.com", "version_id": target.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_patch_user_reactivate_success(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+    target = _make_user(db_session, username="reactivate_me")
+
+    # Deactivate first
+    client.delete(f"/api/v1/users/{target.id}", headers=headers)
+    db_session.refresh(target)
+
+    res = client.patch(
+        f"/api/v1/users/{target.id}",
+        json={"is_active": True, "version_id": target.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["is_active"] is True
+
+
+def test_patch_root_username_guard_skips_gracefully(
+    client: TestClient, db_session: Session
+) -> None:
+    root = _make_user(db_session, username="root_rename", role=UserRole.root)
+    token = _login(client, "root_rename", "pass1234")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.patch(
+        f"/api/v1/users/{root.id}",
+        json={"username": "root_rename_new", "version_id": root.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["username"] == "root_rename_new"
+
+
+def test_patch_inactive_root_role_allowed(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="active_root_guard", role=UserRole.root)
+    inactive_root = _make_user(
+        db_session, username="inactive_root_guard", role=UserRole.root, is_active=False
+    )
+    token = _login(client, "active_root_guard", "pass1234")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.patch(
+        f"/api/v1/users/{inactive_root.id}",
+        json={"role": "scheduler", "version_id": inactive_root.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["role"] == "scheduler"
+
+
+def test_patch_user_update_email_success(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+    target = _make_user(db_session, username="email_update_target")
+
+    res = client.patch(
+        f"/api/v1/users/{target.id}",
+        json={"email": "brand_new@example.com", "version_id": target.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["email"] == "brand_new@example.com"
