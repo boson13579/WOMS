@@ -180,10 +180,10 @@ async def websocket_endpoint(
 
     await websocket.accept()
     manager = get_connection_manager()
-    logger.info("websocket.connected", user_id=str(user_id))
 
     try:
         await manager.connect(user_id, websocket)
+        logger.info("websocket.connected", user_id=str(user_id))
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:

@@ -27,6 +27,7 @@ from app.api.v1 import websocket as ws_api
 from app.api.v1.websocket import ConnectionManager, _handle_event
 from app.core.security import create_access_token
 from app.models.user import User, UserRole
+from app.repositories import user as user_repo
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketDisconnect
@@ -256,3 +257,21 @@ def test_websocket_rejects_inactive_user(client: TestClient, db_session: Session
         with client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
             ws.receive_text()
     assert exc_info.value.code == 4401
+
+
+def test_websocket_closes_4500_on_db_error(
+    client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setattr(
+        user_repo,
+        "get_by_id",
+        lambda db, uid: (_ for _ in ()).throw(OperationalError("DB down", None, None)),
+    )
+    user = _make_user(db_session, username="ws_db_error", role=UserRole.viewer)
+    token = create_access_token(user.id, user.role)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 4500
