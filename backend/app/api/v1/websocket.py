@@ -34,16 +34,21 @@ import uuid
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis as AsyncRedis
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.db import get_db
 from app.core.security import decode_access_token
+from app.repositories import user as user_repo
 from app.services.websocket import EVENT_CHANNEL
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+WS_CLOSE_AUTH_FAILED: int = 4401
 
 __all__ = [
     "ConnectionManager",
@@ -131,22 +136,31 @@ def get_connection_manager() -> ConnectionManager:
 @router.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: str = Query(..., description="JWT access token"),
+    token: str | None = Query(None, description="JWT access token (optional; cookie fallback)"),
+    db: Session = Depends(get_db),
 ) -> None:
-    """Authenticate via the ``?token=`` query param, then keep the socket open.
+    """Authenticate via ``?token=`` query param or ``access_token`` cookie.
 
+    Priority: bearer query param → cookie. Both absent → close(4401).
     The channel is server-driven — clients aren't expected to send anything,
     but ``receive_text()`` blocks until a message arrives or the peer
     disconnects, which is exactly the lifecycle we want.
     """
+    actual_token = token or websocket.cookies.get("access_token")
+    if actual_token is None:
+        await websocket.close(code=WS_CLOSE_AUTH_FAILED)
+        return
     try:
-        payload = decode_access_token(token)
+        payload = decode_access_token(actual_token)
         user_id = uuid.UUID(payload.sub)
+        user = user_repo.get_by_id(db, user_id)
+        if user is None or not user.is_active:
+            raise ValueError("inactive or missing user")
     except Exception as exc:
         logger.warning("websocket.auth_failed", error=str(exc))
         # Application close codes 4000-4999 are reserved for app use; 4401
         # mirrors the HTTP 401 semantic for clients that introspect the code.
-        await websocket.close(code=4401)
+        await websocket.close(code=WS_CLOSE_AUTH_FAILED)
         return
 
     await websocket.accept()

@@ -229,6 +229,30 @@ def test_websocket_rejects_invalid_token(client: TestClient) -> None:
 
 
 def test_websocket_rejects_missing_token(client: TestClient) -> None:
-    # No `token` query param at all → FastAPI rejects at protocol upgrade.
-    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/api/v1/ws"):
-        pass
+    # No token query param and no cookie → endpoint closes with 4401.
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/api/v1/ws") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 4401
+
+
+def test_websocket_accepts_cookie_auth(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="ws_cookie_user", role=UserRole.viewer)
+    token = create_access_token(user.id, user.role)
+    client.cookies.set("access_token", token)
+    try:
+        with client.websocket_connect("/api/v1/ws") as ws:
+            ws.close()
+    finally:
+        client.cookies.clear()
+
+
+def test_websocket_rejects_inactive_user(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="ws_inactive_user", role=UserRole.viewer)
+    user.is_active = False
+    db_session.commit()
+    token = create_access_token(user.id, user.role)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 4401
