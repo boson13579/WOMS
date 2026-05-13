@@ -465,6 +465,12 @@ def update_order(
     if order.is_processing_locked:
         raise _LOCKED_ORDER_ERROR
 
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify orders you created.",
+        )
+
     # Application-level optimistic lock: reject stale client versions before
     # making any changes. SQLAlchemy's DB-level check fires on flush(), but this
     # early guard gives a clearer error and avoids unnecessary DB work.
@@ -594,6 +600,12 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     # already-locked row. See ``_LOCKED_ORDER_ERROR``.
     if order.is_processing_locked:
         raise _LOCKED_ORDER_ERROR
+
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify orders you created.",
+        )
 
     # Build the compound from the *current* row state (the values the
     # worker will use to soft-delete + audit on accept).
