@@ -6,6 +6,7 @@ import uuid
 
 import structlog
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
@@ -120,6 +121,18 @@ def update_self(
             status_code=status.HTTP_409_CONFLICT,
             detail="User was modified by another request. Refresh and try again.",
         ) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        orig = str(exc.orig).lower()
+        if "ix_users_email" in orig or "users_email" in orig:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Email '{request.email}' is already in use.",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{request.username}' is already taken.",
+        ) from exc
 
     audit_log(
         action="user.self_updated",
@@ -212,6 +225,18 @@ def update_user(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User was modified by another request. Refresh and try again.",
+        ) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        orig = str(exc.orig).lower()
+        if "ix_users_email" in orig or "users_email" in orig:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Email '{request.email}' is already in use.",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{request.username}' is already taken.",
         ) from exc
 
     audit_log(

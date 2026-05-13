@@ -5,9 +5,12 @@ Run `pytest tests/api/test_users.py -v` to execute this module.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import bcrypt
 from app.models.user import User, UserRole
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 # ---------------------------------------------------------------------------
@@ -607,3 +610,48 @@ def test_patch_user_update_email_success(client: TestClient, db_session: Session
 
     assert res.status_code == 200
     assert res.json()["email"] == "brand_new@example.com"
+
+
+# ---------------------------------------------------------------------------
+# IntegrityError race-condition guards (mock-based)
+# ---------------------------------------------------------------------------
+
+
+def test_self_update_duplicate_email_integrity_error_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    user = _make_user(db_session, username="self_upd_ie_email", password="password123")
+    token = _login(client, "self_upd_ie_email", "password123")
+
+    fake_orig = Exception('duplicate key value violates unique constraint "ix_users_email"')
+    integrity_err = IntegrityError("stmt", {}, fake_orig)
+
+    with patch("app.services.user.user_repo.update_self", side_effect=integrity_err):
+        res = client.patch(
+            "/api/v1/users/me",
+            json={"email": "race@example.com", "version_id": user.version_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_admin_update_user_duplicate_email_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    headers = _root_headers(client, db_session)
+    target = _make_user(db_session, username="ie_email_target")
+
+    fake_orig = Exception('duplicate key value violates unique constraint "ix_users_email"')
+    integrity_err = IntegrityError("stmt", {}, fake_orig)
+
+    with patch("app.services.user.user_repo.update", side_effect=integrity_err):
+        res = client.patch(
+            f"/api/v1/users/{target.id}",
+            json={"email": "race@example.com", "version_id": target.version_id},
+            headers=headers,
+        )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
