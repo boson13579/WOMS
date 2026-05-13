@@ -12,7 +12,6 @@ import uuid
 from datetime import date
 
 import bcrypt
-import pytest
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
 from fastapi.testclient import TestClient
@@ -234,68 +233,3 @@ def test_viewer_can_update_self(client: TestClient, db_session: Session) -> None
 
     assert res.status_code == 200
     assert res.json()["username"] == "viewer_self_updated"
-
-
-# ---------------------------------------------------------------------------
-# Lock / soft-pin (skipped — depend on feat/order-lock-mechanism)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skip(reason="Requires feat/order-lock-mechanism: Order.is_locked not on main")
-def test_order_manager_can_lock_own_order(client: TestClient, db_session: Session) -> None:
-    mgr = _make_user(db_session, username="mgr_lock", role=UserRole.order_manager)
-    order = _make_order(db_session, created_by=mgr.id)
-    token = _login(client, "mgr_lock")
-
-    res = client.post(f"/api/v1/orders/{order.id}/lock", headers=_auth(token))
-
-    assert res.status_code == 200
-
-
-@pytest.mark.skip(reason="Requires feat/order-lock-mechanism: Order.is_locked not on main")
-def test_order_manager_cannot_lock_others_order_returns_403(
-    client: TestClient, db_session: Session
-) -> None:
-    owner = _make_user(db_session, username="owner_lock", role=UserRole.scheduler)
-    _make_user(db_session, username="mgr_lock2", role=UserRole.order_manager)
-    order = _make_order(db_session, created_by=owner.id)
-    token = _login(client, "mgr_lock2")
-
-    res = client.post(f"/api/v1/orders/{order.id}/lock", headers=_auth(token))
-
-    assert res.status_code == 403
-    assert "only modify orders you created" in res.json()["error"]["message"]
-
-
-@pytest.mark.skip(reason="Requires feat/order-lock-mechanism: Order.soft_pin_date not on main")
-def test_order_manager_can_set_soft_pin_own_order(client: TestClient, db_session: Session) -> None:
-    mgr = _make_user(db_session, username="mgr_pin", role=UserRole.order_manager)
-    order = _make_order(db_session, created_by=mgr.id)
-    token = _login(client, "mgr_pin")
-
-    res = client.patch(
-        f"/api/v1/orders/{order.id}/soft-pin",
-        json={"preferred_date": "2026-07-20"},
-        headers=_auth(token),
-    )
-
-    assert res.status_code == 200
-
-
-@pytest.mark.skip(reason="Requires feat/order-lock-mechanism: Order.soft_pin_date not on main")
-def test_order_manager_cannot_set_soft_pin_others_order_returns_403(
-    client: TestClient, db_session: Session
-) -> None:
-    owner = _make_user(db_session, username="owner_pin", role=UserRole.scheduler)
-    _make_user(db_session, username="mgr_pin2", role=UserRole.order_manager)
-    order = _make_order(db_session, created_by=owner.id)
-    token = _login(client, "mgr_pin2")
-
-    res = client.patch(
-        f"/api/v1/orders/{order.id}/soft-pin",
-        json={"preferred_date": "2026-07-20"},
-        headers=_auth(token),
-    )
-
-    assert res.status_code == 403
-    assert "only modify orders you created" in res.json()["error"]["message"]
