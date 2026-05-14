@@ -279,3 +279,17 @@ def test_create_order_with_nonexistent_assigned_to_returns_422(
 
     assert res.status_code == 422
     assert res.json()["error"]["code"] == 422
+
+
+# ---------------------------------------------------------------------------
+# Read — GET /orders and GET /orders/{id} (viewer should be allowed)
+# ---------------------------------------------------------------------------
+
+
+def test_viewer_can_read_orders(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="viewer_read", role=UserRole.viewer)
+    token = _login(client, "viewer_read")
+
+    res = client.get("/api/v1/orders", headers=_auth(token))
+
+    assert res.status_code == 200
