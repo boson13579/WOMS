@@ -34,16 +34,24 @@ import uuid
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis as AsyncRedis
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.db import get_db
 from app.core.security import decode_access_token
+from app.repositories import user as user_repo
 from app.services.websocket import EVENT_CHANNEL
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+WS_CLOSE_AUTH_FAILED: int = 4401
+WS_CLOSE_DB_ERROR: int = 4500
+_MAX_TOKEN_LEN: int = 8192
 
 __all__ = [
     "ConnectionManager",
@@ -131,30 +139,59 @@ def get_connection_manager() -> ConnectionManager:
 @router.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: str = Query(..., description="JWT access token"),
+    token: str | None = Query(None, description="JWT access token (optional; cookie fallback)"),
+    db: Session = Depends(get_db),
 ) -> None:
-    """Authenticate via the ``?token=`` query param, then keep the socket open.
+    """Authenticate via ``?token=`` query param or ``access_token`` cookie.
 
-    The channel is server-driven — clients aren't expected to send anything,
-    but ``receive_text()`` blocks until a message arrives or the peer
+    Priority: cookie → bearer query param. Both absent → close(4401).
+    The DB session is closed immediately after the auth lookup via
+    ``db.close()``, so no pool slot is held during the long-running loop.
+    FastAPI's ``get_db`` generator calls ``close()`` again on handler exit,
+    which is a no-op once the session is already closed.
+    The channel is server-driven; ``receive_text()`` blocks until the peer
     disconnects, which is exactly the lifecycle we want.
     """
+    actual_token = websocket.cookies.get("access_token") or token
+    if actual_token is None:
+        with contextlib.suppress(Exception):
+            await websocket.close(code=WS_CLOSE_AUTH_FAILED)
+        return
+    if len(actual_token) > _MAX_TOKEN_LEN:
+        with contextlib.suppress(Exception):
+            await websocket.close(code=WS_CLOSE_AUTH_FAILED)
+        return
     try:
-        payload = decode_access_token(token)
+        payload = decode_access_token(actual_token)
         user_id = uuid.UUID(payload.sub)
+        user = user_repo.get_by_id(db, user_id)
+        if user is None or not user.is_active:
+            raise ValueError("inactive or missing user")
+    except SQLAlchemyError as exc:
+        # DB errors (pool exhausted, query timeout, etc.) are server-side
+        # faults, not auth failures — log at ERROR so monitoring fires.
+        logger.error("websocket.db_error", error=str(exc), exc_info=True)
+        with contextlib.suppress(Exception):
+            await websocket.close(code=WS_CLOSE_DB_ERROR)
+        return
     except Exception as exc:
         logger.warning("websocket.auth_failed", error=str(exc))
         # Application close codes 4000-4999 are reserved for app use; 4401
         # mirrors the HTTP 401 semantic for clients that introspect the code.
-        await websocket.close(code=4401)
+        with contextlib.suppress(Exception):
+            await websocket.close(code=WS_CLOSE_AUTH_FAILED)
         return
+    finally:
+        # Release the DB connection back to the pool before the long-running
+        # loop — the while loop doesn't use the DB at all.
+        db.close()
 
     await websocket.accept()
     manager = get_connection_manager()
-    await manager.connect(user_id, websocket)
-    logger.info("websocket.connected", user_id=str(user_id))
 
     try:
+        await manager.connect(user_id, websocket)
+        logger.info("websocket.connected", user_id=str(user_id))
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:

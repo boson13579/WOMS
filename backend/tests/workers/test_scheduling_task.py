@@ -2149,6 +2149,7 @@ def test_perform_db_action_accept_update_writes_new_values_and_audits(
 
     actor = User(
         username="worker-dbaction-actor",
+        email="worker-dbaction-actor@test.internal",
         password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
         role=UserRole.scheduler,
         is_active=True,
@@ -2211,6 +2212,7 @@ def test_perform_db_action_reject_update_clears_lock_only(
 
     actor = User(
         username="worker-dbaction-reject-update",
+        email="worker-dbaction-reject-update@test.internal",
         password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
         role=UserRole.scheduler,
         is_active=True,
@@ -2270,6 +2272,7 @@ def test_perform_db_action_accept_delete_soft_deletes_and_audits(
 
     actor = User(
         username="worker-dbaction-delete",
+        email="worker-dbaction-delete@test.internal",
         password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
         role=UserRole.scheduler,
         is_active=True,
@@ -2332,6 +2335,7 @@ def test_perform_db_action_reject_create_soft_deletes_orphan_row(
 
     actor = User(
         username="worker-dbaction-rej-create",
+        email="worker-dbaction-rej-create@test.internal",
         password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
         role=UserRole.scheduler,
         is_active=True,

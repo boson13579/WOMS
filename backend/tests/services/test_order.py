@@ -45,6 +45,7 @@ def mock_enqueue(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 def _make_user(db: Session, *, username: str) -> User:
     user = User(
         username=username,
+        email=f"{username}@test.internal",
         password_hash=bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode(),
         role=UserRole.scheduler,
         is_active=True,
