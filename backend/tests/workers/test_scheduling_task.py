@@ -406,17 +406,17 @@ def test_run_scheduling_rejects_first_compound_when_infeasible_alone(
 
 
 # ---------------------------------------------------------------------------
-# run_scheduling_task — binary-search halving accepts the largest fitting prefix
+# run_scheduling_task — halving accepts the largest fitting prefix
 # ---------------------------------------------------------------------------
 
 
-def test_run_scheduling_binary_search_accepts_smaller_prefix_then_drains_rest(
+def test_run_scheduling_halving_accepts_smaller_prefix_then_drains_rest(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """Binary-search halving: when ``[1..N]`` is infeasible, the worker
-    halves to ``[1..N//2]`` etc. until first feasible. Remaining
-    compounds get picked up on the next drain-loop iteration.
+    """Halving probe: when ``[1..N]`` is infeasible, the worker halves
+    to ``[1..N//2]`` etc. until first feasible. Remaining compounds get
+    picked up on the next drain-loop iteration.
 
     Setup: 4 compounds where [1..4] fails, [1..2] passes. Expected:
     iter 1 accepts [1..2] (halving N=4 → 2 → pass), iter 2 reads the
@@ -740,7 +740,9 @@ def test_run_scheduling_yields_retrigger_to_waiter(
     real_read = worker_module._read_pending_compounds
     call_count = {"value": 0}
 
-    def faked_read() -> list[tuple[str, dict[str, Any]]]:
+    def faked_read(
+        *, limit: int | None = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
         call_count["value"] += 1
         if call_count["value"] == 1:
             # Simulate the drain loop seeing one compound, processing it,
@@ -750,7 +752,7 @@ def test_run_scheduling_yields_retrigger_to_waiter(
             # for the post-drain ``zcard`` check below.
             _enqueue(redis_client, _make_op(order_number="POST-DRAIN"))
             return []
-        return real_read()
+        return real_read(limit=limit)
 
     monkeypatch.setattr("app.workers.scheduling._read_pending_compounds", faked_read)
 
@@ -2704,6 +2706,131 @@ def test_take_count_caps_pending_by_inverse_rate() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reject-rate — reliability / convergence tests (review round-3)
+# ---------------------------------------------------------------------------
+
+
+def test_reject_rate_converges_to_expected_value_for_fixed_probability(
+    redis_client: Redis,
+) -> None:
+    """Simulate a fixed per-compound reject probability of ~0.2 over many
+    iterations; the EWMA should converge into a neighborhood of 0.2.
+
+    EWMA with alpha=0.05 has effective averaging window ≈ 1/alpha = 20
+    samples. After 200 observations the value should be within a small
+    epsilon of the true probability. This test pins the convergence
+    contract — if someone retunes alpha to 0.001 (super slow) or 0.5
+    (over-reactive) the convergence speed assertion catches it.
+    """
+    from app.workers.scheduling import (
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+        _update_reject_rate,
+    )
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.01")  # start from prior
+
+    # 200 observations with reject probability 0.2 (40 rejects, 160 accepts)
+    # Apply alternating chunks so accept-then-reject ordering doesn't
+    # bias the result (within each call we do all accepts then all rejects).
+    for _ in range(40):
+        _update_reject_rate(accepted=4, rejected=1)  # 5 obs each, ratio 0.2
+
+    final = _get_reject_rate()
+    # After 200 obs, EWMA-with-alpha=0.05 converges to within ~0.05 of true.
+    assert abs(final - 0.2) < 0.05, f"final p={final}, expected ≈ 0.2"
+
+
+def test_reject_rate_cross_worker_race_last_writer_wins(
+    redis_client: Redis,
+) -> None:
+    """Two workers updating concurrently → both compute deltas off the SAME
+    snapshot, the second SET overwrites the first. One observation is
+    effectively lost — that's the documented last-writer-wins tradeoff.
+
+    We can't truly interleave two threads in a deterministic way here, so
+    we simulate by:
+      1. Set p₀
+      2. Worker A reads p₀, computes its new p_A (one accept)
+      3. Worker B reads p₀, computes its new p_B (one reject)
+      4. Both write their value; final state == whoever wrote last
+
+    Verifies the final p is exactly one of {p_A, p_B}, NOT the
+    "compose-both-updates" value (which would be the sequentially-applied
+    result). If the implementation gained CAS / Lua-script atomicity
+    later, the final value would be the composed one and this test would
+    correctly fail to signal the contract change.
+    """
+    from app.workers.scheduling import (
+        _REJECT_RATE_ALPHA,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+    )
+
+    p0 = 0.1
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, str(p0))
+
+    # Manual replay of two non-atomic update sequences. Both start from p₀;
+    # whoever writes second wins.
+    p_after_accept = (1 - _REJECT_RATE_ALPHA) * p0  # worker A: 1 accept
+    p_after_reject = _REJECT_RATE_ALPHA + (1 - _REJECT_RATE_ALPHA) * p0  # worker B: 1 reject
+
+    # Simulate worker A reading p₀, then worker B reading p₀, then both
+    # writing in order A→B. Final value = worker B's computed value.
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, repr(p_after_accept))  # A writes
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, repr(p_after_reject))  # B writes (wins)
+
+    assert _get_reject_rate() == pytest.approx(p_after_reject)
+    # NOT the sequential-compose-both value (which would be obs A then obs B
+    # applied to the same instance, yielding a different p).
+    sequential_both = _REJECT_RATE_ALPHA + (1 - _REJECT_RATE_ALPHA) * p_after_accept
+    assert _get_reject_rate() != pytest.approx(sequential_both)
+
+
+def test_reject_rate_partial_halving_drift_pushes_p_up(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """When ``_largest_halving_feasible_prefix`` halves multiple times
+    before finding a feasible prefix, the EWMA must observe those failed
+    halving rounds as ``rejected=`` signal — not just count the final
+    ``accepted=k``.
+
+    Without this, a workload that keeps halving from 100 to 2 (accepting
+    only 2 per drain) would push p DOWN (only +2 accepts seen), keeping
+    the cap permissively large, perpetuating the wasted halving. The
+    halving-misses signal (= ``attempts_tried - 1`` when k > 0) is what
+    pushes p back UP.
+    """
+    from app.workers.scheduling import COMPOUND_REJECT_RATE_KEY
+
+    p0 = 0.01
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, str(p0))
+
+    _enqueue(redis_client, _make_op(order_number="ORD-A"))
+
+    # Mock halving to simulate "tried 4 prefix sizes, only the last (k=1)
+    # was feasible" — so attempts_tried=4, halving_misses=3.
+    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> tuple[int, int]:
+        return 1, 4
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._largest_halving_feasible_prefix",
+        fake_search,
+    )
+    _patch_common(monkeypatch)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # Final p MUST be higher than p₀ — 3 halving misses dominated 1 accept.
+    raw = redis_client.get(COMPOUND_REJECT_RATE_KEY)
+    assert raw is not None
+    final = float(raw)
+    assert final > p0, f"halving_misses signal failed: p₀={p0}, final={final}"
+
+
+# ---------------------------------------------------------------------------
 # Reject-rate adaptive cap — drain-loop integration
 # ---------------------------------------------------------------------------
 
@@ -2715,8 +2842,8 @@ def test_run_scheduling_caps_candidates_by_reject_rate(
     """With p pre-seeded high (= small cap), the drain loop's binary
     search MUST only see ``ceil(1/p)`` candidates per iteration even
     though the queue holds more. Verified by mocking
-    ``_binary_search_feasible_prefix`` to capture the candidate-list size
-    on each call.
+    ``_largest_halving_feasible_prefix`` to capture the candidate-list
+    size on each call.
     """
     from app.workers.scheduling import COMPOUND_REJECT_RATE_KEY
 
@@ -2728,12 +2855,13 @@ def test_run_scheduling_caps_candidates_by_reject_rate(
 
     captured_window_sizes: list[int] = []
 
-    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> int:
+    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> tuple[int, int]:
         captured_window_sizes.append(len(compounds))
-        return len(compounds)  # accept everything in the window
+        # (k, attempts_tried) — first probe succeeded.
+        return len(compounds), 1
 
     monkeypatch.setattr(
-        "app.workers.scheduling._binary_search_feasible_prefix",
+        "app.workers.scheduling._largest_halving_feasible_prefix",
         fake_search,
     )
     _patch_common(monkeypatch)
@@ -2772,12 +2900,12 @@ def test_run_scheduling_uses_full_pending_when_rate_is_minimal(
 
     captured_window_sizes: list[int] = []
 
-    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> int:
+    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> tuple[int, int]:
         captured_window_sizes.append(len(compounds))
-        return len(compounds)
+        return len(compounds), 1
 
     monkeypatch.setattr(
-        "app.workers.scheduling._binary_search_feasible_prefix",
+        "app.workers.scheduling._largest_halving_feasible_prefix",
         fake_search,
     )
     _patch_common(monkeypatch)

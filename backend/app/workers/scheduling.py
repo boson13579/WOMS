@@ -159,7 +159,7 @@ _RUN_WAIT_POLL_INTERVAL_SECONDS = get_settings().SCHEDULER_RUN_WAIT_POLL_INTERVA
 # Reject-rate adaptive cap for batch admission
 # ---------------------------------------------------------------------------
 #
-# ``_binary_search_feasible_prefix`` halves from ``len(candidates)`` down to
+# ``_largest_halving_feasible_prefix`` halves from ``len(candidates)`` down to
 # the first feasible attempt. When the queue holds N=1000 compounds but the
 # very first compound is the only blocker, halving from 1000 wastes
 # ``log2(N)`` rounds of ``compute_batch_capacity_delta`` (each O(K+D)) on
@@ -212,9 +212,18 @@ def _update_reject_rate(*, accepted: int, rejected: int) -> None:
 
     Each accepted compound pulls p toward 0; each rejected compound pulls
     p toward 1. We apply the updates sequentially (one EWMA step per
-    compound) rather than as a single batched ratio so the same total
-    pattern produces the same final p regardless of whether we observed it
-    as one big batch or many small ones.
+    compound) rather than collapsing the batch into a single ratio — so
+    within a single call, the explicit order is **all accepts first, then
+    all rejects**. Different per-call shapes (one ``(a=N, r=M)`` vs two
+    consecutive ``(a=N, r=0)`` + ``(a=0, r=M)``) produce the SAME final p
+    because the inter-call concatenation preserves that accept-then-reject
+    ordering.
+
+    Note EWMA is NOT commutative across orderings in general — e.g.
+    ``(a=1)`` then ``(r=1)`` lands at a different p than ``(r=1)`` then
+    ``(a=1)``. Callers that care about exact final value must batch
+    observations in a single call; callers that just need "monotonic
+    drift in the right direction" can fire updates ad-hoc.
 
     Concurrent writes (multiple workers) race on the SET — last-writer-wins.
     Acceptable for a tuning heuristic: convergence is slower but still
@@ -396,7 +405,7 @@ def _is_waiter_pending() -> bool:
     return _get_redis().get(WAITER_FLAG_KEY) is not None
 
 
-def _read_pending_compounds() -> list[tuple[str, dict[str, Any]]]:
+def _read_pending_compounds(*, limit: int | None = None) -> list[tuple[str, dict[str, Any]]]:
     """Read every pending compound in priority order WITHOUT popping.
 
     Returns ``[(raw_member, parsed_dict), ...]`` sorted ascending by
@@ -422,11 +431,22 @@ def _read_pending_compounds() -> list[tuple[str, dict[str, Any]]]:
     placement information when we ZREM it here, but the raw bytes go
     onto a List so ops can recover the affected ``order_id`` /
     ``requested_by`` manually.
+
+    ``limit`` (optional): cap the ZRANGE read at the first ``limit``
+    members. The drain loop only ever inspects ``pending[:take]`` where
+    ``take ≤ ceil(1/p)``, so reading the whole queue is wasted O(N)
+    bandwidth per drain iteration (and O(N²) across a long drain). Set
+    ``limit`` to the reject-rate cap to bound traffic to what we'll
+    actually use; ``None`` (= legacy) reads everything. Any entries past
+    ``limit`` stay in pending and get picked up on the next iteration.
+    A DLQ drain mid-window can reduce the returned count below
+    ``limit`` — that's OK, the next iteration re-reads.
     """
     rds = _get_redis()
+    end_idx = -1 if limit is None else max(0, limit - 1)
     members = cast(
         "list[tuple[str, float]]",
-        rds.zrange(PENDING_OPS_KEY, 0, -1, withscores=True),
+        rds.zrange(PENDING_OPS_KEY, 0, end_idx, withscores=True),
     )
     parsed: list[tuple[str, dict[str, Any]]] = []
     for member, _score in members:
@@ -564,11 +584,11 @@ def _extract_batch_ops(compounds: list[dict[str, Any]]) -> list[BatchOp]:
     return ops
 
 
-def _binary_search_feasible_prefix(
+def _largest_halving_feasible_prefix(
     state: SchedulerState,
     compounds: list[dict[str, Any]],
-) -> int:
-    """Halving search for the largest feasible compound prefix.
+) -> tuple[int, int]:
+    """Halving probe for the largest feasible compound prefix.
 
     Sequence (per user spec, ``N = len(compounds)``):
 
@@ -582,26 +602,40 @@ def _binary_search_feasible_prefix(
     though 2 would have fit. The remaining compound(s) are picked up
     on the next outer-loop iteration (with possibly new arrivals).
 
-    Returns ``0`` when even ``[1..1]`` is infeasible — caller treats
-    that as "drop and reject the first compound", which is the only
-    way out of a queue head that cannot fit.
+    True binary search would find the optimal k in the same O(log N)
+    probes but requires prefix-feasibility monotonicity, which mixed-sign
+    grow-group compounds (qty-smaller + deadline-earlier) can break.
+    Halving stays safe under broken monotonicity at the cost of accepting
+    a possibly-suboptimal k.
 
-    Complexity: O(log N · (K + D log D)) where K is total ops in the
-    attempted prefix and D is HORIZON_DAYS. Each halving rebuilds the
-    delta from scratch — could be incrementalized (re-use prefix delta
-    and subtract the dropped tail) but the constant factor is small and
-    halving converges quickly.
+    Returns ``(k, attempts_tried)``:
+      - ``k = 0`` when even ``[1..1]`` is infeasible — caller treats
+        that as "drop and reject the first compound", the only way out
+        of a queue head that cannot fit.
+      - ``attempts_tried`` is the number of halving rounds executed;
+        ``attempts_tried - k`` is the count of probes that failed before
+        the successful one (or all of them, when ``k == 0``). The reject-
+        rate EWMA uses ``attempts_tried - k`` as a "this many prefix
+        sizes were rejected" signal to bias the next iteration's cap.
+
+    Complexity: O(log N · (K + D)) where K is total ops in the attempted
+    prefix and D is HORIZON_DAYS. Each halving rebuilds the delta from
+    scratch — could be incrementalized (re-use prefix delta and subtract
+    the dropped tail) but the constant factor is small and halving
+    converges quickly.
     """
     base_date = state.base_date
     attempt = len(compounds)
+    attempts_tried = 0
     while attempt > 0:
         prefix = compounds[:attempt]
         batch_ops = _extract_batch_ops(prefix)
         delta = compute_batch_capacity_delta(batch_ops, base_date)
+        attempts_tried += 1
         if is_batch_feasible(state, delta):
-            return attempt
+            return attempt, attempts_tried
         attempt //= 2
-    return 0
+    return 0, attempts_tried
 
 
 def _apply_compound_leaf_structural(
@@ -694,7 +728,7 @@ def _notify_compound_accepted(compound: dict[str, Any]) -> None:
 def _notify_compound_batch_rejected(compound: dict[str, Any]) -> None:
     """WS notify a compound that was rejected by single-compound infeasibility.
 
-    Fired when ``_binary_search_feasible_prefix`` returns 0 — even the
+    Fired when ``_largest_halving_feasible_prefix`` returns 0 — even the
     first compound alone cannot fit current capacity. Envelope mirrors
     the pre-rewrite ``_notify_compound_failure`` so frontends see the
     same ``schedule.compound_failed`` shape; ``failed_op_index=0`` and
@@ -1115,7 +1149,7 @@ def _finalize_run(state: SchedulerState) -> int:
 
 
 @celery_app.task(bind=True, name="scheduling.run")  # type: ignore[untyped-decorator]
-def run_scheduling_task(self: Task) -> None:
+def run_scheduling_task(self: Task) -> None:  # noqa: PLR0915 — orchestration function: long but linear, extracting helpers hurts readability
     """Drain the pending queue via batch admission, then flip back to idle.
 
     **Phase 4 fast/slow split** still applies: this task is the fast path,
@@ -1134,7 +1168,7 @@ def run_scheduling_task(self: Task) -> None:
        a. Read all pending compounds in priority order
           (``_read_pending_compounds``, ZRANGE without popping).
        b. Halving search for the largest feasible prefix
-          (``_binary_search_feasible_prefix``: tries ``[1..N]``,
+          (``_largest_halving_feasible_prefix``: tries ``[1..N]``,
           ``[1..N//2]``, ``[1..N//4]``, ..., ``[1..1]``).
        c. If the largest feasible attempt is **0** (even the first
           compound alone is infeasible), drop just that compound via
@@ -1186,33 +1220,45 @@ def run_scheduling_task(self: Task) -> None:
         any_compound_rejected = False
 
         while True:
-            pending = _read_pending_compounds()
-            if not pending:
-                break
-
-            state = _load_state()
             # Reject-rate adaptive cap: only consider the first ``ceil(1/p)``
-            # candidates for binary-search. With p tracking the per-compound
+            # candidates for halving. With p tracking the per-compound
             # reject rate, this is the expected position of the next reject,
             # so prefixes beyond it are unlikely to be feasible anyway —
             # skipping them avoids paying ``compute_batch_capacity_delta``
             # on doomed candidates. ``_update_reject_rate`` keeps p current
-            # below, so the cap auto-adapts to the workload.
+            # below, so the cap auto-adapts to the workload. Reading p
+            # BEFORE the pending fetch lets us bound the ZRANGE itself to
+            # ``ceil(1/p)`` entries — saves O(N) bandwidth on long queues.
             rate = _get_reject_rate()
+            read_cap = _take_count_from_rate(pending_count=10**9, rate=rate)
+            pending = _read_pending_compounds(limit=read_cap)
+            if not pending:
+                break
+
+            state = _load_state()
             take = _take_count_from_rate(len(pending), rate)
             candidates = pending[:take]
 
-            k = _binary_search_feasible_prefix(state, [c for _, c in candidates])
+            k, attempts_tried = _largest_halving_feasible_prefix(
+                state, [c for _, c in candidates]
+            )
+            # Halving rounds that failed before the successful one (or all
+            # rounds, if k == 0) feed the EWMA as "this many prefix sizes
+            # were rejected" — so the cap moves up when halving had to
+            # retreat repeatedly, even if some compounds ended up accepted.
+            halving_misses = max(0, attempts_tried - (1 if k > 0 else 0))
 
             if k == 0:
                 first_member, first_compound = pending[0]
                 _reject_first_compound(first_member, first_compound)
-                _update_reject_rate(accepted=0, rejected=1)
+                # Count the dropped head as one real rejection; halving_misses
+                # are extra hint pressure from the failed probes.
+                _update_reject_rate(accepted=0, rejected=1 + halving_misses)
                 any_compound_rejected = True
                 continue
 
             _commit_accepted_batch(state, candidates[:k])
-            _update_reject_rate(accepted=k, rejected=0)
+            _update_reject_rate(accepted=k, rejected=halving_misses)
             any_batch_committed = True
 
         if any_batch_committed:

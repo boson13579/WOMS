@@ -456,6 +456,79 @@ def test_update_order_unpinned_pushes_remove_add_compound(
     assert compound.ops[1].deadline == date(2026, 5, 25)  # new
 
 
+def test_update_order_qty_grow_with_deadline_later_is_grow_group(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """Regression for batch-admission monotonicity: a PATCH that BOTH grows
+    qty AND defers the deadline must be classified ``grow``.
+
+    Pre-fix rule was ``shrink if (qty_smaller OR deadline_later) else grow``,
+    which mis-classified this case as shrink even though the cumulative
+    per-day delta is net-additive (e.g. ``qty=100→10000, day3→day5`` lands
+    +9900 on day5). Halving's prefix-feasibility monotonicity assumed
+    shrink-group compounds were always net-non-additive, so a
+    self-infeasible "shrink" head would slip past admission and the
+    worker would binary-search-reject it. Strict-AND rule fixes that.
+    """
+    creator = _make_user(db_session, username="sru-grow-defer")
+    order = Order(
+        order_number="ORD-GROW-DEFER",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    req = UpdateOrderRequest(
+        wafer_quantity=2500,  # grew (clamped to CHECK constraint max)
+        requested_delivery_date=date(2026, 5, 25),  # defer
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert compound.group == "grow"  # net-additive ⇒ grow
+
+
+def test_update_order_qty_smaller_with_deadline_earlier_is_grow_group(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """Companion regression: qty smaller BUT deadline pulled earlier must
+    also be ``grow``.
+
+    The deadline-earlier move shifts demand to an earlier day; even if
+    total qty drops, the cumulative prefix on the earlier day can spike
+    above pre-PATCH levels. Strict-AND rule classifies any deadline
+    tightening as grow, regardless of qty direction.
+    """
+    creator = _make_user(db_session, username="sru-smaller-earlier")
+    order = Order(
+        order_number="ORD-SMALLER-EARLIER",
+        customer_name="ACME",
+        wafer_quantity=500,
+        requested_delivery_date=date(2026, 5, 25),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    req = UpdateOrderRequest(
+        wafer_quantity=100,  # smaller
+        requested_delivery_date=date(2026, 5, 20),  # earlier
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert compound.group == "grow"
+
+
 def test_update_order_pinned_with_compatible_change_auto_re_pins(
     db_session: Session, mock_enqueue: MagicMock
 ) -> None:

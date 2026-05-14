@@ -1727,3 +1727,140 @@ def test_batch_apply_matches_per_op_for_mixed_batch() -> None:
         assert state_a.deadline_tree.query(i) == state_b.deadline_tree.query(i), (
             f"deadline prefix mismatch at day {i}"
         )
+
+
+# ---------------------------------------------------------------------------
+# _iter_pq_edf_sorted — direct tests of the lazy bucket-sort iterator
+# ---------------------------------------------------------------------------
+#
+# pq is now dict-backed; EDF ordering is materialized at iteration time via
+# bucket sort (30 buckets by deadline_rel + within-bucket sort_key). These
+# tests cover the helper directly rather than through advance_day /
+# compute_schedule so a regression in the iterator surfaces here, not as a
+# downstream symptom.
+
+
+def test_iter_pq_edf_sorted_empty_pq_returns_empty_list() -> None:
+    """Short-circuit branch: no pq orders ⇒ no bucket allocation, return
+    ``[]`` directly. Without this guard the function would still allocate
+    HORIZON_DAYS+1 empty lists and walk them — correct but wasteful."""
+    state = SchedulerState.initial(_BASE)
+
+    assert _iter_pq_edf_sorted(state) == []
+
+
+def test_iter_pq_edf_sorted_single_order_round_trip() -> None:
+    """One order in pq ⇒ helper returns ``[order]``. Sanity check the
+    single-bucket-single-entry path."""
+    state = SchedulerState.initial(_BASE)
+    order = _make_order(qty=1000, deadline=_BASE + timedelta(days=5))
+    add_order(state, order)
+
+    result = _iter_pq_edf_sorted(state)
+
+    assert len(result) == 1
+    assert result[0].order_id == order.order_id
+
+
+def test_iter_pq_edf_sorted_orders_by_deadline_first() -> None:
+    """Primary sort key is deadline (earlier → first). Verify across multiple
+    buckets so the bucket-placement step is exercised."""
+    state = SchedulerState.initial(_BASE)
+    late = _make_order(order_number="late", qty=500, deadline=_BASE + timedelta(days=15))
+    early = _make_order(order_number="early", qty=500, deadline=_BASE + timedelta(days=2))
+    mid = _make_order(order_number="mid", qty=500, deadline=_BASE + timedelta(days=8))
+    for o in (late, early, mid):  # insert in non-EDF order to confirm bucket sort works
+        add_order(state, o)
+
+    result = _iter_pq_edf_sorted(state)
+
+    assert [o.order_id for o in result] == [early.order_id, mid.order_id, late.order_id]
+
+
+def test_iter_pq_edf_sorted_tie_breaks_by_qty_desc_then_order_number() -> None:
+    """Same deadline → tie-break on ``(-wafer_quantity, order_number)``.
+    Larger qty wins, alphabetical for equal qty. Locks the in-bucket sort
+    contract."""
+    state = SchedulerState.initial(_BASE)
+    same_day = _BASE + timedelta(days=4)
+    small_b = _make_order(order_number="b-small", qty=100, deadline=same_day)
+    big_z = _make_order(order_number="z-big", qty=1000, deadline=same_day)
+    big_a = _make_order(order_number="a-big", qty=1000, deadline=same_day)
+    for o in (small_b, big_z, big_a):
+        add_order(state, o)
+
+    result = _iter_pq_edf_sorted(state)
+    order_numbers = [o.order_number for o in result]
+
+    # qty=1000 group sorts before qty=100; within qty=1000, "a-big" < "z-big".
+    assert order_numbers == ["a-big", "z-big", "b-small"]
+
+
+def test_iter_pq_edf_sorted_day_1_and_day_30_both_placed_correctly() -> None:
+    """Boundary buckets: deadline = base_date (rel=1) and deadline =
+    base_date + HORIZON_DAYS - 1 (rel=30). After the bucket-collision fix,
+    day-30 orders land in bucket[29] (not bucket[30] which is the
+    out-of-horizon sentinel)."""
+    state = SchedulerState.initial(_BASE)
+    day_30 = _make_order(qty=100, deadline=_BASE + timedelta(days=HORIZON_DAYS - 1))
+    day_1 = _make_order(qty=100, deadline=_BASE)
+    add_order(state, day_30)
+    add_order(state, day_1)
+
+    result = _iter_pq_edf_sorted(state)
+
+    assert [o.order_id for o in result] == [day_1.order_id, day_30.order_id]
+
+
+def test_iter_pq_edf_sorted_parity_with_sorted_baseline() -> None:
+    """Property-style: a random-ish bag of orders sorted by ``_iter_pq_edf_sorted``
+    must equal ``sorted(..., key=sort_key)``. Pins the helper against a trivial
+    reference implementation."""
+    state = SchedulerState.initial(_BASE)
+    orders = []
+    # Mix qtys, deadlines, and order_numbers so tie-breaks fire on each axis.
+    for i in range(15):
+        o = _make_order(
+            order_number=f"ord-{i:02d}",
+            qty=100 * ((i % 5) + 1),
+            deadline=_BASE + timedelta(days=(i * 3) % HORIZON_DAYS),
+        )
+        add_order(state, o)
+        orders.append(o)
+
+    result = _iter_pq_edf_sorted(state)
+    expected = sorted(orders, key=lambda o: o.sort_key())
+
+    assert [o.order_id for o in result] == [o.order_id for o in expected]
+
+
+def test_iter_pq_edf_sorted_out_of_horizon_lands_in_sentinel_bucket() -> None:
+    """An order whose deadline is past the horizon (defensive — shouldn't
+    happen under normal admission control) must NOT collide with real
+    day-HORIZON_DAYS orders. Verifies the bucket-collision fix: stale
+    orders go into the dedicated sentinel bucket appended after all
+    in-horizon buckets, so iteration order is ``[in-horizon orders] +
+    [out-of-horizon orders]``."""
+    state = SchedulerState.initial(_BASE)
+    # Inject an out-of-horizon order directly into pq_index, bypassing
+    # add_order which would reject it as ``deadline_too_far``. This is
+    # the only way to simulate the "stale order somehow in pq" scenario
+    # the sentinel bucket defends against.
+    stale = _make_order(
+        order_number="stale",
+        qty=500,
+        deadline=_BASE + timedelta(days=HORIZON_DAYS + 5),
+    )
+    state.pq_index[stale.order_id] = stale
+
+    in_horizon = _make_order(
+        order_number="in-horizon",
+        qty=500,
+        deadline=_BASE + timedelta(days=HORIZON_DAYS - 1),  # day-30 (rel=30)
+    )
+    add_order(state, in_horizon)
+
+    result = _iter_pq_edf_sorted(state)
+
+    # Day-30 order comes first (bucket[29]), out-of-horizon last (bucket[30]).
+    assert [o.order_id for o in result] == [in_horizon.order_id, stale.order_id]

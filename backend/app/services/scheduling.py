@@ -489,19 +489,26 @@ def _iter_pq_edf_sorted(state: SchedulerState) -> list[SchedulingOrder]:
 
     Returns a fresh list — callers may index, slice, or iterate it freely.
     Orders with a deadline outside the horizon (defensive — should be
-    filtered upstream) end up in a synthetic 30-day-out bucket so they
-    still get a deterministic placement rather than being silently
-    dropped here.
+    filtered upstream) end up in a dedicated sentinel bucket appended
+    after all in-horizon buckets so they still get a deterministic
+    placement rather than being silently dropped here.
+
+    Bucket layout (size ``HORIZON_DAYS + 1``):
+      - index ``0..HORIZON_DAYS-1`` → days ``rel=1..HORIZON_DAYS`` (in-horizon)
+      - index ``HORIZON_DAYS`` → out-of-horizon sentinel
+
+    Pre-fix the in-horizon mapping used ``idx = rel`` (1..30) and the
+    sentinel used ``idx = HORIZON_DAYS`` (=30), which collided real
+    day-30 orders with sentinel orders in the same bucket and left
+    bucket[0] permanently empty.
     """
     if not state.pq_index:
         return []
     buckets: list[list[SchedulingOrder]] = [[] for _ in range(HORIZON_DAYS + 1)]
     for order in state.pq_index.values():
         rel = abs_to_rel(order.deadline, state.base_date)
-        # Out-of-horizon orders shouldn't exist in pq (callers filter at
-        # admission), but if they do, park them at the last bucket so
-        # iteration still yields them deterministically.
-        idx = rel if rel is not None else HORIZON_DAYS
+        # rel ∈ {1..HORIZON_DAYS} → bucket[rel-1]; None → bucket[HORIZON_DAYS]
+        idx = rel - 1 if rel is not None else HORIZON_DAYS
         buckets[idx].append(order)
     flat: list[SchedulingOrder] = []
     for bucket in buckets:
@@ -1075,16 +1082,21 @@ def is_batch_feasible(state: SchedulerState, delta: list[int]) -> bool:
     ``capacity_tree.query(i) ≥ 0`` always holds. The check is symmetric in
     sign and does not need a separate path for removal-heavy batches.
 
-    Complexity: O(HORIZON_DAYS · log HORIZON_DAYS) due to per-day tree query.
+    Complexity: O(HORIZON_DAYS). Pre-opt this did one ``tree.query(i)`` per
+    day (O(D log D) total); now we materialize the raw per-day capacity
+    once via ``to_array()`` and run a cumulative-sum compare in one pass.
     """
     if len(delta) != HORIZON_DAYS:
         raise ValueError(
             f"is_batch_feasible: expected delta of length {HORIZON_DAYS}, got {len(delta)}"
         )
+    raw_capacity = state.capacity_tree.to_array()
     cumulative_demand = 0
-    for i, day_demand in enumerate(delta, start=1):
+    cumulative_capacity = 0
+    for day_demand, day_capacity in zip(delta, raw_capacity, strict=True):
         cumulative_demand += day_demand
-        if cumulative_demand > state.capacity_tree.query(i):
+        cumulative_capacity += day_capacity
+        if cumulative_demand > cumulative_capacity:
             return False
     return True
 
