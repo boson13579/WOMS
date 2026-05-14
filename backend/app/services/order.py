@@ -18,9 +18,10 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from app.core.logger import audit_log as emit_audit_log
 from app.models.order import MUTABLE_STATUSES, Order, OrderStatus
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import order as order_repo
+from app.repositories import user as user_repo
 from app.schemas.order import (
     AuditLogResponse,
     BatchUpdateRequest,
@@ -80,6 +81,15 @@ _LOCKED_ORDER_ERROR = HTTPException(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _validate_assigned_to_user(db: Session, assigned_to: uuid.UUID | None) -> None:
+    """Raise 422 if assigned_to is non-null but refers to a non-existent user."""
+    if assigned_to is not None and user_repo.get_by_id(db, assigned_to) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Assigned user not found.",
+        )
 
 
 def _generate_order_number(db: Session) -> str:
@@ -441,6 +451,12 @@ def update_order(
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify orders you created.",
+        )
+
     if order.status not in MUTABLE_STATUSES:
         raise _IMMUTABLE_STATUS_ERROR
 
@@ -467,23 +483,35 @@ def update_order(
     )
     notes_set = "notes" in req.model_fields_set
     new_notes = req.notes if notes_set else order.notes
-    # ``UpdateOrderRequest`` doesn't currently expose assigned_to; reserve the
-    # plumbing so the worker carries it forward unchanged.
-    assigned_to_set = False
-    new_assigned_to = order.assigned_to
+    assigned_to_set = "assigned_to" in req.model_fields_set
+    if assigned_to_set and actor.role not in (UserRole.scheduler, UserRole.root):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only scheduler and root can reassign orders.",
+        )
+    new_assigned_to = req.assigned_to if assigned_to_set else order.assigned_to
 
     scheduling_changed = (
         new_qty != order.wafer_quantity or new_deadline != order.requested_delivery_date
     )
 
     if not scheduling_changed:
-        # Non-scheduling PATCH (notes / etc.) — no worker round-trip needed.
+        # Non-scheduling PATCH (notes / assigned_to) — no worker round-trip needed.
         # Write directly and audit here; the producer remains the single
         # writer because no compound is ever enqueued.
-        old_val: dict[str, Any] = {"notes": order.notes}
+        old_val: dict[str, Any] = {
+            "notes": order.notes,
+            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        }
         if notes_set:
             order.notes = req.notes
-        new_val_simple: dict[str, Any] = {"notes": order.notes}
+        if assigned_to_set:
+            _validate_assigned_to_user(db, req.assigned_to)
+            order.assigned_to = req.assigned_to
+        new_val_simple: dict[str, Any] = {
+            "notes": order.notes,
+            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        }
         _write_audit(
             db,
             action="order.updated",
@@ -556,6 +584,12 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify orders you created.",
+        )
+
     # N-3 round-2 guard: refuse to stack another compound on top of an
     # already-locked row. See ``_LOCKED_ORDER_ERROR``.
     if order.is_processing_locked:
@@ -610,6 +644,10 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
         # ``BatchUpdateResponse.skipped_ids`` already documents partial
         # failures.
         if order.is_processing_locked:
+            skipped.append(order_id)
+            continue
+
+        if actor.role == UserRole.order_manager and order.created_by != actor.id:
             skipped.append(order_id)
             continue
 

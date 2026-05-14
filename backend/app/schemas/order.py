@@ -41,11 +41,15 @@ class UpdateOrderRequest(BaseModel):
     """Payload for PATCH /orders/{order_id} (scheduler+).
 
     `version_id` is required for optimistic-lock validation.
+    `assigned_to` uses model_fields_set as sentinel: omitting the field keeps
+    the current assignee; sending null clears it; sending a UUID reassigns.
+    Only scheduler and root may change assigned_to.
     """
 
     wafer_quantity: int | None = Field(default=None, ge=25, le=2500)
     requested_delivery_date: date | None = None
     notes: str | None = None
+    assigned_to: uuid.UUID | None = Field(default=None, description="Pass null to unassign")
     version_id: int = Field(..., description="Current version_id (optimistic lock)")
 
 

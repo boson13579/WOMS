@@ -44,6 +44,7 @@ def _make_user(
 ) -> User:
     user = User(
         username=username,
+        email=f"{username}@test.internal",
         password_hash=bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode(),
         role=role,
         is_active=True,
