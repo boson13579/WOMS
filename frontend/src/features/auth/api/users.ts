@@ -15,15 +15,18 @@ export type UserOption = z.infer<typeof userOptionSchema>;
 
 async function fetchUsers(): Promise<UserOption[]> {
   const res = await fetch('/api/v1/users', { credentials: 'include' });
-  if (!res.ok) return [];
+  if (!res.ok) throw new Error(String(res.status));
   return usersResponseSchema.parse(await res.json()).users;
 }
+
+const EMPTY_USERS: UserOption[] = [];
 
 export function useUsers(): UserOption[] {
   const { data } = useQuery<UserOption[]>({
     queryKey: ['users'],
     queryFn: fetchUsers,
     staleTime: 5 * 60 * 1000,
+    retry: false,
   });
-  return data ?? [];
+  return data ?? EMPTY_USERS;
 }
