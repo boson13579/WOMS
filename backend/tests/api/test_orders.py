@@ -396,6 +396,89 @@ def test_update_order_not_found_returns_404(client: TestClient, db_session: Sess
     assert res.json()["error"]["code"] == 404
 
 
+def test_scheduler_can_update_assigned_to(client: TestClient, db_session: Session) -> None:
+    """Scheduler updating assigned_to is a non-scheduling PATCH — written inline.
+
+    Unlike qty/deadline changes the new assignee is NOT deferred to the worker;
+    it is written directly by the producer and immediately visible in the response.
+    is_processing_locked must remain False because no compound is enqueued.
+    """
+    scheduler = _make_user(db_session, username="sched_assign_ok", role=UserRole.scheduler)
+    assignee = _make_user(db_session, username="assignee_user", role=UserRole.order_manager)
+    token = _login(client, "sched_assign_ok")
+    order = _make_order(db_session, created_by=scheduler.id)
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"assigned_to": str(assignee.id), "version_id": order.version_id},
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["assigned_to"] == str(assignee.id)
+    assert body["is_processing_locked"] is False
+
+
+def test_scheduler_can_clear_assigned_to(client: TestClient, db_session: Session) -> None:
+    """Sending assigned_to: null unassigns the order."""
+    scheduler = _make_user(db_session, username="sched_unassign_ok", role=UserRole.scheduler)
+    assignee = _make_user(db_session, username="assignee_user2", role=UserRole.order_manager)
+    token = _login(client, "sched_unassign_ok")
+    order = _make_order(db_session, created_by=scheduler.id)
+    order.assigned_to = assignee.id
+    db_session.commit()
+    db_session.refresh(order)
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"assigned_to": None, "version_id": order.version_id},
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    assert res.json()["assigned_to"] is None
+
+
+def test_order_manager_cannot_update_assigned_to_returns_403(
+    client: TestClient, db_session: Session
+) -> None:
+    """order_manager is not allowed to change assigned_to; must get 403."""
+    mgr = _make_user(db_session, username="mgr_assign_fail", role=UserRole.order_manager)
+    other = _make_user(db_session, username="target_assign_user", role=UserRole.viewer)
+    token = _login(client, "mgr_assign_fail")
+    order = _make_order(db_session, created_by=mgr.id)
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"assigned_to": str(other.id), "version_id": order.version_id},
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_omitting_assigned_to_does_not_change_it(client: TestClient, db_session: Session) -> None:
+    """Not sending assigned_to in PATCH payload keeps the current value unchanged."""
+    scheduler = _make_user(db_session, username="sched_omit_assign", role=UserRole.scheduler)
+    assignee = _make_user(db_session, username="assignee_omit", role=UserRole.order_manager)
+    token = _login(client, "sched_omit_assign")
+    order = _make_order(db_session, created_by=scheduler.id)
+    order.assigned_to = assignee.id
+    db_session.commit()
+    db_session.refresh(order)
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"notes": "updated notes", "version_id": order.version_id},
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    assert res.json()["assigned_to"] == str(assignee.id)
+
+
 def test_update_order_partial_fields(client: TestClient, db_session: Session) -> None:
     user = _make_user(db_session, username="sched_partial", role=UserRole.scheduler)
     token = _login(client, "sched_partial")

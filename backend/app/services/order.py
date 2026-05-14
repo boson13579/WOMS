@@ -473,23 +473,34 @@ def update_order(
     )
     notes_set = "notes" in req.model_fields_set
     new_notes = req.notes if notes_set else order.notes
-    # ``UpdateOrderRequest`` doesn't currently expose assigned_to; reserve the
-    # plumbing so the worker carries it forward unchanged.
-    assigned_to_set = False
-    new_assigned_to = order.assigned_to
+    assigned_to_set = "assigned_to" in req.model_fields_set
+    if assigned_to_set and actor.role not in (UserRole.scheduler, UserRole.root):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only scheduler and root can reassign orders.",
+        )
+    new_assigned_to = req.assigned_to if assigned_to_set else order.assigned_to
 
     scheduling_changed = (
         new_qty != order.wafer_quantity or new_deadline != order.requested_delivery_date
     )
 
     if not scheduling_changed:
-        # Non-scheduling PATCH (notes / etc.) — no worker round-trip needed.
+        # Non-scheduling PATCH (notes / assigned_to) — no worker round-trip needed.
         # Write directly and audit here; the producer remains the single
         # writer because no compound is ever enqueued.
-        old_val: dict[str, Any] = {"notes": order.notes}
+        old_val: dict[str, Any] = {
+            "notes": order.notes,
+            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        }
         if notes_set:
             order.notes = req.notes
-        new_val_simple: dict[str, Any] = {"notes": order.notes}
+        if assigned_to_set:
+            order.assigned_to = req.assigned_to
+        new_val_simple: dict[str, Any] = {
+            "notes": order.notes,
+            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        }
         _write_audit(
             db,
             action="order.updated",
