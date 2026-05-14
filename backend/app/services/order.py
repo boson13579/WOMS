@@ -428,7 +428,7 @@ def get_order(db: Session, order_id: uuid.UUID) -> OrderResponse:
     return OrderResponse.model_validate(order)
 
 
-def update_order(
+def update_order(  # noqa: PLR0912
     db: Session, order_id: uuid.UUID, req: UpdateOrderRequest, actor: User
 ) -> OrderResponse:
     """Update a mutable order with optimistic-lock and status guard.
