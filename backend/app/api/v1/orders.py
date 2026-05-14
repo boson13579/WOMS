@@ -29,8 +29,10 @@ from app.services import order as order_service
 
 router = APIRouter()
 
-# Roles allowed to read orders (order_manager and above)
-_READ_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
+# Roles allowed to read orders (viewer and above)
+_READ_ROLES = require_roles(
+    UserRole.viewer, UserRole.order_manager, UserRole.scheduler, UserRole.root
+)
 # Roles allowed to write orders (order_manager and above)
 _WRITE_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
 
