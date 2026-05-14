@@ -32,9 +32,11 @@ def _make_user(
     username: str,
     password: str = "password123",
     role: UserRole = UserRole.viewer,
+    email: str | None = None,
 ) -> User:
     user = User(
         username=username,
+        email=email or f"{username}@test.internal",
         password_hash=bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
         role=role,
         is_active=True,
