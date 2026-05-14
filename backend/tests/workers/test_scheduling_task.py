@@ -741,7 +741,8 @@ def test_run_scheduling_yields_retrigger_to_waiter(
     call_count = {"value": 0}
 
     def faked_read(
-        *, limit: int | None = None,
+        *,
+        limit: int | None = None,
     ) -> list[tuple[str, dict[str, Any]]]:
         call_count["value"] += 1
         if call_count["value"] == 1:

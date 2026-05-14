@@ -1239,9 +1239,7 @@ def run_scheduling_task(self: Task) -> None:  # noqa: PLR0915 — orchestration 
             take = _take_count_from_rate(len(pending), rate)
             candidates = pending[:take]
 
-            k, attempts_tried = _largest_halving_feasible_prefix(
-                state, [c for _, c in candidates]
-            )
+            k, attempts_tried = _largest_halving_feasible_prefix(state, [c for _, c in candidates])
             # Halving rounds that failed before the successful one (or all
             # rounds, if k == 0) feed the EWMA as "this many prefix sizes
             # were rejected" — so the cap moves up when halving had to
