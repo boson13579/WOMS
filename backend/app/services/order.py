@@ -357,6 +357,7 @@ def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResp
     the scheduler has applied the pending op (``apply_schedule`` clears it
     via ``set_schedule_dates``).
     """
+    _validate_assigned_to_user(db, req.assigned_to)
     order_number = _generate_order_number(db)
     order = order_repo.create(
         db,
@@ -465,12 +466,6 @@ def update_order(  # noqa: PLR0912
     if order.is_processing_locked:
         raise _LOCKED_ORDER_ERROR
 
-    if actor.role == UserRole.order_manager and order.created_by != actor.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only modify orders you created.",
-        )
-
     # Application-level optimistic lock: reject stale client versions before
     # making any changes. SQLAlchemy's DB-level check fires on flush(), but this
     # early guard gives a clearer error and avoids unnecessary DB work.
@@ -496,6 +491,8 @@ def update_order(  # noqa: PLR0912
             detail="Only scheduler and root can reassign orders.",
         )
     new_assigned_to = req.assigned_to if assigned_to_set else order.assigned_to
+    if assigned_to_set:
+        _validate_assigned_to_user(db, new_assigned_to)
 
     scheduling_changed = (
         new_qty != order.wafer_quantity or new_deadline != order.requested_delivery_date
@@ -512,7 +509,6 @@ def update_order(  # noqa: PLR0912
         if notes_set:
             order.notes = req.notes
         if assigned_to_set:
-            _validate_assigned_to_user(db, req.assigned_to)
             order.assigned_to = req.assigned_to
         new_val_simple: dict[str, Any] = {
             "notes": order.notes,
@@ -600,12 +596,6 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     # already-locked row. See ``_LOCKED_ORDER_ERROR``.
     if order.is_processing_locked:
         raise _LOCKED_ORDER_ERROR
-
-    if actor.role == UserRole.order_manager and order.created_by != actor.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only modify orders you created.",
-        )
 
     # Build the compound from the *current* row state (the values the
     # worker will use to soft-delete + audit on accept).
