@@ -13,13 +13,13 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import type { ServiceHealth } from '../types';
+import type { ServiceHealthEntry } from '../types';
 
 import { StatusCard } from './StatusCard';
 
-function svc(overrides: Partial<ServiceHealth> = {}): ServiceHealth {
+function svc(overrides: Partial<ServiceHealthEntry> = {}): ServiceHealthEntry {
   return {
-    id: 'svc',
+    id: 'api',
     name: 'API',
     status: 'healthy',
     summary: 'FastAPI · v0.1.0',
