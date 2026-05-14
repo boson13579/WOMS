@@ -275,3 +275,29 @@ def test_websocket_closes_4500_on_db_error(
         with client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
             ws.receive_text()
     assert exc_info.value.code == 4500
+
+
+def test_websocket_cookie_takes_priority_over_query_token(
+    client: TestClient, db_session: Session
+) -> None:
+    user = _make_user(db_session, username="ws_priority_user", role=UserRole.viewer)
+    valid_token = create_access_token(user.id, user.role)
+    client.cookies.set("access_token", valid_token)
+    try:
+        with client.websocket_connect("/api/v1/ws?token=invalid-jwt-token") as ws:
+            ws.close()
+    finally:
+        client.cookies.clear()
+
+
+def test_websocket_auth_failure_leaves_no_zombie_connection(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fresh_manager = ConnectionManager()
+    monkeypatch.setattr(ws_api, "_manager", fresh_manager)
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/api/v1/ws?token=bad-token") as ws:
+            ws.receive_text()
+
+    assert len(fresh_manager._connections) == 0

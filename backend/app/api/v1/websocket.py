@@ -51,6 +51,7 @@ router = APIRouter()
 
 WS_CLOSE_AUTH_FAILED: int = 4401
 WS_CLOSE_DB_ERROR: int = 4500
+_MAX_TOKEN_LEN: int = 8192
 
 __all__ = [
     "ConnectionManager",
@@ -143,7 +144,7 @@ async def websocket_endpoint(
 ) -> None:
     """Authenticate via ``?token=`` query param or ``access_token`` cookie.
 
-    Priority: bearer query param → cookie. Both absent → close(4401).
+    Priority: cookie → bearer query param. Both absent → close(4401).
     The DB session is closed immediately after the auth lookup via
     ``db.close()``, so no pool slot is held during the long-running loop.
     FastAPI's ``get_db`` generator calls ``close()`` again on handler exit,
@@ -151,9 +152,14 @@ async def websocket_endpoint(
     The channel is server-driven; ``receive_text()`` blocks until the peer
     disconnects, which is exactly the lifecycle we want.
     """
-    actual_token = token or websocket.cookies.get("access_token")
+    actual_token = websocket.cookies.get("access_token") or token
     if actual_token is None:
-        await websocket.close(code=WS_CLOSE_AUTH_FAILED)
+        with contextlib.suppress(Exception):
+            await websocket.close(code=WS_CLOSE_AUTH_FAILED)
+        return
+    if len(actual_token) > _MAX_TOKEN_LEN:
+        with contextlib.suppress(Exception):
+            await websocket.close(code=WS_CLOSE_AUTH_FAILED)
         return
     try:
         payload = decode_access_token(actual_token)
@@ -165,13 +171,15 @@ async def websocket_endpoint(
         # DB errors (pool exhausted, query timeout, etc.) are server-side
         # faults, not auth failures — log at ERROR so monitoring fires.
         logger.error("websocket.db_error", error=str(exc), exc_info=True)
-        await websocket.close(code=WS_CLOSE_DB_ERROR)
+        with contextlib.suppress(Exception):
+            await websocket.close(code=WS_CLOSE_DB_ERROR)
         return
     except Exception as exc:
         logger.warning("websocket.auth_failed", error=str(exc))
         # Application close codes 4000-4999 are reserved for app use; 4401
         # mirrors the HTTP 401 semantic for clients that introspect the code.
-        await websocket.close(code=WS_CLOSE_AUTH_FAILED)
+        with contextlib.suppress(Exception):
+            await websocket.close(code=WS_CLOSE_AUTH_FAILED)
         return
     finally:
         # Release the DB connection back to the pool before the long-running
