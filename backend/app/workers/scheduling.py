@@ -721,6 +721,7 @@ def _perform_compound_db_action(
                     "notification.create_failed",
                     order_id=str(_oid),
                     user_id=str(_created_by),
+                    exc_info=True,
                 )
     finally:
         db.close()

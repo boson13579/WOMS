@@ -331,7 +331,8 @@ def test_apply_schedule_creates_status_notification(db_session: Session) -> None
             quantity=100,
         )
     ]
-    order_service.apply_schedule(db_session, results)
+    with patch("app.services.notification.notify_user"):
+        order_service.apply_schedule(db_session, results)
 
     db_session.expire_all()
     notifs = db_session.scalars(
@@ -369,7 +370,8 @@ def test_order_cancelled_notification(db_session: Session) -> None:
     # from tearing down the test session.
     with patch("app.workers.scheduling.SessionLocal", return_value=db_session):
         with patch.object(db_session, "close"):
-            _perform_compound_db_action(compound, accepted=True)
+            with patch("app.services.notification.notify_user"):
+                _perform_compound_db_action(compound, accepted=True)
 
     db_session.expire_all()
     notifs = db_session.scalars(

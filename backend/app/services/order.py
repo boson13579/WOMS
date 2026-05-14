@@ -582,6 +582,7 @@ def update_order(  # noqa: PLR0912, PLR0915
             "notification.create_failed",
             order_id=str(order.id),
             user_id=str(order.created_by),
+            exc_info=True,
         )
     return OrderResponse.model_validate(order)
 
@@ -644,6 +645,7 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
             "notification.create_failed",
             order_id=str(order.id),
             user_id=str(order.created_by),
+            exc_info=True,
         )
 
     logger.info("order.cancel_requested", order_id=str(order_id), actor_id=str(actor.id))
@@ -961,6 +963,7 @@ def apply_schedule(
                 "notification.create_failed",
                 order_id=str(notif_order_id),
                 user_id=str(notif_user_id),
+                exc_info=True,
             )
 
     return applied
