@@ -123,15 +123,16 @@ def update_self(
         ) from exc
     except IntegrityError as exc:
         db.rollback()
-        if "username" in request.model_fields_set:
+        orig = str(exc.orig).lower()
+        if "ix_users_email" in orig or "users_email" in orig:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Username '{request.username}' is already taken.",
+                detail=f"Email '{request.email or '<unknown>'}' is already in use.",
             ) from exc
-        if "email" in request.model_fields_set:
+        if "ix_users_username" in orig or "users_username" in orig:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Email '{request.email}' is already taken.",
+                detail=f"Username '{request.username or '<unknown>'}' is already taken.",
             ) from exc
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -232,15 +233,16 @@ def update_user(
         ) from exc
     except IntegrityError as exc:
         db.rollback()
-        if "username" in request.model_fields_set:
+        orig = str(exc.orig).lower()
+        if "ix_users_email" in orig or "users_email" in orig:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Username '{request.username}' is already taken.",
+                detail=f"Email '{request.email or '<unknown>'}' is already in use.",
             ) from exc
-        if "email" in request.model_fields_set:
+        if "ix_users_username" in orig or "users_username" in orig:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Email '{request.email}' is already taken.",
+                detail=f"Username '{request.username or '<unknown>'}' is already taken.",
             ) from exc
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

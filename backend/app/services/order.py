@@ -21,6 +21,7 @@ from app.models.order import MUTABLE_STATUSES, Order, OrderStatus
 from app.models.user import User, UserRole
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import order as order_repo
+from app.repositories import user as user_repo
 from app.schemas.order import (
     AuditLogResponse,
     BatchUpdateRequest,
@@ -80,6 +81,15 @@ _LOCKED_ORDER_ERROR = HTTPException(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _validate_assigned_to_user(db: Session, assigned_to: uuid.UUID | None) -> None:
+    """Raise 422 if assigned_to is non-null but refers to a non-existent user."""
+    if assigned_to is not None and user_repo.get_by_id(db, assigned_to) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Assigned user not found.",
+        )
 
 
 def _generate_order_number(db: Session) -> str:
@@ -496,6 +506,7 @@ def update_order(
         if notes_set:
             order.notes = req.notes
         if assigned_to_set:
+            _validate_assigned_to_user(db, req.assigned_to)
             order.assigned_to = req.assigned_to
         new_val_simple: dict[str, Any] = {
             "notes": order.notes,
