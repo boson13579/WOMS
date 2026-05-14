@@ -219,10 +219,20 @@ def _build_patch_compound(
         condition failing means the pin day's capacity might be exceeded
         if we forced the re-pin; we silent-drop the pin (per case 13/14).
 
-    Group selection: ``shrink`` if any of (qty smaller, deadline later);
-    otherwise ``grow``. This matches the existing CRUD-to-op rules for
-    non-pinned PATCH and falls through cleanly when pin/unpin ops are
-    prepended/appended — every op in a compound shares one group anyway.
+    Group selection: ``shrink`` only when **both** axes monotonically
+    release capacity — qty doesn't increase (``new_qty <= old_qty``) AND
+    deadline doesn't move earlier (``new_deadline >= old_deadline``).
+    Otherwise ``grow``. The strict-AND keeps the per-day cumulative
+    delta of a shrink-group compound non-positive everywhere, which is
+    the invariant the worker's batch-admission halving relies on: a
+    contiguous prefix of feasible compounds stays feasible when we
+    drop tail compounds. Pre-rewrite this used OR (``qty_smaller OR
+    deadline_later``), which mis-classified e.g. ``qty=100→10000,
+    deadline=day3→day5`` as shrink even though it adds +9900 to day5's
+    cumulative demand; that broke halving's prefix-feasibility
+    monotonicity assumption and let self-infeasible compounds slip
+    through admission. Every op in a compound shares one group, so
+    pin / unpin ops prepended / appended inherit this classification.
     """
     old_qty = order.wafer_quantity
     old_deadline = order.requested_delivery_date
@@ -234,9 +244,11 @@ def _build_patch_compound(
         # the scheduler.
         return None
 
-    qty_smaller = new_qty < old_qty
-    deadline_later = new_deadline > old_deadline
-    group: Literal["shrink", "grow"] = "shrink" if (qty_smaller or deadline_later) else "grow"
+    qty_non_growing = new_qty <= old_qty
+    deadline_non_earlier = new_deadline >= old_deadline
+    group: Literal["shrink", "grow"] = (
+        "shrink" if (qty_non_growing and deadline_non_earlier) else "grow"
+    )
 
     is_pinned_before = order.is_pinned
     pin_day = order.pinned_production_date
