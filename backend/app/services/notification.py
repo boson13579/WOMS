@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 import structlog
+from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.repositories import notification as notification_repo
@@ -57,6 +58,7 @@ def create_notification(
             "notification.broadcast_failed",
             user_id=str(user_id),
             notification_id=str(notif.id),
+            exc_info=True,
         )
 
     return resp
@@ -90,7 +92,14 @@ def mark_read(
     notif = notification_repo.mark_read(db, notification_id, user_id)
     if notif is None:
         return None
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update notification.",
+        ) from None
     db.refresh(notif)
     return NotificationResponse.model_validate(notif)
 
@@ -101,5 +110,12 @@ def mark_all_read(db: Session, user_id: uuid.UUID) -> int:
     Returns the number of rows updated.
     """
     count = notification_repo.mark_all_read(db, user_id)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update notification.",
+        ) from None
     return count

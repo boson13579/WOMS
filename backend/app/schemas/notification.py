@@ -28,7 +28,7 @@ class NotificationResponse(BaseModel):
 
 
 class NotificationListResponse(BaseModel):
-    """Paginated list of notifications."""
+    """List of notifications for a user."""
 
     items: list[NotificationResponse]
     total: int

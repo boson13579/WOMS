@@ -430,7 +430,7 @@ def get_order(db: Session, order_id: uuid.UUID) -> OrderResponse:
     return OrderResponse.model_validate(order)
 
 
-def update_order(  # noqa: PLR0912
+def update_order(  # noqa: PLR0912, PLR0915
     db: Session, order_id: uuid.UUID, req: UpdateOrderRequest, actor: User
 ) -> OrderResponse:
     """Update a mutable order with optimistic-lock and status guard.
@@ -568,14 +568,21 @@ def update_order(  # noqa: PLR0912
         ) from exc
     db.refresh(order)
 
-    notification_service.create_notification(
-        db,
-        user_id=order.created_by,
-        order_id=order.id,
-        type="order_locked",
-        message=f"訂單 {order.order_number} 已被鎖定處理中",
-    )
     enqueue_compound(compound)
+    try:
+        notification_service.create_notification(
+            db,
+            user_id=order.created_by,
+            order_id=order.id,
+            type="order_locked",
+            message=f"訂單 {order.order_number} 已被鎖定處理中",
+        )
+    except Exception:
+        logger.warning(
+            "notification.create_failed",
+            order_id=str(order.id),
+            user_id=str(order.created_by),
+        )
     return OrderResponse.model_validate(order)
 
 
@@ -623,14 +630,21 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
         ) from exc
     db.refresh(order)
 
-    notification_service.create_notification(
-        db,
-        user_id=order.created_by,
-        order_id=order.id,
-        type="order_locked",
-        message=f"訂單 {order.order_number} 已被鎖定處理中",
-    )
     enqueue_compound(compound)
+    try:
+        notification_service.create_notification(
+            db,
+            user_id=order.created_by,
+            order_id=order.id,
+            type="order_locked",
+            message=f"訂單 {order.order_number} 已被鎖定處理中",
+        )
+    except Exception:
+        logger.warning(
+            "notification.create_failed",
+            order_id=str(order.id),
+            user_id=str(order.created_by),
+        )
 
     logger.info("order.cancel_requested", order_id=str(order_id), actor_id=str(actor.id))
     return OrderResponse.model_validate(order)
@@ -934,12 +948,19 @@ def apply_schedule(
     logger.info("order.schedule.applied", applied=applied)
 
     for notif_user_id, notif_order_id, order_number, status_val in _notif_queue:
-        notification_service.create_notification(
-            db,
-            user_id=notif_user_id,
-            order_id=notif_order_id,
-            type="order_status_changed",
-            message=f"訂單 {order_number} 狀態已變更為 {status_val}",
-        )
+        try:
+            notification_service.create_notification(
+                db,
+                user_id=notif_user_id,
+                order_id=notif_order_id,
+                type="order_status_changed",
+                message=f"訂單 {order_number} 狀態已變更為 {status_val}",
+            )
+        except Exception:
+            logger.warning(
+                "notification.create_failed",
+                order_id=str(notif_order_id),
+                user_id=str(notif_user_id),
+            )
 
     return applied

@@ -16,6 +16,9 @@ from app.models.notification import Notification
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
 from app.services import notification as notification_service
+from app.services import order as order_service
+from app.services.scheduling import ScheduledResult
+from app.workers.scheduling import _perform_compound_db_action
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -309,3 +312,71 @@ def test_broadcast_failure_does_not_rollback(db_session: Session) -> None:
     notif = db_session.get(Notification, result.id)
     assert notif is not None
     assert notif.user_id == user.id
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — apply_schedule triggers order_status_changed notification
+# ---------------------------------------------------------------------------
+
+
+def test_apply_schedule_creates_status_notification(db_session: Session) -> None:
+    """order_service.apply_schedule must create an order_status_changed notification."""
+    user = _make_user(db_session, username="notif_schedule_user")
+    order = _make_order(db_session, created_by=user.id)
+
+    results = [
+        ScheduledResult(
+            order_id=order.id,
+            scheduled_date=date(2026, 9, 1),
+            quantity=100,
+        )
+    ]
+    order_service.apply_schedule(db_session, results)
+
+    db_session.expire_all()
+    notifs = db_session.scalars(
+        select(Notification).where(
+            Notification.user_id == user.id,
+            Notification.order_id == order.id,
+            Notification.type == "order_status_changed",
+        )
+    ).all()
+    assert len(notifs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 10 — _perform_compound_db_action (delete accepted) triggers order_cancelled
+# ---------------------------------------------------------------------------
+
+
+def test_order_cancelled_notification(db_session: Session) -> None:
+    """Worker cancel path (kind=delete, accepted=True) must create order_cancelled notification."""
+    user = _make_user(db_session, username="notif_cancel_user")
+    order = _make_order(db_session, created_by=user.id)
+
+    compound = {
+        "ops": [{"order_id": str(order.id)}],
+        "db_action": {
+            "kind": "delete",
+            "actor_id": str(user.id),
+            "old_wafer_quantity": order.wafer_quantity,
+            "old_requested_delivery_date": order.requested_delivery_date.isoformat(),
+        },
+    }
+
+    # Redirect _perform_compound_db_action's SessionLocal to the test session so
+    # the worker can see records committed via savepoints, and prevent db.close()
+    # from tearing down the test session.
+    with patch("app.workers.scheduling.SessionLocal", return_value=db_session):
+        with patch.object(db_session, "close"):
+            _perform_compound_db_action(compound, accepted=True)
+
+    db_session.expire_all()
+    notifs = db_session.scalars(
+        select(Notification).where(
+            Notification.user_id == user.id,
+            Notification.order_id == order.id,
+            Notification.type == "order_cancelled",
+        )
+    ).all()
+    assert len(notifs) == 1

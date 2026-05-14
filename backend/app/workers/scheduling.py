@@ -708,13 +708,20 @@ def _perform_compound_db_action(
         # Triggers for: explicit user delete accepted, or orphan create rejected.
         _is_cancel = (kind == "delete" and accepted) or (kind == "create" and not accepted)
         if _is_cancel:
-            notification_service.create_notification(
-                db,
-                user_id=_created_by,
-                order_id=_oid,
-                type="order_cancelled",
-                message=f"訂單 {_order_number} 已被取消",
-            )
+            try:
+                notification_service.create_notification(
+                    db,
+                    user_id=_created_by,
+                    order_id=_oid,
+                    type="order_cancelled",
+                    message=f"訂單 {_order_number} 已被取消",
+                )
+            except Exception:
+                logger.warning(
+                    "notification.create_failed",
+                    order_id=str(_oid),
+                    user_id=str(_created_by),
+                )
     finally:
         db.close()
 
