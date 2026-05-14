@@ -38,6 +38,7 @@ from app.schemas.schedule import (
     ScheduleOpInCompound,
     ScheduleResultResponse,
 )
+from app.services import notification as notification_service
 from app.services.schedule_queue import enqueue_compound
 from app.services.scheduling import ScheduledResult, SchedulingOrder
 
@@ -567,6 +568,13 @@ def update_order(  # noqa: PLR0912
         ) from exc
     db.refresh(order)
 
+    notification_service.create_notification(
+        db,
+        user_id=order.created_by,
+        order_id=order.id,
+        type="order_locked",
+        message=f"訂單 {order.order_number} 已被鎖定處理中",
+    )
     enqueue_compound(compound)
     return OrderResponse.model_validate(order)
 
@@ -615,6 +623,13 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
         ) from exc
     db.refresh(order)
 
+    notification_service.create_notification(
+        db,
+        user_id=order.created_by,
+        order_id=order.id,
+        type="order_locked",
+        message=f"訂單 {order.order_number} 已被鎖定處理中",
+    )
     enqueue_compound(compound)
 
     logger.info("order.cancel_requested", order_id=str(order_id), actor_id=str(actor.id))
@@ -857,6 +872,8 @@ def apply_schedule(
         per_order.setdefault(sr.order_id, []).append(sr)
 
     applied = 0
+    # Collect data for notifications before commit; attributes expire after commit.
+    _notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, str]] = []
     for order_id, results in per_order.items():
         results.sort(key=lambda x: x.scheduled_date)
         earliest = results[0].scheduled_date
@@ -881,6 +898,7 @@ def apply_schedule(
             )
             continue
         applied += 1
+        _notif_queue.append((order.created_by, order.id, order.order_number, order.status.value))
         # Read status from the refreshed row, not a hard-coded constant —
         # ``set_schedule_dates`` preserves ``in_production`` (see its
         # docstring for why), so an in-production order being re-materialized
@@ -914,4 +932,14 @@ def apply_schedule(
 
     db.commit()
     logger.info("order.schedule.applied", applied=applied)
+
+    for notif_user_id, notif_order_id, order_number, status_val in _notif_queue:
+        notification_service.create_notification(
+            db,
+            user_id=notif_user_id,
+            order_id=notif_order_id,
+            type="order_status_changed",
+            message=f"訂單 {order_number} 狀態已變更為 {status_val}",
+        )
+
     return applied

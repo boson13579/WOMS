@@ -45,6 +45,7 @@ from app.core.logger import audit_log as emit_audit_log
 from app.models.order import Order, OrderStatus
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import order as order_repo
+from app.services import notification as notification_service
 from app.services import order as order_service
 from app.services import websocket
 from app.services.schedule_queue import enqueue_notify_user
@@ -691,12 +692,29 @@ def _perform_compound_db_action(
             )
             return
 
+        # Capture before commit — attributes expire after Session.commit().
+        _order_number = order.order_number
+        _created_by = order.created_by
+        _oid = order.id
+
         if accepted:
             _apply_db_action_accept(db, order, kind, db_action_raw, actor_id)
         else:
             _apply_db_action_reject(order, kind)
 
         db.commit()
+
+        # Send cancellation notification after commit (best-effort).
+        # Triggers for: explicit user delete accepted, or orphan create rejected.
+        _is_cancel = (kind == "delete" and accepted) or (kind == "create" and not accepted)
+        if _is_cancel:
+            notification_service.create_notification(
+                db,
+                user_id=_created_by,
+                order_id=_oid,
+                type="order_cancelled",
+                message=f"訂單 {_order_number} 已被取消",
+            )
     finally:
         db.close()
 
