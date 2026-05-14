@@ -441,6 +441,12 @@ def update_order(
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify orders you created.",
+        )
+
     if order.status not in MUTABLE_STATUSES:
         raise _IMMUTABLE_STATUS_ERROR
 
@@ -448,12 +454,6 @@ def update_order(
     # to stack another one on top. See ``_LOCKED_ORDER_ERROR`` docstring.
     if order.is_processing_locked:
         raise _LOCKED_ORDER_ERROR
-
-    if actor.role == UserRole.order_manager and order.created_by != actor.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only modify orders you created.",
-        )
 
     # Application-level optimistic lock: reject stale client versions before
     # making any changes. SQLAlchemy's DB-level check fires on flush(), but this
@@ -573,16 +573,16 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
-    # N-3 round-2 guard: refuse to stack another compound on top of an
-    # already-locked row. See ``_LOCKED_ORDER_ERROR``.
-    if order.is_processing_locked:
-        raise _LOCKED_ORDER_ERROR
-
     if actor.role == UserRole.order_manager and order.created_by != actor.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only modify orders you created.",
         )
+
+    # N-3 round-2 guard: refuse to stack another compound on top of an
+    # already-locked row. See ``_LOCKED_ORDER_ERROR``.
+    if order.is_processing_locked:
+        raise _LOCKED_ORDER_ERROR
 
     # Build the compound from the *current* row state (the values the
     # worker will use to soft-delete + audit on accept).
