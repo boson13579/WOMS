@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from app.services.scheduling import (
+    MATERIALIZE_NOTIFY_PENDING_KEY,
     PENDING_OPS_KEY,
     STATE_KEY,
     STATUS_KEY,
@@ -1673,6 +1674,57 @@ def test_materialize_task_drains_pending_users_and_notifies(
     assert redis_client.get("schedule:materialize_running") is None
 
 
+def test_materialize_task_tolerates_system_sentinel_in_notify_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """advance_day / rebuild SADD a non-UUID system sentinel into
+    notify_pending before their follow-up ``.delay()`` so this materializer's
+    post-release re-trigger check is guaranteed to see pending work (see
+    the race walkthrough at ``_MATERIALIZE_SYSTEM_SENTINEL``).
+
+    This means the per-member loop will encounter a non-UUID member.
+    ``websocket.notify_user`` is called with ``uuid.UUID(member)`` and the
+    parse raises ``ValueError`` — the materializer must catch, log, and
+    keep draining (no exception escapes, real UUIDs still get notified).
+    """
+    from app.workers.scheduling import _MATERIALIZE_SYSTEM_SENTINEL, materialize_schedule_task
+
+    real_user = uuid.uuid4()
+    redis_client.sadd(
+        "schedule:materialize_notify_pending",
+        str(real_user),
+        _MATERIALIZE_SYSTEM_SENTINEL,
+    )
+    redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._load_state",
+        lambda: SchedulerState.initial(date(2026, 5, 5)),
+    )
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    notify_mock = MagicMock()
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        MagicMock(),
+    )
+
+    result = materialize_schedule_task.apply()
+    assert result.successful(), result.traceback
+
+    # Sentinel never reached notify_user — only the real UUID did.
+    notified_ids = [c.kwargs["user_id"] for c in notify_mock.call_args_list]
+    assert notified_ids == [real_user]
+    # Pending fully drained (both real user + sentinel removed).
+    assert redis_client.scard("schedule:materialize_notify_pending") == 0
+
+
 def test_materialize_task_exits_when_already_running(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
@@ -1832,45 +1884,38 @@ def test_materialize_task_skips_when_state_key_missing(
     assert redis_client.sismember("schedule:materialize_notify_pending", str(requester))
 
 
-def test_materialize_task_holds_state_writer_lock_during_batch(
+def test_materialize_task_runs_independently_of_state_writer_lock(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """N-1 round-2: materializer's read-state → write-DB window must be
-    serialized against ``advance_day_task`` / ``rebuild_schedule_task``.
+    """Materializer must NOT participate in ``state_writer_lock`` —
+    it's a slow path (apply_schedule per N orders, several ms/order)
+    and gating it on the same mutex as ``run_scheduling_task`` would
+    pile user-facing PATCH latency behind it.
 
-    Pre-fix the materializer only held its own ``materialize_running``
-    flag, not ``state_writer_lock``. Sequence that broke it:
-      T=0  advance_day grabs state_writer_lock, ``_load_state`` V
-      T=1  materializer starts (no lock), ``_load_state`` V (stale)
-      T=2  advance_day apply_schedule(V'), commits, releases lock
-      T=3  materializer apply_schedule(V_results) — **overwrites
-           advance_day's freshly-written daily_breakdown with stale V**
-    Now DB shows pre-advance_day schedule until the next compound
-    arrives and triggers another materializer.
+    The previous round-2 design had materializer per-batch acquire
+    ``state_writer_lock``. We rolled that back: materializer runs
+    free, and ``advance_day_task`` / ``rebuild_schedule_task`` instead
+    dispatch a follow-up materializer after their commit to bound any
+    stale write that might race with them.
 
-    Verifies the fix by pre-claiming the lock as advance_day, running
-    the materializer, asserting it could NOT proceed (apply_schedule
-    not called, notify users put back on pending).
+    This test pre-claims the lock as if a long-running task is using
+    it, then runs the materializer and verifies it proceeds normally
+    (apply_schedule called, user notified) — i.e., the lock does NOT
+    block it.
     """
     from app.workers.scheduling import STATE_WRITER_LOCK_KEY, materialize_schedule_task
 
     requester = uuid.uuid4()
     redis_client.sadd("schedule:materialize_notify_pending", str(requester))
-    # STATE_KEY must exist or P3-3's empty-state guard fires first.
     redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
-    # Pre-claim state_writer_lock as another task (advance_day's POV).
+    # Pre-claim state_writer_lock as another task — should NOT affect
+    # the materializer at all under the new design.
     redis_client.set(STATE_WRITER_LOCK_KEY, "other-task-id", ex=300)
-
-    # Make the lock-acquire timeout effectively immediate so the test
-    # doesn't actually wait 300s for the holder to "finish".
-    monkeypatch.setattr(
-        "app.workers.scheduling._acquire_state_lock_blocking",
-        lambda _task_id, timeout_seconds=0: False,
-    )
 
     apply_mock = MagicMock(return_value=0)
     monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
     notify_mock = MagicMock()
     monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
@@ -1882,13 +1927,142 @@ def test_materialize_task_holds_state_writer_lock_during_batch(
     result = materialize_schedule_task.apply()
     assert result.successful(), result.traceback
 
-    # apply_schedule NOT called — the lock guard fired.
-    assert apply_mock.call_count == 0
-    # User not notified — work is preserved for next run.
-    assert notify_mock.call_count == 0
-    assert redis_client.scard("schedule:materialize_notify_pending") == 1
-    # Other task's lock untouched (we never acquired so we didn't release).
+    # Materializer proceeded normally despite the held lock.
+    assert apply_mock.call_count == 1
+    # User was notified.
+    notify_kinds = [c.kwargs["message"]["type"] for c in notify_mock.call_args_list]
+    assert "schedule.materialized" in notify_kinds
+    # We never touched the held lock — still belongs to the other task.
     assert redis_client.get(STATE_WRITER_LOCK_KEY) == "other-task-id"
+
+
+def test_advance_day_dispatches_materializer_after_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """advance_day_task must trigger a fresh ``materialize_schedule_task``
+    after its commit + lock release. Without this, an in-flight
+    materializer that read pre-advance_day state could overwrite
+    advance_day's freshly-written ``daily_breakdown`` /
+    ``scheduled_production_date`` with stale values — and since
+    materializer isn't lock-serialized anymore, advance_day can't
+    block the race directly. Triggering a follow-up materializer
+    bounds the stale window to one materializer cycle.
+
+    Also asserts the **sentinel SADD lands before** ``.delay()``: without
+    it, an in-flight materializer (M1) holding ``MATERIALIZE_RUNNING_KEY``
+    would cause our M2 to ``skip_concurrent``, and M1's post-release
+    re-trigger check sees an empty notify_pending and never re-fires —
+    so DB silently keeps the pre-advance state until the next user
+    compound. The sentinel makes M1's post-release check observe pending
+    and dispatch a fresh M3.
+    """
+    from app.workers.scheduling import _MATERIALIZE_SYSTEM_SENTINEL, advance_day_task
+
+    redis_client.set(STATE_KEY, SchedulerState.initial(date(2026, 5, 5)).to_json())
+
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
+    monkeypatch.setattr(
+        "app.workers.scheduling.advance_day",
+        lambda s: s,
+    )
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_repo.mark_completed_outside_set",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_repo.mark_in_production",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+
+    # Capture the state of notify_pending at the moment .delay() is
+    # called — ordering matters: SADD must land BEFORE dispatch so an
+    # in-flight materializer's post-release check is guaranteed to see
+    # pending work.
+    pending_at_dispatch: list[set[str]] = []
+
+    def capture_pending() -> None:
+        members = redis_client.smembers(MATERIALIZE_NOTIFY_PENDING_KEY)
+        pending_at_dispatch.append(set(members))
+
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        capture_pending,
+    )
+
+    result = advance_day_task.apply()
+    assert result.successful(), result.traceback
+
+    # advance_day dispatched a materializer at the end…
+    assert len(pending_at_dispatch) >= 1
+    # …and the sentinel was already in notify_pending at that moment, so
+    # any racing in-flight materializer that hits skip_concurrent will
+    # still re-trigger on its post-release check.
+    assert _MATERIALIZE_SYSTEM_SENTINEL in pending_at_dispatch[-1]
+
+
+def test_rebuild_dispatches_materializer_with_sentinel_after_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """Same race-guard contract as advance_day, but for ``rebuild_schedule_task``.
+
+    Rebuild's finally also dispatches a follow-up materializer, and the
+    same in-flight-materializer-loses-the-race scenario applies. Verifies
+    the sentinel is SADD'd into notify_pending before .delay() so M1's
+    post-release re-trigger picks it up if M2 hits skip_concurrent.
+    """
+    from app.workers.scheduling import _MATERIALIZE_SYSTEM_SENTINEL, rebuild_schedule_task
+
+    base = date(2026, 5, 5)
+    redis_client.set(STATE_KEY, SchedulerState.initial(base).to_json())
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._get_status",
+        lambda: {"state": "idle"},
+    )
+    _patch_rebuild_time(monkeypatch)
+    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.list_for_scheduler",
+        lambda db: ([], {}),
+    )
+    monkeypatch.setattr(
+        "app.workers.scheduling.rebuild_state",
+        lambda orders, base_date: (SchedulerState.initial(base_date), []),
+    )
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", MagicMock(return_value=[]))
+    monkeypatch.setattr(
+        "app.workers.scheduling.order_service.apply_schedule",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
+    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
+
+    pending_at_dispatch: list[set[str]] = []
+
+    def capture_pending() -> None:
+        members = redis_client.smembers(MATERIALIZE_NOTIFY_PENDING_KEY)
+        pending_at_dispatch.append(set(members))
+
+    monkeypatch.setattr(
+        "app.workers.scheduling.materialize_schedule_task.delay",
+        capture_pending,
+    )
+
+    result = rebuild_schedule_task.apply()
+    assert result.successful(), result.traceback
+
+    assert len(pending_at_dispatch) >= 1
+    assert _MATERIALIZE_SYSTEM_SENTINEL in pending_at_dispatch[-1]
 
 
 # ---------------------------------------------------------------------------
