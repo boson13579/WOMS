@@ -35,6 +35,14 @@ const DEFAULT_TIMEOUT_MS = 5_000;
  * AbortError from the timeout is rewritten to a friendlier message so
  * the dashboard's "Failed to load" UI carries useful copy instead of a
  * generic "The user aborted a request.".
+ *
+ * The timeout covers the FULL request/response lifecycle including body
+ * read: the `AbortController` is held alive in an outer try/finally so
+ * that a server which streams headers fast but stalls the body still
+ * gets aborted (per WHATWG Fetch, an aborted signal rejects any
+ * in-progress `Response.json()` read with AbortError). An earlier
+ * version cleared the timer right after `await fetch(...)` resolved,
+ * leaving `res.json()` unprotected.
  */
 export async function apiFetch<T>(
   url: string,
@@ -46,25 +54,34 @@ export async function apiFetch<T>(
   const timer = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
-  let res: Response;
   try {
-    res = await fetch(url, { ...init, signal: controller.signal });
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    let res: Response;
+    try {
+      res = await fetch(url, { ...init, signal: controller.signal });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw new Error(`Request timed out after ${timeoutMs}ms`);
+      }
+      throw err;
     }
-    throw err;
+    if (!res.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
+      const body = await res.json().catch((): any => ({}));
+      const msg: string =
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        (body?.error?.message as string | undefined) ?? res.statusText;
+      throw new Error(msg);
+    }
+    if (res.status === 204) return undefined as T;
+    try {
+      return parse(await res.json());
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw new Error(`Request timed out after ${timeoutMs}ms`);
+      }
+      throw err;
+    }
   } finally {
     clearTimeout(timer);
   }
-  if (!res.ok) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
-    const body = await res.json().catch((): any => ({}));
-    const msg: string =
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-      (body?.error?.message as string | undefined) ?? res.statusText;
-    throw new Error(msg);
-  }
-  if (res.status === 204) return undefined as T;
-  return parse(await res.json());
 }
