@@ -7,12 +7,14 @@
  */
 import { Outlet } from 'react-router-dom';
 
+import { MobileNav } from '@/components/layout/MobileNav';
 import { Sidebar } from '@/components/layout/Sidebar';
 
 export function AppShell(): JSX.Element {
   return (
     <div className="flex min-h-screen bg-muted/30">
       <Sidebar />
+      <MobileNav />
       <main className="flex min-h-screen flex-1 flex-col">
         <Outlet />
       </main>
