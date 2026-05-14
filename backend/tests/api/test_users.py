@@ -5,9 +5,12 @@ Run `pytest tests/api/test_users.py -v` to execute this module.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import bcrypt
 from app.models.user import User, UserRole
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 # ---------------------------------------------------------------------------
@@ -27,10 +30,10 @@ def _make_user(
     """Insert a user directly into the DB for test setup."""
     user = User(
         username=username,
+        email=email or f"{username}@test.internal",
         password_hash=bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
         role=role,
         is_active=is_active,
-        email=email,
     )
     db.add(user)
     db.commit()
@@ -320,7 +323,9 @@ def test_delete_user_without_token_returns_401(client: TestClient, db_session: S
 # ---------------------------------------------------------------------------
 
 
-def test_patch_user_clear_email_with_null_succeeds(client: TestClient, db_session: Session) -> None:
+def test_patch_user_clear_email_with_null_returns_422(
+    client: TestClient, db_session: Session
+) -> None:
     headers = _root_headers(client, db_session)
     target = _make_user(db_session, username="sam", email="sam@example.com")
 
@@ -330,8 +335,8 @@ def test_patch_user_clear_email_with_null_succeeds(client: TestClient, db_sessio
         headers=headers,
     )
 
-    assert res.status_code == 200
-    assert res.json()["email"] is None
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
 
 
 def test_patch_user_omit_email_leaves_it_unchanged(client: TestClient, db_session: Session) -> None:
@@ -406,6 +411,247 @@ def test_delete_user_deactivate_last_root_returns_409(
     headers = {"Authorization": f"Bearer {token}"}
 
     res = client.delete(f"/api/v1/users/{root.id}", headers=headers)
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+# ---------------------------------------------------------------------------
+# [RED] PATCH /users/me — self-update (any authenticated role)
+# ---------------------------------------------------------------------------
+
+
+def test_self_update_username_success(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="self_upd_u", password="password123")
+    token = _login(client, "self_upd_u", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"username": "self_upd_u_new", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["username"] == "self_upd_u_new"
+
+
+def test_self_update_email_success(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="self_upd_e", password="password123")
+    token = _login(client, "self_upd_e", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"email": "updated@example.com", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["email"] == "updated@example.com"
+
+
+def test_self_update_stale_version_returns_409(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="self_upd_stale", password="password123")
+    token = _login(client, "self_upd_stale", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"username": "wont_matter", "version_id": 9999},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_self_update_duplicate_username_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    _make_user(db_session, username="taken_name")
+    user = _make_user(db_session, username="self_upd_dup", password="password123")
+    token = _login(client, "self_upd_dup", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"username": "taken_name", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_self_update_cannot_change_role(client: TestClient, db_session: Session) -> None:
+    user = _make_user(
+        db_session, username="self_upd_role", role=UserRole.viewer, password="password123"
+    )
+    token = _login(client, "self_upd_role", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"role": "root", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    # role field is not part of UserSelfUpdateRequest → 422 validation error
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
+
+
+def test_self_update_duplicate_email_returns_409(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="taken_email_owner", email="taken@example.com")
+    user = _make_user(db_session, username="self_upd_email_dup", password="password123")
+    token = _login(client, "self_upd_email_dup", "password123")
+
+    res = client.patch(
+        "/api/v1/users/me",
+        json={"email": "taken@example.com", "version_id": user.version_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+# ---------------------------------------------------------------------------
+# Additional PATCH /users/{user_id} edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_patch_user_not_found_returns_404(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+
+    res = client.patch(
+        "/api/v1/users/00000000-0000-0000-0000-000000000000",
+        json={"username": "ghost", "version_id": 1},
+        headers=headers,
+    )
+
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == 404
+
+
+def test_patch_user_duplicate_email_returns_409(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+    _make_user(db_session, username="email_owner", email="occupied@example.com")
+    target = _make_user(db_session, username="email_target")
+
+    res = client.patch(
+        f"/api/v1/users/{target.id}",
+        json={"email": "occupied@example.com", "version_id": target.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_patch_user_reactivate_success(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+    target = _make_user(db_session, username="reactivate_me")
+
+    # Deactivate first
+    client.delete(f"/api/v1/users/{target.id}", headers=headers)
+    db_session.refresh(target)
+
+    res = client.patch(
+        f"/api/v1/users/{target.id}",
+        json={"is_active": True, "version_id": target.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["is_active"] is True
+
+
+def test_patch_root_username_guard_skips_gracefully(
+    client: TestClient, db_session: Session
+) -> None:
+    root = _make_user(db_session, username="root_rename", role=UserRole.root)
+    token = _login(client, "root_rename", "pass1234")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.patch(
+        f"/api/v1/users/{root.id}",
+        json={"username": "root_rename_new", "version_id": root.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["username"] == "root_rename_new"
+
+
+def test_patch_inactive_root_role_allowed(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="active_root_guard", role=UserRole.root)
+    inactive_root = _make_user(
+        db_session, username="inactive_root_guard", role=UserRole.root, is_active=False
+    )
+    token = _login(client, "active_root_guard", "pass1234")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    res = client.patch(
+        f"/api/v1/users/{inactive_root.id}",
+        json={"role": "scheduler", "version_id": inactive_root.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["role"] == "scheduler"
+
+
+def test_patch_user_update_email_success(client: TestClient, db_session: Session) -> None:
+    headers = _root_headers(client, db_session)
+    target = _make_user(db_session, username="email_update_target")
+
+    res = client.patch(
+        f"/api/v1/users/{target.id}",
+        json={"email": "brand_new@example.com", "version_id": target.version_id},
+        headers=headers,
+    )
+
+    assert res.status_code == 200
+    assert res.json()["email"] == "brand_new@example.com"
+
+
+# ---------------------------------------------------------------------------
+# IntegrityError race-condition guards (mock-based)
+# ---------------------------------------------------------------------------
+
+
+def test_self_update_duplicate_email_integrity_error_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    user = _make_user(db_session, username="self_upd_ie_email", password="password123")
+    token = _login(client, "self_upd_ie_email", "password123")
+
+    fake_orig = Exception('duplicate key value violates unique constraint "ix_users_email"')
+    integrity_err = IntegrityError("stmt", {}, fake_orig)
+
+    with patch("app.services.user.user_repo.update_self", side_effect=integrity_err):
+        res = client.patch(
+            "/api/v1/users/me",
+            json={"email": "race@example.com", "version_id": user.version_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_admin_update_user_duplicate_email_returns_409(
+    client: TestClient, db_session: Session
+) -> None:
+    headers = _root_headers(client, db_session)
+    target = _make_user(db_session, username="ie_email_target")
+
+    fake_orig = Exception('duplicate key value violates unique constraint "ix_users_email"')
+    integrity_err = IntegrityError("stmt", {}, fake_orig)
+
+    with patch("app.services.user.user_repo.update", side_effect=integrity_err):
+        res = client.patch(
+            f"/api/v1/users/{target.id}",
+            json={"email": "race@example.com", "version_id": target.version_id},
+            headers=headers,
+        )
 
     assert res.status_code == 409
     assert res.json()["error"]["code"] == 409
