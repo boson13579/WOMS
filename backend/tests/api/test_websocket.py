@@ -27,6 +27,7 @@ from app.api.v1 import websocket as ws_api
 from app.api.v1.websocket import ConnectionManager, _handle_event
 from app.core.security import create_access_token
 from app.models.user import User, UserRole
+from app.repositories import user as user_repo
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketDisconnect
@@ -229,6 +230,74 @@ def test_websocket_rejects_invalid_token(client: TestClient) -> None:
 
 
 def test_websocket_rejects_missing_token(client: TestClient) -> None:
-    # No `token` query param at all → FastAPI rejects at protocol upgrade.
-    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/api/v1/ws"):
-        pass
+    # No token query param and no cookie → endpoint closes with 4401.
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/api/v1/ws") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 4401
+
+
+def test_websocket_accepts_cookie_auth(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="ws_cookie_user", role=UserRole.viewer)
+    token = create_access_token(user.id, user.role)
+    client.cookies.set("access_token", token)
+    try:
+        with client.websocket_connect("/api/v1/ws") as ws:
+            ws.close()
+    finally:
+        client.cookies.clear()
+
+
+def test_websocket_rejects_inactive_user(client: TestClient, db_session: Session) -> None:
+    user = _make_user(db_session, username="ws_inactive_user", role=UserRole.viewer)
+    user.is_active = False
+    db_session.commit()
+    token = create_access_token(user.id, user.role)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 4401
+
+
+def test_websocket_closes_4500_on_db_error(
+    client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setattr(
+        user_repo,
+        "get_by_id",
+        lambda db, uid: (_ for _ in ()).throw(OperationalError("DB down", None, None)),
+    )
+    user = _make_user(db_session, username="ws_db_error", role=UserRole.viewer)
+    token = create_access_token(user.id, user.role)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 4500
+
+
+def test_websocket_cookie_takes_priority_over_query_token(
+    client: TestClient, db_session: Session
+) -> None:
+    user = _make_user(db_session, username="ws_priority_user", role=UserRole.viewer)
+    valid_token = create_access_token(user.id, user.role)
+    client.cookies.set("access_token", valid_token)
+    try:
+        with client.websocket_connect("/api/v1/ws?token=invalid-jwt-token") as ws:
+            ws.close()
+    finally:
+        client.cookies.clear()
+
+
+def test_websocket_auth_failure_leaves_no_zombie_connection(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fresh_manager = ConnectionManager()
+    monkeypatch.setattr(ws_api, "_manager", fresh_manager)
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/api/v1/ws?token=bad-token") as ws:
+            ws.receive_text()
+
+    assert len(fresh_manager._connections) == 0

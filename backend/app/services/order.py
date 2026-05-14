@@ -357,6 +357,7 @@ def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResp
     the scheduler has applied the pending op (``apply_schedule`` clears it
     via ``set_schedule_dates``).
     """
+    _validate_assigned_to_user(db, req.assigned_to)
     order_number = _generate_order_number(db)
     order = order_repo.create(
         db,
@@ -428,7 +429,7 @@ def get_order(db: Session, order_id: uuid.UUID) -> OrderResponse:
     return OrderResponse.model_validate(order)
 
 
-def update_order(
+def update_order(  # noqa: PLR0912
     db: Session, order_id: uuid.UUID, req: UpdateOrderRequest, actor: User
 ) -> OrderResponse:
     """Update a mutable order with optimistic-lock and status guard.
@@ -490,6 +491,8 @@ def update_order(
             detail="Only scheduler and root can reassign orders.",
         )
     new_assigned_to = req.assigned_to if assigned_to_set else order.assigned_to
+    if assigned_to_set:
+        _validate_assigned_to_user(db, new_assigned_to)
 
     scheduling_changed = (
         new_qty != order.wafer_quantity or new_deadline != order.requested_delivery_date
@@ -506,7 +509,6 @@ def update_order(
         if notes_set:
             order.notes = req.notes
         if assigned_to_set:
-            _validate_assigned_to_user(db, req.assigned_to)
             order.assigned_to = req.assigned_to
         new_val_simple: dict[str, Any] = {
             "notes": order.notes,

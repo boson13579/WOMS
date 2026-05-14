@@ -234,3 +234,48 @@ def test_viewer_can_update_self(client: TestClient, db_session: Session) -> None
 
     assert res.status_code == 200
     assert res.json()["username"] == "viewer_self_updated"
+
+
+# ---------------------------------------------------------------------------
+# assigned_to permission and validation
+# ---------------------------------------------------------------------------
+
+
+def test_order_manager_cannot_set_assigned_to(client: TestClient, db_session: Session) -> None:
+    mgr = _make_user(db_session, username="mgr_assign", role=UserRole.order_manager)
+    target_user = _make_user(db_session, username="target_assign", role=UserRole.viewer)
+    order = _make_order(db_session, created_by=mgr.id)
+    token = _login(client, "mgr_assign")
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={
+            "assigned_to": str(target_user.id),
+            "version_id": order.version_id,
+        },
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_create_order_with_nonexistent_assigned_to_returns_422(
+    client: TestClient, db_session: Session
+) -> None:
+    _make_user(db_session, username="sched_assign", role=UserRole.scheduler)
+    token = _login(client, "sched_assign")
+
+    res = client.post(
+        "/api/v1/orders",
+        json={
+            "customer_name": "TSMC",
+            "wafer_quantity": 100,
+            "requested_delivery_date": _DELIVERY,
+            "assigned_to": str(uuid.uuid4()),
+        },
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
