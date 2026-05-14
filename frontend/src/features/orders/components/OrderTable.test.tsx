@@ -206,7 +206,11 @@ describe('OrderTable', () => {
     render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
     await user.click(screen.getByTitle('刪除'));
 
-    expect(mockDeleteMutate).toHaveBeenCalledWith('delete-me-id', expect.objectContaining({ onError: expect.any(Function) }));
+    expect(mockDeleteMutate).toHaveBeenCalledWith(
+      'delete-me-id',
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      expect.objectContaining({ onError: expect.any(Function) }),
+    );
   });
 
   it('calls setSort with the column field when a sortable header is clicked', async () => {
