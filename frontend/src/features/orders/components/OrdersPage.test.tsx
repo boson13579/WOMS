@@ -114,6 +114,7 @@ vi.mock('./OrderTable', () => ({
             assigned_to: null,
             created_by: 'user-id-0001',
             notes: null,
+            is_locked: false,
             version_id: 1,
             created_at: '2026-05-04T08:00:00Z',
             updated_at: '2026-05-04T08:00:00Z',

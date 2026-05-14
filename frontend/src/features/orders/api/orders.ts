@@ -41,6 +41,7 @@ const orderSchema = z.object({
   assigned_to: z.string().nullable(),
   created_by: z.string().uuid(),
   notes: z.string().nullable(),
+  is_locked: z.boolean(),
   version_id: z.number().int(),
   created_at: z.string(),
   updated_at: z.string(),

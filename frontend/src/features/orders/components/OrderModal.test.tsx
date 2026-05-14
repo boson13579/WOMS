@@ -62,6 +62,7 @@ function makeOrder(overrides: Partial<Order> = {}): Order {
     assigned_to: null,
     created_by: 'aaaaaaaa-0000-0000-0000-000000000001',
     notes: '測試備註',
+    is_locked: false,
     version_id: 1,
     created_at: '2026-05-04T08:00:00Z',
     updated_at: '2026-05-04T08:00:00Z',

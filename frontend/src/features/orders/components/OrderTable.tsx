@@ -3,7 +3,16 @@
  * Exposes onEdit / onSchedule callbacks so the parent page can manage
  * modal open state and schedule task IDs without prop-drilling.
  */
-import { ArrowDown, ArrowUp, ArrowUpDown, Calendar, Loader2, Pencil, Trash2 } from 'lucide-react';
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  Calendar,
+  Loader2,
+  Lock,
+  Pencil,
+  Trash2,
+} from 'lucide-react';
 import type { ReactNode } from 'react';
 
 import { Badge } from '@/components/ui/badge';
@@ -187,7 +196,16 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
           ) : (
             data.items.map((order) => (
               <TableRow key={order.id}>
-                <TableCell className="font-mono text-xs">{order.order_number}</TableCell>
+                <TableCell className="font-mono text-xs">
+                  <span className="inline-flex items-center gap-1">
+                    {order.order_number}
+                    {order.is_locked && (
+                      <span title="此訂單已鎖定，不受排程影響">
+                        <Lock className="h-3 w-3 text-muted-foreground" />
+                      </span>
+                    )}
+                  </span>
+                </TableCell>
                 <TableCell className="font-medium">{order.customer_name}</TableCell>
                 <TableCell className="text-right">
                   {order.wafer_quantity.toLocaleString()}

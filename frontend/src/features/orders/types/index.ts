@@ -24,6 +24,7 @@ export interface Order {
   assigned_to: string | null;
   created_by: string;
   notes: string | null;
+  is_locked: boolean;
   version_id: number;
   created_at: string;
   updated_at: string;
