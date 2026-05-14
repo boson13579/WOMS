@@ -1489,6 +1489,16 @@ def materialize_schedule_task() -> None:
                     except ValueError:
                         # Bad UUID slipped into the set somehow — log and
                         # move on, don't block the batch on one bad entry.
+                        #
+                        # This branch is LOAD-BEARING for the sentinel race
+                        # fix: ``advance_day_task`` / ``rebuild_schedule_task``
+                        # SADD ``_MATERIALIZE_SYSTEM_SENTINEL`` into
+                        # ``notify_pending`` before dispatching the follow-up
+                        # materializer (see the docstring at that constant).
+                        # The sentinel is intentionally not a UUID, and it
+                        # MUST reach this log-and-skip path — do NOT tighten
+                        # the except clause or pre-validate ``user_raw``
+                        # against a UUID regex.
                         logger.warning(
                             "schedule.materialize.bad_user_id",
                             user=user_raw,
