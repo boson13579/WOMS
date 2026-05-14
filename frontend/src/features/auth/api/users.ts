@@ -19,11 +19,13 @@ async function fetchUsers(): Promise<UserOption[]> {
   return usersResponseSchema.parse(await res.json()).users;
 }
 
+const EMPTY_USERS: UserOption[] = [];
+
 export function useUsers(): UserOption[] {
   const { data } = useQuery<UserOption[]>({
     queryKey: ['users'],
     queryFn: fetchUsers,
     staleTime: 5 * 60 * 1000,
   });
-  return data ?? [];
+  return data ?? EMPTY_USERS;
 }

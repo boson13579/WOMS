@@ -8,21 +8,37 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ApiError } from '../api/orders';
 import type { Order } from '../types';
 
 import { OrderModal } from './OrderModal';
 
 // ---------------------------------------------------------------------------
-// Mock mutations
+// Mock mutations — state is mutable so individual tests can set isError/error
 // ---------------------------------------------------------------------------
 
 const mockCreateMutate = vi.fn();
 const mockUpdateMutate = vi.fn();
 
-vi.mock('../api/orders', () => ({
-  useCreateOrder: () => ({ mutate: mockCreateMutate, isPending: false, isError: false }),
-  useUpdateOrder: () => ({ mutate: mockUpdateMutate, isPending: false, isError: false }),
-}));
+interface MutationState {
+  mutate: ReturnType<typeof vi.fn>;
+  isPending: boolean;
+  isError: boolean;
+  error: Error | null;
+}
+
+let createState: MutationState;
+let updateState: MutationState;
+
+// Spread the real module so ApiError keeps its class identity for instanceof checks.
+vi.mock('../api/orders', async () => {
+  const actual = await vi.importActual<Record<string, unknown>>('../api/orders');
+  return {
+    ...actual,
+    useCreateOrder: () => createState,
+    useUpdateOrder: () => updateState,
+  };
+});
 
 vi.mock('@/features/auth/api/users', () => {
   // Must be a stable reference — if useUsers() returns a new array every render,
@@ -78,6 +94,8 @@ describe('OrderModal', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    createState = { mutate: mockCreateMutate, isPending: false, isError: false, error: null };
+    updateState = { mutate: mockUpdateMutate, isPending: false, isError: false, error: null };
   });
 
   // --- create mode ---
@@ -178,5 +196,48 @@ describe('OrderModal', () => {
     await user.click(screen.getByRole('button', { name: '取消' }));
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  // --- error states ---
+
+  describe('error states', () => {
+    it('edit mode: shows version-conflict warning on 409', () => {
+      updateState = {
+        mutate: mockUpdateMutate,
+        isPending: false,
+        isError: true,
+        error: new ApiError(409, 'Order was modified by another user.'),
+      };
+      render(<OrderModal open order={makeOrder()} onClose={onClose} />);
+
+      expect(screen.getByText('資料版本已更新')).toBeInTheDocument();
+      expect(screen.getByText(/此訂單已被其他人修改/)).toBeInTheDocument();
+      expect(screen.queryByText(/操作失敗/)).not.toBeInTheDocument();
+    });
+
+    it('edit mode: shows generic error text for non-409 errors', () => {
+      updateState = {
+        mutate: mockUpdateMutate,
+        isPending: false,
+        isError: true,
+        error: new Error('伺服器錯誤，請稍後再試'),
+      };
+      render(<OrderModal open order={makeOrder()} onClose={onClose} />);
+
+      expect(screen.getByText('伺服器錯誤，請稍後再試')).toBeInTheDocument();
+      expect(screen.queryByText('資料版本已更新')).not.toBeInTheDocument();
+    });
+
+    it('create mode: shows generic error text on failure', () => {
+      createState = {
+        mutate: mockCreateMutate,
+        isPending: false,
+        isError: true,
+        error: new Error('建立訂單失敗'),
+      };
+      render(<OrderModal open order={undefined} onClose={onClose} />);
+
+      expect(screen.getByText('建立訂單失敗')).toBeInTheDocument();
+    });
   });
 });

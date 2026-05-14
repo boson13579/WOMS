@@ -71,6 +71,16 @@ export const scheduleProgressSchema = z.object({
 // Shared fetch helper
 // ---------------------------------------------------------------------------
 
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 function jsonHeaders(): HeadersInit {
   return { 'Content-Type': 'application/json' };
 }
@@ -80,10 +90,12 @@ async function apiFetch<T>(url: string, init: RequestInit, parse: (raw: unknown)
   if (!res.ok) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
     const body = await res.json().catch((): any => ({}));
-    const msg: string =
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-      (body?.error?.message as string | undefined) ?? res.statusText;
-    throw new Error(msg);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const errorMessage = body?.error?.message as string | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const detail = body?.detail as string | undefined;
+    const msg: string = errorMessage ?? detail ?? res.statusText;
+    throw new ApiError(res.status, msg);
   }
   if (res.status === 204) return undefined as T;
   return parse(await res.json());
