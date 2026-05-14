@@ -10,7 +10,7 @@ import { CheckCircle2, AlertTriangle, XCircle } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
 
-import type { ServiceHealth } from '../types';
+import type { ServiceHealthEntry } from '../types';
 
 const STATUS_CONFIG = {
   healthy: {
@@ -33,7 +33,7 @@ const STATUS_CONFIG = {
   },
 } as const;
 
-export function StatusCard({ service }: { service: ServiceHealth }): JSX.Element {
+export function StatusCard({ service }: { service: ServiceHealthEntry }): JSX.Element {
   const cfg = STATUS_CONFIG[service.status];
   const StatusIcon = cfg.icon;
 
