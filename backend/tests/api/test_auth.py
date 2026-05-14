@@ -22,10 +22,12 @@ def _make_user(
     password: str = "password123",
     role: UserRole = UserRole.viewer,
     is_active: bool = True,
+    email: str | None = None,
 ) -> User:
     """Insert a user directly into the DB for test setup."""
     user = User(
         username=username,
+        email=email or f"{username}@test.internal",
         password_hash=bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode(),
         role=role,
         is_active=is_active,
@@ -115,7 +117,7 @@ def test_login_missing_fields_returns_422(client: TestClient) -> None:
 def test_register_without_token_succeeds(client: TestClient) -> None:
     res = client.post(
         "/api/v1/auth/register",
-        json={"username": "newuser", "password": "newpassword1"},
+        json={"username": "newuser", "password": "newpassword1", "email": "newuser@example.com"},
     )
 
     assert res.status_code == 201
@@ -130,7 +132,7 @@ def test_register_duplicate_username_returns_409(client: TestClient, db_session:
 
     res = client.post(
         "/api/v1/auth/register",
-        json={"username": "existing", "password": "newpassword1"},
+        json={"username": "existing", "password": "newpassword1", "email": "existing2@example.com"},
     )
 
     assert res.status_code == 409
@@ -140,7 +142,12 @@ def test_register_duplicate_username_returns_409(client: TestClient, db_session:
 def test_register_always_assigns_viewer_role(client: TestClient) -> None:
     res = client.post(
         "/api/v1/auth/register",
-        json={"username": "tricky", "password": "password1", "role": "root"},
+        json={
+            "username": "tricky",
+            "password": "password1",
+            "role": "root",
+            "email": "tricky@example.com",
+        },
     )
 
     assert res.status_code == 201
@@ -162,7 +169,11 @@ def test_register_concurrent_duplicate_username_returns_409(
     with patch.object(_user_repo, "get_by_username", return_value=None):
         res = client.post(
             "/api/v1/auth/register",
-            json={"username": "race_victim", "password": "password1"},
+            json={
+                "username": "race_victim",
+                "password": "password1",
+                "email": "race_victim@example.com",
+            },
         )
 
     assert res.status_code == 409
@@ -266,3 +277,30 @@ def test_me_with_missing_claims_token_returns_401(client: TestClient) -> None:
 
     assert res.status_code == 401
     assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
+# [RED] Email primary — register must include email
+# ---------------------------------------------------------------------------
+
+
+def test_register_without_email_returns_422(client: TestClient) -> None:
+    res = client.post(
+        "/api/v1/auth/register",
+        json={"username": "no_email_user", "password": "password123"},
+    )
+
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == 422
+
+
+def test_register_with_duplicate_email_returns_409(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="email_owner", email="dup@example.com")
+
+    res = client.post(
+        "/api/v1/auth/register",
+        json={"username": "email_thief", "password": "password123", "email": "dup@example.com"},
+    )
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409

@@ -225,6 +225,7 @@ def _patch_worker_io(
 def _make_actor(db_session: Session, username: str) -> User:
     actor = User(
         username=username,
+        email=f"{username}@test.internal",
         password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
         role=UserRole.scheduler,
         is_active=True,
