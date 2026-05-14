@@ -49,6 +49,15 @@ async function fetchCount(status: OrdersSnapshotStatus): Promise<number> {
 interface UseOrdersSnapshotResult {
   data: OrdersSnapshotCounts | undefined;
   isLoading: boolean;
+  /**
+   * True whenever any of the 4 underlying queries is in-flight, including
+   * background refetches triggered by `refetch()` / `invalidateQueries`.
+   * Distinct from `isLoading`, which only flips true on the very first
+   * fetch (no cached data). Consumers wiring a Refresh button to a
+   * spinner should aggregate on `isFetching` to stay in sync with the
+   * other dashboard hooks.
+   */
+  isFetching: boolean;
   isSuccess: boolean;
   isError: boolean;
   error: Error | null;
@@ -73,6 +82,10 @@ export function useOrdersSnapshot(): UseOrdersSnapshotResult {
   // we report ``isLoading``; if any errored we report ``isError`` so the
   // card shows a clear failure rather than rendering partial numbers.
   const isLoading = queries.some((q) => q.isLoading);
+  // Distinct from ``isLoading``: stays true during background refetches
+  // (Refresh button, polling tick) so the Header spinner aggregation
+  // can stay accurate after the first successful load.
+  const isFetching = queries.some((q) => q.isFetching);
   const isError = queries.some((q) => q.isError);
   const firstError = queries.find((q) => q.isError)?.error ?? null;
   const isSuccess = !isLoading && !isError && queries.every((q) => q.isSuccess);
@@ -98,6 +111,7 @@ export function useOrdersSnapshot(): UseOrdersSnapshotResult {
   return {
     data,
     isLoading,
+    isFetching,
     isSuccess,
     isError,
     error: firstError instanceof Error ? firstError : null,

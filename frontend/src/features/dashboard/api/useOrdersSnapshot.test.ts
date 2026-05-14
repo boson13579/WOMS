@@ -122,6 +122,51 @@ describe('useOrdersSnapshot', () => {
     });
   });
 
+  it('reflects background refetches via isFetching after the first load resolves', async () => {
+    // ``isLoading`` flips false the moment cached data exists; only
+    // ``isFetching`` stays true through background refetches (Refresh
+    // button, polling tick). The Header's spinner aggregation in
+    // DashboardPage depends on this distinction — assert it explicitly
+    // so a future regression to ``isLoading`` semantics is caught.
+
+    // First load — synchronous mock, resolves immediately.
+    setupFetchPerStatus({ pending: 1, scheduled: 1, in_production: 1, completed: 1 });
+    const { result } = renderHook(() => useOrdersSnapshot(), { wrapper: makeWrapper() });
+
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+    });
+    expect(result.current.isFetching).toBe(false);
+
+    // Swap to a deferred mock so we can observe the in-flight state
+    // before letting the refetch complete.
+    let releaseRefetch: () => void = () => {};
+    const refetchPending = new Promise<void>((resolve) => {
+      releaseRefetch = resolve;
+    });
+    vi.mocked(global.fetch).mockImplementation(async () => {
+      await refetchPending;
+      return new Response(JSON.stringify({ items: [], total: 1, page: 1, page_size: 1 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    void qc.invalidateQueries({ queryKey: ['orders', 'snapshot'] });
+
+    await waitFor(() => {
+      expect(result.current.isFetching).toBe(true);
+    });
+    // Cached data is still there, so isLoading stays false — this is
+    // exactly the case the Header spinner was missing before.
+    expect(result.current.isLoading).toBe(false);
+
+    releaseRefetch();
+    await waitFor(() => {
+      expect(result.current.isFetching).toBe(false);
+    });
+  });
+
   it('requests page_size=1 (counts only, no items needed)', async () => {
     setupFetchPerStatus({ pending: 3, scheduled: 96, in_production: 12, completed: 65 });
     renderHook(() => useOrdersSnapshot(), { wrapper: makeWrapper() });

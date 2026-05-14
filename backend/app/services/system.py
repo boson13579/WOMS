@@ -89,6 +89,13 @@ _CELERY_STALL_THRESHOLD_SECONDS = 30
 def _get_redis_client() -> Redis:
     """Module-level Redis client; instantiated on first use.
 
+    Cached at process lifetime (``maxsize=1``) — the client instance is
+    reused across every probe call. ``REDIS_URL`` is read from
+    ``Settings`` once on the first invocation and pinned thereafter, so
+    a runtime settings reload would not be picked up here. Production
+    doesn't reload settings, and tests monkeypatch this whole accessor
+    (not ``Settings``) to swap clients, which bypasses the cache.
+
     Separate accessor (not reusing ``schedule_queue._redis()``) so tests can
     monkeypatch ``app.services.system._get_redis_client`` to inject a fake
     without touching every other Redis-using module.

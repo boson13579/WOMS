@@ -56,7 +56,7 @@ export function DashboardPage(): JSX.Element {
     scheduleStatus.isFetching ||
     capacity.isFetching ||
     pendingOps.isFetching ||
-    ordersSnapshot.isLoading;
+    ordersSnapshot.isFetching;
 
   // ``onRefresh`` triggers a refetch on every dashboard query at once.
   // React Query's ``invalidate`` flips the `isFetching` flag synchronously
