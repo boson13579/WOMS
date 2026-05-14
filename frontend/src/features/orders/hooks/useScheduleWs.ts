@@ -5,12 +5,13 @@
  * toasts on progress/completion. The Vite dev proxy (ws:true) forwards the
  * connection to the FastAPI backend transparently.
  */
+import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 
 import { useCurrentUser } from '@/lib/auth';
 
-import { scheduleProgressSchema } from '../api/orders';
+import { orderKeys, scheduleProgressSchema } from '../api/orders';
 import type { ScheduleProgress } from '../types';
 
 interface UseScheduleWsResult {
@@ -20,6 +21,7 @@ interface UseScheduleWsResult {
 
 export function useScheduleWs(taskId: string | null): UseScheduleWsResult {
   const user = useCurrentUser();
+  const qc = useQueryClient();
   const [progress, setProgress] = useState<ScheduleProgress | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -48,6 +50,7 @@ export function useScheduleWs(taskId: string | null): UseScheduleWsResult {
           id: toastId,
           description: data.message,
         });
+        void qc.invalidateQueries({ queryKey: orderKeys.all });
         ws.close();
       } else {
         toast.loading(`排程中 ${data.progress}%`, {
@@ -70,7 +73,7 @@ export function useScheduleWs(taskId: string | null): UseScheduleWsResult {
       ws.close();
       toast.dismiss(toastId);
     };
-  }, [taskId, user]);
+  }, [taskId, user, qc]);
 
   return { progress, isConnected };
 }

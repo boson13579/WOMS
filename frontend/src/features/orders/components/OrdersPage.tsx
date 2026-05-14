@@ -3,6 +3,7 @@ import { useCallback, useState } from 'react';
 
 import { Header } from '@/components/layout/Header';
 import { Button } from '@/components/ui/button';
+import { useCanWrite } from '@/lib/auth';
 
 import { useTriggerSchedule } from '../api/orders';
 import { useScheduleWs } from '../hooks/useScheduleWs';
@@ -18,6 +19,7 @@ export function OrdersPage(): JSX.Element {
 
   const [scheduleTaskId, setScheduleTaskId] = useState<string | null>(null);
   const triggerSchedule = useTriggerSchedule();
+  const canWrite = useCanWrite();
 
   useScheduleWs(scheduleTaskId);
 
@@ -49,12 +51,14 @@ export function OrdersPage(): JSX.Element {
     <>
       <Header title="訂單列表" />
 
-      <div className="mx-auto max-w-7xl px-6 py-6 space-y-5">
+      <div className="px-6 py-6 space-y-5">
         <div className="flex items-center justify-between gap-4">
-          <Button onClick={handleNewOrder} size="sm">
-            <Plus className="mr-1.5 h-4 w-4" />
-            新增訂單
-          </Button>
+          {canWrite && (
+            <Button onClick={handleNewOrder} size="sm">
+              <Plus className="mr-1.5 h-4 w-4" />
+              新增訂單
+            </Button>
+          )}
         </div>
 
         <OrderFilters />

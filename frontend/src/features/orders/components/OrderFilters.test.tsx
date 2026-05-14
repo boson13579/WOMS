@@ -11,6 +11,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { OrderFilters } from './OrderFilters';
 
 // ---------------------------------------------------------------------------
+// Mock @/lib/auth and users
+// ---------------------------------------------------------------------------
+
+vi.mock('@/lib/auth', () => ({
+  useCanWrite: () => false,
+  useCurrentUserId: () => null,
+}));
+
+vi.mock('@/features/auth/api/users', () => ({
+  useUsers: () => [],
+}));
+
+// ---------------------------------------------------------------------------
 // Mock useOrderStore
 // ---------------------------------------------------------------------------
 
@@ -21,9 +34,13 @@ const mockReset = vi.fn();
 const mockStore = {
   status: null as string | null,
   search: '',
+  assignedTo: [] as string[],
+  createdBy: [] as string[],
   page: 1,
   setStatus: mockSetStatus,
   setSearch: mockSetSearch,
+  setAssignedTo: vi.fn(),
+  setCreatedBy: vi.fn(),
   setPage: vi.fn(),
   reset: mockReset,
 };

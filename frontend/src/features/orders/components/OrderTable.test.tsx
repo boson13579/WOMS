@@ -13,14 +13,24 @@ import type { Order, OrderListResponse } from '../types';
 import { OrderTable } from './OrderTable';
 
 // ---------------------------------------------------------------------------
-// Mock @/lib/auth — controls canWrite per test
+// Mock @/lib/auth — controls canWrite / canSchedule / role per test
 // ---------------------------------------------------------------------------
 
 let mockCanWrite = true;
+let mockCanSchedule = true;
+let mockRole = 'scheduler';
+const mockCurrentUserId = 'test-user-id';
 
 vi.mock('@/lib/auth', () => ({
-  useCurrentUser: () => ({ username: 'test', role: 'scheduler' }),
+  useCurrentUser: () => ({ username: 'test', role: mockRole }),
   useCanWrite: () => mockCanWrite,
+  useCanSchedule: () => mockCanSchedule,
+  useCurrentRole: () => mockRole,
+  useCurrentUserId: () => mockCurrentUserId,
+}));
+
+vi.mock('@/features/auth/api/users', () => ({
+  useUsers: () => [],
 }));
 
 // ---------------------------------------------------------------------------
@@ -34,6 +44,8 @@ const mockDeleteMutate = vi.fn();
 const mockStore = {
   status: null as string | null,
   search: '',
+  assignedTo: [] as string[],
+  createdBy: [] as string[],
   page: 1,
   sortBy: 'order_number' as string,
   sortOrder: 'asc' as 'asc' | 'desc',
@@ -76,6 +88,9 @@ function makeOrder(overrides: Partial<Order> = {}): Order {
     version_id: 1,
     created_at: '2026-05-04T08:00:00Z',
     updated_at: '2026-05-04T08:00:00Z',
+    pinned_production_date: null,
+    is_pinned: false,
+    is_processing_locked: false,
     ...overrides,
   };
 }
@@ -95,6 +110,8 @@ describe('OrderTable', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockCanWrite = true;
+    mockCanSchedule = true;
+    mockRole = 'scheduler';
     mockStore.sortBy = 'order_number';
     mockStore.sortOrder = 'asc';
     mockUseDeleteOrder.mockReturnValue({ mutate: mockDeleteMutate, isPending: false });
@@ -189,7 +206,7 @@ describe('OrderTable', () => {
     render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
     await user.click(screen.getByTitle('刪除'));
 
-    expect(mockDeleteMutate).toHaveBeenCalledWith('delete-me-id');
+    expect(mockDeleteMutate).toHaveBeenCalledWith('delete-me-id', expect.objectContaining({ onError: expect.any(Function) }));
   });
 
   it('calls setSort with the column field when a sortable header is clicked', async () => {
@@ -219,6 +236,8 @@ describe('OrderTable', () => {
   describe('role-based rendering', () => {
     it('scheduler — shows edit, schedule, delete buttons', () => {
       mockCanWrite = true;
+      mockCanSchedule = true;
+      mockRole = 'scheduler';
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
@@ -231,6 +250,8 @@ describe('OrderTable', () => {
 
     it('root — shows edit, schedule, delete buttons', () => {
       mockCanWrite = true;
+      mockCanSchedule = true;
+      mockRole = 'root';
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
@@ -241,8 +262,11 @@ describe('OrderTable', () => {
       expect(screen.getByTitle('刪除')).toBeInTheDocument();
     });
 
-    it('order_manager — hides edit, schedule, delete buttons', () => {
-      mockCanWrite = false;
+    it("order_manager — hides edit and delete for another user's order, hides schedule", () => {
+      mockCanWrite = true;
+      mockCanSchedule = false;
+      mockRole = 'order_manager';
+      // mockCurrentUserId ('test-user-id') !== order.created_by ('aaaaaaaa-...') → canEditOrder=false
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 

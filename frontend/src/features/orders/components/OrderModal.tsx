@@ -39,7 +39,7 @@ const formSchema = z.object({
     .max(2500, '最多 2500 片'),
   requested_delivery_date: z.string().min(1, '請選擇要求交貨日'),
   notes: z.string().max(2000).nullable().optional(),
-  assigned_to_email: z.string().min(1, '請選擇負責人'),
+  assigned_to_email: z.string().optional(),
 });
 
 type FormValues = z.infer<typeof formSchema>;
@@ -212,7 +212,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="assigned_to_email">負責人{!isEdit && ' *'}</Label>
+            <Label htmlFor="assigned_to_email">負責人</Label>
             <Input
               id="assigned_to_email"
               list="users-datalist"
