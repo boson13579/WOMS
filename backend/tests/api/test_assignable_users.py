@@ -23,6 +23,7 @@ def _make_user(
     username: str,
     role: UserRole = UserRole.viewer,
     is_active: bool = True,
+    is_deleted: bool = False,
     email: str | None = None,
 ) -> User:
     user = User(
@@ -31,6 +32,7 @@ def _make_user(
         password_hash=bcrypt.hashpw(_PASSWORD.encode(), bcrypt.gensalt()).decode(),
         role=role,
         is_active=is_active,
+        is_deleted=is_deleted,
     )
     db.add(user)
     db.commit()
@@ -115,6 +117,31 @@ def test_assignable_excludes_inactive_users(client: TestClient, db_session: Sess
     assert res.status_code == 200
     ids = {item["id"] for item in res.json()}
     assert str(inactive.id) not in ids
+
+
+def test_assignable_excludes_deleted_users(client: TestClient, db_session: Session) -> None:
+    """Soft-deleted users must not appear in the assignable list."""
+    _make_user(db_session, username="sched_d", role=UserRole.scheduler)
+    deleted = _make_user(
+        db_session, username="deleted_a", role=UserRole.order_manager, is_deleted=True
+    )
+    token = _login(client, "sched_d")
+
+    res = client.get("/api/v1/users/assignable", headers=_auth(token))
+
+    assert res.status_code == 200
+    ids = {item["id"] for item in res.json()}
+    assert str(deleted.id) not in ids
+
+
+def test_assignable_viewer_returns_403(client: TestClient, db_session: Session) -> None:
+    """viewer role calling /assignable is forbidden (HTTP 403)."""
+    _make_user(db_session, username="viewer_a", role=UserRole.viewer)
+    token = _login(client, "viewer_a")
+
+    res = client.get("/api/v1/users/assignable", headers=_auth(token))
+
+    assert res.status_code == 403
 
 
 def test_assignable_requires_auth(client: TestClient, db_session: Session) -> None:
