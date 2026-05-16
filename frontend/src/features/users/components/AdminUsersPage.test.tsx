@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
+import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { deactivateUser, listUsers, updateUser } from '../api/users';
@@ -59,7 +60,11 @@ function makeWrapper(): { wrapper: ({ children }: { children: ReactNode }) => JS
   });
 
   function Wrapper({ children }: { children: ReactNode }): JSX.Element {
-    return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+    return (
+      <MemoryRouter>
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      </MemoryRouter>
+    );
   }
 
   return { wrapper: Wrapper };
