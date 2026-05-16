@@ -41,6 +41,16 @@ def list_users(db: Session, *, search: str | None = None) -> list[User]:
     return list(db.scalars(stmt).all())
 
 
+def list_active_users(db: Session) -> list[User]:
+    """Return all non-deleted, active users ordered by username."""
+    stmt = (
+        select(User)
+        .where(User.is_deleted.is_(False), User.is_active.is_(True))
+        .order_by(User.username.asc())
+    )
+    return list(db.scalars(stmt).all())
+
+
 def lock_and_count_other_active_roots(db: Session, exclude_id: uuid.UUID) -> int:
     """Lock all active root rows then return the count excluding *exclude_id*.
 
