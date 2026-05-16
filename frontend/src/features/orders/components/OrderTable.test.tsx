@@ -29,8 +29,8 @@ vi.mock('@/lib/auth', () => ({
   useCurrentUserId: () => mockCurrentUserId,
 }));
 
-vi.mock('@/features/auth/api/users', () => ({
-  useUsers: () => [],
+vi.mock('@/features/dashboard/api/useUsernames', () => ({
+  useUsernames: () => ({ data: undefined }),
 }));
 
 // ---------------------------------------------------------------------------

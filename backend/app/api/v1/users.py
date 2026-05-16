@@ -8,14 +8,20 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.security import require_roles
+from app.core.security import get_current_user, require_roles
 from app.models.user import User, UserRole
-from app.schemas.user import UserListResponse, UserResponse, UserUpdateRequest
+from app.schemas.user import (
+    UserListResponse,
+    UserResponse,
+    UserSelfUpdateRequest,
+    UserUpdateRequest,
+)
 from app.services import user as user_service
 
 router = APIRouter()
 
 _root_only = Depends(require_roles(UserRole.root))
+_any_auth = Depends(get_current_user)
 
 
 @router.get("", response_model=UserListResponse)
@@ -51,6 +57,26 @@ def get_user(
         404: user not found.
     """
     return user_service.get_user(db, user_id)
+
+
+@router.patch("/me", response_model=UserResponse)
+def update_self(
+    request: UserSelfUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = _any_auth,
+) -> UserResponse:
+    """Update the calling user's own username or email.
+
+    Cannot change role or is_active.  Requires version_id for optimistic locking.
+
+    Permission: any authenticated user.
+
+    Errors:
+        401: missing or invalid bearer token.
+        409: version_id mismatch or duplicate username/email.
+        422: request body fails validation.
+    """
+    return user_service.update_self(db, current_user, request)
 
 
 @router.patch("/{user_id}", response_model=UserResponse)

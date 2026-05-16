@@ -4,7 +4,7 @@
  * Protected feature pages share the AppShell layout. Auth pages live outside
  * that shell so login and registration keep their full-screen layout.
  */
-import { createBrowserRouter } from 'react-router-dom';
+import { createBrowserRouter, type RouteObject } from 'react-router-dom';
 
 import { AppShell } from '@/components/layout/AppShell';
 import { ProtectedRoute } from '@/components/layout/ProtectedRoute';
@@ -13,12 +13,12 @@ import { DashboardPage } from '@/features/dashboard/components/DashboardPage';
 import { OrdersPage } from '@/features/orders/components/OrdersPage';
 import { AdminUsersPage } from '@/features/users/components/AdminUsersPage';
 
-export const router = createBrowserRouter([
+export const routes: RouteObject[] = [
   {
+    path: '/',
     element: <ProtectedRoute />,
     children: [
       {
-        path: '/',
         element: <AppShell />,
         children: [
           { index: true, element: <DashboardPage /> },
@@ -32,4 +32,6 @@ export const router = createBrowserRouter([
   },
   { path: '/login', element: <AuthPage /> },
   { path: '/register', element: <AuthPage /> },
-]);
+];
+
+export const router = createBrowserRouter(routes);

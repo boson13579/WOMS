@@ -4,7 +4,7 @@
  * modal open state and schedule task IDs without prop-drilling.
  */
 import { ArrowDown, ArrowUp, ArrowUpDown, Calendar, Loader2, Pencil, Trash2 } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -17,7 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { useUsers } from '@/features/auth/api/users';
+import { useUsernames } from '@/features/dashboard/api/useUsernames';
 import { useCanSchedule, useCanWrite, useCurrentRole, useCurrentUserId } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 
@@ -116,13 +116,22 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
   const canSchedule = useCanSchedule();
   const role = useCurrentRole();
   const currentUserId = useCurrentUserId();
-  const users = useUsers();
+
+  const userIds = useMemo(() => {
+    if (!data) return [];
+    const ids = data.items
+      .flatMap((o) => [o.assigned_to, o.created_by])
+      .filter(Boolean) as string[];
+    return Array.from(new Set(ids));
+  }, [data]);
+  const { data: usernamesMap } = useUsernames(userIds);
 
   function userDisplay(userId: string | null): string {
     if (!userId) return '—';
-    const u = users.find((x) => x.id === userId);
-    if (!u) return '—';
-    return u.id === currentUserId ? '自己' : (u.email ?? u.username);
+    if (userId === currentUserId) return '自己';
+    const username = usernamesMap?.[userId];
+    if (username == null) return '—';
+    return username;
   }
 
   function canEditOrder(order: Order): boolean {

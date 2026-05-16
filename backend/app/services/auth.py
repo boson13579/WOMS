@@ -52,6 +52,12 @@ def register(db: Session, request: RegisterRequest) -> UserResponse:
             detail=f"Username '{request.username}' is already taken.",
         )
 
+    if user_repo.get_by_email(db, request.email) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Email '{request.email}' is already in use.",
+        )
+
     try:
         new_user = user_repo.create(
             db,
@@ -60,12 +66,18 @@ def register(db: Session, request: RegisterRequest) -> UserResponse:
             role=UserRole.viewer,
             email=request.email,
         )
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
+        orig = str(exc.orig).lower()
+        if "ix_users_email" in orig or "users_email" in orig:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Email '{request.email}' is already in use.",
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Username '{request.username}' is already taken.",
-        ) from None
+        ) from exc
     audit_log_repo.create(
         db,
         action="user.created",

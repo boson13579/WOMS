@@ -26,6 +26,7 @@ Three tasks live here:
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from datetime import UTC, date, datetime
@@ -55,15 +56,19 @@ from app.services.scheduling import (
     PENDING_OPS_KEY,
     STATE_KEY,
     STATUS_KEY,
-    ScheduleResult,
+    BatchOp,
     SchedulerState,
     SchedulingOrder,
-    add_order,
     advance_day,
+    apply_batch_to_capacity,
+    apply_batch_to_deadline,
+    compute_batch_capacity_delta,
     compute_schedule,
+    is_batch_feasible,
     pin_order,
+    pq_add,
+    pq_remove,
     rebuild_state,
-    remove_order,
     unpin_order,
 )
 from app.workers.celery_app import celery_app
@@ -148,6 +153,104 @@ _WAITER_FLAG_TTL_SECONDS = get_settings().SCHEDULER_WAITER_FLAG_TTL_SECONDS
 # ``SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS`` env vars.
 _RUN_WAIT_TIMEOUT_SECONDS = get_settings().SCHEDULER_RUN_WAIT_TIMEOUT_SECONDS
 _RUN_WAIT_POLL_INTERVAL_SECONDS = get_settings().SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Reject-rate adaptive cap for batch admission
+# ---------------------------------------------------------------------------
+#
+# ``_largest_halving_feasible_prefix`` halves from ``len(candidates)`` down to
+# the first feasible attempt. When the queue holds N=1000 compounds but the
+# very first compound is the only blocker, halving from 1000 wastes
+# ``log2(N)`` rounds of ``compute_batch_capacity_delta`` (each O(K+D)) on
+# prefixes that were doomed before we built their delta. The "look at the
+# first 1/p compounds" heuristic caps the candidate window at the EXPECTED
+# position of the next reject — so with p=0.01 (1 in 100 compounds rejected)
+# we never test prefixes larger than 100.
+#
+# p is updated per-compound via EWMA (alpha = 0.05 → roughly 20 events to fully
+# adapt) and persisted to Redis so the rate survives worker restarts and is
+# shared across worker replicas (last-writer-wins on concurrent updates;
+# acceptable noise for a tuning heuristic).
+COMPOUND_REJECT_RATE_KEY = "schedule:compound_reject_rate"
+_REJECT_RATE_INITIAL = 0.01
+# Floor: a worker that's seen only accepts would otherwise let p → 0 and
+# take = N (= no cap, same as pre-heuristic behavior). 1e-4 caps take at
+# 10_000 — well above any sane pending-queue depth, so still effectively
+# uncapped but bounded.
+_REJECT_RATE_MIN = 1e-4
+# Ceiling: prevents p > 1 from a buggy update path (would imply take < 1).
+_REJECT_RATE_MAX = 1.0
+# Smoothing factor. alpha small ⇒ p adapts slowly to recent events; alpha large ⇒
+# p over-reacts to one-off rejections. 0.05 gives ~20 events for full
+# adaptation, which is roughly the resolution we want (a sustained shift
+# in reject pattern is noticed within a couple of typical batches; an
+# isolated reject barely moves p).
+_REJECT_RATE_ALPHA = 0.05
+
+
+def _get_reject_rate() -> float:
+    """Read the EWMA reject rate from Redis; fall back to the initial prior.
+
+    Clamps to ``[MIN, MAX]`` defensively in case a corrupted value got into
+    the key (manual surgery, future schema change, etc.) — a wild p would
+    poison the take-count computation otherwise.
+    """
+    raw = cast("str | None", _get_redis().get(COMPOUND_REJECT_RATE_KEY))
+    if raw is None:
+        return _REJECT_RATE_INITIAL
+    try:
+        rate = float(raw)
+    except (ValueError, TypeError):
+        logger.warning("schedule.reject_rate.corrupted_value", raw=raw)
+        return _REJECT_RATE_INITIAL
+    return max(_REJECT_RATE_MIN, min(_REJECT_RATE_MAX, rate))
+
+
+def _update_reject_rate(*, accepted: int, rejected: int) -> None:
+    """Apply per-compound EWMA updates to the persisted reject rate.
+
+    Each accepted compound pulls p toward 0; each rejected compound pulls
+    p toward 1. We apply the updates sequentially (one EWMA step per
+    compound) rather than collapsing the batch into a single ratio — so
+    within a single call, the explicit order is **all accepts first, then
+    all rejects**. Different per-call shapes (one ``(a=N, r=M)`` vs two
+    consecutive ``(a=N, r=0)`` + ``(a=0, r=M)``) produce the SAME final p
+    because the inter-call concatenation preserves that accept-then-reject
+    ordering.
+
+    Note EWMA is NOT commutative across orderings in general — e.g.
+    ``(a=1)`` then ``(r=1)`` lands at a different p than ``(r=1)`` then
+    ``(a=1)``. Callers that care about exact final value must batch
+    observations in a single call; callers that just need "monotonic
+    drift in the right direction" can fire updates ad-hoc.
+
+    Concurrent writes (multiple workers) race on the SET — last-writer-wins.
+    Acceptable for a tuning heuristic: convergence is slower but still
+    monotonic in the expected direction.
+    """
+    if accepted == 0 and rejected == 0:
+        return
+    rate = _get_reject_rate()
+    # Each accepted observation: target = 0
+    for _ in range(accepted):
+        rate = (1 - _REJECT_RATE_ALPHA) * rate
+    # Each rejected observation: target = 1
+    for _ in range(rejected):
+        rate = _REJECT_RATE_ALPHA + (1 - _REJECT_RATE_ALPHA) * rate
+    rate = max(_REJECT_RATE_MIN, min(_REJECT_RATE_MAX, rate))
+    _get_redis().set(COMPOUND_REJECT_RATE_KEY, repr(rate))
+
+
+def _take_count_from_rate(pending_count: int, rate: float) -> int:
+    """How many leading pending compounds to consider in this iteration.
+
+    ``take = min(pending_count, ceil(1/p))``. Floored at 1 so we always
+    look at at least the head of the queue (otherwise an unstable p that
+    momentarily exceeded 1 would freeze the drain).
+    """
+    cap = max(1, math.ceil(1.0 / rate))
+    return min(pending_count, cap)
 
 
 # ---------------------------------------------------------------------------
@@ -302,59 +405,120 @@ def _is_waiter_pending() -> bool:
     return _get_redis().get(WAITER_FLAG_KEY) is not None
 
 
-def _pop_next_compound() -> dict[str, Any] | None:
-    """Pop the highest-priority pending compound, or ``None`` if empty.
+def _read_pending_compounds(*, limit: int | None = None) -> list[tuple[str, dict[str, Any]]]:
+    """Read every pending compound in priority order WITHOUT popping.
 
-    Priority: shrink-group compounds before grow-group, FIFO within each
-    group. Both invariants are encoded in the sorted-set score by the
-    producer (``score_for_op``), so this function is just an atomic
-    ``ZPOPMIN`` — O(log n) regardless of queue depth.
+    Returns ``[(raw_member, parsed_dict), ...]`` sorted ascending by
+    sorted-set score (= shrink-group first, then grow; FIFO within each
+    group). The raw member string is preserved so the caller can
+    ``ZREM`` exactly that member after batch acceptance / single-
+    compound rejection — necessary because ``ZRANGE`` only reads.
 
-    Each sorted-set member is a JSON-serialized
-    :class:`ScheduleCompoundRequest` (with ``_seq`` added by
-    ``schedule_queue.enqueue_compound``). Worker processes the compound's
-    ops atomically; a freshly-arrived shrink compound CANNOT interrupt
-    a compound currently being processed — that's the atomicity guarantee
-    that supersedes the per-op "shrink jumps grow" mid-run behavior.
+    Why not ``ZPOPMIN``: the batch admission path needs to inspect a
+    candidate prefix and possibly reject it (binary-search halving) WITHOUT
+    losing the compounds we decided not to accept yet. Popping each
+    compound, deciding feasibility, then re-adding rejected ones would
+    burn O(N) ZADD ops per round and would also reset FIFO ordering for
+    re-added members (their score reflects original seq, not re-add seq —
+    but ``ZADD`` semantics on same member overwrite, so the queue position
+    is preserved; the real cost is the unnecessary round-trips). Read-
+    only inspection + targeted ``ZREM`` post-commit is the cleaner shape.
 
-    Malformed JSON entries (shouldn't happen given the schema-validated
-    producer, but Redis itself doesn't enforce content) are NOT silently
-    discarded — that previous behavior could leave an order's
-    ``is_processing_locked=True`` forever, because once ``ZPOPMIN``
-    removed the member from the queue there was no way to reach the
-    affected ``order_id`` or ``requested_by`` and the row would
-    spin forever. Per P1-5 review: corrupted members are RPUSHed to
-    ``schedule:pending_ops:dlq`` and ERROR-logged so ops can inspect
-    them and recover manually. The loop then continues until a valid
-    compound or an empty queue.
+    Malformed JSON entries are drained to ``PENDING_OPS_DLQ_KEY`` and
+    ``ZREM``'d here so the batch path's binary search doesn't have to
+    skip them mid-decision. Same forensic-preservation rationale as the
+    old ``_pop_next_compound``: ZADD already removed the member's
+    placement information when we ZREM it here, but the raw bytes go
+    onto a List so ops can recover the affected ``order_id`` /
+    ``requested_by`` manually.
+
+    ``limit`` (optional): cap the ZRANGE read at the first ``limit``
+    members. The drain loop only ever inspects ``pending[:take]`` where
+    ``take ≤ ceil(1/p)``, so reading the whole queue is wasted O(N)
+    bandwidth per drain iteration (and O(N²) across a long drain). Set
+    ``limit`` to the reject-rate cap to bound traffic to what we'll
+    actually use; ``None`` (= legacy) reads everything. Any entries past
+    ``limit`` stay in pending and get picked up on the next iteration.
+    A DLQ drain mid-window can reduce the returned count below
+    ``limit`` — that's OK, the next iteration re-reads.
     """
     rds = _get_redis()
-    while True:
-        result = cast("list[tuple[str, float]]", rds.zpopmin(PENDING_OPS_KEY, 1))
-        if not result:
-            return None
-        member, _score = result[0]
+    end_idx = -1 if limit is None else max(0, limit - 1)
+    members = cast(
+        "list[tuple[str, float]]",
+        rds.zrange(PENDING_OPS_KEY, 0, end_idx, withscores=True),
+    )
+    parsed: list[tuple[str, dict[str, Any]]] = []
+    for member, _score in members:
         try:
-            return cast("dict[str, Any]", json.loads(member))
+            payload = cast("dict[str, Any]", json.loads(member))
         except json.JSONDecodeError:
-            # Persist the raw member to the DLQ so the lost work is
-            # diagnosable; ZPOPMIN already removed it from pending_ops.
-            try:
-                rds.rpush(PENDING_OPS_DLQ_KEY, member)
-            except Exception as exc:
-                logger.error(
-                    "schedule.pending_compound.dlq_push_failed",
-                    raw=member,
-                    score=_score,
-                    error=str(exc),
-                )
-            logger.error(
-                "schedule.pending_compound.malformed_drained_to_dlq",
-                raw=member,
+            # Drain to DLQ + ZREM the malformed entry so it doesn't
+            # block batch admission on the next read.
+            _drain_corrupted_to_dlq(
+                rds,
+                member,
+                reason="malformed_json",
                 score=_score,
-                dlq_key=PENDING_OPS_DLQ_KEY,
             )
-            # Discarded by ZPOPMIN already; loop to try the next one.
+            continue
+        # Defensive: payload self-declares its op count. A mismatch means the
+        # member was tampered with post-enqueue (manual surgery, partial
+        # write, bit flip) — we have no idea what's actually in the ops list,
+        # so drain it to DLQ rather than admit a half-truncated business
+        # action. Schema validation at producer time already enforces the
+        # count, so this branch should never fire in practice.
+        declared_op_count = payload.get("op_count")
+        actual_ops = payload.get("ops") or []
+        if declared_op_count is not None and declared_op_count != len(actual_ops):
+            _drain_corrupted_to_dlq(
+                rds,
+                member,
+                reason="op_count_mismatch",
+                score=_score,
+                declared=declared_op_count,
+                actual=len(actual_ops),
+            )
+            continue
+        parsed.append((member, payload))
+    return parsed
+
+
+def _drain_corrupted_to_dlq(
+    rds: Redis,
+    member: str,
+    *,
+    reason: str,
+    score: float,
+    **extras: Any,
+) -> None:
+    """ZREM a corrupted pending member + RPUSH onto DLQ + ERROR log.
+
+    Shared between the JSON-decode failure path and the op_count-mismatch
+    guard inside ``_read_pending_compounds``. Catches Redis errors during
+    the drain itself so we don't crash the whole task on a transient
+    network blip — the corrupted member stays in pending and gets retried
+    on the next read; the ERROR log surfaces the situation to ops.
+    """
+    try:
+        rds.zrem(PENDING_OPS_KEY, member)
+        rds.rpush(PENDING_OPS_DLQ_KEY, member)
+    except Exception as exc:
+        logger.error(
+            "schedule.pending_compound.dlq_drain_failed",
+            raw=member,
+            reason=reason,
+            error=str(exc),
+        )
+        return
+    logger.error(
+        "schedule.pending_compound.corrupted_drained_to_dlq",
+        raw=member,
+        reason=reason,
+        score=score,
+        dlq_key=PENDING_OPS_DLQ_KEY,
+        **extras,
+    )
 
 
 def _op_to_scheduling_order(op: dict[str, Any]) -> SchedulingOrder:
@@ -368,215 +532,310 @@ def _op_to_scheduling_order(op: dict[str, Any]) -> SchedulingOrder:
 
 
 # ---------------------------------------------------------------------------
-# Compound application
+# Batch admission — read pending → binary search feasible prefix → commit
 # ---------------------------------------------------------------------------
+#
+# Pre-rewrite: ``run_scheduling_task`` popped ONE compound, took a
+# ``SchedulerState`` snapshot, applied each leaf op via single-order
+# ``add_order`` / ``remove_order`` (with O(D log D) tree backward-fill per
+# op), and rolled back the snapshot on any per-op failure (saga). For a
+# burst of N compounds that's N task invocations + N snapshots + N*K
+# per-op tree operations.
+#
+# This rewrite reads the WHOLE pending queue in priority order, binary-
+# searches the largest feasible prefix ``[1..k]`` of compounds (halving
+# from N until the first prefix passes ``is_batch_feasible``), then
+# applies the whole batch in a single pair of tree updates (``apply_batch_
+# to_capacity`` + ``apply_batch_to_deadline``) followed by per-compound
+# pq + pin/unpin + DB + WebSocket. After a batch commits, the loop re-
+# reads pending (which may have grown via concurrent enqueues) and
+# searches again. First-compound infeasibility (``k=0``) drops only that
+# compound and notifies ``compound_failed``.
+#
+# Saga rollback is intentionally gone: ``is_batch_feasible`` is checked
+# BEFORE any tree mutation, so an accepted batch never partially fails.
+# Pin/unpin's ``capacity_exceeded`` branch is treated as a producer-side
+# admission bug (defensive warning log), not as a compound failure.
 
 
-def _apply_op(state: SchedulerState, op: dict[str, Any]) -> ScheduleResult:
-    """Dispatch a single leaf op to the appropriate algorithm entrypoint.
+def _extract_batch_ops(compounds: list[dict[str, Any]]) -> list[BatchOp]:
+    """Project add/remove leaf ops across a batch of compounds into ``BatchOp``s.
 
-    Returns the ``ScheduleResult`` directly so the compound driver can
-    detect failure and trigger snapshot rollback. Malformed ops (unknown
-    ``op`` field, missing required keys) come back as ``capacity_exceeded``
-    with a clear message — same failure path as a legitimate algorithm
-    rejection, so the caller's rollback / WS code doesn't need to special-
-    case them.
+    Pin/unpin leaf ops are intentionally skipped — by design they do not
+    contribute to the per-day capacity delta table (producer-side admission
+    control vets fake_deadline feasibility before enqueueing). Their
+    capacity-tree swap (real→fake or fake→real) is applied per-compound
+    inside ``_apply_compound_leaf_structural`` via the existing
+    ``pin_order`` / ``unpin_order`` helpers, which are self-contained.
     """
-    op_type = op.get("op")
-    if op_type == "remove":
-        return remove_order(state, _op_to_scheduling_order(op))
-    if op_type == "add":
-        return add_order(state, _op_to_scheduling_order(op))
-    if op_type == "pin":
-        fake_raw = op.get("fake_deadline")
-        if fake_raw is None:
-            # Schema layer should have rejected this at enqueue time; if it
-            # still gets here the payload is malformed.
-            return ScheduleResult(
-                status="capacity_exceeded",
-                order_id=uuid.UUID(op["order_id"]),
-                message="op='pin' is missing fake_deadline.",
+    ops: list[BatchOp] = []
+    for compound in compounds:
+        for leaf in compound.get("ops", []):
+            kind = leaf.get("op")
+            if kind not in ("add", "remove"):
+                continue
+            ops.append(
+                BatchOp(
+                    kind=kind,
+                    wafer_quantity=int(leaf["wafer_quantity"]),
+                    deadline=date.fromisoformat(leaf["deadline"]),
+                )
             )
-        return pin_order(
+    return ops
+
+
+def _largest_halving_feasible_prefix(
+    state: SchedulerState,
+    compounds: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Halving probe for the largest feasible compound prefix.
+
+    Sequence (per user spec, ``N = len(compounds)``):
+
+      attempt = N, N//2, N//4, ..., 1, then exit ⇒ 0
+
+    The first attempt size whose ``[1..attempt]`` projection passes
+    ``is_batch_feasible`` is returned. This is NOT a true binary search
+    for the MAXIMUM feasible prefix — for ``N=3`` with feasibility
+    pattern ``[1..1] OK, [1..2] OK, [1..3] FAIL`` we test ``[1..3]``
+    (fail) then ``[1..1]`` (pass) and accept only 1 compound, even
+    though 2 would have fit. The remaining compound(s) are picked up
+    on the next outer-loop iteration (with possibly new arrivals).
+
+    True binary search would find the optimal k in the same O(log N)
+    probes but requires prefix-feasibility monotonicity, which mixed-sign
+    grow-group compounds (qty-smaller + deadline-earlier) can break.
+    Halving stays safe under broken monotonicity at the cost of accepting
+    a possibly-suboptimal k.
+
+    Returns ``(k, attempts_tried)``:
+      - ``k = 0`` when even ``[1..1]`` is infeasible — caller treats
+        that as "drop and reject the first compound", the only way out
+        of a queue head that cannot fit.
+      - ``attempts_tried`` is the number of halving rounds executed;
+        ``attempts_tried - k`` is the count of probes that failed before
+        the successful one (or all of them, when ``k == 0``). The reject-
+        rate EWMA uses ``attempts_tried - k`` as a "this many prefix
+        sizes were rejected" signal to bias the next iteration's cap.
+
+    Complexity: O(log N · (K + D)) where K is total ops in the attempted
+    prefix and D is HORIZON_DAYS. Each halving rebuilds the delta from
+    scratch — could be incrementalized (re-use prefix delta and subtract
+    the dropped tail) but the constant factor is small and halving
+    converges quickly.
+    """
+    base_date = state.base_date
+    attempt = len(compounds)
+    attempts_tried = 0
+    while attempt > 0:
+        prefix = compounds[:attempt]
+        batch_ops = _extract_batch_ops(prefix)
+        delta = compute_batch_capacity_delta(batch_ops, base_date)
+        attempts_tried += 1
+        if is_batch_feasible(state, delta):
+            return attempt, attempts_tried
+        attempt //= 2
+    return 0, attempts_tried
+
+
+def _apply_compound_leaf_structural(
+    state: SchedulerState,
+    leaf: dict[str, Any],
+) -> None:
+    """Mutate ``pq`` / ``pinned_orders`` for one leaf op, post-batch-tree-update.
+
+    Contract: caller MUST have already applied ``apply_batch_to_capacity``
+    + ``apply_batch_to_deadline`` for the batch containing this leaf —
+    so for ``add`` / ``remove`` the tree side is already done and this
+    function only touches pq. For ``pin`` / ``unpin`` the trees still
+    need a swap (the batch delta excludes pin/unpin by design); the
+    existing ``pin_order`` / ``unpin_order`` do their own self-contained
+    swap so we just delegate.
+
+    Failure handling: ``pin`` / ``unpin`` failures (``deadline_too_far``
+    / ``capacity_exceeded``) should not happen if the producer's
+    admission control is correct. We log a warning rather than raise
+    because (a) the batch tree updates have already committed and we
+    can't easily roll them back, and (b) the worst case is one pin
+    didn't take effect — the order is still in pq at real deadline,
+    materializer will write DB consistently with that, and ops can
+    notice via the warning log.
+    """
+    kind = leaf.get("op")
+    if kind == "add":
+        pq_add(state, _op_to_scheduling_order(leaf))
+        return
+    if kind == "remove":
+        pq_remove(state, uuid.UUID(leaf["order_id"]))
+        return
+    if kind == "pin":
+        fake_raw = leaf.get("fake_deadline")
+        if fake_raw is None:
+            logger.error(
+                "schedule.batch.pin_missing_fake_deadline",
+                order_id=leaf.get("order_id"),
+            )
+            return
+        result = pin_order(
             state,
-            _op_to_scheduling_order(op),
+            _op_to_scheduling_order(leaf),
             date.fromisoformat(fake_raw),
         )
-    if op_type == "unpin":
-        return unpin_order(state, uuid.UUID(op["order_id"]))
-    # Unknown op_type — surface as a structured failure.
-    logger.warning("schedule.compound.unknown_op", op=op_type)
-    return ScheduleResult(
-        status="capacity_exceeded",
-        order_id=uuid.UUID(op["order_id"]) if op.get("order_id") else None,
-        message=f"unknown op kind: {op_type!r}",
-    )
+        if result.status != "success":
+            logger.warning(
+                "schedule.batch.pin_unexpected_failure",
+                order_id=leaf.get("order_id"),
+                status=result.status,
+                message=result.message,
+            )
+        return
+    if kind == "unpin":
+        result = unpin_order(state, uuid.UUID(leaf["order_id"]))
+        if result.status != "success":
+            logger.warning(
+                "schedule.batch.unpin_unexpected_failure",
+                order_id=leaf.get("order_id"),
+                status=result.status,
+                message=result.message,
+            )
+        return
+    logger.warning("schedule.batch.unknown_op", op=kind)
 
 
-def _notify_compound_failure(
-    *,
-    compound: dict[str, Any],
-    failed_op_index: int,
-    failed_op: dict[str, Any],
-    result: ScheduleResult,
-) -> None:
-    """Log + WS-notify a failed compound (post-rollback).
+def _notify_compound_accepted(compound: dict[str, Any]) -> None:
+    """WS notify + materializer notify-pending SADD for one accepted compound.
 
-    Envelope shape matches :class:`ScheduleCompoundFailedDetail` in
-    ``app.schemas.schedule`` so the frontend has a structured contract.
-    Only emits ``notify_user`` if ``requested_by`` is present on the
-    compound — internal-only compounds (no human originator) get logged
-    but not pushed to any WS recipient.
+    Same envelope shape as the old per-compound success path so frontend
+    contracts are preserved (``schedule.compound_accepted``). The SADD
+    into ``materialize_notify_pending`` is what makes the slow-path
+    materializer eventually emit ``schedule.materialized`` once DB rows
+    catch up.
     """
+    requested_by = compound.get("requested_by")
+    if not requested_by:
+        return
+    user_id = uuid.UUID(requested_by)
+    websocket.notify_user(
+        user_id=user_id,
+        message={
+            "type": "schedule.compound_accepted",
+            "compound_id": str(compound.get("compound_id")),
+        },
+    )
+    enqueue_notify_user(user_id)
+
+
+def _notify_compound_batch_rejected(compound: dict[str, Any]) -> None:
+    """WS notify a compound that was rejected by single-compound infeasibility.
+
+    Fired when ``_largest_halving_feasible_prefix`` returns 0 — even the
+    first compound alone cannot fit current capacity. Envelope mirrors
+    the pre-rewrite ``_notify_compound_failure`` so frontends see the
+    same ``schedule.compound_failed`` shape; ``failed_op_index=0`` and
+    ``rolled_back=True`` because no part of the compound was applied.
+    """
+    ops = compound.get("ops") or []
+    first_op = ops[0] if ops else {}
     logger.warning(
-        "schedule.compound.failed",
+        "schedule.compound.batch_rejected",
         compound_id=compound.get("compound_id"),
-        failed_op_index=failed_op_index,
-        failed_op=failed_op.get("op"),
-        status=result.status,
-        message=result.message,
+        first_op=first_op.get("op"),
     )
     requested_by = compound.get("requested_by")
     if not requested_by:
         return
+    order_id_raw = first_op.get("order_id")
     websocket.notify_user(
         user_id=uuid.UUID(requested_by),
         message={
             "type": "schedule.compound_failed",
             "compound_id": str(compound.get("compound_id")),
-            "failed_op_index": failed_op_index,
-            "failed_op": failed_op.get("op"),
-            "order_id": str(failed_op.get("order_id")),
-            "order_number": failed_op.get("order_number"),
-            "reason": result.status,
-            "detail": result.message,
+            "failed_op_index": 0,
+            "failed_op": first_op.get("op"),
+            "order_id": str(order_id_raw) if order_id_raw else None,
+            "order_number": first_op.get("order_number"),
+            "reason": "capacity_exceeded",
+            "detail": "Batch admission could not fit this compound.",
             "rolled_back": True,
         },
     )
 
 
-def _restore_state_in_place(state: SchedulerState, snapshot_json: str) -> None:
-    """Mutate *state* in-place to match the JSON snapshot.
-
-    Used by the compound driver to roll back to pre-compound state on any
-    leaf-op failure. We can't simply ``state = SchedulerState.from_json(...)``
-    because that just rebinds the local name; callers hold a reference and
-    expect the same object's internals to be updated.
-    """
-    restored = SchedulerState.from_json(snapshot_json)
-    state.capacity_tree = restored.capacity_tree
-    state.deadline_tree = restored.deadline_tree
-    state.priority_queue = restored.priority_queue
-    state.pinned_orders = restored.pinned_orders
-    state.base_date = restored.base_date
-
-
-def _process_compound(
+def _commit_accepted_batch(
     state: SchedulerState,
-    compound: dict[str, Any],
-) -> bool:
-    """Apply a compound's ops in order, with snapshot-based saga rollback.
+    accepted: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Commit a feasible batch end-to-end: trees → pq → ZREM → DB → WS.
 
-    Steps:
+    Pipeline:
 
-    1. Take a JSON snapshot of *state* (cheap — segment trees serialize as
-       small int arrays).
-    2. Iterate ops in order. Each calls into the appropriate algorithm
-       function (``add_order`` / ``remove_order`` / ``pin_order`` /
-       ``unpin_order``) and returns a :class:`ScheduleResult`.
-    3. **Any single leaf op returning non-success** → restore state from
-       the snapshot, emit ``schedule.compound_failed``, return ``False``.
-       No partial mutation is observable past this function's return.
-    4. All ops succeed → return ``True``. Caller will then ``_finalize_run``
-       to compute + persist + broadcast.
+    1. Build the batch delta from add/remove ops in all accepted compounds
+       and apply it ONCE to both segment trees (``apply_batch_to_capacity``
+       with carry-back distribution, ``apply_batch_to_deadline`` direct).
+       This is the single optimization that makes batched admission cheaper
+       than per-compound: tree mutations collapse from K per batch to 2
+       per batch.
+    2. Per-compound, leaf-by-leaf: ``_apply_compound_leaf_structural``
+       updates pq / pinned_orders only (or delegates to pin_order /
+       unpin_order for swaps).
+    3. ``ZREM`` all accepted members from the pending queue (one round-trip).
+    4. ``_save_state`` once for the whole batch.
+    5. Per-compound: drop secondary-index entry, run db_action, notify_user.
 
-    The whole compound is treated as one atomic unit; ``schedule:status``
-    stays ``running`` for the entire span (set by the caller before this
-    function is invoked, cleared after). That's the key invariant that lets
-    ``advance_day`` / ``rebuild`` no longer slip into the middle of a
-    compound — a problem the previous per-op design had.
+    State save is deliberately AFTER tree+pq commit but BEFORE per-
+    compound DB / WS so a crash between save and DB leaves the queue
+    drained and state advanced (no double-apply on restart) — at worst
+    a few users miss the immediate WS ack and pick it up on the next
+    state refresh.
     """
-    snapshot = state.to_json()
-    ops: list[dict[str, Any]] = compound.get("ops", [])
+    rds = _get_redis()
 
-    # Tamper / truncation guard: payload self-declares its op count.
-    # Schema validation at enqueue time already enforced this, but the
-    # Redis member could in principle be corrupted post-enqueue (manual
-    # surgery, partial write, etc.). A mismatch here means we have no
-    # idea what we're processing — fail the whole compound up front
-    # rather than execute a half-truncated business action.
-    declared_op_count = compound.get("op_count")
-    if declared_op_count is not None and declared_op_count != len(ops):
-        logger.warning(
-            "schedule.compound.op_count_mismatch",
-            compound_id=compound.get("compound_id"),
-            declared=declared_op_count,
-            actual=len(ops),
-        )
-        sentinel_op = {
-            "op": ops[0]["op"] if ops else "add",
-            "order_id": ops[0]["order_id"] if ops else None,
-            "order_number": ops[0].get("order_number", "") if ops else "",
-        }
-        _notify_compound_failure(
-            compound=compound,
-            failed_op_index=-1,
-            failed_op=sentinel_op,
-            result=ScheduleResult(
-                status="capacity_exceeded",
-                message=(
-                    f"Compound payload corrupted: op_count={declared_op_count} "
-                    f"but ops list has {len(ops)} entries."
-                ),
-            ),
-        )
-        return False
+    batch_ops = _extract_batch_ops([compound for _, compound in accepted])
+    delta = compute_batch_capacity_delta(batch_ops, state.base_date)
+    apply_batch_to_capacity(state, delta)
+    apply_batch_to_deadline(state, delta)
 
-    for i, op in enumerate(ops):
-        try:
-            result = _apply_op(state, op)
-        except RuntimeError as exc:
-            # P2-5: a leaf op raised on a segment-tree invariant break
-            # (e.g. _apply_remove_to_trees residual > 0). State is already
-            # mid-mutation; restore from snapshot to keep the compound's
-            # atomicity guarantee, then surface as a normal compound
-            # failure so the requester gets ``compound_failed`` over WS
-            # and the run_task's accept-path doesn't run.
-            logger.error(
-                "schedule.compound.invariant_break",
-                compound_id=compound.get("compound_id"),
-                failed_op_index=i,
-                failed_op=op.get("op"),
-                error=str(exc),
-            )
-            _restore_state_in_place(state, snapshot)
-            _notify_compound_failure(
-                compound=compound,
-                failed_op_index=i,
-                failed_op=op,
-                result=ScheduleResult(
-                    status="capacity_exceeded",
-                    order_id=uuid.UUID(op["order_id"]) if op.get("order_id") else None,
-                    message=f"Segment-tree invariant broken during {op.get('op')}: {exc}",
-                ),
-            )
-            return False
-        if result.status != "success":
-            _restore_state_in_place(state, snapshot)
-            _notify_compound_failure(
-                compound=compound,
-                failed_op_index=i,
-                failed_op=op,
-                result=result,
-            )
-            return False
+    for _, compound in accepted:
+        for leaf in compound.get("ops", []):
+            _apply_compound_leaf_structural(state, leaf)
+
+    members = [member for member, _ in accepted]
+    if members:
+        rds.zrem(PENDING_OPS_KEY, *members)
+
+    _save_state(state)
+
+    for _, compound in accepted:
+        _drop_compound_index_entry(compound.get("compound_id"))
+        _perform_compound_db_action(compound, accepted=True)
+        _notify_compound_accepted(compound)
 
     logger.info(
-        "schedule.compound.success",
-        compound_id=compound.get("compound_id"),
-        op_count=len(ops),
+        "schedule.batch.committed",
+        compound_count=len(accepted),
+        total_ops=sum(len(c.get("ops", [])) for _, c in accepted),
     )
-    return True
+
+
+def _reject_first_compound(member: str, compound: dict[str, Any]) -> None:
+    """Drop the head compound when even ``[1..1]`` is infeasible.
+
+    No tree / pq mutation: the binary search detected infeasibility
+    BEFORE any state was touched, so rejection is a pure
+    queue-and-compensate operation:
+
+    1. ``ZREM`` the member from pending_ops.
+    2. Drop the secondary-index entry (best-effort).
+    3. Run ``_perform_compound_db_action(accepted=False)`` so the
+       producer's ``is_processing_locked=True`` flag is cleared and any
+       pre-created orphan rows are soft-deleted.
+    4. WS-notify ``compound_failed`` to the requester.
+    """
+    rds = _get_redis()
+    rds.zrem(PENDING_OPS_KEY, member)
+    _drop_compound_index_entry(compound.get("compound_id"))
+    _perform_compound_db_action(compound, accepted=False)
+    _notify_compound_batch_rejected(compound)
 
 
 def _drop_compound_index_entry(compound_id: str | None) -> None:
@@ -890,61 +1149,65 @@ def _finalize_run(state: SchedulerState) -> int:
 
 
 @celery_app.task(bind=True, name="scheduling.run")  # type: ignore[untyped-decorator]
-def run_scheduling_task(self: Task) -> None:
-    """Process **one compound** end-to-end, then re-fire if more queued.
+def run_scheduling_task(self: Task) -> None:  # noqa: PLR0915 — orchestration function: long but linear, extracting helpers hurts readability
+    """Drain the pending queue via batch admission, then flip back to idle.
 
-    **Phase 4 fast/slow split**: this task is the fast path. It does the
-    in-memory state mutation (O(log n)·N per compound thanks to
-    SortedKeyList + pq_index) plus the small ``_save_state`` to Redis,
-    then immediately emits ``schedule.compound_accepted`` so the producer
-    knows their compound was accepted. **It does NOT run
-    ``compute_schedule`` / ``apply_schedule`` / DB writes** — those are
-    offloaded to ``materialize_schedule_task`` which self-coalesces so
-    bursts of compounds collapse into one DB rewrite. The user spec calls
-    out the goal: accept/reject feedback in O(log n)·N instead of being
-    gated on N DB round-trips per compound.
+    **Phase 4 fast/slow split** still applies: this task is the fast path,
+    doing in-memory state mutation + ``_save_state`` to Redis + WS
+    ``compound_accepted`` per accepted compound; DB rewrites are
+    offloaded to ``materialize_schedule_task`` which self-coalesces.
+
+    **Batch admission (rewrite, supersedes the per-compound design)**:
 
     Each task invocation:
 
-    1. Sets ``schedule:status`` to ``running``.
-    2. ``ZPOPMIN``s the highest-priority compound (shrink-group compounds
-       sort before grow, FIFO within each group). If the queue is empty,
-       sets status back to ``idle`` and returns — no state change, no
-       notify.
-    3. Otherwise: applies the compound atomically via ``_process_compound``
-       (saga rollback on any leaf-op failure). On success:
-       ``_save_state`` to Redis, ``notify_user(schedule.compound_accepted)``
-       to ``requested_by``, ``enqueue_notify_user`` for the deferred
-       materializer to notify post-DB-write, and
-       ``materialize_schedule_task.delay()``. On failure, state is rolled
-       back, ``schedule.compound_failed`` is notified inside
-       ``_process_compound`` — no state save, no materialize trigger.
-    4. Flips status back to ``idle``.
-    5. If more compounds are still pending, ``self.delay()`` to fire another
-       invocation (unless a waiter has set the ``schedule:waiter_pending``
-       flag, in which case yield to the waiter).
+    1. Acquire ``schedule:state_writer_lock`` (single-flight). If held,
+       silently skip — the holder will pick up our work on its drain loop.
+    2. Set ``schedule:status`` to ``running``.
+    3. **Drain loop** — repeat until the pending queue is empty:
+       a. Read all pending compounds in priority order
+          (``_read_pending_compounds``, ZRANGE without popping).
+       b. Halving search for the largest feasible prefix
+          (``_largest_halving_feasible_prefix``: tries ``[1..N]``,
+          ``[1..N//2]``, ``[1..N//4]``, ..., ``[1..1]``).
+       c. If the largest feasible attempt is **0** (even the first
+          compound alone is infeasible), drop just that compound via
+          ``_reject_first_compound`` and continue the drain loop.
+       d. Otherwise commit the accepted prefix in one shot via
+          ``_commit_accepted_batch`` (batch tree updates + per-compound
+          pq/pin + ZREM + save + DB + WS), then continue.
+    4. After draining, dispatch one ``materialize_schedule_task`` so
+       fresh ``daily_breakdown`` / ``scheduled_production_date`` rows
+       reflect the accepted state.
+    5. Flip status to ``idle``.
+    6. If new compounds arrived during step 4-5, re-trigger (unless a
+       waiter has the flag set, in which case yield to it).
 
-    **Compound atomicity invariant** (replaces the old per-op invariant):
-    ``schedule:status`` stays ``running`` for the entire compound — every
-    leaf op inside the compound runs without ``advance_day`` /
-    ``rebuild_schedule`` getting a chance to slip in. The trade-off vs.
-    per-op design: a long compound holds the lock longer, but the
-    correctness benefit (no cross-action interleaving in trees) outweighs
-    that.
+    **Why drain in one task rather than re-fire per batch**: each batch
+    commit already touches Redis (ZREM + SAVE + per-compound HDEL), the
+    Celery dispatch overhead would dominate. The drain loop bounds tail
+    latency only by the queue depth itself; under a sustained
+    enqueue-faster-than-drain workload the lock holder eventually
+    re-triggers anyway via step 6.
 
-    On any exception (not a leaf-op failure — those are caught and turn
-    into rollback — but a genuine Python exception like a Redis outage)
-    the status is flipped to ``failed`` and re-raised so Celery records
-    the traceback. ``failed`` doesn't block subsequent ``/trigger`` calls
-    because the 409 logic only checks ``running``.
+    **No saga / rollback**: ``is_batch_feasible`` is checked BEFORE any
+    tree mutation. An accepted batch is committed as a single atomic
+    unit at the segment-tree level; pin/unpin failures in the structural
+    pass are logged but not propagated (defensive — producer admission
+    control vets fake_deadline upstream).
+
+    Exception handling unchanged: any Python exception flips status to
+    ``failed`` and re-raises so Celery records the traceback;
+    ``schedule:status="failed"`` does NOT block ``/trigger`` calls
+    because the 409 path only checks ``running``.
     """
     started_at = datetime.now(tz=UTC).isoformat()
     task_id = str(self.request.id) if self.request.id else None
     lock_holder_id = task_id or f"run-{uuid.uuid4()}"
 
     # P0-2: only one task at a time may mutate ``schedule:state``. If the
-    # lock is held, the holder will pick up our compound on its self-
-    # retrigger — silently skip without touching status.
+    # lock is held, the holder will pick up our compound on its drain
+    # loop or self-retrigger — silently skip without touching status.
     if not _try_acquire_state_lock(lock_holder_id):
         logger.info("schedule.run.skip_lock_held", task_id=task_id)
         return
@@ -953,69 +1216,60 @@ def run_scheduling_task(self: Task) -> None:
     logger.info("schedule.run.start", task_id=task_id)
 
     try:
-        compound = _pop_next_compound()
+        any_batch_committed = False
+        any_compound_rejected = False
 
-        if compound is None:
-            # Empty queue — flip back to idle without touching state.
-            finished_at = datetime.now(tz=UTC).isoformat()
-            _set_status(
-                state=_STATUS_IDLE,
-                started_at=started_at,
-                finished_at=finished_at,
-                task_id=task_id,
-            )
-            logger.info("schedule.run.empty_queue", task_id=task_id)
-            return
+        while True:
+            # Reject-rate adaptive cap: only consider the first ``ceil(1/p)``
+            # candidates for halving. With p tracking the per-compound
+            # reject rate, this is the expected position of the next reject,
+            # so prefixes beyond it are unlikely to be feasible anyway —
+            # skipping them avoids paying ``compute_batch_capacity_delta``
+            # on doomed candidates. ``_update_reject_rate`` keeps p current
+            # below, so the cap auto-adapts to the workload. Reading p
+            # BEFORE the pending fetch lets us bound the ZRANGE itself to
+            # ``ceil(1/p)`` entries — saves O(N) bandwidth on long queues.
+            rate = _get_reject_rate()
+            read_cap = _take_count_from_rate(pending_count=10**9, rate=rate)
+            pending = _read_pending_compounds(limit=read_cap)
+            if not pending:
+                break
 
-        # Best-effort secondary-index cleanup BEFORE applying — the compound
-        # is no longer cancellable now that we've popped it.
-        _drop_compound_index_entry(compound.get("compound_id"))
+            state = _load_state()
+            take = _take_count_from_rate(len(pending), rate)
+            candidates = pending[:take]
 
-        state = _load_state()
-        applied = _process_compound(state, compound)
+            k, attempts_tried = _largest_halving_feasible_prefix(state, [c for _, c in candidates])
+            # Halving rounds that failed before the successful one (or all
+            # rounds, if k == 0) feed the EWMA as "this many prefix sizes
+            # were rejected" — so the cap moves up when halving had to
+            # retreat repeatedly, even if some compounds ended up accepted.
+            halving_misses = max(0, attempts_tried - (1 if k > 0 else 0))
 
-        if applied:
-            # Fast-path success: persist state to Redis (O(n) serialize, but
-            # tiny in absolute terms — just int arrays + small pq dump) and
-            # notify the requester *immediately* that the compound was
-            # accepted. The heavy compute_schedule + apply_schedule + DB
-            # write is offloaded to ``materialize_schedule_task``; this is
-            # what keeps the producer's accept/reject feedback O(log n)·N
-            # instead of being gated on N DB round-trips per compound.
-            _save_state(state)
-            # P1-2: producer deferred the user-facing DB columns to us.
-            # Apply them now that state has actually accepted the compound.
-            _perform_compound_db_action(compound, accepted=True)
-            requested_by_raw = compound.get("requested_by")
-            if requested_by_raw:
-                websocket.notify_user(
-                    user_id=uuid.UUID(requested_by_raw),
-                    message={
-                        "type": "schedule.compound_accepted",
-                        "compound_id": str(compound.get("compound_id")),
-                    },
-                )
-                # Defer DB materialization + per-user refetch notify.
-                enqueue_notify_user(uuid.UUID(requested_by_raw))
+            if k == 0:
+                first_member, first_compound = pending[0]
+                _reject_first_compound(first_member, first_compound)
+                # Count the dropped head as one real rejection; halving_misses
+                # are extra hint pressure from the failed probes.
+                _update_reject_rate(accepted=0, rejected=1 + halving_misses)
+                any_compound_rejected = True
+                continue
+
+            _commit_accepted_batch(state, candidates[:k])
+            _update_reject_rate(accepted=k, rejected=halving_misses)
+            any_batch_committed = True
+
+        if any_batch_committed:
+            # Dispatch one materializer for the whole drain so DB rows
+            # catch up to the accepted state. The race-guard sentinel is
+            # only needed for advance_day / rebuild (which run concurrent
+            # to an in-flight materializer); fast-path SADDs in
+            # ``enqueue_notify_user`` already cover the post-release
+            # re-trigger contract for our case.
             materialize_schedule_task.delay()
-            logger.info(
-                "schedule.run.success",
-                task_id=task_id,
-                compound_id=compound.get("compound_id"),
-            )
-        else:
-            # Compound rolled back. No state change, no materialize trigger
-            # — the WS notify_user (compound_failed) already fired inside
-            # ``_process_compound``. We still need to compensate the
-            # producer's lock write (and, for create compounds, soft-delete
-            # the orphan row); ``_perform_compound_db_action`` with
-            # accepted=False handles that.
-            _perform_compound_db_action(compound, accepted=False)
-            logger.info(
-                "schedule.run.rolled_back",
-                task_id=task_id,
-                compound_id=compound.get("compound_id"),
-            )
+
+        if not any_batch_committed and not any_compound_rejected:
+            logger.info("schedule.run.empty_queue", task_id=task_id)
 
         finished_at = datetime.now(tz=UTC).isoformat()
         _set_status(
@@ -1025,16 +1279,11 @@ def run_scheduling_task(self: Task) -> None:
             task_id=task_id,
         )
 
-        # If more compounds are queued (either pre-existing or arrived
-        # while we were running), fire another invocation so the next
-        # compound gets processed without waiting for an external trigger.
-        #
-        # Exception: if a waiter task (advance_day / rebuild) has set the
-        # waiter flag — meaning it's currently inside _wait_for_idle_run
-        # observing our status flip to idle — yield the re-trigger to it.
-        # The waiter will fire run_scheduling_task.delay() at the end of
-        # its own body. This prevents the (us-just-re-triggered) task and
-        # the waiter from racing on schedule:state writes.
+        # If new compounds arrived between the last drain-loop read and
+        # the status flip (window where producers see ``idle`` and SADD
+        # without re-dispatching us themselves), re-fire so they don't
+        # sit idle until external pressure. Yield to a waiter (advance_day
+        # / rebuild) if its flag is set, otherwise self-dispatch.
         if cast("int", _get_redis().zcard(PENDING_OPS_KEY)) > 0:
             if _is_waiter_pending():
                 logger.info("schedule.run.yield_to_waiter", task_id=task_id)
@@ -1329,7 +1578,7 @@ def advance_day_task() -> None:
 
     1. **``in_production → completed``** for orders that WERE locked in
        on a previous day and are no longer in the new scheduler state's
-       living set (= ``priority_queue + pinned_orders``). Signal: those
+       living set (= ``pq_index + pinned_orders``). Signal: those
        orders' last remaining work was made yesterday, they're done.
     2. **(scheduled | …) → ``in_production``** for orders that have any
        production assigned to "today" (the day-1 of the OLD state, which
@@ -1401,7 +1650,7 @@ def advance_day_task() -> None:
             # Orders still alive in the new state — used by
             # ``mark_completed_outside_set`` to decide which currently-
             # in_production rows are done.
-            new_alive_ids: set[uuid.UUID] = {o.order_id for o in new_state.priority_queue} | set(
+            new_alive_ids: set[uuid.UUID] = set(new_state.pq_index.keys()) | set(
                 new_state.pinned_orders.keys()
             )
 
@@ -1433,7 +1682,7 @@ def advance_day_task() -> None:
                 "schedule.advance_day.success",
                 old_base=state.base_date.isoformat(),
                 new_base=new_state.base_date.isoformat(),
-                carried=len(new_state.priority_queue),
+                carried=len(new_state.pq_index),
                 in_production_count=in_prod_count,
                 completed_count=completed_count,
             )
@@ -1573,7 +1822,7 @@ def rebuild_schedule_task() -> None:
             logger.info(
                 "schedule.rebuild.success",
                 base_date=base_date.isoformat(),
-                orders_added=len(new_state.priority_queue),
+                orders_added=len(new_state.pq_index),
                 orders_skipped=len(skipped),
             )
 
