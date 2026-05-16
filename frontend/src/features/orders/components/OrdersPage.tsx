@@ -49,7 +49,7 @@ export function OrdersPage(): JSX.Element {
     <>
       <Header title="訂單列表" />
 
-      <div className="mx-auto max-w-7xl px-6 py-6 space-y-5">
+      <div className="px-6 py-6 space-y-5">
         <div className="flex items-center justify-between gap-4">
           <Button onClick={handleNewOrder} size="sm">
             <Plus className="mr-1.5 h-4 w-4" />
