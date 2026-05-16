@@ -1,5 +1,6 @@
 import { Plus } from 'lucide-react';
 import { useCallback, useState } from 'react';
+import { toast } from 'sonner';
 
 import { Header } from '@/components/layout/Header';
 import { Button } from '@/components/ui/button';
@@ -17,11 +18,12 @@ export function OrdersPage(): JSX.Element {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingOrder, setEditingOrder] = useState<Order | undefined>(undefined);
 
-  const [scheduleCompoundId, setScheduleCompoundId] = useState<string | null>(null);
   const triggerSchedule = useTriggerSchedule();
   const canWrite = useCanWrite();
 
-  useScheduleWs(scheduleCompoundId);
+  // Passive listener: any schedule.* WS event invalidates the orders cache
+  // so the table refreshes once the worker finishes draining its queue.
+  useScheduleWs();
 
   const handleNewOrder = useCallback(() => {
     setEditingOrder(undefined);
@@ -33,21 +35,16 @@ export function OrdersPage(): JSX.Element {
     setModalOpen(true);
   }, []);
 
-  const handleSchedule = useCallback(
-    (order: Order) => {
-      triggerSchedule.mutate(order, {
-        onSuccess: (res) => {
-          setScheduleCompoundId(res.compound_id);
-          // Fall-back clear: if the WS never delivers a terminal event, drop
-          // the compound id after 30 s so the toast / hook don't linger.
-          setTimeout(() => {
-            setScheduleCompoundId(null);
-          }, 30_000);
-        },
-      });
-    },
-    [triggerSchedule],
-  );
+  const handleSchedule = useCallback(() => {
+    triggerSchedule.mutate(undefined, {
+      onSuccess: (res) => {
+        toast.success('排程已啟動', { description: res.message });
+      },
+      onError: (err) => {
+        toast.error('排程啟動失敗', { description: err.message });
+      },
+    });
+  }, [triggerSchedule]);
 
   return (
     <>

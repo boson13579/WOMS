@@ -172,15 +172,15 @@ describe('OrderTable', () => {
     expect(onEdit).toHaveBeenCalledWith(order);
   });
 
-  it('calls onSchedule(order) when the schedule button is clicked', async () => {
+  it('calls onSchedule() when the schedule button is clicked', async () => {
     const user = userEvent.setup();
     const order = makeOrder({ id: 'test-id-0001' });
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
     render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
-    await user.click(screen.getByTitle('觸發排程'));
+    await user.click(screen.getByTitle('觸發排程器（全域）'));
 
-    expect(onSchedule).toHaveBeenCalledWith(order);
+    expect(onSchedule).toHaveBeenCalledWith();
   });
 
   it('does not call deleteMutation.mutate when the confirm dialog is cancelled', async () => {
@@ -248,7 +248,7 @@ describe('OrderTable', () => {
       render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
 
       expect(screen.getByTitle('編輯')).toBeInTheDocument();
-      expect(screen.getByTitle('觸發排程')).toBeInTheDocument();
+      expect(screen.getByTitle('觸發排程器（全域）')).toBeInTheDocument();
       expect(screen.getByTitle('刪除')).toBeInTheDocument();
     });
 
@@ -262,7 +262,7 @@ describe('OrderTable', () => {
       render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
 
       expect(screen.getByTitle('編輯')).toBeInTheDocument();
-      expect(screen.getByTitle('觸發排程')).toBeInTheDocument();
+      expect(screen.getByTitle('觸發排程器（全域）')).toBeInTheDocument();
       expect(screen.getByTitle('刪除')).toBeInTheDocument();
     });
 
@@ -277,7 +277,7 @@ describe('OrderTable', () => {
       render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
 
       expect(screen.queryByTitle('編輯')).not.toBeInTheDocument();
-      expect(screen.queryByTitle('觸發排程')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('觸發排程器（全域）')).not.toBeInTheDocument();
       expect(screen.queryByTitle('刪除')).not.toBeInTheDocument();
     });
   });

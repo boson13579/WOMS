@@ -5,7 +5,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { z } from 'zod';
 
-import { useCurrentUser, useCurrentUserId } from '@/lib/auth';
+import { useCurrentUser } from '@/lib/auth';
 
 import type {
   AuditLogEntry,
@@ -15,7 +15,7 @@ import type {
   OrderCreate,
   OrderListResponse,
   OrderUpdate,
-  ScheduleCompoundResponse,
+  ScheduleTriggerResponse,
 } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -73,8 +73,8 @@ const auditLogEntrySchema = z.object({
   created_at: z.string(),
 });
 
-const scheduleCompoundResponseSchema = z.object({
-  compound_id: z.string().uuid(),
+const scheduleTriggerResponseSchema = z.object({
+  task_id: z.string(),
   message: z.string(),
 });
 
@@ -220,50 +220,26 @@ export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error
 }
 
 /**
- * Trigger scheduling for a single order via the compound API.
+ * Manually kick the scheduler.
  *
- * Backend's per-order schedule trigger is the compound flow at
- * POST /api/v1/schedule/operations — we enqueue a one-op "add" compound for
- * the order and let the worker pick it up. The returned compound_id is used
- * by the WebSocket hook to filter events back to this specific request.
+ * Backend already enqueues compounds automatically on every order CRUD
+ * (`POST /orders`, `PATCH /orders/{id}`, `DELETE /orders/{id}`), so the
+ * frontend should NOT build its own compound payload — doing so would
+ * double-enqueue the order and skip the backend's lock / audit / rollback
+ * machinery. This endpoint just tells the scheduler to drain its pending
+ * queue now. No order payload.
+ *
+ * If a per-order "reschedule this one" semantic is needed in the future,
+ * ask the backend to add a dedicated endpoint
+ * (e.g. POST /orders/{id}/reschedule) rather than driving the compound API
+ * from the frontend.
  */
-export function useTriggerSchedule(): ReturnType<
-  typeof useMutation<ScheduleCompoundResponse, Error, Order>
-> {
-  const currentUserId = useCurrentUserId();
-
-  return useMutation<ScheduleCompoundResponse, Error, Order>({
-    mutationFn: (order) => {
-      if (!currentUserId) {
-        return Promise.reject(new Error('未登入，無法觸發排程'));
-      }
-      const compoundId = crypto.randomUUID();
-      const body = {
-        compound_id: compoundId,
-        group: 'grow' as const,
-        op_count: 1,
-        ops: [
-          {
-            op: 'add' as const,
-            order_id: order.id,
-            order_number: order.order_number,
-            wafer_quantity: order.wafer_quantity,
-            deadline: order.requested_delivery_date,
-          },
-        ],
-        requested_by: currentUserId,
-      };
-      return apiFetch(
-        '/api/v1/schedule/operations',
-        {
-          method: 'POST',
-          credentials: 'include',
-          headers: jsonHeaders(),
-          body: JSON.stringify(body),
-        },
-        (d) => scheduleCompoundResponseSchema.parse(d),
-      );
-    },
+export function useTriggerSchedule(): ReturnType<typeof useMutation<ScheduleTriggerResponse>> {
+  return useMutation<ScheduleTriggerResponse>({
+    mutationFn: () =>
+      apiFetch('/api/v1/schedule/trigger', { method: 'POST', credentials: 'include' }, (d) =>
+        scheduleTriggerResponseSchema.parse(d),
+      ),
   });
 }
 

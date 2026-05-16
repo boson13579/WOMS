@@ -111,13 +111,7 @@ const SAMPLE_ORDER: Order = {
 };
 
 vi.mock('./OrderTable', () => ({
-  OrderTable: ({
-    onEdit,
-    onSchedule,
-  }: {
-    onEdit: (o: Order) => void;
-    onSchedule: (o: Order) => void;
-  }) => (
+  OrderTable: ({ onEdit, onSchedule }: { onEdit: (o: Order) => void; onSchedule: () => void }) => (
     <div data-testid="order-table">
       <button
         type="button"
@@ -130,7 +124,7 @@ vi.mock('./OrderTable', () => ({
       <button
         type="button"
         onClick={() => {
-          onSchedule(SAMPLE_ORDER);
+          onSchedule();
         }}
       >
         table-schedule
@@ -232,16 +226,13 @@ describe('OrdersPage', () => {
     expect(screen.getByTestId('order-modal')).toHaveAttribute('data-open', 'false');
   });
 
-  it('calls triggerSchedule.mutate(order) when OrderTable fires onSchedule', async () => {
+  it('calls triggerSchedule.mutate() when OrderTable fires onSchedule', async () => {
     const user = userEvent.setup();
     renderPage();
 
     await user.click(screen.getByRole('button', { name: 'table-schedule' }));
 
-    expect(mockTriggerMutate).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'order-id-0001' }),
-      expect.anything(),
-    );
+    expect(mockTriggerMutate).toHaveBeenCalledWith(undefined, expect.anything());
   });
 
   it('calls logout() and navigates to /login when the logout button is clicked', async () => {
