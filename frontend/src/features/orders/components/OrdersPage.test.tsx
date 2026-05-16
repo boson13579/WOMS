@@ -90,37 +90,39 @@ vi.mock('./OrderFilters', () => ({
 }));
 
 // exposes buttons that trigger onEdit / onSchedule so the page's handlers can be tested
+const SAMPLE_ORDER: Order = {
+  id: 'order-id-0001',
+  order_number: 'ORD-20260504-0001',
+  customer_name: 'TSMC',
+  wafer_quantity: 500,
+  requested_delivery_date: '2026-06-01',
+  scheduled_production_date: null,
+  expected_delivery_date: null,
+  status: 'pending',
+  assigned_to: null,
+  created_by: 'user-id-0001',
+  notes: null,
+  version_id: 1,
+  created_at: '2026-05-04T08:00:00Z',
+  updated_at: '2026-05-04T08:00:00Z',
+  pinned_production_date: null,
+  is_pinned: false,
+  is_processing_locked: false,
+};
+
 vi.mock('./OrderTable', () => ({
   OrderTable: ({
     onEdit,
     onSchedule,
   }: {
     onEdit: (o: Order) => void;
-    onSchedule: (id: string) => void;
+    onSchedule: (o: Order) => void;
   }) => (
     <div data-testid="order-table">
       <button
         type="button"
         onClick={() => {
-          onEdit({
-            id: 'order-id-0001',
-            order_number: 'ORD-20260504-0001',
-            customer_name: 'TSMC',
-            wafer_quantity: 500,
-            requested_delivery_date: '2026-06-01',
-            scheduled_production_date: null,
-            expected_delivery_date: null,
-            status: 'pending',
-            assigned_to: null,
-            created_by: 'user-id-0001',
-            notes: null,
-            version_id: 1,
-            created_at: '2026-05-04T08:00:00Z',
-            updated_at: '2026-05-04T08:00:00Z',
-            pinned_production_date: null,
-            is_pinned: false,
-            is_processing_locked: false,
-          });
+          onEdit(SAMPLE_ORDER);
         }}
       >
         table-edit
@@ -128,7 +130,7 @@ vi.mock('./OrderTable', () => ({
       <button
         type="button"
         onClick={() => {
-          onSchedule('test-order-id');
+          onSchedule(SAMPLE_ORDER);
         }}
       >
         table-schedule
@@ -230,13 +232,16 @@ describe('OrdersPage', () => {
     expect(screen.getByTestId('order-modal')).toHaveAttribute('data-open', 'false');
   });
 
-  it('calls triggerSchedule.mutate(orderId) when OrderTable fires onSchedule', async () => {
+  it('calls triggerSchedule.mutate(order) when OrderTable fires onSchedule', async () => {
     const user = userEvent.setup();
     renderPage();
 
     await user.click(screen.getByRole('button', { name: 'table-schedule' }));
 
-    expect(mockTriggerMutate).toHaveBeenCalledWith('test-order-id', expect.anything());
+    expect(mockTriggerMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'order-id-0001' }),
+      expect.anything(),
+    );
   });
 
   it('calls logout() and navigates to /login when the logout button is clicked', async () => {

@@ -172,7 +172,7 @@ describe('OrderTable', () => {
     expect(onEdit).toHaveBeenCalledWith(order);
   });
 
-  it('calls onSchedule(order.id) when the schedule button is clicked', async () => {
+  it('calls onSchedule(order) when the schedule button is clicked', async () => {
     const user = userEvent.setup();
     const order = makeOrder({ id: 'test-id-0001' });
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
@@ -180,7 +180,7 @@ describe('OrderTable', () => {
     render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
     await user.click(screen.getByTitle('觸發排程'));
 
-    expect(onSchedule).toHaveBeenCalledWith('test-id-0001');
+    expect(onSchedule).toHaveBeenCalledWith(order);
   });
 
   it('does not call deleteMutation.mutate when the confirm dialog is cancelled', async () => {

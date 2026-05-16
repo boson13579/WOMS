@@ -34,6 +34,12 @@ vi.mock('@/features/auth/api/users', () => {
   return { useUsers: () => stableUsers };
 });
 
+// Default role is `root` so the 負責人 input is enabled and the existing
+// form-fill tests can interact with it. Individual tests can override below.
+vi.mock('@/lib/auth', () => ({
+  useCurrentRole: () => 'root',
+}));
+
 // Radix Dialog has animation timers that keep the test runner alive.
 // Replace with a plain stub so tests exit cleanly.
 vi.mock('@/components/ui/dialog', () => ({

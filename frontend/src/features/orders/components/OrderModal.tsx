@@ -22,6 +22,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { useUsers } from '@/features/auth/api/users';
+import { useCurrentRole } from '@/lib/auth';
 
 import { useCreateOrder, useUpdateOrder } from '../api/orders';
 import type { Order } from '../types';
@@ -59,7 +60,14 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const createMutation = useCreateOrder();
   const updateMutation = useUpdateOrder();
   const isPending = createMutation.isPending || updateMutation.isPending;
+  const role = useCurrentRole();
+  const isRoot = role === 'root';
+  // Non-root sessions can't list users (the `/api/v1/users` endpoint is
+  // root-only), so the assignment input is disabled for them — better than
+  // silently dropping `assigned_to` when their email lookup against an empty
+  // user list returns nothing.
   const users = useUsers();
+  const assignedToDisabled = isEdit || !isRoot;
 
   const {
     register,
@@ -99,7 +107,12 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   }, [order, reset, users]);
 
   const onSubmit = handleSubmit((values) => {
-    const matchedUser = users.find((u) => u.email === values.assigned_to_email);
+    // Only root can resolve emails against the full user list. For non-root
+    // we never even rendered the input, so any stray value is ignored to
+    // keep the request shape honest.
+    const matchedUser = isRoot
+      ? users.find((u) => u.email === values.assigned_to_email)
+      : undefined;
     const assignedTo = matchedUser?.id ?? null;
     const notes = values.notes !== '' ? (values.notes ?? null) : null;
 
@@ -216,9 +229,9 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
             <Input
               id="assigned_to_email"
               list="users-datalist"
-              placeholder="輸入 email 搜尋"
+              placeholder={isRoot ? '輸入 email 搜尋' : '僅 root 可指派負責人'}
               autoComplete="off"
-              disabled={isEdit}
+              disabled={assignedToDisabled}
               aria-invalid={!!errors.assigned_to_email}
               aria-describedby={errors.assigned_to_email ? 'assigned_to_email-error' : undefined}
               {...register('assigned_to_email')}
@@ -230,6 +243,12 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
                   <option key={u.id} value={u.email ?? ''} />
                 ))}
             </datalist>
+            {!isRoot && !isEdit && (
+              <p className="text-xs text-muted-foreground">
+                目前後端無法提供使用者清單給非 root 角色，建立後可請 root 指派或之後在後端開放
+                `/users/assignable` 後再啟用。
+              </p>
+            )}
             {errors.assigned_to_email && (
               <p id="assigned_to_email-error" role="alert" className="text-xs text-destructive">
                 {errors.assigned_to_email.message}

@@ -92,7 +92,7 @@ function SortableHead({
 
 interface OrderTableProps {
   onEdit: (order: Order) => void;
-  onSchedule: (orderId: string) => void;
+  onSchedule: (order: Order) => void;
 }
 
 export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element {
@@ -270,7 +270,7 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
                             variant="ghost"
                             size="icon"
                             onClick={() => {
-                              onSchedule(order.id);
+                              onSchedule(order);
                             }}
                             title={order.is_processing_locked ? '排程處理中，請稍候' : '觸發排程'}
                             disabled={order.is_processing_locked}

@@ -77,16 +77,8 @@ export interface AuditLogEntry {
   created_at: string;
 }
 
-export interface ScheduleTaskResponse {
-  task_id: string;
-  order_id: string;
-  message: string;
-}
-
-export interface ScheduleProgress {
-  task_id: string;
-  order_id: string;
-  status: 'started' | 'analyzing' | 'optimizing' | 'applying' | 'completed';
-  progress: number;
+/** Matches backend ScheduleCompoundResponse from POST /schedule/operations */
+export interface ScheduleCompoundResponse {
+  compound_id: string;
   message: string;
 }

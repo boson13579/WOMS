@@ -17,11 +17,11 @@ export function OrdersPage(): JSX.Element {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingOrder, setEditingOrder] = useState<Order | undefined>(undefined);
 
-  const [scheduleTaskId, setScheduleTaskId] = useState<string | null>(null);
+  const [scheduleCompoundId, setScheduleCompoundId] = useState<string | null>(null);
   const triggerSchedule = useTriggerSchedule();
   const canWrite = useCanWrite();
 
-  useScheduleWs(scheduleTaskId);
+  useScheduleWs(scheduleCompoundId);
 
   const handleNewOrder = useCallback(() => {
     setEditingOrder(undefined);
@@ -34,12 +34,14 @@ export function OrdersPage(): JSX.Element {
   }, []);
 
   const handleSchedule = useCallback(
-    (orderId: string) => {
-      triggerSchedule.mutate(orderId, {
+    (order: Order) => {
+      triggerSchedule.mutate(order, {
         onSuccess: (res) => {
-          setScheduleTaskId(res.task_id);
+          setScheduleCompoundId(res.compound_id);
+          // Fall-back clear: if the WS never delivers a terminal event, drop
+          // the compound id after 30 s so the toast / hook don't linger.
           setTimeout(() => {
-            setScheduleTaskId(null);
+            setScheduleCompoundId(null);
           }, 30_000);
         },
       });

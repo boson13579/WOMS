@@ -1,6 +1,8 @@
 import { useQuery } from '@tanstack/react-query';
 import { z } from 'zod';
 
+import { useCurrentRole } from '@/lib/auth';
+
 const userOptionSchema = z.object({
   id: z.string().uuid(),
   username: z.string(),
@@ -21,12 +23,20 @@ async function fetchUsers(): Promise<UserOption[]> {
 
 const EMPTY_USERS: UserOption[] = [];
 
+/**
+ * Root-only listing of all users. Gated on role so non-root sessions don't
+ * hammer `/api/v1/users` with 401s that just resolve to the same empty array.
+ * Callers that need name lookups for any logged-in user should use
+ * `useUsernames` from the dashboard feature instead.
+ */
 export function useUsers(): UserOption[] {
+  const role = useCurrentRole();
   const { data } = useQuery<UserOption[]>({
     queryKey: ['users'],
     queryFn: fetchUsers,
     staleTime: 5 * 60 * 1000,
     retry: false,
+    enabled: role === 'root',
   });
   return data ?? EMPTY_USERS;
 }
