@@ -41,6 +41,14 @@ vi.mock('sonner', () => ({
   },
 }));
 
+// `useDashboardWs` opens a real ``WebSocket`` against `/api/v1/ws`, which
+// jsdom can't satisfy and which the composition tests don't care about
+// (its behaviour has its own dedicated spec file). Stub it to a no-op
+// here so DashboardPage stays the unit under test.
+vi.mock('../api/useDashboardWs', () => ({
+  useDashboardWs: () => {},
+}));
+
 let qc: QueryClient;
 
 function makeWrapper() {

@@ -11,14 +11,16 @@
  * registrations default to viewer until root promotes them.
  *
  * All server state is React Query — components stay pure presentational.
- * WebSocket-driven invalidation lands in a follow-up PR; for now we poll
- * (see hook files for cadence).
+ * Polling intervals stay in place as a fallback; `useDashboardWs`
+ * invalidates the relevant query keys on push so the page reflects
+ * scheduling activity without waiting for the next polling tick.
  */
 import { useQueryClient } from '@tanstack/react-query';
 
 import { Header } from '@/components/layout/Header';
 import { useCurrentRole } from '@/lib/auth';
 
+import { useDashboardWs } from '../api/useDashboardWs';
 import { useOrdersSnapshot } from '../api/useOrdersSnapshot';
 import { usePendingOps } from '../api/usePendingOps';
 import { useScheduleCapacity } from '../api/useScheduleCapacity';
@@ -44,6 +46,12 @@ const DASHBOARD_INVALIDATE_PREFIXES = [
 export function DashboardPage(): JSX.Element {
   const role = useCurrentRole();
   const queryClient = useQueryClient();
+
+  // Push-driven invalidation. Mounts a WebSocket subscription that
+  // translates backend scheduling events into ``invalidateQueries``
+  // calls — polling intervals on the hooks below stay as a fallback
+  // if the socket drops or backend events get lost.
+  useDashboardWs();
 
   const systemHealth = useSystemHealth();
   const scheduleStatus = useScheduleStatus();
