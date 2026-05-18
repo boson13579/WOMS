@@ -1,8 +1,6 @@
 /**
  * OrderModal — create / edit form.
  *
- * [RED]   tests written first
- * [GREEN] OrderModal.tsx passes
  */
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -25,13 +23,13 @@ vi.mock('../api/orders', () => ({
 }));
 
 vi.mock('@/features/auth/api/users', () => {
-  // Must be a stable reference — if useUsers() returns a new array every render,
+  // Must be a stable reference — if the hook returns a new array every render,
   // OrderModal's useEffect([order, reset, users]) re-runs infinitely and hangs.
   const stableUsers = [
     { id: 'uid-001', username: 'alice', email: 'alice@example.com' },
     { id: 'uid-002', username: 'bob', email: 'bob@example.com' },
   ];
-  return { useUsers: () => stableUsers };
+  return { useAssignableUsers: () => stableUsers };
 });
 
 // Radix Dialog has animation timers that keep the test runner alive.
@@ -65,6 +63,9 @@ function makeOrder(overrides: Partial<Order> = {}): Order {
     version_id: 1,
     created_at: '2026-05-04T08:00:00Z',
     updated_at: '2026-05-04T08:00:00Z',
+    pinned_production_date: null,
+    is_pinned: false,
+    is_processing_locked: false,
     ...overrides,
   };
 }
@@ -129,6 +130,14 @@ describe('OrderModal', () => {
       }),
       expect.anything(),
     );
+  });
+
+  it('create mode: allows order managers to assign from the assignable users list', () => {
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    const assigneeInput = screen.getByLabelText(/負責人/);
+    expect(assigneeInput).toBeEnabled();
+    expect(assigneeInput).toHaveAttribute('list', 'users-datalist');
   });
 
   // --- edit mode ---

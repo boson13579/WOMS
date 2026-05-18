@@ -24,6 +24,9 @@ export interface Order {
   assigned_to: string | null;
   created_by: string;
   notes: string | null;
+  pinned_production_date: string | null;
+  is_pinned: boolean;
+  is_processing_locked: boolean;
   version_id: number;
   created_at: string;
   updated_at: string;
@@ -53,16 +56,28 @@ export interface OrderUpdate {
   version_id: number;
 }
 
-export interface ScheduleTaskResponse {
-  task_id: string;
-  order_id: string;
-  message: string;
+export interface BatchUpdateRequest {
+  order_ids: string[];
+  requested_delivery_date: string;
 }
 
-export interface ScheduleProgress {
+export interface BatchUpdateResponse {
+  updated_count: number;
+  skipped_count: number;
+  skipped_ids: string[];
+}
+
+export interface AuditLogEntry {
+  id: string;
+  action: string;
+  user_id: string | null;
+  resource_id: string;
+  old_value: Record<string, unknown> | null;
+  new_value: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface ScheduleTriggerResponse {
   task_id: string;
-  order_id: string;
-  status: 'started' | 'analyzing' | 'optimizing' | 'applying' | 'completed';
-  progress: number;
   message: string;
 }

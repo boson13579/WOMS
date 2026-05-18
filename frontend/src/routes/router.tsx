@@ -30,7 +30,6 @@ export const routes: RouteObject[] = [
       },
     ],
   },
-  // Auth pages live outside the AppShell so they have their own full-screen layout.
   { path: '/login', element: <AuthPage /> },
   { path: '/register', element: <AuthPage /> },
 ];

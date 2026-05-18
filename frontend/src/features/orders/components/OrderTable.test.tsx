@@ -1,8 +1,6 @@
 /**
  * OrderTable — paginated list, pagination, delete.
  *
- * [RED]   tests written first
- * [GREEN] OrderTable.tsx passes
  */
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -13,14 +11,22 @@ import type { Order, OrderListResponse } from '../types';
 import { OrderTable } from './OrderTable';
 
 // ---------------------------------------------------------------------------
-// Mock @/lib/auth — controls canWrite per test
+// Mock @/lib/auth — controls canWrite / canSchedule / role per test
 // ---------------------------------------------------------------------------
 
 let mockCanWrite = true;
+let mockRole = 'scheduler';
+const mockCurrentUserId = 'test-user-id';
 
 vi.mock('@/lib/auth', () => ({
-  useCurrentUser: () => ({ username: 'test', role: 'scheduler' }),
+  useCurrentUser: () => ({ username: 'test', role: mockRole }),
   useCanWrite: () => mockCanWrite,
+  useCurrentRole: () => mockRole,
+  useCurrentUserId: () => mockCurrentUserId,
+}));
+
+vi.mock('@/features/users/api/useUsernames', () => ({
+  useUsernames: () => ({ data: undefined }),
 }));
 
 // ---------------------------------------------------------------------------
@@ -34,6 +40,8 @@ const mockDeleteMutate = vi.fn();
 const mockStore = {
   status: null as string | null,
   search: '',
+  assignedTo: [] as string[],
+  createdBy: [] as string[],
   page: 1,
   sortBy: 'order_number' as string,
   sortOrder: 'asc' as 'asc' | 'desc',
@@ -76,6 +84,9 @@ function makeOrder(overrides: Partial<Order> = {}): Order {
     version_id: 1,
     created_at: '2026-05-04T08:00:00Z',
     updated_at: '2026-05-04T08:00:00Z',
+    pinned_production_date: null,
+    is_pinned: false,
+    is_processing_locked: false,
     ...overrides,
   };
 }
@@ -90,11 +101,11 @@ function makeList(items: Order[]): OrderListResponse {
 
 describe('OrderTable', () => {
   const onEdit = vi.fn();
-  const onSchedule = vi.fn();
 
   beforeEach(() => {
     vi.clearAllMocks();
     mockCanWrite = true;
+    mockRole = 'scheduler';
     mockStore.sortBy = 'order_number';
     mockStore.sortOrder = 'asc';
     mockUseDeleteOrder.mockReturnValue({ mutate: mockDeleteMutate, isPending: false });
@@ -103,7 +114,7 @@ describe('OrderTable', () => {
   it('shows a loading spinner while data is pending', () => {
     mockUseOrders.mockReturnValue({ isPending: true, isError: false, data: undefined });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText(/載入中/)).toBeInTheDocument();
   });
@@ -111,7 +122,7 @@ describe('OrderTable', () => {
   it('shows an error message when the API fails', () => {
     mockUseOrders.mockReturnValue({ isPending: false, isError: true, data: undefined });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText(/載入失敗/)).toBeInTheDocument();
   });
@@ -119,7 +130,7 @@ describe('OrderTable', () => {
   it('shows an empty-state message when there are no results', () => {
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText(/沒有符合條件的訂單/)).toBeInTheDocument();
   });
@@ -128,7 +139,7 @@ describe('OrderTable', () => {
     const order = makeOrder({ customer_name: 'TSMC', order_number: 'ORD-20260504-0001' });
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText('TSMC')).toBeInTheDocument();
     expect(screen.getByText('ORD-20260504-0001')).toBeInTheDocument();
@@ -139,7 +150,7 @@ describe('OrderTable', () => {
     const order = makeOrder({ status: 'scheduled' });
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText('已排程')).toBeInTheDocument();
   });
@@ -149,21 +160,10 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByTitle('編輯'));
 
     expect(onEdit).toHaveBeenCalledWith(order);
-  });
-
-  it('calls onSchedule(order.id) when the schedule button is clicked', async () => {
-    const user = userEvent.setup();
-    const order = makeOrder({ id: 'test-id-0001' });
-    mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
-
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
-    await user.click(screen.getByTitle('觸發排程'));
-
-    expect(onSchedule).toHaveBeenCalledWith('test-id-0001');
   });
 
   it('does not call deleteMutation.mutate when the confirm dialog is cancelled', async () => {
@@ -173,7 +173,7 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByTitle('刪除'));
 
     expect(mockDeleteMutate).not.toHaveBeenCalled();
@@ -186,10 +186,14 @@ describe('OrderTable', () => {
     const order = makeOrder({ id: 'delete-me-id' });
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByTitle('刪除'));
 
-    expect(mockDeleteMutate).toHaveBeenCalledWith('delete-me-id');
+    expect(mockDeleteMutate).toHaveBeenCalledWith(
+      'delete-me-id',
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      expect.objectContaining({ onError: expect.any(Function) }),
+    );
   });
 
   it('calls setSort with the column field when a sortable header is clicked', async () => {
@@ -197,7 +201,7 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByText('客戶'));
 
     expect(mockSetSort).toHaveBeenCalledWith('customer_name');
@@ -210,46 +214,47 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByText('客戶'));
 
     expect(mockSetSort).toHaveBeenCalledWith('customer_name');
   });
 
   describe('role-based rendering', () => {
-    it('scheduler — shows edit, schedule, delete buttons', () => {
+    it('scheduler — shows edit and delete buttons', () => {
       mockCanWrite = true;
+      mockRole = 'scheduler';
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+      render(<OrderTable onEdit={onEdit} />);
 
       expect(screen.getByTitle('編輯')).toBeInTheDocument();
-      expect(screen.getByTitle('觸發排程')).toBeInTheDocument();
       expect(screen.getByTitle('刪除')).toBeInTheDocument();
     });
 
-    it('root — shows edit, schedule, delete buttons', () => {
+    it('root — shows edit and delete buttons', () => {
       mockCanWrite = true;
+      mockRole = 'root';
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+      render(<OrderTable onEdit={onEdit} />);
 
       expect(screen.getByTitle('編輯')).toBeInTheDocument();
-      expect(screen.getByTitle('觸發排程')).toBeInTheDocument();
       expect(screen.getByTitle('刪除')).toBeInTheDocument();
     });
 
-    it('order_manager — hides edit, schedule, delete buttons', () => {
-      mockCanWrite = false;
+    it("order_manager — hides edit and delete for another user's order", () => {
+      mockCanWrite = true;
+      mockRole = 'order_manager';
+      // mockCurrentUserId ('test-user-id') !== order.created_by ('aaaaaaaa-...') → canEditOrder=false
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+      render(<OrderTable onEdit={onEdit} />);
 
       expect(screen.queryByTitle('編輯')).not.toBeInTheDocument();
-      expect(screen.queryByTitle('觸發排程')).not.toBeInTheDocument();
       expect(screen.queryByTitle('刪除')).not.toBeInTheDocument();
     });
   });
@@ -258,7 +263,7 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.queryByRole('button', { name: /上一頁/ })).not.toBeInTheDocument();
   });
