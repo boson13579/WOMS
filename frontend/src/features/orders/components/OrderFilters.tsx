@@ -2,10 +2,6 @@
  * Filter bar for the order list: keyword search + status select.
  * Filter state lives in Zustand (useOrderStore) — React Query re-fetches
  * automatically when the query key changes.
- *
- * Note: assigned_to / created_by user filters are disabled until the backend
- * list_orders endpoint supports array parameters (currently accepts only a
- * single uuid.UUID, so repeated params silently take only the last value).
  */
 import { useEffect, useState } from 'react';
 

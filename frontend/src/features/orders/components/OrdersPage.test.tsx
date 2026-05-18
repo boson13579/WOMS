@@ -1,9 +1,5 @@
 /**
  * OrdersPage — page composition tests.
- *
- * [RED]   tests written first to verify page-level composition behaviour
- * [GREEN] OrdersPage.tsx passes
- *
  * Strategy: child components (OrderFilters / OrderTable / OrderModal) are
  * mocked so tests focus on page-level state management and callback wiring,
  * not on details already covered by child component tests.

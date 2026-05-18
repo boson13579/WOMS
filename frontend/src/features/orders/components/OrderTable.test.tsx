@@ -1,8 +1,6 @@
 /**
  * OrderTable — paginated list, pagination, delete.
  *
- * [RED]   tests written first
- * [GREEN] OrderTable.tsx passes
  */
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';

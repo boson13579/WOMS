@@ -2,10 +2,9 @@
  * Shared fetch helper — promoted from `features/dashboard/api/apiFetch.ts`
  * once cross-feature use became necessary.
  *
- * On non-2xx the backend returns `{ error: { code, message, details } }`
- * (see `backend/app/api/errors.py`). We surface `error.message` as the
- * thrown `Error.message` so React Query toasts / error UIs can render
- * a useful string without parsing the envelope themselves.
+ * On non-2xx the backend normally returns `{ error: { code, message, details } }`
+ * (see `backend/app/api/errors.py`). FastAPI validation/auth errors may use
+ * `{ detail }`, so both shapes are supported.
  *
  * 204 No Content short-circuits the parse step and returns `undefined`.
  *
@@ -45,7 +44,10 @@ export async function apiFetch<T>(
       const body = await res.json().catch((): any => ({}));
       const msg: string =
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-        (body?.error?.message as string | undefined) ?? res.statusText;
+        (body?.error?.message as string | undefined) ??
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        (body?.detail as string | undefined) ??
+        res.statusText;
       throw new Error(msg);
     }
     if (res.status === 204) return undefined as T;

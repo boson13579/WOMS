@@ -1,7 +1,8 @@
 import { useQuery } from '@tanstack/react-query';
 import { z } from 'zod';
 
-import { useCurrentRole } from '@/lib/auth';
+import { apiFetch } from '@/lib/apiFetch';
+import { useCurrentRole, useCurrentUser } from '@/lib/auth';
 
 const userOptionSchema = z.object({
   id: z.string().uuid(),
@@ -13,12 +14,20 @@ const usersResponseSchema = z.object({
   users: z.array(userOptionSchema),
 });
 
+const assignableUsersResponseSchema = z.array(userOptionSchema);
+
 export type UserOption = z.infer<typeof userOptionSchema>;
 
 async function fetchUsers(): Promise<UserOption[]> {
   const res = await fetch('/api/v1/users', { credentials: 'include' });
   if (!res.ok) throw new Error(String(res.status));
   return usersResponseSchema.parse(await res.json()).users;
+}
+
+async function fetchAssignableUsers(): Promise<UserOption[]> {
+  return apiFetch('/api/v1/users/assignable', { credentials: 'include' }, (raw) =>
+    assignableUsersResponseSchema.parse(raw),
+  );
 }
 
 const EMPTY_USERS: UserOption[] = [];
@@ -37,6 +46,27 @@ export function useUsers(): UserOption[] {
     staleTime: 5 * 60 * 1000,
     retry: false,
     enabled: role === 'root',
+  });
+  return data ?? EMPTY_USERS;
+}
+
+/**
+ * Users the current role can assign as order owners.
+ *
+ * Backend contract: order_manager receives only themselves; scheduler/root
+ * receive active users. Viewers cannot create orders, so this query stays
+ * disabled for them.
+ */
+export function useAssignableUsers(): UserOption[] {
+  const user = useCurrentUser();
+  const role = user?.role;
+  const canAssign = role === 'order_manager' || role === 'scheduler' || role === 'root';
+  const { data } = useQuery<UserOption[]>({
+    queryKey: ['users', 'assignable', user?.id],
+    queryFn: fetchAssignableUsers,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+    enabled: canAssign,
   });
   return data ?? EMPTY_USERS;
 }

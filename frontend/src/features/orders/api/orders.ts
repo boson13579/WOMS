@@ -5,6 +5,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { z } from 'zod';
 
+import { apiFetch, jsonHeaders } from '@/lib/apiFetch';
 import { useCurrentUser } from '@/lib/auth';
 
 import type {
@@ -77,30 +78,6 @@ const auditLogEntrySchema = z.object({
   new_value: z.record(z.unknown()).nullable(),
   created_at: z.string(),
 });
-
-// ---------------------------------------------------------------------------
-// Shared fetch helper
-// ---------------------------------------------------------------------------
-
-function jsonHeaders(): HeadersInit {
-  return { 'Content-Type': 'application/json' };
-}
-
-async function apiFetch<T>(url: string, init: RequestInit, parse: (raw: unknown) => T): Promise<T> {
-  const res = await fetch(url, init);
-  if (!res.ok) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
-    const body = await res.json().catch((): any => ({}));
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-    const errorMessage = body?.error?.message as string | undefined;
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-    const detail = body?.detail as string | undefined;
-    const msg: string = errorMessage ?? detail ?? res.statusText;
-    throw new Error(msg);
-  }
-  if (res.status === 204) return undefined as T;
-  return parse(await res.json());
-}
 
 // ---------------------------------------------------------------------------
 // Query key factory

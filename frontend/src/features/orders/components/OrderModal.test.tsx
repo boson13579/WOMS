@@ -1,8 +1,6 @@
 /**
  * OrderModal — create / edit form.
  *
- * [RED]   tests written first
- * [GREEN] OrderModal.tsx passes
  */
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -25,13 +23,13 @@ vi.mock('../api/orders', () => ({
 }));
 
 vi.mock('@/features/auth/api/users', () => {
-  // Must be a stable reference — if useUsers() returns a new array every render,
+  // Must be a stable reference — if the hook returns a new array every render,
   // OrderModal's useEffect([order, reset, users]) re-runs infinitely and hangs.
   const stableUsers = [
     { id: 'uid-001', username: 'alice', email: 'alice@example.com' },
     { id: 'uid-002', username: 'bob', email: 'bob@example.com' },
   ];
-  return { useUsers: () => stableUsers };
+  return { useAssignableUsers: () => stableUsers };
 });
 
 // Default role is `root` so the 負責人 input is enabled and the existing

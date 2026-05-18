@@ -1,8 +1,6 @@
 /**
  * OrderFilters — search input and status select.
  *
- * [RED]   tests written first
- * [GREEN] OrderFilters.tsx passes
  */
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
