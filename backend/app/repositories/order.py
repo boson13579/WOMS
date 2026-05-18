@@ -57,7 +57,8 @@ def get_many(
     db: Session,
     *,
     status: list[OrderStatus] | None = None,
-    assigned_to: uuid.UUID | None = None,
+    assigned_to: list[uuid.UUID] | None = None,
+    created_by: uuid.UUID | None = None,
     search: str | None = None,
     page: int = 1,
     page_size: int = 20,
@@ -69,8 +70,10 @@ def get_many(
 
     if status:
         base = base.where(Order.status.in_(status))
-    if assigned_to is not None:
-        base = base.where(Order.assigned_to == assigned_to)
+    if assigned_to:
+        base = base.where(Order.assigned_to.in_(assigned_to))
+    if created_by is not None:
+        base = base.where(Order.created_by == created_by)
     if search:
         trimmed = search.strip()
         if trimmed:

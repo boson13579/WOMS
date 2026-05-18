@@ -15,6 +15,7 @@ from app.models.user import User, UserRole
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import user as user_repo
 from app.schemas.user import (
+    AssignableUserResponse,
     UserListResponse,
     UserResponse,
     UserSelfUpdateRequest,
@@ -40,6 +41,19 @@ def _guard_last_root(
         return
     if user_repo.lock_and_count_other_active_roots(db, user.id) == 0:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_LAST_ROOT_MSG)
+
+
+def get_assignable_users(db: Session, current_user: User) -> list[AssignableUserResponse]:
+    """Return the list of users that can be assigned as order owners.
+
+    Business rules:
+    - root / scheduler: all active users.
+    - order_manager: only themselves.
+    """
+    if current_user.role == UserRole.order_manager:
+        return [AssignableUserResponse.model_validate(current_user)]
+    users = user_repo.list_active_users(db)
+    return [AssignableUserResponse.model_validate(u) for u in users]
 
 
 def list_users(db: Session, search: str | None = None) -> UserListResponse:
