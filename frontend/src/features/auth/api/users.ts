@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { z } from 'zod';
 
 import { apiFetch } from '@/lib/apiFetch';
-import { useCurrentRole, useCurrentUser } from '@/lib/auth';
+import { useCanWrite, useCurrentRole, useCurrentUser } from '@/lib/auth';
 
 const userOptionSchema = z.object({
   id: z.string().uuid(),
@@ -19,9 +19,10 @@ const assignableUsersResponseSchema = z.array(userOptionSchema);
 export type UserOption = z.infer<typeof userOptionSchema>;
 
 async function fetchUsers(): Promise<UserOption[]> {
-  const res = await fetch('/api/v1/users', { credentials: 'include' });
-  if (!res.ok) throw new Error(String(res.status));
-  return usersResponseSchema.parse(await res.json()).users;
+  const parsed = await apiFetch('/api/v1/users', { credentials: 'include' }, (raw) =>
+    usersResponseSchema.parse(raw),
+  );
+  return parsed.users;
 }
 
 async function fetchAssignableUsers(): Promise<UserOption[]> {
@@ -59,8 +60,7 @@ export function useUsers(): UserOption[] {
  */
 export function useAssignableUsers(): UserOption[] {
   const user = useCurrentUser();
-  const role = user?.role;
-  const canAssign = role === 'order_manager' || role === 'scheduler' || role === 'root';
+  const canAssign = useCanWrite();
   const { data } = useQuery<UserOption[]>({
     queryKey: ['users', 'assignable', user?.id],
     queryFn: fetchAssignableUsers,

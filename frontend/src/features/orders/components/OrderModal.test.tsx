@@ -32,12 +32,6 @@ vi.mock('@/features/auth/api/users', () => {
   return { useAssignableUsers: () => stableUsers };
 });
 
-// Default role is `root` so the 負責人 input is enabled and the existing
-// form-fill tests can interact with it. Individual tests can override below.
-vi.mock('@/lib/auth', () => ({
-  useCurrentRole: () => 'root',
-}));
-
 // Radix Dialog has animation timers that keep the test runner alive.
 // Replace with a plain stub so tests exit cleanly.
 vi.mock('@/components/ui/dialog', () => ({
@@ -136,6 +130,14 @@ describe('OrderModal', () => {
       }),
       expect.anything(),
     );
+  });
+
+  it('create mode: allows order managers to assign from the assignable users list', () => {
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    const assigneeInput = screen.getByLabelText(/負責人/);
+    expect(assigneeInput).toBeEnabled();
+    expect(assigneeInput).toHaveAttribute('list', 'users-datalist');
   });
 
   // --- edit mode ---

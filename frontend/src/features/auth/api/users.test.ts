@@ -16,6 +16,10 @@ const mockAuth = vi.hoisted(() => ({
 vi.mock('@/lib/auth', () => ({
   useCurrentUser: () => mockAuth.user,
   useCurrentRole: () => mockAuth.user?.role ?? null,
+  useCanWrite: () =>
+    mockAuth.user?.role === 'root' ||
+    mockAuth.user?.role === 'scheduler' ||
+    mockAuth.user?.role === 'order_manager',
 }));
 
 let qc: QueryClient;
