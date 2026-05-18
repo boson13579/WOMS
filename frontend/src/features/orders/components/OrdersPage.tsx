@@ -1,10 +1,10 @@
-import { Plus } from 'lucide-react';
+import { Calendar, Plus } from 'lucide-react';
 import { useCallback, useState } from 'react';
 import { toast } from 'sonner';
 
 import { Header } from '@/components/layout/Header';
 import { Button } from '@/components/ui/button';
-import { useCanWrite } from '@/lib/auth';
+import { useCanSchedule, useCanWrite } from '@/lib/auth';
 
 import { useTriggerSchedule } from '../api/orders';
 import { useScheduleWs } from '../hooks/useScheduleWs';
@@ -20,6 +20,7 @@ export function OrdersPage(): JSX.Element {
 
   const triggerSchedule = useTriggerSchedule();
   const canWrite = useCanWrite();
+  const canSchedule = useCanSchedule();
 
   // Passive listener: any schedule.* WS event invalidates the orders cache
   // so the table refreshes once the worker finishes draining its queue.
@@ -51,18 +52,29 @@ export function OrdersPage(): JSX.Element {
       <Header title="訂單列表" />
 
       <div className="px-6 py-6 space-y-5">
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-2">
           {canWrite && (
             <Button onClick={handleNewOrder} size="sm">
               <Plus className="mr-1.5 h-4 w-4" />
               新增訂單
             </Button>
           )}
+          {canSchedule && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleSchedule}
+              disabled={triggerSchedule.isPending}
+            >
+              <Calendar className="mr-1.5 h-4 w-4" />
+              觸發排程器
+            </Button>
+          )}
         </div>
 
         <OrderFilters />
 
-        <OrderTable onEdit={handleEdit} onSchedule={handleSchedule} />
+        <OrderTable onEdit={handleEdit} />
       </div>
 
       <OrderModal

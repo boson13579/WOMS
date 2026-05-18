@@ -1,9 +1,8 @@
 /**
  * Paginated order list table.
- * Exposes onEdit / onSchedule callbacks so the parent page can manage
- * modal open state and schedule task IDs without prop-drilling.
+ * Exposes onEdit callback so the parent page can manage modal open state.
  */
-import { ArrowDown, ArrowUp, ArrowUpDown, Calendar, Loader2, Pencil, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, Loader2, Pencil, Trash2 } from 'lucide-react';
 import { useMemo, type ReactNode } from 'react';
 
 import { Badge } from '@/components/ui/badge';
@@ -17,8 +16,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { useUsernames } from '@/features/dashboard/api/useUsernames';
-import { useCanSchedule, useCanWrite, useCurrentRole, useCurrentUserId } from '@/lib/auth';
+import { useUsernames } from '@/features/users/api/useUsernames';
+import { useCanWrite, useCurrentRole, useCurrentUserId } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 
 import { useDeleteOrder, useOrders } from '../api/orders';
@@ -92,10 +91,9 @@ function SortableHead({
 
 interface OrderTableProps {
   onEdit: (order: Order) => void;
-  onSchedule: () => void;
 }
 
-export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element {
+export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
   const { status, search, assignedTo, createdBy, page, sortBy, sortOrder, setPage, setSort } =
     useOrderStore();
   const PAGE_SIZE = 20;
@@ -113,7 +111,6 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
 
   const deleteMutation = useDeleteOrder();
   const canWrite = useCanWrite();
-  const canSchedule = useCanSchedule();
   const role = useCurrentRole();
   const currentUserId = useCurrentUserId();
 
@@ -263,23 +260,6 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
                             title="編輯"
                           >
                             <Pencil className="h-4 w-4" />
-                          </Button>
-                        )}
-                        {canSchedule && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={() => {
-                              onSchedule();
-                            }}
-                            title={
-                              order.is_processing_locked
-                                ? '排程處理中，請稍候'
-                                : '觸發排程器（全域）'
-                            }
-                            disabled={order.is_processing_locked}
-                          >
-                            <Calendar className="h-4 w-4" />
                           </Button>
                         )}
                         {canEditOrder(order) && (

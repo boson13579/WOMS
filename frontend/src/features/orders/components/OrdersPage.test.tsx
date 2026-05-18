@@ -68,13 +68,13 @@ vi.mock('@/components/layout/Header', () => ({
 }));
 
 // ---------------------------------------------------------------------------
-// Mock API / WS hook
+// Mock API / WS hooks
 // ---------------------------------------------------------------------------
 
 const mockTriggerMutate = vi.fn();
 
 vi.mock('../api/orders', () => ({
-  useTriggerSchedule: () => ({ mutate: mockTriggerMutate }),
+  useTriggerSchedule: () => ({ mutate: mockTriggerMutate, isPending: false }),
 }));
 
 vi.mock('../hooks/useScheduleWs', () => ({
@@ -111,7 +111,7 @@ const SAMPLE_ORDER: Order = {
 };
 
 vi.mock('./OrderTable', () => ({
-  OrderTable: ({ onEdit, onSchedule }: { onEdit: (o: Order) => void; onSchedule: () => void }) => (
+  OrderTable: ({ onEdit }: { onEdit: (o: Order) => void }) => (
     <div data-testid="order-table">
       <button
         type="button"
@@ -120,14 +120,6 @@ vi.mock('./OrderTable', () => ({
         }}
       >
         table-edit
-      </button>
-      <button
-        type="button"
-        onClick={() => {
-          onSchedule();
-        }}
-      >
-        table-schedule
       </button>
     </div>
   ),
@@ -226,11 +218,11 @@ describe('OrdersPage', () => {
     expect(screen.getByTestId('order-modal')).toHaveAttribute('data-open', 'false');
   });
 
-  it('calls triggerSchedule.mutate() when OrderTable fires onSchedule', async () => {
+  it('calls triggerSchedule.mutate() when the toolbar schedule button is clicked', async () => {
     const user = userEvent.setup();
     renderPage();
 
-    await user.click(screen.getByRole('button', { name: 'table-schedule' }));
+    await user.click(screen.getByRole('button', { name: /觸發排程器/ }));
 
     expect(mockTriggerMutate).toHaveBeenCalledWith(undefined, expect.anything());
   });

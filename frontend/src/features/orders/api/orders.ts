@@ -63,6 +63,11 @@ const batchUpdateResponseSchema = z.object({
   skipped_ids: z.array(z.string().uuid()),
 });
 
+const scheduleTriggerResponseSchema = z.object({
+  task_id: z.string(),
+  message: z.string(),
+});
+
 const auditLogEntrySchema = z.object({
   id: z.string().uuid(),
   action: z.string(),
@@ -71,11 +76,6 @@ const auditLogEntrySchema = z.object({
   old_value: z.record(z.unknown()).nullable(),
   new_value: z.record(z.unknown()).nullable(),
   created_at: z.string(),
-});
-
-const scheduleTriggerResponseSchema = z.object({
-  task_id: z.string(),
-  message: z.string(),
 });
 
 // ---------------------------------------------------------------------------
@@ -220,19 +220,9 @@ export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error
 }
 
 /**
- * Manually kick the scheduler.
- *
- * Backend already enqueues compounds automatically on every order CRUD
- * (`POST /orders`, `PATCH /orders/{id}`, `DELETE /orders/{id}`), so the
- * frontend should NOT build its own compound payload — doing so would
- * double-enqueue the order and skip the backend's lock / audit / rollback
- * machinery. This endpoint just tells the scheduler to drain its pending
- * queue now. No order payload.
- *
- * If a per-order "reschedule this one" semantic is needed in the future,
- * ask the backend to add a dedicated endpoint
- * (e.g. POST /orders/{id}/reschedule) rather than driving the compound API
- * from the frontend.
+ * Kick the global scheduler to drain its pending queue now.
+ * The backend enqueues compounds automatically on order CRUD, so the
+ * frontend must NOT build compound payloads — just call this trigger.
  */
 export function useTriggerSchedule(): ReturnType<typeof useMutation<ScheduleTriggerResponse>> {
   return useMutation<ScheduleTriggerResponse>({

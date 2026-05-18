@@ -6,7 +6,7 @@
 > writing a feature that touches more than one layer. For deep-dives, this doc
 > points at the right specialized doc / file.
 >
-> Last reviewed: 2026-05-16.
+> Last reviewed: 2026-05-18.
 
 ---
 
@@ -72,7 +72,7 @@ browser can't attach the cookie.
 | `users.py` | `GET /users`, `GET /users/{id}`, `PATCH /users/me`, `PATCH /users/{id}`, `DELETE /users/{id}` | list/edit = root only; self-edit = all |
 | `system.py` | `GET /system/usernames?ids=…`, health bits | **all authed roles** — used by feature pages to resolve UUIDs without granting root |
 | `orders.py` | `POST /orders`, `GET /orders`, `GET /orders/{id}`, `PATCH /orders/{id}`, `DELETE /orders/{id}`, `PATCH /orders/batch-update`, `GET /orders/{id}/audit-log` | read = viewer+; write = order_manager+ (with row-level checks) |
-| `schedule.py` | `POST /schedule/trigger`, `POST /schedule/operations`, `DELETE /schedule/operations/{compound_id}`, `GET /schedule/status`, `GET /schedule/result`, `GET /schedule/pending-ops`, `GET /schedule/capacity`, `POST /schedule/rebuild` | read = viewer+; trigger/rebuild/operations = scheduler+ |
+| `schedule.py` | `POST /schedule/trigger`, `POST /schedule/operations`, `DELETE /schedule/operations/{compound_id}`, `GET /schedule/status`, `GET /schedule/result`, `GET /schedule/pending-ops`, `GET /schedule/capacity`, `POST /schedule/rebuild` | read = order_manager+; trigger/rebuild/operations = scheduler+ |
 | `websocket.py` | `WS /ws` | authed; single global channel, see §6 |
 | `health.py` | `GET /health` | public |
 
@@ -181,7 +181,7 @@ src/
 │   ├── auth/             login/register, authStore (Zustand)
 │   ├── users/            admin /users page (root only)
 │   ├── dashboard/        landing page; schedule status, capacity, pending ops
-│   └── orders/           order list, modal, filters, schedule-trigger button
+│   └── orders/           order list, modal, filters
 ├── lib/
 │   ├── auth.ts           role hooks (see §4.4)
 │   └── utils.ts          cn() + small helpers
@@ -193,10 +193,10 @@ src/
 `hooks/`, `stores/`, `types/`. Features should not import each other's
 internals — go through `@/lib/*` or `@/components/*` for shared code.
 
-> One known violation today: `orders/components/OrderTable.tsx` imports
-> `@/features/dashboard/api/useUsernames`. Promoting `useUsernames` into a
-> shared layer (`@/lib/users.ts` or a thin `users/api/useUsernames.ts`) is a
-> queued follow-up.
+> `useUsernames` now lives in `features/users/api/useUsernames.ts` (canonical)
+> and is re-exported by `dashboard/api/useUsernames.ts` for backward compat.
+> `apiFetch` was promoted to `@/lib/apiFetch.ts`; `dashboard/api/apiFetch.ts`
+> is now a thin re-export.
 
 ### 4.2 Routes (`frontend/src/routes/router.tsx`)
 
@@ -254,7 +254,7 @@ Quick reverse-index so you don't have to grep:
 | `GET /auth/me` | `features/auth/api/auth.ts` (session bootstrap) |
 | `GET /orders` | `features/orders/api/orders.ts → useOrders` |
 | `POST/PATCH/DELETE /orders/...` | `useCreateOrder` / `useUpdateOrder` / `useDeleteOrder` |
-| `POST /schedule/trigger` | `features/orders/api/orders.ts → useTriggerSchedule` **and** `features/dashboard/components/ScheduleControlBar.tsx` (both kick the same global re-run) |
+| `POST /schedule/trigger` | `features/dashboard/components/ScheduleControlBar.tsx` |
 | `POST /schedule/operations` | _frontend does not call this directly_ — backend service layer enqueues compounds on order CRUD |
 | `POST /schedule/rebuild` | same component |
 | `GET /schedule/status` | `features/dashboard/api/useScheduleStatus.ts` |
@@ -317,10 +317,10 @@ Flow:
 2. That writes to Redis pub/sub channel `schedule:ws:events`.
 3. The FastAPI side runs an async consumer that pulls events off the
    channel and fans them out to in-process sockets via `ConnectionManager`.
-4. Frontend `useScheduleWs(compoundId)` filters by `compound_id` for the
-   `compound_accepted` / `compound_failed` events (those carry the id) and
-   uses the prior `accepted` event as the anchor for the no-id terminal
-   events (`schedule.updated` / `schedule.materialized`).
+4. Frontend `useScheduleWs()` is a passive listener — on any `schedule.*`
+   event it invalidates the orders query cache so the table refreshes once
+   the worker finishes. It does not track compound IDs or show per-operation
+   toasts.
 
 Authentication on WS: same JWT as REST. The browser sends the cookie
 automatically; the worker / server-to-server case can also pass `?token=`.
@@ -349,9 +349,8 @@ right `add` / `remove` / `pin` / `unpin` compound inside the service
 layer. The frontend just calls the order endpoints — the scheduling
 pipeline picks up the work automatically.
 
-**Manual scheduler kick** — both the dashboard "Trigger scheduling"
-button and the per-row "觸發排程器" button on OrdersPage call
-`POST /schedule/trigger`, which kicks `run_scheduling_task` without
+**Manual scheduler kick** — the dashboard "Trigger scheduling" button
+calls `POST /schedule/trigger`, which kicks `run_scheduling_task` without
 modifying the op queue. The endpoint returns a Celery `task_id` that
 isn't currently surfaced beyond a confirmation toast.
 
@@ -375,10 +374,11 @@ needs to own the lock / audit / rollback machinery.
 
 | Capability | viewer | order_manager | scheduler | root |
 |---|:-:|:-:|:-:|:-:|
-| Read orders, schedule, dashboards | ✓ | ✓ | ✓ | ✓ |
+| Read orders (list / detail / audit-log) | ✓ | ✓ | ✓ | ✓ |
+| Read schedule / dashboard data (`/schedule/status`, `/result`, `/pending-ops`, `/capacity`) | | ✓ | ✓ | ✓ |
 | Create / edit own orders | | ✓ | ✓ | ✓ |
 | Edit any order | | | ✓ | ✓ |
-| Trigger schedule (per-order + global) | | | ✓ | ✓ |
+| Trigger schedule (global) | | | ✓ | ✓ |
 | Rebuild schedule from DB | | | ✓ | ✓ |
 | List all users (`/users`) | | | | ✓ |
 | Resolve UUID → username (`/system/usernames`) | ✓ | ✓ | ✓ | ✓ |

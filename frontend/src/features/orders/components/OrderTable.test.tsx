@@ -17,19 +17,17 @@ import { OrderTable } from './OrderTable';
 // ---------------------------------------------------------------------------
 
 let mockCanWrite = true;
-let mockCanSchedule = true;
 let mockRole = 'scheduler';
 const mockCurrentUserId = 'test-user-id';
 
 vi.mock('@/lib/auth', () => ({
   useCurrentUser: () => ({ username: 'test', role: mockRole }),
   useCanWrite: () => mockCanWrite,
-  useCanSchedule: () => mockCanSchedule,
   useCurrentRole: () => mockRole,
   useCurrentUserId: () => mockCurrentUserId,
 }));
 
-vi.mock('@/features/dashboard/api/useUsernames', () => ({
+vi.mock('@/features/users/api/useUsernames', () => ({
   useUsernames: () => ({ data: undefined }),
 }));
 
@@ -105,12 +103,10 @@ function makeList(items: Order[]): OrderListResponse {
 
 describe('OrderTable', () => {
   const onEdit = vi.fn();
-  const onSchedule = vi.fn();
 
   beforeEach(() => {
     vi.clearAllMocks();
     mockCanWrite = true;
-    mockCanSchedule = true;
     mockRole = 'scheduler';
     mockStore.sortBy = 'order_number';
     mockStore.sortOrder = 'asc';
@@ -120,7 +116,7 @@ describe('OrderTable', () => {
   it('shows a loading spinner while data is pending', () => {
     mockUseOrders.mockReturnValue({ isPending: true, isError: false, data: undefined });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText(/載入中/)).toBeInTheDocument();
   });
@@ -128,7 +124,7 @@ describe('OrderTable', () => {
   it('shows an error message when the API fails', () => {
     mockUseOrders.mockReturnValue({ isPending: false, isError: true, data: undefined });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText(/載入失敗/)).toBeInTheDocument();
   });
@@ -136,7 +132,7 @@ describe('OrderTable', () => {
   it('shows an empty-state message when there are no results', () => {
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText(/沒有符合條件的訂單/)).toBeInTheDocument();
   });
@@ -145,7 +141,7 @@ describe('OrderTable', () => {
     const order = makeOrder({ customer_name: 'TSMC', order_number: 'ORD-20260504-0001' });
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText('TSMC')).toBeInTheDocument();
     expect(screen.getByText('ORD-20260504-0001')).toBeInTheDocument();
@@ -156,7 +152,7 @@ describe('OrderTable', () => {
     const order = makeOrder({ status: 'scheduled' });
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.getByText('已排程')).toBeInTheDocument();
   });
@@ -166,21 +162,10 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByTitle('編輯'));
 
     expect(onEdit).toHaveBeenCalledWith(order);
-  });
-
-  it('calls onSchedule() when the schedule button is clicked', async () => {
-    const user = userEvent.setup();
-    const order = makeOrder({ id: 'test-id-0001' });
-    mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
-
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
-    await user.click(screen.getByTitle('觸發排程器（全域）'));
-
-    expect(onSchedule).toHaveBeenCalledWith();
   });
 
   it('does not call deleteMutation.mutate when the confirm dialog is cancelled', async () => {
@@ -190,7 +175,7 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByTitle('刪除'));
 
     expect(mockDeleteMutate).not.toHaveBeenCalled();
@@ -203,7 +188,7 @@ describe('OrderTable', () => {
     const order = makeOrder({ id: 'delete-me-id' });
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByTitle('刪除'));
 
     expect(mockDeleteMutate).toHaveBeenCalledWith(
@@ -218,7 +203,7 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByText('客戶'));
 
     expect(mockSetSort).toHaveBeenCalledWith('customer_name');
@@ -231,53 +216,47 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
     await user.click(screen.getByText('客戶'));
 
     expect(mockSetSort).toHaveBeenCalledWith('customer_name');
   });
 
   describe('role-based rendering', () => {
-    it('scheduler — shows edit, schedule, delete buttons', () => {
+    it('scheduler — shows edit and delete buttons', () => {
       mockCanWrite = true;
-      mockCanSchedule = true;
       mockRole = 'scheduler';
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+      render(<OrderTable onEdit={onEdit} />);
 
       expect(screen.getByTitle('編輯')).toBeInTheDocument();
-      expect(screen.getByTitle('觸發排程器（全域）')).toBeInTheDocument();
       expect(screen.getByTitle('刪除')).toBeInTheDocument();
     });
 
-    it('root — shows edit, schedule, delete buttons', () => {
+    it('root — shows edit and delete buttons', () => {
       mockCanWrite = true;
-      mockCanSchedule = true;
       mockRole = 'root';
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+      render(<OrderTable onEdit={onEdit} />);
 
       expect(screen.getByTitle('編輯')).toBeInTheDocument();
-      expect(screen.getByTitle('觸發排程器（全域）')).toBeInTheDocument();
       expect(screen.getByTitle('刪除')).toBeInTheDocument();
     });
 
-    it("order_manager — hides edit and delete for another user's order, hides schedule", () => {
+    it("order_manager — hides edit and delete for another user's order", () => {
       mockCanWrite = true;
-      mockCanSchedule = false;
       mockRole = 'order_manager';
       // mockCurrentUserId ('test-user-id') !== order.created_by ('aaaaaaaa-...') → canEditOrder=false
       const order = makeOrder();
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-      render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+      render(<OrderTable onEdit={onEdit} />);
 
       expect(screen.queryByTitle('編輯')).not.toBeInTheDocument();
-      expect(screen.queryByTitle('觸發排程器（全域）')).not.toBeInTheDocument();
       expect(screen.queryByTitle('刪除')).not.toBeInTheDocument();
     });
   });
@@ -286,7 +265,7 @@ describe('OrderTable', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
-    render(<OrderTable onEdit={onEdit} onSchedule={onSchedule} />);
+    render(<OrderTable onEdit={onEdit} />);
 
     expect(screen.queryByRole('button', { name: /上一頁/ })).not.toBeInTheDocument();
   });

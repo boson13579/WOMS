@@ -77,7 +77,6 @@ export interface AuditLogEntry {
   created_at: string;
 }
 
-/** Matches backend ScheduleTriggerResponse from POST /schedule/trigger */
 export interface ScheduleTriggerResponse {
   task_id: string;
   message: string;
