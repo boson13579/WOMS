@@ -14,13 +14,19 @@ from datetime import date, timedelta
 from app.services.scheduling import (
     DAILY_CAPACITY,
     HORIZON_DAYS,
+    BatchOp,
     PinnedOrder,
     SchedulerState,
     SchedulingOrder,
+    _iter_pq_edf_sorted,
     abs_to_rel,
     add_order,
     advance_day,
+    apply_batch_to_capacity,
+    apply_batch_to_deadline,
+    compute_batch_capacity_delta,
     compute_schedule,
+    is_batch_feasible,
     pin_order,
     rebuild_state,
     rel_to_abs,
@@ -82,7 +88,7 @@ def test_add_order_success_updates_both_trees() -> None:
 
     assert result.status == "success"
     assert result.order_id == order.order_id
-    assert order in state.priority_queue
+    assert order.order_id in state.pq_index
     # capacity_tree: 30 days * 10000 - 2000 consumed
     assert state.capacity_tree.query(3) == 3 * DAILY_CAPACITY - 2000
     assert state.capacity_tree.query(HORIZON_DAYS) == HORIZON_DAYS * DAILY_CAPACITY - 2000
@@ -98,7 +104,7 @@ def test_add_order_capacity_exceeded() -> None:
     result = add_order(state, order)
 
     assert result.status == "capacity_exceeded"
-    assert order not in state.priority_queue
+    assert order.order_id not in state.pq_index
     # Trees untouched
     assert state.capacity_tree.query(1) == DAILY_CAPACITY
     assert state.deadline_tree.query(1) == 0
@@ -114,7 +120,7 @@ def test_add_order_deadline_too_far() -> None:
     result = add_order(state, order)
 
     assert result.status == "deadline_too_far"
-    assert order not in state.priority_queue
+    assert order.order_id not in state.pq_index
     assert state.deadline_tree.query(HORIZON_DAYS) == 0
 
 
@@ -133,7 +139,7 @@ def test_remove_order_restores_capacity_after_single_add() -> None:
 
     remove_order(state, order)
 
-    assert state.priority_queue == []
+    assert state.pq_index == {}
     # Every prefix sum back to the original full-capacity state
     for d in range(1, HORIZON_DAYS + 1):
         assert state.capacity_tree.query(d) == d * DAILY_CAPACITY
@@ -158,7 +164,7 @@ def test_remove_order_leaves_other_orders_intact() -> None:
     # Only a + c remain → 4000 used, 6000 free at day 1
     assert state.capacity_tree.query(1) == 6000
     assert state.deadline_tree.query(1) == 4000
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     assert pq_ids == {a.order_id, c.order_id}
 
 
@@ -217,9 +223,9 @@ def test_remove_order_restores_when_later_add_overlaps_earlier_one() -> None:
     for d in range(3, HORIZON_DAYS + 1):
         assert state.deadline_tree.query(d) == 10_000
 
-    # priority_queue: only first remains
-    assert len(state.priority_queue) == 1
-    assert state.priority_queue[0].order_id == first.order_id
+    # pq_index: only first remains
+    assert len(state.pq_index) == 1
+    assert _iter_pq_edf_sorted(state)[0].order_id == first.order_id
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +291,8 @@ def test_advance_day_processes_pq_and_shifts_trees() -> None:
     assert new_state.base_date == _BASE + timedelta(days=1)
 
     # Only the boundary order f (reduced) and the unprocessed g remain.
-    assert len(new_state.priority_queue) == 2
-    surviving = {o.order_id: o for o in new_state.priority_queue}
+    assert len(new_state.pq_index) == 2
+    surviving = dict(new_state.pq_index)
     assert set(surviving.keys()) == {f.order_id, g.order_id}
 
     # f's quantity was 2000; 1000 ran on day 1; remaining = 1000.
@@ -299,8 +305,9 @@ def test_advance_day_processes_pq_and_shifts_trees() -> None:
     # within the same deadline — g first, then f. This is the EDF-correct
     # ordering; the old per-spec "preserve position" was a deliberate
     # simplification of pre-refactor code and isn't a semantic invariant.
-    assert new_state.priority_queue[0].order_id == g.order_id
-    assert new_state.priority_queue[1].order_id == f.order_id
+    edf = _iter_pq_edf_sorted(new_state)
+    assert edf[0].order_id == g.order_id
+    assert edf[1].order_id == f.order_id
 
     # Capacity prefix after the doc's "步驟 4": 10000, 17000 for the first two
     # days of the new horizon (third day onwards is fresh full-capacity slots).
@@ -314,7 +321,7 @@ def test_advance_day_processes_pq_and_shifts_trees() -> None:
 
     # Original state untouched.
     assert state.base_date == _BASE
-    assert len(state.priority_queue) == 7
+    assert len(state.pq_index) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +333,7 @@ def test_rebuild_state_empty_orders_returns_empty_state() -> None:
     state, skipped = rebuild_state([], _BASE)
 
     assert state.base_date == _BASE
-    assert state.priority_queue == []
+    assert state.pq_index == {}
     assert skipped == []
     # Full capacity on every day, no deadline obligations.
     for d in range(1, HORIZON_DAYS + 1):
@@ -343,8 +350,8 @@ def test_rebuild_state_single_order_matches_fresh_add() -> None:
     rebuilt, skipped = rebuild_state([order], _BASE)
 
     assert skipped == []
-    assert len(rebuilt.priority_queue) == 1
-    assert rebuilt.priority_queue[0].order_id == order.order_id
+    assert len(rebuilt.pq_index) == 1
+    assert _iter_pq_edf_sorted(rebuilt)[0].order_id == order.order_id
     # Trees must match a single fresh add_order call exactly.
     for d in range(1, HORIZON_DAYS + 1):
         assert rebuilt.capacity_tree.query(d) == fresh.capacity_tree.query(d)
@@ -364,8 +371,9 @@ def test_rebuild_state_multiple_orders_adds_in_priority_order() -> None:
 
     assert skipped == []
     # PQ should have b before a (earlier deadline wins).
-    assert rebuilt.priority_queue[0].order_id == b.order_id
-    assert rebuilt.priority_queue[1].order_id == a.order_id
+    edf = _iter_pq_edf_sorted(rebuilt)
+    assert edf[0].order_id == b.order_id
+    assert edf[1].order_id == a.order_id
     # Tree state should be identical to the correctly-ordered fresh sequence.
     for d in range(1, HORIZON_DAYS + 1):
         assert rebuilt.capacity_tree.query(d) == fresh.capacity_tree.query(d)
@@ -384,7 +392,7 @@ def test_rebuild_state_skips_orders_past_horizon() -> None:
 
     state, skipped = rebuild_state([inside, outside], _BASE)
 
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     assert inside.order_id in pq_ids
     assert outside.order_id not in pq_ids
     # Skipped list carries identity + reason so the caller can notify the
@@ -415,14 +423,14 @@ def test_add_order_rejects_duplicate_already_in_pq() -> None:
 
     cap_before = state.capacity_tree.to_array()
     dead_before = state.deadline_tree.to_array()
-    pq_len_before = len(state.priority_queue)
+    pq_len_before = len(state.pq_index)
 
     second = add_order(state, order)
     assert second.status == "capacity_exceeded"
     # Critical: state is UNCHANGED by the rejected duplicate.
     assert state.capacity_tree.to_array() == cap_before
     assert state.deadline_tree.to_array() == dead_before
-    assert len(state.priority_queue) == pq_len_before
+    assert len(state.pq_index) == pq_len_before
 
 
 def test_add_order_rejects_when_already_pinned() -> None:
@@ -438,7 +446,7 @@ def test_add_order_rejects_when_already_pinned() -> None:
     pin_order(state, order, fake_deadline=_BASE + timedelta(days=1))
 
     # Now the order is in pinned_orders, not pq.
-    assert not any(o.order_id == order.order_id for o in state.priority_queue)
+    assert order.order_id not in state.pq_index
 
     second = add_order(state, order)
     assert second.status == "capacity_exceeded"
@@ -457,7 +465,7 @@ def test_remove_order_rejects_not_in_pq() -> None:
 
     cap_before = state.capacity_tree.to_array()
     dead_before = state.deadline_tree.to_array()
-    pq_before = list(state.priority_queue)
+    pq_before = dict(state.pq_index)
 
     phantom = _make_order(order_number="phantom", qty=500, deadline=_BASE + timedelta(days=2))
     result = remove_order(state, phantom)
@@ -465,7 +473,7 @@ def test_remove_order_rejects_not_in_pq() -> None:
     # State unchanged.
     assert state.capacity_tree.to_array() == cap_before
     assert state.deadline_tree.to_array() == dead_before
-    assert state.priority_queue == pq_before
+    assert state.pq_index == pq_before
 
 
 def test_remove_order_on_pinned_order_gives_pinned_hint() -> None:
@@ -507,14 +515,14 @@ def test_pin_order_rejected_when_capacity_insufficient_at_pin_day() -> None:
     # Snapshot trees + pq for post-rejection comparison.
     cap_before = state.capacity_tree.to_array()
     dead_before = state.deadline_tree.to_array()
-    pq_ids_before = [o.order_id for o in state.priority_queue]
+    pq_ids_before = set(state.pq_index.keys())
 
     result = pin_order(state, b, fake_deadline=_BASE)
     assert result.status == "capacity_exceeded"
 
     assert state.capacity_tree.to_array() == cap_before
     assert state.deadline_tree.to_array() == dead_before
-    assert [o.order_id for o in state.priority_queue] == pq_ids_before
+    assert set(state.pq_index.keys()) == pq_ids_before
     assert state.pinned_orders == {}
 
 
@@ -554,7 +562,7 @@ def test_pin_order_success_matches_spec_example_2() -> None:
     assert state.deadline_tree.query(2) == 2000
     assert state.deadline_tree.query(3) == 11000
 
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id}
     assert pinned_ids == {b.order_id, c.order_id}
@@ -586,7 +594,7 @@ def test_unpin_order_restores_state_to_pre_pin() -> None:
     assert state.deadline_tree.query(2) == 1000
     assert state.deadline_tree.query(3) == 11000
 
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id, c.order_id}
     assert pinned_ids == {b.order_id}
@@ -601,13 +609,13 @@ def test_unpin_order_unknown_id_returns_error_without_mutating_state() -> None:
     add_order(state, _make_order(order_number="a", qty=1000, deadline=_BASE + timedelta(days=2)))
 
     cap_before = state.capacity_tree.to_array()
-    pq_before = list(state.priority_queue)
+    pq_before = dict(state.pq_index)
     pinned_before = dict(state.pinned_orders)
 
     result = unpin_order(state, uuid.uuid4())
     assert result.status == "capacity_exceeded"
     assert state.capacity_tree.to_array() == cap_before
-    assert list(state.priority_queue) == pq_before
+    assert state.pq_index == pq_before
     assert state.pinned_orders == pinned_before
 
 
@@ -658,9 +666,10 @@ def test_advance_day_completes_pinned_today_and_fills_remainder_from_pq() -> Non
     # Pinned x is gone — produced today.
     assert new_state.pinned_orders == {}
     # y remains in pq with qty reduced by 8000 (the pq budget after pinned-today).
-    assert len(new_state.priority_queue) == 1
-    assert new_state.priority_queue[0].order_id == y.order_id
-    assert new_state.priority_queue[0].wafer_quantity == 15000 - 8000
+    assert len(new_state.pq_index) == 1
+    edf = _iter_pq_edf_sorted(new_state)
+    assert edf[0].order_id == y.order_id
+    assert edf[0].wafer_quantity == 15000 - 8000
     # base_date advanced by 1 day.
     assert new_state.base_date == _BASE + timedelta(days=1)
 
@@ -687,7 +696,7 @@ def test_rebuild_state_separates_pinned_from_pq() -> None:
     state, skipped = rebuild_state([a, b], _BASE)
 
     assert skipped == []
-    pq_ids = {o.order_id for o in state.priority_queue}
+    pq_ids = set(state.pq_index.keys())
     pinned_ids = set(state.pinned_orders.keys())
     assert pq_ids == {a.order_id}
     assert pinned_ids == {b.order_id}
@@ -961,7 +970,7 @@ def test_unpin_order_drops_when_real_deadline_already_passed() -> None:
     # Pinned record is gone (pop happened earlier in unpin_order).
     assert pinned.order_id not in state.pinned_orders
     # pq is empty — the order was dropped, not re-added.
-    assert pinned.order_id not in {o.order_id for o in state.priority_queue}
+    assert pinned.order_id not in set(state.pq_index.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -1122,7 +1131,7 @@ def test_rebuild_state_falls_back_to_pq_when_pin_capacity_exceeded() -> None:
     # Second order's pin failed but its add succeeded → it stays in pq
     # (not pinned_orders) and shows up in skipped with the pin failure
     # reason.
-    pq_ids = {o.order_id for o in new_state.priority_queue}
+    pq_ids = set(new_state.pq_index.keys())
     assert second.order_id in pq_ids
     assert second.order_id not in new_state.pinned_orders
     skipped_ids = {s.order_id for s in skipped}
@@ -1298,8 +1307,560 @@ def test_advance_day_handles_empty_pq_and_no_pins() -> None:
     new_state = advance_day(state)
 
     assert new_state.base_date == _BASE + timedelta(days=1)
-    assert len(new_state.priority_queue) == 0
+    assert len(new_state.pq_index) == 0
     assert new_state.pinned_orders == {}
     # Trees shifted: day 30 of the new state should be a fresh
     # DAILY_CAPACITY (the rolled-in tail day).
     assert new_state.capacity_tree.query(HORIZON_DAYS) == HORIZON_DAYS * DAILY_CAPACITY
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — compute_batch_capacity_delta
+# ---------------------------------------------------------------------------
+
+
+def test_compute_batch_delta_add_only_lands_on_deadline_day() -> None:
+    """A single add op contributes +qty at its deadline's rel index and
+    zero everywhere else."""
+    ops = [BatchOp(kind="add", wafer_quantity=500, deadline=_BASE + timedelta(days=3))]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert len(delta) == HORIZON_DAYS
+    # rel = 3 + 1 = 4 ⇒ index 3.
+    assert delta[3] == 500
+    assert all(d == 0 for i, d in enumerate(delta) if i != 3)
+
+
+def test_compute_batch_delta_remove_negates_quantity() -> None:
+    """Remove contributes ``-wafer_quantity`` at the deadline day."""
+    ops = [BatchOp(kind="remove", wafer_quantity=300, deadline=_BASE + timedelta(days=5))]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert delta[5] == -300
+    assert sum(abs(d) for i, d in enumerate(delta) if i != 5) == 0
+
+
+def test_compute_batch_delta_patch_self_cancels_when_same_day() -> None:
+    """A PATCH (remove old + add new) on the same deadline day with the
+    same quantity nets to zero — the batch is a no-op for capacity
+    accounting even though pq / DB rows still change."""
+    same_day = _BASE + timedelta(days=4)
+    ops = [
+        BatchOp(kind="remove", wafer_quantity=200, deadline=same_day),
+        BatchOp(kind="add", wafer_quantity=200, deadline=same_day),
+    ]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert all(d == 0 for d in delta)
+
+
+def test_compute_batch_delta_deadline_shift_splits_across_days() -> None:
+    """PATCH that shifts a deadline from day A to day B (same qty) lands
+    -qty on day A and +qty on day B — the two cancel in total but the
+    per-day distribution matters for feasibility."""
+    ops = [
+        BatchOp(kind="remove", wafer_quantity=400, deadline=_BASE + timedelta(days=2)),
+        BatchOp(kind="add", wafer_quantity=400, deadline=_BASE + timedelta(days=10)),
+    ]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert delta[2] == -400
+    assert delta[10] == 400
+
+
+def test_compute_batch_delta_drops_ops_outside_horizon() -> None:
+    """Op with deadline before base_date OR ≥ base_date + HORIZON_DAYS is
+    silently skipped — caller is responsible for surfacing these as
+    individual failures before they reach the batch path."""
+    ops = [
+        BatchOp(kind="add", wafer_quantity=500, deadline=_BASE - timedelta(days=1)),  # past
+        BatchOp(
+            kind="add",
+            wafer_quantity=500,
+            deadline=_BASE + timedelta(days=HORIZON_DAYS),  # too far
+        ),
+        BatchOp(kind="add", wafer_quantity=100, deadline=_BASE + timedelta(days=0)),  # rel=1
+    ]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert delta[0] == 100  # only the in-horizon op contributed
+    assert sum(d for i, d in enumerate(delta) if i != 0) == 0
+
+
+def test_compute_batch_delta_multiple_ops_same_day_sum() -> None:
+    """Three ops on the same day all add into the same delta cell."""
+    day = _BASE + timedelta(days=7)
+    ops = [
+        BatchOp(kind="add", wafer_quantity=100, deadline=day),
+        BatchOp(kind="add", wafer_quantity=250, deadline=day),
+        BatchOp(kind="remove", wafer_quantity=50, deadline=day),
+    ]
+
+    delta = compute_batch_capacity_delta(ops, _BASE)
+
+    assert delta[7] == 100 + 250 - 50
+
+
+def test_compute_batch_delta_empty_input_returns_zeros() -> None:
+    """No ops ⇒ all-zero delta. Sanity check + degenerate base case."""
+    delta = compute_batch_capacity_delta([], _BASE)
+
+    assert delta == [0] * HORIZON_DAYS
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — is_batch_feasible
+# ---------------------------------------------------------------------------
+
+
+def test_is_batch_feasible_empty_delta_is_feasible() -> None:
+    """All-zero delta is always feasible — no demand to compare against."""
+    state = SchedulerState.initial(_BASE)
+    assert is_batch_feasible(state, [0] * HORIZON_DAYS) is True
+
+
+def test_is_batch_feasible_demand_under_capacity_passes() -> None:
+    """Demand prefix strictly less than capacity prefix on every day ⇒
+    feasible."""
+    state = SchedulerState.initial(_BASE)
+    delta = [100] * HORIZON_DAYS  # 100 wafers due per day, far below DAILY_CAPACITY
+
+    assert is_batch_feasible(state, delta) is True
+
+
+def test_is_batch_feasible_demand_equals_capacity_passes() -> None:
+    """Demand exactly at the prefix-sum boundary is feasible (``≤``, not
+    strict). Validates the inequality direction."""
+    state = SchedulerState.initial(_BASE)
+    delta = [DAILY_CAPACITY] + [0] * (HORIZON_DAYS - 1)  # exactly fills day 1
+
+    assert is_batch_feasible(state, delta) is True
+
+
+def test_is_batch_feasible_single_day_over_capacity_fails() -> None:
+    """One day's prefix sum exceeding the capacity prefix sum is enough
+    to reject the whole batch."""
+    state = SchedulerState.initial(_BASE)
+    # Demand DAILY_CAPACITY + 1 on day 1 — one unit over.
+    delta = [DAILY_CAPACITY + 1] + [0] * (HORIZON_DAYS - 1)
+
+    assert is_batch_feasible(state, delta) is False
+
+
+def test_is_batch_feasible_later_day_violation_caught() -> None:
+    """Demand on a later day pushing cumulative prefix past cumulative
+    capacity prefix should be detected (not just the first day)."""
+    state = SchedulerState.initial(_BASE)
+    # Days 1-4 take all the cumulative cap. Day 5 demand is +1 over.
+    delta = [DAILY_CAPACITY] * 5 + [0] * (HORIZON_DAYS - 5)
+    delta[4] += 1  # day 5 over
+
+    assert is_batch_feasible(state, delta) is False
+
+
+def test_is_batch_feasible_negative_prefix_passes_trivially() -> None:
+    """If the batch nets to a removal (negative cumulative demand at some
+    day), feasibility is automatic at that day. Validates that the
+    inequality stays correct for sign-mixed batches."""
+    state = SchedulerState.initial(_BASE)
+    # Day 3: -500 (the batch removes existing demand)
+    delta = [0, 0, -500] + [0] * (HORIZON_DAYS - 3)
+
+    assert is_batch_feasible(state, delta) is True
+
+
+def test_is_batch_feasible_wrong_length_raises() -> None:
+    """API contract: delta must be exactly HORIZON_DAYS long."""
+    state = SchedulerState.initial(_BASE)
+    import pytest
+
+    with pytest.raises(ValueError, match=str(HORIZON_DAYS)):
+        is_batch_feasible(state, [0] * (HORIZON_DAYS - 1))
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — apply_batch_to_capacity (carry-back)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_batch_to_capacity_noop_for_zero_delta() -> None:
+    """All-zero delta leaves the tree bit-identical."""
+    state = SchedulerState.initial(_BASE)
+    before = state.capacity_tree.to_array()
+
+    apply_batch_to_capacity(state, [0] * HORIZON_DAYS)
+
+    assert state.capacity_tree.to_array() == before
+
+
+def test_apply_batch_to_capacity_single_add_distributes_via_carry_back() -> None:
+    """Adding qty < DAILY_CAPACITY on a single day reduces that day's
+    raw remaining by exactly qty (no spill-back needed). The prefix-sum
+    semantics match: ``prefix(HORIZON_DAYS) decreased by qty``."""
+    state = SchedulerState.initial(_BASE)
+    qty = 1500
+    delta = [0] * HORIZON_DAYS
+    delta[4] = qty  # day 5
+
+    apply_batch_to_capacity(state, delta)
+
+    raw = state.capacity_tree.to_array()
+    # Day 5 absorbed all qty (it had DAILY_CAPACITY available, qty < cap).
+    assert raw[4] == DAILY_CAPACITY - qty
+    # Earlier days untouched (no spill-back).
+    assert all(r == DAILY_CAPACITY for r in raw[:4])
+    # Later days untouched.
+    assert all(r == DAILY_CAPACITY for r in raw[5:])
+
+
+def test_apply_batch_to_capacity_overflow_spills_to_earlier_days() -> None:
+    """If a day's demand exceeds its remaining capacity, the carry-back
+    formula moves the overflow to earlier days. After applying, prefix
+    sums reflect the cumulative demand correctly even when individual
+    days hit zero."""
+    state = SchedulerState.initial(_BASE)
+    # Demand 1.5x DAILY_CAPACITY on day 2 — must spill into day 1.
+    overflow_qty = DAILY_CAPACITY + (DAILY_CAPACITY // 2)
+    delta = [0, overflow_qty] + [0] * (HORIZON_DAYS - 2)
+
+    assert is_batch_feasible(state, delta) is True
+
+    apply_batch_to_capacity(state, delta)
+
+    raw = state.capacity_tree.to_array()
+    # Day 2 absorbed DAILY_CAPACITY (its full slot), day 1 absorbed the rest.
+    assert raw[1] == 0
+    assert raw[0] == DAILY_CAPACITY - (DAILY_CAPACITY // 2)
+    # Prefix sum at day 2 dropped by exactly overflow_qty.
+    assert state.capacity_tree.query(2) == 2 * DAILY_CAPACITY - overflow_qty
+
+
+def test_apply_batch_to_capacity_add_then_remove_round_trips_to_original() -> None:
+    """Add + remove of the same order on the same day must restore the
+    tree to its starting state — this is the critical invariant the
+    two-branch formula is designed to preserve."""
+    state = SchedulerState.initial(_BASE)
+    before = state.capacity_tree.to_array()
+
+    add_delta = [0] * HORIZON_DAYS
+    add_delta[4] = 7000
+    apply_batch_to_capacity(state, add_delta)
+
+    remove_delta = [0] * HORIZON_DAYS
+    remove_delta[4] = -7000
+    apply_batch_to_capacity(state, remove_delta)
+
+    assert state.capacity_tree.to_array() == before
+
+
+def test_apply_batch_to_capacity_remove_after_spillback_restores_state() -> None:
+    """The harder round-trip: add forces spill-back to earlier days, then
+    remove must un-spill correctly so raw values return to the initial
+    configuration. Validates the negative-branch (min-clamp) formula."""
+    state = SchedulerState.initial(_BASE)
+    before = state.capacity_tree.to_array()
+
+    # Add 1.5x cap on day 3 — overflows back into days 1 and 2.
+    add_qty = DAILY_CAPACITY + (DAILY_CAPACITY // 2)
+    add_delta = [0, 0, add_qty] + [0] * (HORIZON_DAYS - 3)
+    apply_batch_to_capacity(state, add_delta)
+
+    # Now remove the same demand.
+    remove_delta = [0, 0, -add_qty] + [0] * (HORIZON_DAYS - 3)
+    apply_batch_to_capacity(state, remove_delta)
+
+    assert state.capacity_tree.to_array() == before
+
+
+def test_apply_batch_to_capacity_preserves_prefix_sum_invariant() -> None:
+    """For any feasible delta, post-apply prefix sum on day i must equal
+    pre-apply prefix sum minus the cumulative delta through day i. This
+    is the contract the feasibility check relies on."""
+    state = SchedulerState.initial(_BASE)
+    delta = [0, 5000, 3000, 0, 7000] + [0] * (HORIZON_DAYS - 5)
+
+    pre_prefix = [state.capacity_tree.query(i) for i in range(1, HORIZON_DAYS + 1)]
+    apply_batch_to_capacity(state, delta)
+    post_prefix = [state.capacity_tree.query(i) for i in range(1, HORIZON_DAYS + 1)]
+
+    cumulative = 0
+    for i in range(HORIZON_DAYS):
+        cumulative += delta[i]
+        assert post_prefix[i] == pre_prefix[i] - cumulative
+
+
+def test_apply_batch_to_capacity_wrong_length_raises() -> None:
+    """API contract."""
+    state = SchedulerState.initial(_BASE)
+    import pytest
+
+    with pytest.raises(ValueError, match=str(HORIZON_DAYS)):
+        apply_batch_to_capacity(state, [0] * (HORIZON_DAYS - 1))
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — apply_batch_to_deadline
+# ---------------------------------------------------------------------------
+
+
+def test_apply_batch_to_deadline_adds_to_corresponding_day() -> None:
+    """Non-zero delta on day i adds delta[i-1] to deadline_tree's day i
+    raw value; zero days untouched. Symmetric for negative delta."""
+    state = SchedulerState.initial(_BASE)
+    delta = [0] * HORIZON_DAYS
+    delta[2] = 800  # day 3
+    delta[7] = -300  # day 8
+
+    apply_batch_to_deadline(state, delta)
+
+    raw = state.deadline_tree.to_array()
+    assert raw[2] == 800
+    assert raw[7] == -300
+    assert all(r == 0 for i, r in enumerate(raw) if i not in (2, 7))
+
+
+def test_apply_batch_to_deadline_zero_delta_is_noop() -> None:
+    """All-zero delta leaves deadline_tree bit-identical (no point_update
+    calls with delta=0 due to the explicit skip)."""
+    state = SchedulerState.initial(_BASE)
+    before = state.deadline_tree.to_array()
+
+    apply_batch_to_deadline(state, [0] * HORIZON_DAYS)
+
+    assert state.deadline_tree.to_array() == before
+
+
+def test_apply_batch_to_deadline_wrong_length_raises() -> None:
+    """API contract."""
+    state = SchedulerState.initial(_BASE)
+    import pytest
+
+    with pytest.raises(ValueError, match=str(HORIZON_DAYS)):
+        apply_batch_to_deadline(state, [0] * (HORIZON_DAYS + 1))
+
+
+# ---------------------------------------------------------------------------
+# Batch admission — end-to-end equivalence with per-op add_order/remove_order
+# ---------------------------------------------------------------------------
+
+
+def test_batch_apply_matches_per_op_add_for_single_order_within_capacity() -> None:
+    """Applying batch updates for a single add op should leave capacity
+    and deadline trees in the same prefix-sum state as calling
+    ``add_order`` directly on that order. (Raw distributions can differ
+    — carry-back fills latest day first whereas ``_apply_add_to_trees``
+    backward-fills from prefix-geq; both are valid EDF-equivalent
+    distributions that produce identical prefix sums.)
+    """
+    order = _make_order(qty=2000, deadline=_BASE + timedelta(days=3))
+
+    # Path A: existing per-op add.
+    state_a = SchedulerState.initial(_BASE)
+    add_order(state_a, order)
+
+    # Path B: batch.
+    state_b = SchedulerState.initial(_BASE)
+    delta = compute_batch_capacity_delta(
+        [BatchOp(kind="add", wafer_quantity=order.wafer_quantity, deadline=order.deadline)],
+        _BASE,
+    )
+    assert is_batch_feasible(state_b, delta) is True
+    apply_batch_to_capacity(state_b, delta)
+    apply_batch_to_deadline(state_b, delta)
+
+    # Prefix sums match on every day.
+    for i in range(1, HORIZON_DAYS + 1):
+        assert state_a.capacity_tree.query(i) == state_b.capacity_tree.query(i)
+        assert state_a.deadline_tree.query(i) == state_b.deadline_tree.query(i)
+
+
+def test_batch_apply_matches_per_op_for_mixed_batch() -> None:
+    """Same equivalence for a mixed add+remove batch (PATCH-style):
+    prefix sums on both trees must match the result of doing each op
+    individually via remove_order + add_order."""
+    base = _BASE
+    # Seed an order so it can be removed.
+    seed = _make_order(qty=1500, deadline=base + timedelta(days=5))
+
+    # Path A: per-op.
+    state_a = SchedulerState.initial(base)
+    add_order(state_a, seed)
+    # Replace seed (remove + add at new deadline) and add a brand-new order.
+    new_seed = _make_order(qty=1500, deadline=base + timedelta(days=10))
+    new_seed = SchedulingOrder(
+        order_id=seed.order_id,
+        order_number=seed.order_number,
+        wafer_quantity=seed.wafer_quantity,
+        deadline=base + timedelta(days=10),
+    )
+    fresh = _make_order(qty=800, deadline=base + timedelta(days=7))
+    remove_order(state_a, seed)
+    add_order(state_a, new_seed)
+    add_order(state_a, fresh)
+
+    # Path B: batch on the same start state.
+    state_b = SchedulerState.initial(base)
+    add_order(state_b, seed)  # seed shared with path A's pre-state
+    batch_ops = [
+        BatchOp(kind="remove", wafer_quantity=seed.wafer_quantity, deadline=seed.deadline),
+        BatchOp(
+            kind="add",
+            wafer_quantity=new_seed.wafer_quantity,
+            deadline=new_seed.deadline,
+        ),
+        BatchOp(kind="add", wafer_quantity=fresh.wafer_quantity, deadline=fresh.deadline),
+    ]
+    delta = compute_batch_capacity_delta(batch_ops, base)
+    assert is_batch_feasible(state_b, delta) is True
+    apply_batch_to_capacity(state_b, delta)
+    apply_batch_to_deadline(state_b, delta)
+
+    for i in range(1, HORIZON_DAYS + 1):
+        assert state_a.capacity_tree.query(i) == state_b.capacity_tree.query(i), (
+            f"capacity prefix mismatch at day {i}"
+        )
+        assert state_a.deadline_tree.query(i) == state_b.deadline_tree.query(i), (
+            f"deadline prefix mismatch at day {i}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _iter_pq_edf_sorted — direct tests of the lazy bucket-sort iterator
+# ---------------------------------------------------------------------------
+#
+# pq is now dict-backed; EDF ordering is materialized at iteration time via
+# bucket sort (30 buckets by deadline_rel + within-bucket sort_key). These
+# tests cover the helper directly rather than through advance_day /
+# compute_schedule so a regression in the iterator surfaces here, not as a
+# downstream symptom.
+
+
+def test_iter_pq_edf_sorted_empty_pq_returns_empty_list() -> None:
+    """Short-circuit branch: no pq orders ⇒ no bucket allocation, return
+    ``[]`` directly. Without this guard the function would still allocate
+    HORIZON_DAYS+1 empty lists and walk them — correct but wasteful."""
+    state = SchedulerState.initial(_BASE)
+
+    assert _iter_pq_edf_sorted(state) == []
+
+
+def test_iter_pq_edf_sorted_single_order_round_trip() -> None:
+    """One order in pq ⇒ helper returns ``[order]``. Sanity check the
+    single-bucket-single-entry path."""
+    state = SchedulerState.initial(_BASE)
+    order = _make_order(qty=1000, deadline=_BASE + timedelta(days=5))
+    add_order(state, order)
+
+    result = _iter_pq_edf_sorted(state)
+
+    assert len(result) == 1
+    assert result[0].order_id == order.order_id
+
+
+def test_iter_pq_edf_sorted_orders_by_deadline_first() -> None:
+    """Primary sort key is deadline (earlier → first). Verify across multiple
+    buckets so the bucket-placement step is exercised."""
+    state = SchedulerState.initial(_BASE)
+    late = _make_order(order_number="late", qty=500, deadline=_BASE + timedelta(days=15))
+    early = _make_order(order_number="early", qty=500, deadline=_BASE + timedelta(days=2))
+    mid = _make_order(order_number="mid", qty=500, deadline=_BASE + timedelta(days=8))
+    for o in (late, early, mid):  # insert in non-EDF order to confirm bucket sort works
+        add_order(state, o)
+
+    result = _iter_pq_edf_sorted(state)
+
+    assert [o.order_id for o in result] == [early.order_id, mid.order_id, late.order_id]
+
+
+def test_iter_pq_edf_sorted_tie_breaks_by_qty_desc_then_order_number() -> None:
+    """Same deadline → tie-break on ``(-wafer_quantity, order_number)``.
+    Larger qty wins, alphabetical for equal qty. Locks the in-bucket sort
+    contract."""
+    state = SchedulerState.initial(_BASE)
+    same_day = _BASE + timedelta(days=4)
+    small_b = _make_order(order_number="b-small", qty=100, deadline=same_day)
+    big_z = _make_order(order_number="z-big", qty=1000, deadline=same_day)
+    big_a = _make_order(order_number="a-big", qty=1000, deadline=same_day)
+    for o in (small_b, big_z, big_a):
+        add_order(state, o)
+
+    result = _iter_pq_edf_sorted(state)
+    order_numbers = [o.order_number for o in result]
+
+    # qty=1000 group sorts before qty=100; within qty=1000, "a-big" < "z-big".
+    assert order_numbers == ["a-big", "z-big", "b-small"]
+
+
+def test_iter_pq_edf_sorted_day_1_and_day_30_both_placed_correctly() -> None:
+    """Boundary buckets: deadline = base_date (rel=1) and deadline =
+    base_date + HORIZON_DAYS - 1 (rel=30). After the bucket-collision fix,
+    day-30 orders land in bucket[29] (not bucket[30] which is the
+    out-of-horizon sentinel)."""
+    state = SchedulerState.initial(_BASE)
+    day_30 = _make_order(qty=100, deadline=_BASE + timedelta(days=HORIZON_DAYS - 1))
+    day_1 = _make_order(qty=100, deadline=_BASE)
+    add_order(state, day_30)
+    add_order(state, day_1)
+
+    result = _iter_pq_edf_sorted(state)
+
+    assert [o.order_id for o in result] == [day_1.order_id, day_30.order_id]
+
+
+def test_iter_pq_edf_sorted_parity_with_sorted_baseline() -> None:
+    """Property-style: a random-ish bag of orders sorted by ``_iter_pq_edf_sorted``
+    must equal ``sorted(..., key=sort_key)``. Pins the helper against a trivial
+    reference implementation."""
+    state = SchedulerState.initial(_BASE)
+    orders = []
+    # Mix qtys, deadlines, and order_numbers so tie-breaks fire on each axis.
+    for i in range(15):
+        o = _make_order(
+            order_number=f"ord-{i:02d}",
+            qty=100 * ((i % 5) + 1),
+            deadline=_BASE + timedelta(days=(i * 3) % HORIZON_DAYS),
+        )
+        add_order(state, o)
+        orders.append(o)
+
+    result = _iter_pq_edf_sorted(state)
+    expected = sorted(orders, key=lambda o: o.sort_key())
+
+    assert [o.order_id for o in result] == [o.order_id for o in expected]
+
+
+def test_iter_pq_edf_sorted_out_of_horizon_lands_in_sentinel_bucket() -> None:
+    """An order whose deadline is past the horizon (defensive — shouldn't
+    happen under normal admission control) must NOT collide with real
+    day-HORIZON_DAYS orders. Verifies the bucket-collision fix: stale
+    orders go into the dedicated sentinel bucket appended after all
+    in-horizon buckets, so iteration order is ``[in-horizon orders] +
+    [out-of-horizon orders]``."""
+    state = SchedulerState.initial(_BASE)
+    # Inject an out-of-horizon order directly into pq_index, bypassing
+    # add_order which would reject it as ``deadline_too_far``. This is
+    # the only way to simulate the "stale order somehow in pq" scenario
+    # the sentinel bucket defends against.
+    stale = _make_order(
+        order_number="stale",
+        qty=500,
+        deadline=_BASE + timedelta(days=HORIZON_DAYS + 5),
+    )
+    state.pq_index[stale.order_id] = stale
+
+    in_horizon = _make_order(
+        order_number="in-horizon",
+        qty=500,
+        deadline=_BASE + timedelta(days=HORIZON_DAYS - 1),  # day-30 (rel=30)
+    )
+    add_order(state, in_horizon)
+
+    result = _iter_pq_edf_sorted(state)
+
+    # Day-30 order comes first (bucket[29]), out-of-horizon last (bucket[30]).
+    assert [o.order_id for o in result] == [in_horizon.order_id, stale.order_id]

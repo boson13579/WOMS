@@ -11,6 +11,7 @@ from app.core.db import get_db
 from app.core.security import get_current_user, require_roles
 from app.models.user import User, UserRole
 from app.schemas.user import (
+    AssignableUserResponse,
     UserListResponse,
     UserResponse,
     UserSelfUpdateRequest,
@@ -39,6 +40,25 @@ def list_users(
         403: authenticated user does not have the root role.
     """
     return user_service.list_users(db, search=search)
+
+
+@router.get("/assignable", response_model=list[AssignableUserResponse])
+def get_assignable_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
+    ),
+) -> list[AssignableUserResponse]:
+    """Return the list of users that can be assigned as order owners.
+
+    Permission: order_manager+. order_manager sees only themselves;
+    scheduler and root see all active users.
+
+    Errors:
+        401: missing or invalid bearer token.
+        403: authenticated user does not have at least order_manager role.
+    """
+    return user_service.get_assignable_users(db, current_user)
 
 
 @router.get("/{user_id}", response_model=UserResponse)

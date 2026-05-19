@@ -18,5 +18,10 @@ export function useCurrentUserId(): string | null {
 
 export function useCanWrite(): boolean {
   const role = useCurrentRole();
-  return role === 'scheduler' || role === 'root';
+  return role === 'root' || role === 'scheduler' || role === 'order_manager';
+}
+
+export function useCanSchedule(): boolean {
+  const role = useCurrentRole();
+  return role === 'root' || role === 'scheduler';
 }

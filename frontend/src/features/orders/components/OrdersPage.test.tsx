@@ -1,9 +1,5 @@
 /**
  * OrdersPage — page composition tests.
- *
- * [RED]   tests written first to verify page-level composition behaviour
- * [GREEN] OrdersPage.tsx passes
- *
  * Strategy: child components (OrderFilters / OrderTable / OrderModal) are
  * mocked so tests focus on page-level state management and callback wiring,
  * not on details already covered by child component tests.
@@ -68,13 +64,13 @@ vi.mock('@/components/layout/Header', () => ({
 }));
 
 // ---------------------------------------------------------------------------
-// Mock API / WS hook
+// Mock API / WS hooks
 // ---------------------------------------------------------------------------
 
 const mockTriggerMutate = vi.fn();
 
 vi.mock('../api/orders', () => ({
-  useTriggerSchedule: () => ({ mutate: mockTriggerMutate }),
+  useTriggerSchedule: () => ({ mutate: mockTriggerMutate, isPending: false }),
 }));
 
 vi.mock('../hooks/useScheduleWs', () => ({
@@ -90,45 +86,36 @@ vi.mock('./OrderFilters', () => ({
 }));
 
 // exposes buttons that trigger onEdit / onSchedule so the page's handlers can be tested
+const SAMPLE_ORDER: Order = {
+  id: 'order-id-0001',
+  order_number: 'ORD-20260504-0001',
+  customer_name: 'TSMC',
+  wafer_quantity: 500,
+  requested_delivery_date: '2026-06-01',
+  scheduled_production_date: null,
+  expected_delivery_date: null,
+  status: 'pending',
+  assigned_to: null,
+  created_by: 'user-id-0001',
+  notes: null,
+  version_id: 1,
+  created_at: '2026-05-04T08:00:00Z',
+  updated_at: '2026-05-04T08:00:00Z',
+  pinned_production_date: null,
+  is_pinned: false,
+  is_processing_locked: false,
+};
+
 vi.mock('./OrderTable', () => ({
-  OrderTable: ({
-    onEdit,
-    onSchedule,
-  }: {
-    onEdit: (o: Order) => void;
-    onSchedule: (id: string) => void;
-  }) => (
+  OrderTable: ({ onEdit }: { onEdit: (o: Order) => void }) => (
     <div data-testid="order-table">
       <button
         type="button"
         onClick={() => {
-          onEdit({
-            id: 'order-id-0001',
-            order_number: 'ORD-20260504-0001',
-            customer_name: 'TSMC',
-            wafer_quantity: 500,
-            requested_delivery_date: '2026-06-01',
-            scheduled_production_date: null,
-            expected_delivery_date: null,
-            status: 'pending',
-            assigned_to: null,
-            created_by: 'user-id-0001',
-            notes: null,
-            version_id: 1,
-            created_at: '2026-05-04T08:00:00Z',
-            updated_at: '2026-05-04T08:00:00Z',
-          });
+          onEdit(SAMPLE_ORDER);
         }}
       >
         table-edit
-      </button>
-      <button
-        type="button"
-        onClick={() => {
-          onSchedule('test-order-id');
-        }}
-      >
-        table-schedule
       </button>
     </div>
   ),
@@ -227,13 +214,13 @@ describe('OrdersPage', () => {
     expect(screen.getByTestId('order-modal')).toHaveAttribute('data-open', 'false');
   });
 
-  it('calls triggerSchedule.mutate(orderId) when OrderTable fires onSchedule', async () => {
+  it('calls triggerSchedule.mutate() when the toolbar schedule button is clicked', async () => {
     const user = userEvent.setup();
     renderPage();
 
-    await user.click(screen.getByRole('button', { name: 'table-schedule' }));
+    await user.click(screen.getByRole('button', { name: /觸發排程器/ }));
 
-    expect(mockTriggerMutate).toHaveBeenCalledWith('test-order-id', expect.anything());
+    expect(mockTriggerMutate).toHaveBeenCalledWith(undefined, expect.anything());
   });
 
   it('calls logout() and navigates to /login when the logout button is clicked', async () => {
