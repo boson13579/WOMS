@@ -34,7 +34,7 @@ describe('users API', () => {
     expect(result.users).toHaveLength(1);
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/users', {
       headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
+      credentials: 'include',
     });
   });
 
@@ -47,7 +47,7 @@ describe('users API', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/users?search=alice%40example.com', {
       headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
+      credentials: 'include',
     });
   });
 
@@ -73,7 +73,7 @@ describe('users API', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ role: 'scheduler', is_active: false, version_id: 3 }),
-      credentials: 'same-origin',
+      credentials: 'include',
     });
   });
 
@@ -88,7 +88,7 @@ describe('users API', () => {
     expect(fetchMock).toHaveBeenCalledWith(`/api/v1/users/${USER.id}`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
+      credentials: 'include',
     });
   });
 

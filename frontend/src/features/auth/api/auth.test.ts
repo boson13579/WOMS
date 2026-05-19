@@ -6,11 +6,15 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { ApiError } from '@/lib/apiFetch';
+
 import {
+  getMe,
   login,
   loginRequestSchema,
   loginResponseSchema,
   logout,
+  meResponseSchema,
   register,
   registerRequestSchema,
   registerResponseSchema,
@@ -159,6 +163,105 @@ describe('auth API error handling', () => {
     );
 
     await expect(logout()).rejects.toThrow('Logout failed on server.');
+  });
+});
+
+// RED: login/register/logout should send credentials: 'include' so the
+// httpOnly cookie is attached to the request even when the SPA is served
+// from a different origin (e.g. behind a reverse proxy in production).
+describe('auth API credential mode', () => {
+  it('login sends credentials: include', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      jsonResponse({
+        access_token: 'tok',
+        token_type: 'bearer',
+      }),
+    );
+
+    await login({ username: 'alice', password: 'Password1' });
+
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.credentials).toBe('include');
+  });
+
+  it('register sends credentials: include', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      jsonResponse({
+        id: '00000000-0000-0000-0000-000000000001',
+        username: 'alice',
+        email: 'alice@example.com',
+        role: 'viewer',
+        is_active: true,
+        version_id: 1,
+        created_at: '2026-05-04T00:00:00.000Z',
+      }),
+    );
+
+    await register({
+      username: 'alice123',
+      email: 'alice@example.com',
+      password: 'Password1',
+      confirmPassword: 'Password1',
+    });
+
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.credentials).toBe('include');
+  });
+
+  it('logout sends credentials: include', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+    await logout();
+
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.credentials).toBe('include');
+  });
+});
+
+// RED: getMe() and meResponseSchema do not exist yet.
+describe('getMe', () => {
+  const VALID_ME = {
+    id: '00000000-0000-0000-0000-000000000002',
+    username: 'alice',
+    email: 'alice@example.com',
+    role: 'viewer',
+    is_active: true,
+    version_id: 4,
+  };
+
+  it('meResponseSchema accepts a valid /auth/me payload', () => {
+    const result = meResponseSchema.safeParse(VALID_ME);
+    expect(result.success).toBe(true);
+  });
+
+  it('returns the parsed user on 200 with credentials: include', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(jsonResponse(VALID_ME));
+
+    const user = await getMe();
+
+    expect(user.id).toBe(VALID_ME.id);
+    expect(user.role).toBe('viewer');
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/auth/me',
+      expect.objectContaining({ credentials: 'include' }),
+    );
+  });
+
+  it('throws ApiError(401) when the cookie is missing or expired', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      jsonResponse({ detail: 'Not authenticated.' }, 401),
+    );
+
+    let caught: unknown;
+    try {
+      await getMe();
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).status).toBe(401);
   });
 });
 
