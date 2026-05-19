@@ -259,6 +259,35 @@ describe('OrderTable', () => {
     });
   });
 
+  describe('is_processing_locked', () => {
+    it('shows a lock icon next to the order number when locked', () => {
+      const order = makeOrder({ is_processing_locked: true });
+      mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
+
+      render(<OrderTable onEdit={onEdit} />);
+
+      expect(screen.getByLabelText('排程處理中')).toBeInTheDocument();
+    });
+
+    it('does not show a lock icon when not locked', () => {
+      const order = makeOrder({ is_processing_locked: false });
+      mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
+
+      render(<OrderTable onEdit={onEdit} />);
+
+      expect(screen.queryByLabelText('排程處理中')).not.toBeInTheDocument();
+    });
+
+    it('disables the delete button when locked', () => {
+      const order = makeOrder({ is_processing_locked: true });
+      mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
+
+      render(<OrderTable onEdit={onEdit} />);
+
+      expect(screen.getByTitle('排程處理中，請稍候')).toBeDisabled();
+    });
+  });
+
   it('does not render pagination when there is only one page', () => {
     const order = makeOrder();
     mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
