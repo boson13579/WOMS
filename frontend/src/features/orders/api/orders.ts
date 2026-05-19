@@ -210,6 +210,16 @@ export function useTriggerSchedule(): ReturnType<typeof useMutation<ScheduleTrig
   });
 }
 
+/**
+ * TODO(future PR): wire into a multi-select bulk-update toolbar on the
+ * Orders table (SUMMARY-zh feature #7 — "useBatchUpdateOrders 接 UI").
+ * Intended consumer: a "Bulk reassign / status change" action surfaced
+ * once row selection ships in the orders feature (rough scope: add a
+ * selection column + a toolbar that calls this hook with the selected
+ * IDs — ~80 LoC of new UI). Kept here because the backend endpoint and
+ * Zod contract are already stable; only the UI surface is missing, and
+ * adding it now is out of scope for the convention-cleanup PR.
+ */
 export function useBatchUpdateOrders(): ReturnType<
   typeof useMutation<BatchUpdateResponse, Error, BatchUpdateRequest>
 > {
@@ -233,6 +243,16 @@ export function useBatchUpdateOrders(): ReturnType<
   });
 }
 
+/**
+ * TODO(future PR): wire into an order-history drawer / dialog on
+ * `OrderTable` (and eventually `OrderDetail`). Intended consumer:
+ * a chronological audit-trail view that renders each entry with the
+ * action, the actor's username (resolved via `useUsernames`), the
+ * timestamp, and a diff of `old_value` / `new_value` — rough scope
+ * ~60 LoC of new UI. Kept here because `/orders/{id}/audit-log` is
+ * already implemented backend-side; the missing piece is the dialog
+ * surface, which is out of scope for the convention-cleanup PR.
+ */
 export function useOrderAuditLog(orderId: string): ReturnType<typeof useQuery<AuditLogEntry[]>> {
   return useQuery<AuditLogEntry[]>({
     queryKey: ['orders', 'audit-log', orderId],

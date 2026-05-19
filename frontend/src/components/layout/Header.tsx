@@ -5,7 +5,7 @@
  * right. The sidebar owns primary navigation.
  */
 import { useQueryClient } from '@tanstack/react-query';
-import { LogOut, Menu, RefreshCcw, Search } from 'lucide-react';
+import { LogOut, Menu, RefreshCcw } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 import { useMobileNavStore } from '@/components/layout/mobileNavStore';
@@ -63,16 +63,6 @@ export function Header({
       <div className="min-w-0 flex-1">
         <h1 className="truncate text-lg font-semibold tracking-tight">{title}</h1>
         {subtitle ? <p className="truncate text-xs text-muted-foreground">{subtitle}</p> : null}
-      </div>
-
-      <div className="relative hidden items-center md:flex">
-        <Search className="pointer-events-none absolute left-2.5 h-4 w-4 text-muted-foreground" />
-        <input
-          type="search"
-          disabled
-          placeholder="Search (Phase 2)"
-          className="h-9 w-56 cursor-not-allowed rounded-md border border-border bg-muted/40 pl-8 pr-3 text-sm text-muted-foreground placeholder:text-muted-foreground/70 focus-visible:outline-none"
-        />
       </div>
 
       {lastUpdatedLabel ? (

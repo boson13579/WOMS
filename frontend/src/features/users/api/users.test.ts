@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { ApiError } from '@/lib/apiFetch';
+
 import { deactivateUser, listUsers, updateUser } from './users';
 
 const USER = {
@@ -32,10 +34,13 @@ describe('users API', () => {
     const result = await listUsers();
 
     expect(result.users).toHaveLength(1);
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/users', {
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/users',
+      expect.objectContaining({
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+      }),
+    );
   });
 
   it('trims and encodes search queries', async () => {
@@ -45,10 +50,13 @@ describe('users API', () => {
 
     await listUsers(' alice@example.com ');
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/users?search=alice%40example.com', {
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/users?search=alice%40example.com',
+      expect.objectContaining({
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+      }),
+    );
   });
 
   it('updates role and active status with version_id', async () => {
@@ -69,12 +77,15 @@ describe('users API', () => {
 
     expect(result.role).toBe('scheduler');
     expect(result.is_active).toBe(false);
-    expect(fetchMock).toHaveBeenCalledWith(`/api/v1/users/${USER.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role: 'scheduler', is_active: false, version_id: 3 }),
-      credentials: 'include',
-    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/users/${USER.id}`,
+      expect.objectContaining({
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'scheduler', is_active: false, version_id: 3 }),
+        credentials: 'include',
+      }),
+    );
   });
 
   it('deactivates a user with DELETE and cookie credentials', async () => {
@@ -85,33 +96,46 @@ describe('users API', () => {
     const result = await deactivateUser(USER.id);
 
     expect(result.is_active).toBe(false);
-    expect(fetchMock).toHaveBeenCalledWith(`/api/v1/users/${USER.id}`, {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/users/${USER.id}`,
+      expect.objectContaining({
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+      }),
+    );
   });
 
-  it('throws structured backend error messages', async () => {
+  it('throws structured backend error messages as ApiError', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       jsonResponse({ error: { message: 'Only root users can manage accounts.' } }, 403),
     );
 
-    await expect(listUsers()).rejects.toThrow('Only root users can manage accounts.');
+    await expect(listUsers()).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 403,
+      message: 'Only root users can manage accounts.',
+    });
   });
 
-  it('throws detail fallback messages', async () => {
+  it('throws detail fallback messages as ApiError', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       jsonResponse({ detail: 'Version conflict.' }, 409),
     );
 
-    await expect(updateUser(USER.id, { version_id: 99 })).rejects.toThrow('Version conflict.');
+    await expect(updateUser(USER.id, { version_id: 99 })).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 409,
+      message: 'Version conflict.',
+    });
   });
 
-  it('throws default fallback messages for malformed error responses', async () => {
+  it('throws ApiError(500) for malformed error responses', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('not json', { status: 500 }));
 
-    await expect(deactivateUser(USER.id)).rejects.toThrow('Failed to deactivate user');
+    const promise = deactivateUser(USER.id);
+    await expect(promise).rejects.toBeInstanceOf(ApiError);
+    await expect(promise).rejects.toMatchObject({ status: 500 });
   });
 
   it('rejects invalid update payloads before sending a request', async () => {
