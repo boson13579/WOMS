@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, cast
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from redis import Redis
 from sqlalchemy.orm import Session
@@ -67,6 +68,8 @@ from app.workers.scheduling import (
 )
 
 router = APIRouter()
+
+logger = structlog.get_logger(__name__)
 
 # Same role gates as orders.py.
 _READ_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
@@ -168,7 +171,31 @@ def enqueue_operation(
     its cycle.
 
     Permission: scheduler+.
+
+    Identity overrides: the body-supplied ``requested_by`` and (when
+    present) ``db_action.actor_id`` are silently rewritten to
+    ``current_user.id`` before enqueue. The HTTP boundary is the only
+    trust line — a producer bug or a malicious scheduler must not be
+    able to forge audit-log attribution or WS impersonation by stuffing
+    a different UUID into the request body. The override is a no-op
+    when the body already matches; a single ``debug`` log is emitted on
+    disagreement so producer drift surfaces without breaking clients.
     """
+    if request.requested_by != current_user.id:
+        logger.debug(
+            "schedule.operations.requested_by_overridden",
+            body_value=str(request.requested_by),
+            actual=str(current_user.id),
+        )
+    request.requested_by = current_user.id
+    if request.db_action is not None:
+        if request.db_action.actor_id != current_user.id:
+            logger.debug(
+                "schedule.operations.actor_id_overridden",
+                body_value=str(request.db_action.actor_id),
+                actual=str(current_user.id),
+            )
+        request.db_action.actor_id = current_user.id
     enqueue_compound(request)
     return ScheduleCompoundResponse(
         compound_id=request.compound_id,

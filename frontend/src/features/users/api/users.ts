@@ -29,7 +29,7 @@ export async function listUsers(search?: string): Promise<UserListResponse> {
   const url = `/api/v1/users${params.size ? `?${params.toString()}` : ''}`;
   const res = await fetch(url, {
     headers: authHeaders(),
-    credentials: 'same-origin',
+    credentials: 'include',
   });
 
   if (!res.ok) {
@@ -48,7 +48,7 @@ export async function updateUser(
     method: 'PATCH',
     headers: authHeaders(),
     body: JSON.stringify(body),
-    credentials: 'same-origin',
+    credentials: 'include',
   });
 
   if (!res.ok) {
@@ -62,7 +62,7 @@ export async function deactivateUser(userId: string): Promise<UserResponse> {
   const res = await fetch(`/api/v1/users/${userId}`, {
     method: 'DELETE',
     headers: authHeaders(),
-    credentials: 'same-origin',
+    credentials: 'include',
   });
 
   if (!res.ok) {

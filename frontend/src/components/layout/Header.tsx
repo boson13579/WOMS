@@ -4,6 +4,7 @@
  * Page title lives on the left; lightweight contextual actions live on the
  * right. The sidebar owns primary navigation.
  */
+import { useQueryClient } from '@tanstack/react-query';
 import { LogOut, Menu, RefreshCcw, Search } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
@@ -30,10 +31,16 @@ export function Header({
   refreshing = false,
 }: HeaderProps): JSX.Element {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const logout = useAuthStore((state) => state.logout);
   const openMobileNav = useMobileNavStore((state) => state.setOpen);
 
   const handleLogout = () => {
+    // Clear server-state cache BEFORE the logout HTTP call so a slow
+    // /auth/logout (or a network error during it) never leaves stale
+    // per-user data visible while the redirect is in flight. The auth
+    // store also clears its own local hint inside logout().
+    queryClient.clear();
     void logout().finally(() => {
       navigate('/login', { replace: true });
     });
