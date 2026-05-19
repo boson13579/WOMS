@@ -26,6 +26,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 __all__ = [
+    "AuditActionsResponse",
     "AuditLogListResponse",
     "AuditLogResponse",
     "UserAuditLogListResponse",
@@ -70,6 +71,22 @@ class AuditLogListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class AuditActionsResponse(BaseModel):
+    """Sorted, distinct list of ``action`` values present in ``audit_logs``.
+
+    Backs ``GET /api/v1/audit/actions``, which the admin audit page calls
+    on mount to populate the Action filter's typeahead combobox. Replaces
+    the legacy hard-coded ``KNOWN_AUDIT_ACTIONS`` constant on the frontend
+    (which drifted: missed ``user.update``, included ``schedule.*`` that
+    no code emits). Sourced from the live DB so the list is always exact.
+
+    ``actions`` is sorted ASC for stable rendering. Empty list (not a
+    404) when the table is empty — clients render an empty combobox.
+    """
+
+    actions: list[str]
 
 
 # Backwards-compatibility alias for PR B3 callers (per-user audit endpoint

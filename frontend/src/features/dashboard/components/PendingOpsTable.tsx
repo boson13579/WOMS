@@ -87,14 +87,17 @@ export function PendingOpsTable({
     <Card>
       <CardHeader className="flex flex-row items-center justify-between pb-3">
         <div>
-          <CardTitle className="flex items-center gap-2">
+          <CardTitle
+            className="flex items-center gap-2"
+            title="Scheduler queue depth — one entry per CRUD action (add / patch / pin / unpin / cancel). Differs from Orders' Pending tile because pin / unpin / cancel don't flip the DB order status back to pending."
+          >
             <Layers className="h-4 w-4 text-muted-foreground" aria-hidden />
             Pending operations
           </CardTitle>
           <CardDescription>
             {total === 0
-              ? 'queue is currently empty'
-              : `${total.toLocaleString()} pending compound${total === 1 ? '' : 's'}`}
+              ? 'scheduler queue is empty'
+              : `${total.toLocaleString()} operation${total === 1 ? '' : 's'} queued (one per CRUD action)`}
           </CardDescription>
         </div>
       </CardHeader>

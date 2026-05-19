@@ -54,23 +54,7 @@ export interface AuditFiltersState {
   toDate?: string | undefined;
 }
 
-/**
- * Hard-coded autocomplete list for the Action filter. Keep in sync with
- * the backend `app/core/audit_actions.py` constants when one ships; for
- * now the canonical list is the events emitted across the auth, user,
- * order, and scheduler layers.
- */
-export const KNOWN_AUDIT_ACTIONS: readonly string[] = [
-  'user.login_succeeded',
-  'user.login_failed',
-  'user.logout',
-  'user.created',
-  'user.updated',
-  'user.deactivated',
-  'order.created',
-  'order.updated',
-  'order.deleted',
-  'order.scheduled',
-  'schedule.run',
-  'schedule.completed',
-] as const;
+// The legacy ``KNOWN_AUDIT_ACTIONS`` hard-coded list was removed when the
+// Action filter became a dynamic typeahead backed by ``GET /audit/actions``
+// (see `features/audit/api/useAuditActions.ts`). The frontend no longer
+// owns the canonical action vocabulary — the DB does.

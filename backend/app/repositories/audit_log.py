@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import Select
 
@@ -17,6 +17,7 @@ __all__ = [
     "count_events",
     "create",
     "get_by_resource_id",
+    "list_distinct_actions",
     "list_events",
 ]
 
@@ -229,3 +230,25 @@ def count_events(
         to_ts=to_ts,
     )
     return int(db.scalar(stmt) or 0)
+
+
+def list_distinct_actions(db: Session) -> list[str]:
+    """Return the sorted, unique set of ``action`` values present in ``audit_logs``.
+
+    Powers the ``GET /audit/actions`` admin endpoint, which the audit page
+    uses to populate a dynamic typeahead (replacing the legacy hard-coded
+    constant that drifted out of sync with reality).
+
+    Sort order is ASC so the frontend can render the autocomplete list
+    in a stable, predictable order without re-sorting client-side. The
+    column is indexed (see ``audit_log.py`` model) and the resulting
+    cardinality is small (the system emits a fixed vocabulary of dotted
+    event names), so the DISTINCT scan is cheap enough that we don't
+    cache here — let the route-level HTTP / FE query cache handle that.
+
+    Returns an empty list when the table is empty rather than raising,
+    so the FE's "no data yet" case can render an empty combobox without
+    a special-case branch.
+    """
+    stmt = select(distinct(AuditLog.action)).order_by(AuditLog.action.asc())
+    return list(db.scalars(stmt).all())

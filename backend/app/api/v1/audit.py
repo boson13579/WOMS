@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.core.security import require_roles
 from app.models.user import User, UserRole
-from app.schemas.audit import AuditLogListResponse
+from app.schemas.audit import AuditActionsResponse, AuditLogListResponse
 from app.services import audit as audit_service
 from app.services.audit import AuditEventsFilters
 
@@ -94,3 +94,41 @@ def list_audit_events(
         page_size=page_size,
     )
     return audit_service.get_events(db, filters)
+
+
+@router.get("/actions", response_model=AuditActionsResponse)
+def list_audit_actions(
+    db: Session = Depends(get_db),
+    current_user: User = _root_only,
+) -> AuditActionsResponse:
+    """Return the sorted, distinct set of audit ``action`` values in the DB.
+
+    Backs the admin audit page's Action filter — replaces a hard-coded
+    frontend constant (``KNOWN_AUDIT_ACTIONS``) that drifted out of sync
+    with reality (missed ``user.update``, included ``schedule.*`` that no
+    code emits). Sourcing the list from the live ``audit_logs`` table
+    guarantees the autocomplete always matches what's actually present.
+
+    Permission: root only — same RBAC as ``GET /audit/events``. The set
+    of distinct actions is itself low-sensitivity, but exposing it to a
+    broader audience would give a non-root caller a free reconnaissance
+    surface ("which event types fire in this system?"), so we keep the
+    audit feed's gate uniform across the two endpoints.
+
+    Caching: none here. The DISTINCT scan against the indexed ``action``
+    column is cheap on the small ``audit_logs`` table this project
+    targets, and the frontend's TanStack Query layer already debounces
+    repeat calls within a page session via ``staleTime: 60_000``. If
+    table size grows by orders of magnitude later, a 60-second TTL
+    cache (or Redis SET) would be the place to bolt that on.
+
+    Response shape:
+        ``{"actions": ["order.created", "user.login_succeeded", ...]}``
+        ASC-sorted. Empty list (not 404) when ``audit_logs`` is empty.
+
+    Errors:
+        401: missing or invalid bearer token.
+        403: authenticated user does not have the root role.
+    """
+    del current_user  # role check happens in the dependency — value unused.
+    return audit_service.list_distinct_actions(db)

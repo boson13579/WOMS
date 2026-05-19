@@ -248,20 +248,28 @@ def _probe_celery() -> ServiceHealthEntry:
     the two Redis surfaces it writes:
 
     * ``schedule:status`` — lifecycle JSON (``idle`` / ``running`` /
-      ``failed`` + ``finished_at``). ``failed`` flips us to warning so the
-      dashboard surfaces it immediately.
+      ``failed`` + ``finished_at``). This records the **last task's
+      outcome**, not the current worker health — important for the
+      ``failed`` interpretation below.
     * ``schedule:pending_ops`` — sorted set of queued compounds. Used
-      only as one of the inputs to the stall detector below; deep queue
+      as one of the inputs to the stall detector below; deep queue
       by itself is **not** a warning signal (burst loads of 100s of
       compounds are normal; what matters is whether the worker is
       draining them).
 
-    Stall detection (the case ``state=idle`` + ``queue>0`` + worker
-    actually dead — see frontend ``deriveScheduleDisplay`` for the
-    matching UX logic): if there's queued work but the last task
-    finished more than ``_CELERY_STALL_THRESHOLD_SECONDS`` ago, flip
-    to warning. This catches a crashed worker with backlog regardless
-    of queue size.
+    Severity mapping (queue-aware so the dashboard tile colour matches
+    operational urgency rather than the literal status word):
+
+    * ``state=failed`` AND ``queue_depth > 0`` → ``error`` (red): a
+      task just failed AND there's still work waiting — actively broken.
+    * ``state=failed`` AND ``queue_depth == 0`` → ``warning`` (yellow):
+      a past task failed but nothing's queued, so the failure may be
+      historical (e.g. a transient bug fixed by reset). Summary calls
+      out the failure timestamp so an operator can decide.
+    * ``state=idle`` + ``queue>0`` + last finish >
+      ``_CELERY_STALL_THRESHOLD_SECONDS`` ago → ``warning`` (stall —
+      worker dead with backlog).
+    * Otherwise → ``healthy``.
 
     Any Redis exception → ``error``: better to flag "we have no signal"
     than to silently report healthy.
@@ -305,9 +313,23 @@ def _probe_celery() -> ServiceHealthEntry:
     seconds_since_finish = _seconds_since(finished_at_raw)
 
     status: HealthStatus
-    if worker_state == "failed":
+    if worker_state == "failed" and queue_depth > 0:
+        # Actively broken: a task just failed AND there's queued work
+        # that won't drain until something intervenes.
+        status = "error"
+        summary = (
+            f"Last run failed — {queue_depth} compound{'s' if queue_depth != 1 else ''} "
+            f"still pending"
+        )
+    elif worker_state == "failed":
+        # Past incident: a task failed, but nothing's queued so the
+        # next caller may succeed. Surface the timestamp so operators
+        # know if it's recent (urgent) or old (stale signal).
         status = "warning"
-        summary = "Scheduler reports state=failed"
+        if finished_at_raw:
+            summary = f"Last run failed at {finished_at_raw} — no new tasks since"
+        else:
+            summary = "Last run failed — no new tasks since"
     elif (
         worker_state == "idle"
         and queue_depth > 0

@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.repositories import audit_log as audit_log_repo
-from app.schemas.audit import AuditLogListResponse, AuditLogResponse
+from app.schemas.audit import AuditActionsResponse, AuditLogListResponse, AuditLogResponse
 
 
 class AuditEventsFilters(BaseModel):
@@ -109,3 +109,20 @@ def get_events(
         page=filters.page,
         page_size=filters.page_size,
     )
+
+
+def list_distinct_actions(db: Session) -> AuditActionsResponse:
+    """Return the sorted unique set of audit ``action`` values currently in the DB.
+
+    Thin envelope around :func:`audit_log_repo.list_distinct_actions` — the
+    service layer exists so the route stays a one-liner and so we have a
+    stable seam for any future shaping (e.g. filtering deprecated actions
+    out of the autocomplete). The repository sorts ASC; we preserve that.
+
+    No cache layer here: the underlying DISTINCT scan on an indexed,
+    low-cardinality column is fast on the small ``audit_logs`` table this
+    project targets, and the frontend's ``staleTime: 60_000`` already
+    debounces repeat calls within a page session.
+    """
+    actions = audit_log_repo.list_distinct_actions(db)
+    return AuditActionsResponse(actions=actions)

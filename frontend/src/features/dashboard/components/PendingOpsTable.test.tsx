@@ -91,7 +91,7 @@ describe('PendingOpsTable', () => {
     expect(screen.getByText('ORD-20260512-0001')).toBeInTheDocument();
     expect(screen.getByText('ORD-20260512-0002')).toBeInTheDocument();
     expect(screen.getByText('ORD-20260512-0003')).toBeInTheDocument();
-    expect(screen.getByText(/3 pending compound/)).toBeInTheDocument();
+    expect(screen.getByText(/3 operations queued/)).toBeInTheDocument();
   });
 
   it('truncates to topN rows and shows "showing X of total"', () => {
@@ -110,7 +110,10 @@ describe('PendingOpsTable', () => {
     render(<PendingOpsTable data={[]} isLoading={false} isError={false} />, {
       wrapper: makeWrapper(),
     });
-    expect(screen.getByText(/queue is empty/i)).toBeInTheDocument();
+    // Two surfaces show empty-state: the card description and the
+    // inline body message. Match the body's title-cased phrase to
+    // disambiguate.
+    expect(screen.getByText(/^Queue is empty\.$/)).toBeInTheDocument();
   });
 
   it('renders skeleton while loading', () => {
