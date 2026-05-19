@@ -228,10 +228,7 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
                       <span className="inline-flex items-center gap-1">
                         {order.order_number}
                         {order.is_processing_locked && (
-                          <Lock
-                            className="h-3 w-3 text-muted-foreground"
-                            aria-label="排程處理中"
-                          />
+                          <Lock className="h-3 w-3 text-muted-foreground" aria-label="排程處理中" />
                         )}
                       </span>
                     </TableCell>
