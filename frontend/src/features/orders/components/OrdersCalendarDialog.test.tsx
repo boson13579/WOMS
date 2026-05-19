@@ -104,6 +104,13 @@ const pendingOrder: Order = {
   is_processing_locked: false,
 };
 
+const secondPendingOrder: Order = {
+  ...pendingOrder,
+  id: '33333333-3333-4333-8333-333333333333',
+  order_number: 'ORD-20260504-0003',
+  customer_name: 'UMC',
+};
+
 const scheduledOrderDetail: Order = {
   ...pendingOrder,
   id: scheduledOrder.id,
@@ -188,14 +195,107 @@ describe('OrdersCalendarDialog', () => {
     fireEvent.dragStart(screen.getByText('ORD-20260504-0002'), { dataTransfer });
     fireEvent.drop(screen.getByRole('button', { name: /2026-05-10/ }), { dataTransfer });
 
-    expect(screen.getByText('確認排程移動')).toBeInTheDocument();
+    expect(screen.getByText('待送出的排程變更')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '送出嘗試' }));
 
     const [payload] = mockPinMutate.mock.calls[0] as [
-      { order: { id: string }; targetDate: string },
+      { targets: { order: { id: string }; targetDate: string }[] },
       unknown,
     ];
-    expect(payload.order.id).toBe(pendingOrder.id);
-    expect(payload.targetDate).toBe('2026-05-10');
+    expect(payload.targets.map((target) => target.order.id)).toEqual([pendingOrder.id]);
+    expect(payload.targets.map((target) => target.targetDate)).toEqual(['2026-05-10']);
+  });
+
+  it('keeps selected order order when queueing a multi-order pin attempt', async () => {
+    const user = userEvent.setup();
+    mockOrders.data = {
+      items: [pendingOrder, secondPendingOrder],
+      total: 2,
+      page: 1,
+      page_size: 100,
+    };
+    renderDialog();
+
+    await user.click(screen.getByRole('checkbox', { name: 'Select ORD-20260504-0002' }));
+    await user.click(screen.getByRole('checkbox', { name: 'Select ORD-20260504-0003' }));
+
+    const dragData = new Map<string, string>();
+    const dataTransfer = {
+      effectAllowed: '',
+      dropEffect: '',
+      setData: vi.fn((type: string, value: string) => dragData.set(type, value)),
+      getData: vi.fn((type: string) => dragData.get(type) ?? ''),
+    } as unknown as DataTransfer;
+
+    fireEvent.dragStart(screen.getByText('ORD-20260504-0002'), { dataTransfer });
+    fireEvent.drop(screen.getByRole('button', { name: /2026-05-10/ }), { dataTransfer });
+    await user.click(screen.getByRole('button', { name: '送出嘗試' }));
+
+    const [payload] = mockPinMutate.mock.calls[0] as [
+      { targets: { order: { id: string }; targetDate: string }[] },
+      unknown,
+    ];
+    expect(payload.targets.map((target) => target.order.id)).toEqual([
+      pendingOrder.id,
+      secondPendingOrder.id,
+    ]);
+    expect(payload.targets.map((target) => target.targetDate)).toEqual([
+      '2026-05-10',
+      '2026-05-10',
+    ]);
+  });
+
+  it('queues separately dropped orders with different target dates in one compound', async () => {
+    const user = userEvent.setup();
+    mockOrders.data = {
+      items: [pendingOrder, secondPendingOrder],
+      total: 2,
+      page: 1,
+      page_size: 100,
+    };
+    renderDialog();
+
+    const firstDragData = new Map<string, string>();
+    const firstDataTransfer = {
+      effectAllowed: '',
+      dropEffect: '',
+      setData: vi.fn((type: string, value: string) => firstDragData.set(type, value)),
+      getData: vi.fn((type: string) => firstDragData.get(type) ?? ''),
+    } as unknown as DataTransfer;
+    fireEvent.dragStart(screen.getByText('ORD-20260504-0002'), {
+      dataTransfer: firstDataTransfer,
+    });
+    fireEvent.drop(screen.getByRole('button', { name: /2026-05-10/ }), {
+      dataTransfer: firstDataTransfer,
+    });
+
+    const secondDragData = new Map<string, string>();
+    const secondDataTransfer = {
+      effectAllowed: '',
+      dropEffect: '',
+      setData: vi.fn((type: string, value: string) => secondDragData.set(type, value)),
+      getData: vi.fn((type: string) => secondDragData.get(type) ?? ''),
+    } as unknown as DataTransfer;
+    fireEvent.dragStart(screen.getByText('ORD-20260504-0003'), {
+      dataTransfer: secondDataTransfer,
+    });
+    fireEvent.drop(screen.getByRole('button', { name: /2026-05-11/ }), {
+      dataTransfer: secondDataTransfer,
+    });
+
+    await user.click(screen.getByRole('button', { name: '送出嘗試' }));
+
+    const [payload] = mockPinMutate.mock.calls[0] as [
+      { targets: { order: { id: string }; targetDate: string }[] },
+      unknown,
+    ];
+    expect(payload.targets.map((target) => target.order.id)).toEqual([
+      pendingOrder.id,
+      secondPendingOrder.id,
+    ]);
+    expect(payload.targets.map((target) => target.targetDate)).toEqual([
+      '2026-05-10',
+      '2026-05-11',
+    ]);
   });
 });

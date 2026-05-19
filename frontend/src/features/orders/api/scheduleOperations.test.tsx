@@ -61,8 +61,7 @@ describe('usePinScheduleOperation', () => {
     act(() => {
       result.current.mutate({
         compoundId: '44444444-4444-4444-8444-444444444444',
-        order: baseOrder,
-        targetDate: '2026-05-10',
+        targets: [{ order: baseOrder, targetDate: '2026-05-10' }],
       });
     });
 
@@ -99,8 +98,7 @@ describe('usePinScheduleOperation', () => {
     act(() => {
       result.current.mutate({
         compoundId: '44444444-4444-4444-8444-444444444444',
-        order: { ...baseOrder, status: 'pending' },
-        targetDate: '2026-05-10',
+        targets: [{ order: { ...baseOrder, status: 'pending' }, targetDate: '2026-05-10' }],
       });
     });
 
@@ -120,8 +118,12 @@ describe('usePinScheduleOperation', () => {
     act(() => {
       result.current.mutate({
         compoundId: '44444444-4444-4444-8444-444444444444',
-        order: { ...baseOrder, is_pinned: true, pinned_production_date: '2026-05-09' },
-        targetDate: '2026-05-10',
+        targets: [
+          {
+            order: { ...baseOrder, is_pinned: true, pinned_production_date: '2026-05-09' },
+            targetDate: '2026-05-10',
+          },
+        ],
       });
     });
 
@@ -133,5 +135,50 @@ describe('usePinScheduleOperation', () => {
     const body = JSON.parse(init?.body as string) as { op_count: number; ops: { op: string }[] };
     expect(body.ops.map((op) => op.op)).toEqual(['unpin', 'pin']);
     expect(body.op_count).toBe(2);
+  });
+
+  it('queues multiple orders in one ordered compound', async () => {
+    const { result } = renderHook(() => usePinScheduleOperation(), { wrapper: makeWrapper() });
+
+    act(() => {
+      result.current.mutate({
+        compoundId: '44444444-4444-4444-8444-444444444444',
+        targets: [
+          { order: { ...baseOrder, status: 'pending' }, targetDate: '2026-05-10' },
+          {
+            order: {
+              ...baseOrder,
+              id: '22222222-2222-4222-8222-222222222222',
+              order_number: 'ORD-20260504-0002',
+              status: 'pending',
+            },
+            targetDate: '2026-05-11',
+          },
+        ],
+      });
+    });
+
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+    });
+
+    const [, init] = vi.mocked(global.fetch).mock.calls[0];
+    const body = JSON.parse(init?.body as string) as {
+      op_count: number;
+      ops: { op: string; order_number: string }[];
+    };
+    expect(body.ops.map((op) => `${op.order_number}:${op.op}`)).toEqual([
+      'ORD-20260504-0001:add',
+      'ORD-20260504-0001:pin',
+      'ORD-20260504-0002:add',
+      'ORD-20260504-0002:pin',
+    ]);
+    expect(body.ops.map((op) => ('fake_deadline' in op ? op.fake_deadline : null))).toEqual([
+      null,
+      '2026-05-10',
+      null,
+      '2026-05-11',
+    ]);
+    expect(body.op_count).toBe(4);
   });
 });

@@ -19,22 +19,43 @@ export interface ScheduleCompoundResponse {
   message: string;
 }
 
+type SchedulableOrder = Pick<
+  Order,
+  | 'id'
+  | 'order_number'
+  | 'wafer_quantity'
+  | 'requested_delivery_date'
+  | 'status'
+  | 'is_pinned'
+  | 'pinned_production_date'
+>;
+
+type ScheduleOperation =
+  | {
+      op: 'add' | 'remove' | 'unpin';
+      order_id: string;
+      order_number: string;
+      wafer_quantity: number;
+      deadline: string;
+    }
+  | {
+      op: 'pin';
+      order_id: string;
+      order_number: string;
+      wafer_quantity: number;
+      deadline: string;
+      fake_deadline: string;
+    };
+
 export interface PinScheduleInput {
   compoundId: string;
-  order: Pick<
-    Order,
-    | 'id'
-    | 'order_number'
-    | 'wafer_quantity'
-    | 'requested_delivery_date'
-    | 'status'
-    | 'is_pinned'
-    | 'pinned_production_date'
-  >;
-  targetDate: string;
+  targets: {
+    order: SchedulableOrder;
+    targetDate: string;
+  }[];
 }
 
-function buildPinOps({ order, targetDate }: PinScheduleInput) {
+function buildPinOpsForOrder(order: SchedulableOrder, targetDate: string): ScheduleOperation[] {
   const baseOp = {
     order_id: order.id,
     order_number: order.order_number,
@@ -71,7 +92,9 @@ export function usePinScheduleOperation(): ReturnType<
         throw new Error('You must be logged in to schedule orders.');
       }
 
-      const ops = buildPinOps(input);
+      const ops = input.targets.flatMap(({ order, targetDate }) =>
+        buildPinOpsForOrder(order, targetDate),
+      );
       return apiFetch(
         '/api/v1/schedule/operations',
         {

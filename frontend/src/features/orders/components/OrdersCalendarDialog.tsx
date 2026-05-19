@@ -54,16 +54,18 @@ type DraggableOrder = Pick<
   | 'is_processing_locked'
 >;
 
-interface PendingDrop {
+interface PendingMove {
   order: DraggableOrder;
   targetDate: string;
 }
 
 interface ActiveOperation {
   compoundId: string;
-  orderId: string;
-  orderNumber: string;
-  targetDate: string;
+  targets: {
+    orderId: string;
+    orderNumber: string;
+    targetDate: string;
+  }[];
   readyToVerify: boolean;
 }
 
@@ -110,13 +112,15 @@ function isTargetAfterDeadline(order: DraggableOrder, targetDate: string): boole
   return targetDate > order.requested_delivery_date;
 }
 
-function dragOrderFromEvent(event: DragEvent): DraggableOrder | null {
+function dragOrdersFromEvent(event: DragEvent): DraggableOrder[] {
   const raw = event.dataTransfer.getData(DRAG_MIME);
-  if (!raw) return null;
+  if (!raw) return [];
   try {
-    return JSON.parse(raw) as DraggableOrder;
+    const parsed = JSON.parse(raw) as { orders?: DraggableOrder[] } | DraggableOrder;
+    if ('orders' in parsed && Array.isArray(parsed.orders)) return parsed.orders;
+    return [parsed as DraggableOrder];
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -135,11 +139,15 @@ function OrderLine({
   dragOrder,
   canDrag,
   onDragStart,
+  selected,
+  onSelectedChange,
 }: {
   order: ScheduleResult;
   dragOrder?: DraggableOrder;
   canDrag: boolean;
   onDragStart: (event: DragEvent, order: DraggableOrder) => void;
+  selected: boolean;
+  onSelectedChange: (orderId: string, selected: boolean) => void;
 }): JSX.Element {
   return (
     <div
@@ -154,6 +162,20 @@ function OrderLine({
     >
       <div className="flex items-center justify-between gap-2">
         <span className="flex min-w-0 items-center gap-1 truncate font-medium">
+          {canDrag && dragOrder && (
+            <input
+              type="checkbox"
+              aria-label={`Select ${order.order_number}`}
+              checked={selected}
+              onChange={(event) => {
+                onSelectedChange(order.id, event.target.checked);
+              }}
+              onClick={(event) => {
+                event.stopPropagation();
+              }}
+              className="h-3.5 w-3.5 shrink-0"
+            />
+          )}
           {canDrag && dragOrder && <GripVertical className="h-3.5 w-3.5 shrink-0" />}
           <span className="truncate">{order.order_number}</span>
         </span>
@@ -172,10 +194,14 @@ function UnscheduledOrderLine({
   order,
   canDrag,
   onDragStart,
+  selected,
+  onSelectedChange,
 }: {
   order: Order;
   canDrag: boolean;
   onDragStart: (event: DragEvent, order: DraggableOrder) => void;
+  selected: boolean;
+  onSelectedChange: (orderId: string, selected: boolean) => void;
 }): JSX.Element {
   return (
     <div
@@ -191,6 +217,20 @@ function UnscheduledOrderLine({
     >
       <div className="flex items-center justify-between gap-2">
         <span className="flex min-w-0 items-center gap-1 truncate font-medium">
+          {canDrag && !order.is_processing_locked && (
+            <input
+              type="checkbox"
+              aria-label={`Select ${order.order_number}`}
+              checked={selected}
+              onChange={(event) => {
+                onSelectedChange(order.id, event.target.checked);
+              }}
+              onClick={(event) => {
+                event.stopPropagation();
+              }}
+              className="h-3.5 w-3.5 shrink-0"
+            />
+          )}
           {canDrag && !order.is_processing_locked && (
             <GripVertical className="h-3.5 w-3.5 shrink-0" />
           )}
@@ -213,9 +253,10 @@ export function OrdersCalendarDialog({
 }: OrdersCalendarDialogProps): JSX.Element {
   const [visibleMonth, setVisibleMonth] = useState(() => startOfMonth(new Date()));
   const [selectedDate, setSelectedDate] = useState(() => dateKey(new Date()));
-  const [pendingDrop, setPendingDrop] = useState<PendingDrop | null>(null);
+  const [pendingMoves, setPendingMoves] = useState<PendingMove[]>([]);
   const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
+  const [selectedOrderIds, setSelectedOrderIds] = useState<string[]>([]);
   const role = useCurrentRole();
 
   const scheduleResult = useScheduleResult();
@@ -256,59 +297,98 @@ export function OrdersCalendarDialog({
       ),
     [pendingOrders.data],
   );
+  const selectableOrders = useMemo(
+    () => [...(scheduledOrders.data?.items ?? []), ...unscheduled],
+    [scheduledOrders.data, unscheduled],
+  );
 
-  const handleDragStart = useCallback((event: DragEvent, order: DraggableOrder) => {
-    event.dataTransfer.setData(DRAG_MIME, JSON.stringify(order));
+  const selectedOrders = useMemo(
+    () => selectableOrders.filter((order) => selectedOrderIds.includes(order.id)),
+    [selectableOrders, selectedOrderIds],
+  );
+
+  const updateSelectedOrder = useCallback((orderId: string, selected: boolean) => {
+    setSelectedOrderIds((current) => {
+      if (selected) return current.includes(orderId) ? current : [...current, orderId];
+      return current.filter((id) => id !== orderId);
+    });
   }, []);
+
+  const handleDragStart = useCallback(
+    (event: DragEvent, order: DraggableOrder) => {
+      const ordersToDrag = selectedOrderIds.includes(order.id) ? selectedOrders : [order];
+      event.dataTransfer.setData(DRAG_MIME, JSON.stringify({ orders: ordersToDrag }));
+    },
+    [selectedOrderIds, selectedOrders],
+  );
 
   const handleDropOnDate = useCallback(
     (event: DragEvent, targetDate: string) => {
       event.preventDefault();
       if (!canManageSchedule) return;
 
-      const order = dragOrderFromEvent(event);
-      if (!order) return;
+      const orders = dragOrdersFromEvent(event);
+      if (orders.length === 0) return;
 
-      if (order.is_processing_locked) {
+      if (orders.some((order) => order.is_processing_locked)) {
         toast.error('這筆訂單仍在排程處理中，請稍後再試。');
         return;
       }
-      if (order.status !== 'pending' && order.status !== 'scheduled') {
+      if (orders.some((order) => order.status !== 'pending' && order.status !== 'scheduled')) {
         toast.error('只能移動 pending 或 scheduled 訂單。');
         return;
       }
-      if (isTargetAfterDeadline(order, targetDate)) {
+      if (orders.some((order) => isTargetAfterDeadline(order, targetDate))) {
         toast.error('目標日期不能晚於客戶要求交期。');
         return;
       }
-      if (order.is_pinned && order.pinned_production_date === targetDate) {
-        toast.info('這筆訂單已經固定在該日期。');
+      if (orders.every((order) => order.is_pinned && order.pinned_production_date === targetDate)) {
+        toast.info('選取的訂單已經固定在該日期。');
         return;
       }
 
       setSelectedDate(targetDate);
       setOperationError(null);
-      setPendingDrop({ order, targetDate });
+      setPendingMoves((current) => {
+        const droppedOrderIds = new Set(orders.map((order) => order.id));
+        return [
+          ...current.filter((move) => !droppedOrderIds.has(move.order.id)),
+          ...orders.map((order) => ({ order, targetDate })),
+        ];
+      });
     },
     [canManageSchedule],
   );
 
-  const submitPendingDrop = useCallback(() => {
-    if (!pendingDrop) return;
+  const removePendingMove = useCallback((orderId: string) => {
+    setPendingMoves((current) => current.filter((move) => move.order.id !== orderId));
+  }, []);
+
+  const submitPendingMoves = useCallback(() => {
+    if (pendingMoves.length === 0) return;
     const compoundId = crypto.randomUUID();
     setActiveOperation({
       compoundId,
-      orderId: pendingDrop.order.id,
-      orderNumber: pendingDrop.order.order_number,
-      targetDate: pendingDrop.targetDate,
+      targets: pendingMoves.map((move) => ({
+        orderId: move.order.id,
+        orderNumber: move.order.order_number,
+        targetDate: move.targetDate,
+      })),
       readyToVerify: false,
     });
     pinSchedule.mutate(
-      { compoundId, order: pendingDrop.order, targetDate: pendingDrop.targetDate },
+      {
+        compoundId,
+        targets: pendingMoves.map((move) => ({
+          order: move.order,
+          targetDate: move.targetDate,
+        })),
+      },
       {
         onSuccess: () => {
           toast.success('已送出排程嘗試，等待排程器確認。');
-          setPendingDrop(null);
+          setPendingMoves([]);
+          setSelectedOrderIds([]);
         },
         onError: (error) => {
           setActiveOperation(null);
@@ -317,7 +397,7 @@ export function OrdersCalendarDialog({
         },
       },
     );
-  }, [pendingDrop, pinSchedule]);
+  }, [pendingMoves, pinSchedule]);
 
   useEffect(() => {
     if (!activeOperation) return undefined;
@@ -367,12 +447,18 @@ export function OrdersCalendarDialog({
   useEffect(() => {
     if (!activeOperation?.readyToVerify || scheduledOrders.isFetching) return;
 
-    const updatedOrder = scheduledOrders.data?.items.find(
-      (order) => order.id === activeOperation.orderId,
+    const targetByOrderId = new Map(
+      activeOperation.targets.map((target) => [target.orderId, target.targetDate]),
+    );
+    const updatedOrders = scheduledOrders.data?.items.filter((order) =>
+      targetByOrderId.has(order.id),
     );
     if (
-      updatedOrder?.is_pinned &&
-      updatedOrder.pinned_production_date === activeOperation.targetDate
+      updatedOrders?.length === activeOperation.targets.length &&
+      updatedOrders.every(
+        (order) =>
+          order.is_pinned && order.pinned_production_date === targetByOrderId.get(order.id),
+      )
     ) {
       toast.success('排程日期已套用。');
       setActiveOperation(null);
@@ -541,18 +627,34 @@ export function OrdersCalendarDialog({
           </section>
 
           <aside className="border-t bg-muted/20 p-4 lg:border-l lg:border-t-0">
-            {pendingDrop && (
+            {pendingMoves.length > 0 && (
               <div className="mb-5 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/30">
-                <div className="font-medium">確認排程移動</div>
-                <p className="mt-1 text-muted-foreground">
-                  嘗試將 {pendingDrop.order.order_number} 固定到 {pendingDrop.targetDate}。
-                  排程器會檢查容量與期限，成功後日曆會自動更新。
-                </p>
+                <div className="font-medium">待送出的排程變更</div>
+                <div className="mt-2 space-y-1 text-muted-foreground">
+                  {pendingMoves.map((move) => (
+                    <div key={move.order.id} className="flex items-center justify-between gap-2">
+                      <span className="truncate">
+                        {move.order.order_number} → {move.targetDate}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          removePendingMove(move.order.id);
+                        }}
+                        disabled={pinSchedule.isPending}
+                      >
+                        移除
+                      </Button>
+                    </div>
+                  ))}
+                </div>
                 <div className="mt-3 flex gap-2">
                   <Button
                     type="button"
                     size="sm"
-                    onClick={submitPendingDrop}
+                    onClick={submitPendingMoves}
                     disabled={pinSchedule.isPending}
                   >
                     {pinSchedule.isPending && (
@@ -565,7 +667,7 @@ export function OrdersCalendarDialog({
                     variant="outline"
                     size="sm"
                     onClick={() => {
-                      setPendingDrop(null);
+                      setPendingMoves([]);
                     }}
                     disabled={pinSchedule.isPending}
                   >
@@ -580,7 +682,10 @@ export function OrdersCalendarDialog({
                 <div className="flex items-center gap-2">
                   <Loader2 className="h-4 w-4 animate-spin" />
                   <span>
-                    {activeOperation.orderNumber} 排程處理中，目標日期 {activeOperation.targetDate}
+                    {activeOperation.targets
+                      .map((target) => `${target.orderNumber} → ${target.targetDate}`)
+                      .join(', ')}{' '}
+                    排程處理中
                   </span>
                 </div>
               </div>
@@ -608,6 +713,8 @@ export function OrdersCalendarDialog({
                         {...(dragOrder ? { dragOrder } : {})}
                         canDrag={canManageSchedule && order.status === 'scheduled'}
                         onDragStart={handleDragStart}
+                        selected={selectedOrderIds.includes(order.id)}
+                        onSelectedChange={updateSelectedOrder}
                       />
                     );
                   })
@@ -642,6 +749,8 @@ export function OrdersCalendarDialog({
                         order={order}
                         canDrag={canManageSchedule}
                         onDragStart={handleDragStart}
+                        selected={selectedOrderIds.includes(order.id)}
+                        onSelectedChange={updateSelectedOrder}
                       />
                     ))
                   ) : (
