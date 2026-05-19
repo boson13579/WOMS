@@ -16,7 +16,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
-from app.core.logger import audit_log as emit_audit_log
+from app.core.audit import record_audit
 from app.models.order import MUTABLE_STATUSES, Order, OrderStatus
 from app.models.user import User, UserRole
 from app.repositories import audit_log as audit_log_repo
@@ -338,22 +338,20 @@ def _write_audit(
     old_value: dict[str, Any] | None = None,
     new_value: dict[str, Any] | None = None,
 ) -> None:
-    """Persist an audit row and emit an ECS stdout record."""
-    audit_log_repo.create(
+    """Persist an audit row and emit an ECS stdout record (dual-write).
+
+    Thin wrapper around :func:`app.core.audit.record_audit` that keeps the
+    ``actor: User`` / ``order: Order`` signature so per-caller sites don't
+    need to unpack ids by hand.
+    """
+    record_audit(
         db,
         action=action,
-        user_id=actor.id,
+        actor_id=actor.id,
         resource_type="order",
         resource_id=order.id,
         old_value=old_value,
         new_value=new_value,
-    )
-    emit_audit_log(
-        action=action,
-        actor_id=str(actor.id),
-        resource_type="order",
-        resource_id=str(order.id),
-        changes={"old": old_value, "new": new_value},
     )
 
 
@@ -941,23 +939,15 @@ def apply_schedule(
         }
         if is_pinned:
             new_value["pinned_production_date"] = str(pinned_map[order_id])
-        # Persist to audit_logs DB table — required by PRD §1.6 so the
-        # scheduling history is queryable from Postgres, not only from log
-        # shippers. user_id=None marks this as system-driven.
-        audit_log_repo.create(
+        # Dual-write to audit_logs + stdout. user_id=None marks this as
+        # system-driven (the scheduler, not a human, applied the result).
+        record_audit(
             db,
-            action="order.scheduled",
-            user_id=None,
-            resource_type="order",
-            resource_id=order_id,
-            new_value=new_value,
-        )
-        emit_audit_log(
             action="order.scheduled",
             actor_id=None,
             resource_type="order",
-            resource_id=str(order_id),
-            changes=new_value,
+            resource_id=order_id,
+            new_value=new_value,
         )
 
     db.commit()

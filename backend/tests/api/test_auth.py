@@ -5,9 +5,16 @@ Run `pytest tests/api/test_auth.py -v` to execute this test module.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
 import bcrypt
+import pytest
+import structlog
+from app.models.audit_log import AuditLog
 from app.models.user import User, UserRole
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 # ---------------------------------------------------------------------------
@@ -66,6 +73,131 @@ def test_login_success_returns_token(client: TestClient, db_session: Session) ->
     assert "access_token" in body
     assert body["token_type"] == "bearer"
     assert len(body["access_token"]) > 10
+
+
+def test_login_writes_audit_row(client: TestClient, db_session: Session) -> None:
+    """Successful login must persist an ``audit_logs`` row tagged
+    ``user.login_succeeded``. Before B1 the login path only emitted a
+    stdout log — invisible from Postgres — so a forgotten log shipper meant
+    the security trail vanished. The unified dual-write helper now keeps
+    the event recoverable from the DB.
+    """
+    user = _make_user(db_session, username="audit_login", password="secret123")
+
+    res = client.post(
+        "/api/v1/auth/login",
+        json={"username": "audit_login", "password": "secret123"},
+    )
+    assert res.status_code == 200
+
+    rows = list(
+        db_session.scalars(
+            select(AuditLog)
+            .where(AuditLog.resource_id == user.id)
+            .where(AuditLog.action == "user.login_succeeded")
+        ).all()
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.user_id == user.id
+    assert row.resource_type == "user"
+    assert row.new_value == {"username": "audit_login"}
+
+
+def test_login_updates_last_login_at(client: TestClient, db_session: Session) -> None:
+    """Successful login must stamp ``users.last_login_at`` to ~now.
+
+    B2 added the column; pre-B2 the user row had no record of when it last
+    authenticated. The stamp shares the same commit as the audit-row insert
+    so the snapshot stays consistent: either both land or neither does.
+    """
+    user = _make_user(db_session, username="last_login_user", password="secret123")
+    assert user.last_login_at is None, "fresh user must start with no last_login_at"
+    before = datetime.now(UTC)
+
+    res = client.post(
+        "/api/v1/auth/login",
+        json={"username": "last_login_user", "password": "secret123"},
+    )
+    assert res.status_code == 200
+
+    db_session.refresh(user)
+    assert user.last_login_at is not None
+    delta = abs((user.last_login_at - before).total_seconds())
+    assert delta < 5, f"last_login_at should be within 5s of now, got delta={delta}s"
+    assert datetime.now(UTC) - user.last_login_at < timedelta(seconds=5)
+
+
+def test_login_failed_no_audit_record(client: TestClient, db_session: Session) -> None:
+    """A failed login (bad password) must not write any ``user.login_*`` audit
+    row. The 401 path returns before the audit/last_login_at block, so the
+    user row stays untouched and audit_logs gains nothing.
+    """
+    user = _make_user(db_session, username="bad_pass_user", password="correct")
+
+    res = client.post(
+        "/api/v1/auth/login",
+        json={"username": "bad_pass_user", "password": "wrong"},
+    )
+    assert res.status_code == 401
+
+    rows = list(
+        db_session.scalars(
+            select(AuditLog)
+            .where(AuditLog.resource_id == user.id)
+            .where(AuditLog.action.like("user.login%"))
+        ).all()
+    )
+    assert rows == [], f"failed login must not emit audit rows, got {rows!r}"
+
+    db_session.refresh(user)
+    assert user.last_login_at is None, "failed login must not stamp last_login_at"
+
+
+def test_login_audit_failure_does_not_block_login(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``record_audit`` itself raises, login still returns 200 + a valid
+    token. Login availability outranks audit completeness: the user already
+    passed credential verification, so the API must not penalise them for an
+    internal telemetry hiccup. A ``user.login.audit_failed`` warning is
+    logged for forensic recovery, and the ``last_login_at`` stamp is rolled
+    back along with the missing audit row so the snapshot reflects only
+    durably-persisted state.
+    """
+    _make_user(db_session, username="audit_blowup", password="secret123")
+
+    def _raise(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("simulated audit blow-up")
+
+    # Patch the symbol that services.auth imported at module load time.
+    import app.services.auth as auth_service
+
+    monkeypatch.setattr(auth_service, "record_audit", _raise)
+
+    with structlog.testing.capture_logs() as captured:
+        res = client.post(
+            "/api/v1/auth/login",
+            json={"username": "audit_blowup", "password": "secret123"},
+        )
+
+    # Login still succeeds.
+    assert res.status_code == 200
+    body = res.json()
+    assert "access_token" in body
+    assert len(body["access_token"]) > 10
+
+    # A warning was logged so the audit failure is observable.
+    warnings = [r for r in captured if r.get("log_level") == "warning"]
+    assert any(r.get("event") == "user.login.audit_failed" for r in warnings), (
+        f"expected user.login.audit_failed warning, got {warnings!r}"
+    )
+
+    # last_login_at was rolled back — no audit row, no stamp.
+    user = db_session.scalars(select(User).where(User.username == "audit_blowup")).one()
+    assert user.last_login_at is None
 
 
 def test_login_wrong_password_returns_401(client: TestClient, db_session: Session) -> None:
