@@ -11,7 +11,8 @@ HTTP. They are pure domain objects mapped to database tables.
 
 from app.models.audit_log import AuditLog
 from app.models.base_class import Base
+from app.models.notification import Notification
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
 
-__all__ = ["AuditLog", "Base", "Order", "OrderStatus", "User", "UserRole"]
+__all__ = ["AuditLog", "Base", "Notification", "Order", "OrderStatus", "User", "UserRole"]

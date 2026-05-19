@@ -1,10 +1,9 @@
 /**
  * Paginated order list table.
- * Exposes onEdit / onSchedule callbacks so the parent page can manage
- * modal open state and schedule task IDs without prop-drilling.
+ * Exposes onEdit callback so the parent page can manage modal open state.
  */
-import { ArrowDown, ArrowUp, ArrowUpDown, Calendar, Loader2, Pencil, Trash2 } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { ArrowDown, ArrowUp, ArrowUpDown, Loader2, Pencil, Trash2 } from 'lucide-react';
+import { useMemo, type ReactNode } from 'react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -17,7 +16,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { useCanWrite } from '@/lib/auth';
+import { useUsernames } from '@/features/users/api/useUsernames';
+import { useCanWrite, useCurrentRole, useCurrentUserId } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 
 import { useDeleteOrder, useOrders } from '../api/orders';
@@ -91,16 +91,18 @@ function SortableHead({
 
 interface OrderTableProps {
   onEdit: (order: Order) => void;
-  onSchedule: (orderId: string) => void;
 }
 
-export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element {
-  const { status, search, page, sortBy, sortOrder, setPage, setSort } = useOrderStore();
+export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
+  const { status, search, assignedTo, createdBy, page, sortBy, sortOrder, setPage, setSort } =
+    useOrderStore();
   const PAGE_SIZE = 20;
 
   const { data, isPending, isError } = useOrders({
     status,
     search: search || null,
+    assignedTo,
+    createdBy,
     page,
     page_size: PAGE_SIZE,
     sortBy,
@@ -109,11 +111,41 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
 
   const deleteMutation = useDeleteOrder();
   const canWrite = useCanWrite();
+  const role = useCurrentRole();
+  const currentUserId = useCurrentUserId();
+
+  const userIds = useMemo(() => {
+    if (!data) return [];
+    const ids = data.items
+      .flatMap((o) => [o.assigned_to, o.created_by])
+      .filter(Boolean) as string[];
+    return Array.from(new Set(ids));
+  }, [data]);
+  const { data: usernamesMap } = useUsernames(userIds);
+
+  function userDisplay(userId: string | null): string {
+    if (!userId) return '—';
+    if (userId === currentUserId) return '自己';
+    const username = usernamesMap?.[userId];
+    if (username == null) return '—';
+    return username;
+  }
+
+  function canEditOrder(order: Order): boolean {
+    if (!canWrite) return false;
+    if (role === 'order_manager') return order.created_by === currentUserId;
+    return true;
+  }
 
   function handleDelete(order: Order): void {
     // eslint-disable-next-line no-alert
     if (!window.confirm(`確定要刪除訂單 ${order.order_number}？`)) return;
-    deleteMutation.mutate(order.id);
+    deleteMutation.mutate(order.id, {
+      onError: (err) => {
+        // eslint-disable-next-line no-alert
+        window.alert(err.message);
+      },
+    });
   }
 
   if (isPending) {
@@ -167,6 +199,8 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
                   晶圓數量
                 </SortableHead>
                 <TableHead className="w-28">狀態</TableHead>
+                <TableHead className="hidden md:table-cell">負責人</TableHead>
+                <TableHead className="hidden lg:table-cell">建立者</TableHead>
                 <SortableHead
                   field="requested_delivery_date"
                   sortBy={sortBy}
@@ -183,7 +217,7 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
             <TableBody>
               {data.items.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="py-12 text-center text-muted-foreground">
+                  <TableCell colSpan={9} className="py-12 text-center text-muted-foreground">
                     沒有符合條件的訂單。
                   </TableCell>
                 </TableRow>
@@ -200,6 +234,12 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
                         {STATUS_LABEL[order.status]}
                       </Badge>
                     </TableCell>
+                    <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
+                      {userDisplay(order.assigned_to)}
+                    </TableCell>
+                    <TableCell className="hidden lg:table-cell text-sm text-muted-foreground">
+                      {userDisplay(order.created_by)}
+                    </TableCell>
                     <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
                       {new Date(order.requested_delivery_date).toLocaleDateString('zh-TW')}
                     </TableCell>
@@ -210,41 +250,31 @@ export function OrderTable({ onEdit, onSchedule }: OrderTableProps): JSX.Element
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center justify-end gap-1">
-                        {canWrite && (
-                          <>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={() => {
-                                onEdit(order);
-                              }}
-                              title="編輯"
-                            >
-                              <Pencil className="h-4 w-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={() => {
-                                onSchedule(order.id);
-                              }}
-                              title="觸發排程"
-                            >
-                              <Calendar className="h-4 w-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={() => {
-                                handleDelete(order);
-                              }}
-                              title="刪除"
-                              disabled={deleteMutation.isPending}
-                              className="text-destructive hover:text-destructive"
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </>
+                        {canEditOrder(order) && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => {
+                              onEdit(order);
+                            }}
+                            title="編輯"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </Button>
+                        )}
+                        {canEditOrder(order) && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => {
+                              handleDelete(order);
+                            }}
+                            title={order.is_processing_locked ? '排程處理中，請稍候' : '刪除'}
+                            disabled={deleteMutation.isPending || order.is_processing_locked}
+                            className="text-destructive hover:text-destructive"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
                         )}
                       </div>
                     </TableCell>
