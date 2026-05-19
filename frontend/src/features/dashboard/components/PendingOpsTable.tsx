@@ -24,8 +24,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { useUsernames } from '@/features/users/api/useUsernames';
 
-import { useUsernames } from '../api/useUsernames';
 import type { PendingOpsEntry } from '../types';
 
 const DEFAULT_TOP_N = 10;

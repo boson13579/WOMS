@@ -12,15 +12,7 @@
  * (`MobileNav`) can reuse the same markup at viewport widths where the
  * persistent sidebar is hidden (`<768px`).
  */
-import {
-  Bell,
-  CalendarClock,
-  LayoutDashboard,
-  Package,
-  ScrollText,
-  Settings,
-  Users,
-} from 'lucide-react';
+import { Bell, LayoutDashboard, Package, Settings, Users } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 
@@ -38,11 +30,9 @@ interface NavItem {
 const PRIMARY_NAV: readonly NavItem[] = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/orders', label: 'Orders', icon: Package },
-  { to: '/scheduling', label: 'Scheduling', icon: CalendarClock, disabled: true },
 ];
 
 const SECONDARY_NAV: readonly NavItem[] = [
-  { to: '/audit', label: 'Audit log', icon: ScrollText, disabled: true },
   { to: '/notifications', label: 'Notifications', icon: Bell, disabled: true },
 ];
 

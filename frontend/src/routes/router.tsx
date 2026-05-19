@@ -39,8 +39,6 @@ export const routes: RouteObject[] = [
                 element: <RoleProtectedRoute allowedRoles={['root']} />,
                 children: [{ path: 'users', element: <AdminUsersPage /> }],
               },
-              // Future feature routes go here:
-              // { path: 'scheduling', element: <SchedulingPage /> },
             ],
           },
         ],
