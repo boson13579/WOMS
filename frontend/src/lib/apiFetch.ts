@@ -13,6 +13,16 @@
  * generic "The user aborted a request.".
  */
 
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 export function jsonHeaders(): HeadersInit {
   return { 'Content-Type': 'application/json' };
 }
@@ -48,7 +58,7 @@ export async function apiFetch<T>(
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
         (body?.detail as string | undefined) ??
         res.statusText;
-      throw new Error(msg);
+      throw new ApiError(res.status, msg);
     }
     if (res.status === 204) return undefined as T;
     try {
