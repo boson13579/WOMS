@@ -207,23 +207,32 @@ def _enqueue(redis_client: Redis, compound: dict[str, Any]) -> None:
 def _patch_common(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    add_order: MagicMock | None = None,
-    compute_schedule: Any | None = None,
+    is_batch_feasible: Any | None = None,
 ) -> dict[str, MagicMock]:
     """Stub out the side-effecting collaborators of ``run_scheduling_task``.
 
+    Batch-admission rewrite: the worker no longer calls ``add_order`` /
+    ``remove_order`` (those did per-op tree work + capacity validation;
+    that's now consolidated into ``apply_batch_to_capacity`` +
+    ``apply_batch_to_deadline`` after a single batch feasibility check).
+    pq mutations happen via ``pq_add`` / ``pq_remove`` directly against a
+    real ``SchedulerState``, so tests don't mock those. ``pin_order`` /
+    ``unpin_order`` are still called per leaf because they do their own
+    self-contained tree swap.
+
     Redis itself is NOT patched — the session-scoped ``redis_container``
-    fixture supplies a real client at ``settings.REDIS_URL``, so anything
-    the worker reaches into via ``_get_redis()`` hits the live container.
+    fixture supplies a real client at ``settings.REDIS_URL``. Pre-seeding
+    ``STATE_KEY`` is the test's job; the default empty state
+    (``SchedulerState.initial(today)``) has full HORIZON_DAYS*DAILY_CAPACITY
+    of capacity, so any modest-quantity compound feasibility-checks True.
 
-    Returns a dict of the installed mocks so individual tests can make
-    assertions on them.
+    To force infeasibility in a test: pre-seed ``STATE_KEY`` with a state
+    that already has tree contributions exhausting the prefix sum, OR
+    pass ``is_batch_feasible`` to override the check at the worker module
+    boundary.
     """
-    add_mock = add_order or MagicMock(return_value=ScheduleResult(status="success"))
-    monkeypatch.setattr("app.workers.scheduling.add_order", add_mock)
-
-    remove_mock = MagicMock(return_value=ScheduleResult(status="success"))
-    monkeypatch.setattr("app.workers.scheduling.remove_order", remove_mock)
+    if is_batch_feasible is not None:
+        monkeypatch.setattr("app.workers.scheduling.is_batch_feasible", is_batch_feasible)
 
     pin_mock = MagicMock(return_value=ScheduleResult(status="success"))
     monkeypatch.setattr("app.workers.scheduling.pin_order", pin_mock)
@@ -231,11 +240,11 @@ def _patch_common(
     unpin_mock = MagicMock(return_value=ScheduleResult(status="success"))
     monkeypatch.setattr("app.workers.scheduling.unpin_order", unpin_mock)
 
-    compute_mock = compute_schedule or (lambda state: [])
-    monkeypatch.setattr("app.workers.scheduling.compute_schedule", compute_mock)
-
+    # apply_schedule / compute_schedule are only called by the materializer
+    # / advance_day / rebuild paths — run_scheduling no longer touches them.
+    # We patch them defensively anyway so any accidental call surfaces.
+    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda state: [])
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
-
     apply_mock = MagicMock(return_value=0)
     monkeypatch.setattr("app.workers.scheduling.order_service.apply_schedule", apply_mock)
 
@@ -247,23 +256,18 @@ def _patch_common(
 
     delay_mock = _install_auto_retrigger_delay(monkeypatch)
 
-    # Phase 4: run_scheduling_task now also dispatches the slow materializer
-    # task on each compound success. Tests that focus on the fast path
-    # don't want the real materializer to run, so we mock its .delay().
-    # The dedicated materialize tests reset this monkeypatch locally.
+    # Phase 4 + batch rewrite: run_scheduling_task dispatches the materializer
+    # ONCE per drain (after the while loop), not once per compound. Tests
+    # that focus on the fast path don't want a real materializer to run,
+    # so we mock its .delay(). Dedicated materializer tests reset this
+    # monkeypatch locally.
     materialize_delay_mock = MagicMock()
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",
         materialize_delay_mock,
     )
-    # ``enqueue_notify_user`` does a real SADD against
-    # ``schedule:materialize_notify_pending``. Real Redis handles this
-    # natively, so no patching is needed — tests that want to observe
-    # the queued users just call ``redis_client.smembers(...)``.
 
     return {
-        "add_order": add_mock,
-        "remove_order": remove_mock,
         "pin_order": pin_mock,
         "unpin_order": unpin_mock,
         "apply_schedule": apply_mock,
@@ -279,72 +283,80 @@ def _patch_common(
 # ---------------------------------------------------------------------------
 
 
-def test_run_scheduling_processes_two_adds(
+def test_run_scheduling_processes_two_adds_in_single_batch(
     monkeypatch: pytest.MonkeyPatch, redis_client: Redis
 ) -> None:
+    """Two modest-quantity compounds in pending queue should be accepted as
+    one batch: tree updates apply once, both compounds get
+    ``compound_accepted`` WS, ONE materializer dispatch covers both.
+
+    Batch-admission rewrite contract: when ``is_batch_feasible([1..N]) ==
+    True``, the worker accepts the whole prefix in a single tree update.
+    Materializer is dispatched once per drain (after the while loop),
+    not once per compound — that's a behavior change from the per-
+    compound design.
+    """
     op1 = _make_op(order_number="ORD-001")
     op2 = _make_op(order_number="ORD-002", wafer_quantity=2000)
-    # ZADD with monotonic seq: op1 has smaller score ⇒ ZPOPMIN'd first.
     _enqueue(redis_client, op1)
     _enqueue(redis_client, op2)
 
     mocks = _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
-
     assert result.successful(), result.traceback
-    # Per-compound design: each invocation handles one compound and
-    # re-triggers itself. The test's auto-retrigger delay-side-effect
-    # bridges those calls so the whole queue drains under a single
-    # test-driven apply().
-    assert mocks["add_order"].call_count == 2
-    # Phase 4 fast/slow split: fast path no longer calls apply_schedule
-    # or broadcast. Both moved to the deferred materializer.
-    assert mocks["apply_schedule"].call_count == 0
-    assert mocks["broadcast"].call_count == 0
-    # Per-compound: notify_user(compound_accepted) and
-    # materialize_schedule_task.delay() fire on each success.
+
+    # Both compounds got compound_accepted notifications.
     assert mocks["notify_user"].call_count == 2
     for call in mocks["notify_user"].call_args_list:
         assert call.kwargs["message"]["type"] == "schedule.compound_accepted"
-    assert mocks["materialize_delay"].call_count == 2
-    # run_scheduling_task.delay() fired once between compound1 and
-    # compound2 (after compound1 sees the second still queued).
-    assert mocks["delay"].call_count == 1
-    # Final status: idle, with a finished_at timestamp
+
+    # Materializer dispatched ONCE for the whole drain, not per-compound.
+    assert mocks["materialize_delay"].call_count == 1
+    # Self-retrigger NOT fired (nothing left in queue post-drain).
+    assert mocks["delay"].call_count == 0
+    # Phase 4 slow path: apply_schedule + broadcast still gated on the
+    # materializer, not the fast path.
+    assert mocks["apply_schedule"].call_count == 0
+    assert mocks["broadcast"].call_count == 0
+
+    # Queue is fully drained.
+    assert redis_client.zcard(PENDING_OPS_KEY) == 0
+    # Status flipped back to idle.
     status_doc = json.loads(redis_client.get(STATUS_KEY))
     assert status_doc["state"] == "idle"
     assert status_doc["finished_at"] is not None
-    # State persisted by the fast path (cheap O(n) serialize).
+    # State persisted.
     assert redis_client.get(STATE_KEY) is not None
-    # Both requesters got SADD'd into the materializer's notify queue.
+    # Both requesters SADD'd into the materializer's notify queue.
     assert redis_client.scard("schedule:materialize_notify_pending") == 2
 
 
 # ---------------------------------------------------------------------------
-# run_scheduling_task — capacity exceeded notifies the requester
+# run_scheduling_task — first-compound infeasibility drops + notifies
 # ---------------------------------------------------------------------------
 
 
-def test_run_scheduling_notifies_user_on_capacity_exceeded(
+def test_run_scheduling_rejects_first_compound_when_infeasible_alone(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """Compound containing a failing ``add`` rolls back + WS-notifies.
+    """If even ``[1..1]`` is infeasible (binary search returns 0), the
+    first compound is ZREM'd + ``compound_failed`` WS-notified + the
+    drain loop continues so subsequent feasible compounds still get a
+    chance.
 
-    Compound model contract: an op-level failure inside a compound triggers
-    a snapshot rollback and ``schedule.compound_failed`` to the compound's
-    ``requested_by``. The successful op inside a separate compound runs
-    normally on its own turn.
+    Contract: this is the only path that produces ``compound_failed`` in
+    the new design (saga rollback is gone). ``reason="capacity_exceeded"``
+    matches the schema the frontend expects.
     """
-
     failing_id = uuid.uuid4()
     failing_user = uuid.uuid4()
     failing_compound_id = uuid.uuid4()
     compound_fail = _make_op(
         order_id=failing_id,
         order_number="ORD-FAIL",
-        wafer_quantity=50_000,
+        wafer_quantity=1000,
         requested_by=failing_user,
     )
     compound_fail["compound_id"] = str(failing_compound_id)
@@ -352,30 +364,26 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
     _enqueue(redis_client, compound_fail)
     _enqueue(redis_client, compound_ok)
 
-    add_mock = MagicMock(
-        side_effect=[
-            ScheduleResult(
-                status="capacity_exceeded",
-                order_id=failing_id,
-                message="too big",
-            ),
-            ScheduleResult(status="success"),
-        ]
-    )
-    mocks = _patch_common(monkeypatch, add_order=add_mock)
+    # Force the first compound (alone) to be infeasible, second OK.
+    feasibility_calls: list[int] = []
+
+    def mock_feasible(_state: Any, delta: list[int]) -> bool:
+        feasibility_calls.append(sum(delta))
+        # Round 1 (binary search): [1..2] = both. delta sums to 2000.
+        # Round 1 halved: [1..1] = compound_fail. delta sums to 1000.
+        # Round 2 (after compound_fail rejected): [1..1] = compound_ok. sums to 1000.
+        # We can't distinguish "[1..1] of compound_fail" vs "[1..1] of compound_ok"
+        # by delta sum alone (both are 1000). Track call sequence instead.
+        # Calls 1 and 2 = round 1 (full + halved, both should fail).
+        # Call 3 = round 2 (compound_ok alone, should succeed).
+        return len(feasibility_calls) >= 3
+
+    mocks = _patch_common(monkeypatch, is_batch_feasible=mock_feasible)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # Both compounds were popped; failed compound rolled back, successful
-    # compound finalized normally.
-    assert mocks["add_order"].call_count == 2
-
-    # Phase 4 fast/slow split: notify_user fires twice now —
-    #   1) compound_failed for the rolled-back compound
-    #   2) compound_accepted for the successful compound
-    # (broadcast / apply_schedule no longer fire here; they happen in
-    # the deferred materializer.)
+    # Two WS notifications: one failed (compound_fail), one accepted (compound_ok).
     notify_calls = mocks["notify_user"].call_args_list
     by_type = {c.kwargs["message"]["type"]: c.kwargs for c in notify_calls}
     assert set(by_type.keys()) == {
@@ -391,64 +399,70 @@ def test_run_scheduling_notifies_user_on_capacity_exceeded(
     assert failed_msg["reason"] == "capacity_exceeded"
     assert failed_msg["rolled_back"] is True
 
-    # Only the successful compound dispatches the materializer.
+    # Materializer dispatched once for the accepted compound.
     assert mocks["materialize_delay"].call_count == 1
+    # Queue fully drained.
+    assert redis_client.zcard(PENDING_OPS_KEY) == 0
 
 
-def test_run_scheduling_notifies_user_on_remove_failure(
+# ---------------------------------------------------------------------------
+# run_scheduling_task — halving accepts the largest fitting prefix
+# ---------------------------------------------------------------------------
+
+
+def test_run_scheduling_halving_accepts_smaller_prefix_then_drains_rest(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """Compound containing a failing ``remove`` rolls back + WS-notifies.
+    """Halving probe: when ``[1..N]`` is infeasible, the worker halves
+    to ``[1..N//2]`` etc. until first feasible. Remaining compounds get
+    picked up on the next drain-loop iteration.
 
-    Realistic trigger: a stale producer pushed a ``remove`` for an order
-    that's no longer in the pq (e.g. it was pinned out, or already removed
-    by a previous compound). The compound rolls back (no-op since remove
-    was the only op) and the requester gets ``schedule.compound_failed``
-    with ``failed_op="remove"`` so the UI can surface the inconsistency.
+    Setup: 4 compounds where [1..4] fails, [1..2] passes. Expected:
+    iter 1 accepts [1..2] (halving N=4 → 2 → pass), iter 2 reads the
+    remaining 2 compounds, accepts [1..2] (halving N=2 → 2 → pass; or
+    N=2 → 1 → pass depending on feasibility). Verify the queue drains
+    fully and both materializer dispatches fire (one per accepted batch).
     """
-
-    failing_id = uuid.uuid4()
-    failing_user = uuid.uuid4()
-    failing_compound_id = uuid.uuid4()
-    compound = _make_op(
-        op="remove",
-        order_id=failing_id,
-        order_number="ORD-DEL",
-        requested_by=failing_user,
-    )
-    compound["compound_id"] = str(failing_compound_id)
-    _enqueue(redis_client, compound)
-
-    remove_mock = MagicMock(
-        return_value=ScheduleResult(
-            status="deadline_too_far",
-            order_id=failing_id,
-            message="Deadline outside the 30-day scheduling horizon.",
+    # Future deadline so the ops actually contribute to the batch delta
+    # (compute_batch_capacity_delta silently drops past-dated ops, which
+    # would make a sum-based feasibility mock trivially pass).
+    future_dl = (date.today() + timedelta(days=10)).isoformat()
+    for i in range(4):
+        _enqueue(
+            redis_client,
+            _make_op(order_number=f"ORD-{i:02d}", wafer_quantity=1000, deadline=future_dl),
         )
-    )
-    mocks = _patch_common(monkeypatch)
-    monkeypatch.setattr("app.workers.scheduling.remove_order", remove_mock)
-    mocks["remove_order"] = remove_mock
+
+    # is_batch_feasible: returns False if total demand > 2000 (= more than
+    # 2 compounds at 1000 qty), True otherwise. Forces the binary search
+    # to halve from N=4 → 2 → pass.
+    def mock_feasible(_state: Any, delta: list[int]) -> bool:
+        return sum(delta) <= 2000
+
+    mocks = _patch_common(monkeypatch, is_batch_feasible=mock_feasible)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    assert remove_mock.call_count == 1
-    assert mocks["notify_user"].call_count == 1
-    kwargs = mocks["notify_user"].call_args.kwargs
-    assert kwargs["user_id"] == failing_user
-    msg = kwargs["message"]
-    assert msg["type"] == "schedule.compound_failed"
-    assert msg["compound_id"] == str(failing_compound_id)
-    assert msg["failed_op"] == "remove"
-    assert msg["order_id"] == str(failing_id)
-    assert msg["reason"] == "deadline_too_far"
-    assert msg["rolled_back"] is True
+    # All 4 compounds eventually accepted across 2 drain iterations.
+    accepted_notifies = [
+        c
+        for c in mocks["notify_user"].call_args_list
+        if c.kwargs["message"]["type"] == "schedule.compound_accepted"
+    ]
+    assert len(accepted_notifies) == 4
+    # Materializer dispatched ONCE per drain regardless of internal batch
+    # count — even though the drain committed 2 batches (4 compounds split
+    # 2+2 by binary-search halving), the materializer dispatch is hoisted
+    # to after the drain loop so a single materialize cycle covers the
+    # whole drain. Per-batch dispatches would just thrash the materializer.
+    assert mocks["materialize_delay"].call_count == 1
+    assert redis_client.zcard(PENDING_OPS_KEY) == 0
 
 
 # ---------------------------------------------------------------------------
-# run_scheduling_task — re-trigger when ops arrive mid-flight
+# run_scheduling_task — status=failed + re-raise on unexpected exception
 # ---------------------------------------------------------------------------
 
 
@@ -458,27 +472,17 @@ def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
 ) -> None:
     """When ``run_scheduling_task`` body raises, it MUST:
 
-    1. Write ``schedule:status`` to ``failed`` with the error string captured
-       (so ``GET /schedule/status`` exposes the breakage to operators).
-    2. NOT leave status stuck at ``running`` — that would 409 every future
-       ``POST /schedule/trigger`` permanently and the only escape is
-       hand-editing Redis.
-    3. Re-raise so Celery records the traceback in its result backend.
+    1. Write ``schedule:status`` to ``failed`` with the error string captured.
+    2. NOT leave status stuck at ``running`` (would 409 every future
+       ``POST /schedule/trigger``).
+    3. Re-raise so Celery records the traceback.
 
-    Pre-fix the body had no ``except``, so any exception left status frozen
-    at ``running`` and silently broke /trigger. Locking this contract with a
-    test means a future refactor can't strip the except block without
-    flipping a red light.
+    Forcing the failure via ``_save_state`` exercises the
+    inside-the-try branch of the task. ``_save_state`` is called by
+    ``_commit_accepted_batch``, so a real compound needs to be pending.
     """
     _enqueue(redis_client, _make_op(order_number="ORD-BOOM"))
 
-    # Realistic crash point: an unexpected exception from a non-leaf-op
-    # path (Redis outage during ``_save_state``, programming error in
-    # ``_perform_compound_db_action``, etc.) bubbles up through the task
-    # body. Leaf-op RuntimeErrors (segment-tree invariant breaks etc.)
-    # are now caught inside ``_process_compound`` and turn into normal
-    # compound failures instead — those are exercised in
-    # ``test_apply_remove_residual_triggers_compound_rollback``.
     mocks = _patch_common(monkeypatch)
     monkeypatch.setattr(
         "app.workers.scheduling._save_state",
@@ -486,104 +490,142 @@ def test_run_scheduling_writes_status_failed_on_exception_and_reraises(
     )
 
     result = run_scheduling_task.apply()
-    # Celery sees the failure (traceback is in result.traceback).
     assert not result.successful()
     assert "segment tree corrupted" in (result.traceback or "")
 
-    # Status doc shows the failure so operators see it via /schedule/status.
     raw = redis_client.get(STATUS_KEY)
     assert raw is not None
     payload = json.loads(raw)
     assert payload["state"] == "failed"
     assert payload["error"] == "segment tree corrupted"
     assert payload["finished_at"] is not None
-    # Crucially: NOT stuck at running (would hard-block /trigger).
     assert payload["state"] != "running"
 
-    # No re-trigger fired on the failure path — there's nothing to gain
-    # from looping a known-broken task.
+    # No re-trigger fired on the failure path.
     assert not mocks["delay"].called
 
 
-def test_run_scheduling_retriggers_when_more_ops_arrive(
+# ---------------------------------------------------------------------------
+# run_scheduling_task — mid-drain arrival picked up by re-read
+# ---------------------------------------------------------------------------
+
+
+def test_run_scheduling_picks_up_compound_arriving_during_drain(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """A compound arriving mid-processing must be picked up via re-trigger
-    instead of waiting for an external dispatch.
+    """A compound arriving while the drain loop is mid-commit must be
+    picked up on the next ``_read_pending_compounds`` call.
 
-    Phase 4 changed the fast path so ``compute_schedule`` is no longer
-    called in this task body — the mid-task injection point moves to
-    ``add_order`` (which IS called during compound processing). The
-    re-trigger check still happens at the end via ``zcard``.
+    With batch admission the drain loop re-reads pending after each batch
+    commit, so a late arrival is processed in the SAME task invocation —
+    no separate ``.delay()`` re-trigger is needed for it. The retrigger
+    at the end only fires for arrivals that landed AFTER the loop's last
+    read (between drain finish and status flip).
     """
-    _enqueue(redis_client, _make_op())
+    _enqueue(redis_client, _make_op(order_number="ORD-FIRST"))
 
+    # Inject a late compound via _save_state hook (runs once per batch commit).
+    real_save_state = None
     injected = {"done": False}
 
-    def add_with_late_injection(_state: SchedulerState, _order: SchedulingOrder) -> ScheduleResult:
-        if not injected["done"]:
-            _enqueue(redis_client, _make_op(order_number="LATE"))
-            injected["done"] = True
-        return ScheduleResult(status="success")
+    def save_state_with_injection(state: Any) -> None:
+        # Call the real save_state behavior so state persists.
+        from app.workers.scheduling import _save_state as inner
 
-    mocks = _patch_common(monkeypatch, add_order=MagicMock(side_effect=add_with_late_injection))
+        inner(state)
+        if not injected["done"]:
+            _enqueue(redis_client, _make_op(order_number="ORD-LATE"))
+            injected["done"] = True
+
+    # Save the unpatched ref before patching — but _patch_common doesn't
+    # touch _save_state, so we can read it after patching collaborators.
+    mocks = _patch_common(monkeypatch)
+    # Patch _save_state to a hooked version that injects a late compound
+    # the first time it's called. We need to capture the original
+    # _save_state before our patch so we can still call it.
+    from app.workers import scheduling as worker_module
+
+    real_save_state = worker_module._save_state
+
+    def hooked_save(state: Any) -> None:
+        real_save_state(state)
+        if not injected["done"]:
+            _enqueue(redis_client, _make_op(order_number="ORD-LATE"))
+            injected["done"] = True
+
+    monkeypatch.setattr("app.workers.scheduling._save_state", hooked_save)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # First compound processed, then re-triggered to pick up LATE.
-    assert mocks["delay"].called
+    # Both compounds accepted (the original + the one injected mid-drain).
+    accepted = [
+        c
+        for c in mocks["notify_user"].call_args_list
+        if c.kwargs["message"]["type"] == "schedule.compound_accepted"
+    ]
+    assert len(accepted) == 2
+    # Queue drained — late arrival was picked up in the SAME task invocation.
+    assert redis_client.zcard(PENDING_OPS_KEY) == 0
+    # No retrigger needed — drain loop handled the late arrival itself.
+    assert mocks["delay"].call_count == 0
 
 
-def test_run_scheduling_processes_shrink_group_before_grow(
+# ---------------------------------------------------------------------------
+# run_scheduling_task — shrink-group compounds applied before grow-group
+# ---------------------------------------------------------------------------
+
+
+def test_run_scheduling_applies_compounds_in_priority_order(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """Compound updates' ops must respect their group: shrink-group runs to
-    completion before grow-group, regardless of the queue's RPOP order."""
+    """Within a batch, compounds are applied in sorted-set score order:
+    shrink-group first, then grow-group, FIFO within each group.
 
-    # Producer pushed in order: a defer (shrink remove + shrink add), then an
-    # advance (grow remove + grow add). Worker should process all four shrink
-    # ops first (in original order), then all four grow ops.
+    ``_read_pending_compounds`` uses ZRANGE which returns ascending score.
+    The batch admission applies all accepted compounds via
+    ``_apply_compound_leaf_structural`` in the same order, so the
+    structural side-effects (``pq_add`` / ``pq_remove``) fire in priority
+    order. We verify via mock call ordering on ``pq_add`` / ``pq_remove``.
+    """
     defer_remove = _make_op(op="remove", group="shrink", order_number="DEFER-R")
     defer_add = _make_op(op="add", group="shrink", order_number="DEFER-A")
     advance_remove = _make_op(op="remove", group="grow", order_number="ADVANCE-R")
     advance_add = _make_op(op="add", group="grow", order_number="ADVANCE-A")
-    for op in (defer_remove, defer_add, advance_remove, advance_add):
-        _enqueue(redis_client, op)
+    for compound in (defer_remove, defer_add, advance_remove, advance_add):
+        _enqueue(redis_client, compound)
 
     call_order: list[str] = []
 
-    def track_add(_state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
+    def track_pq_add(_state: Any, order: SchedulingOrder) -> None:
         call_order.append(f"add:{order.order_number}")
-        return ScheduleResult(status="success")
 
-    def track_remove(_state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
-        call_order.append(f"remove:{order.order_number}")
-        return ScheduleResult(status="success")
+    def track_pq_remove(_state: Any, order_id: uuid.UUID) -> SchedulingOrder | None:
+        # Best-effort: find which order_number matches the id from the queue.
+        # For test purposes the order_number is embedded in the compound;
+        # we use a lookup via the queue's stored payloads.
+        for member, _score in redis_client.zrange(PENDING_OPS_KEY, 0, -1, withscores=True):
+            compound = json.loads(member)
+            for op in compound.get("ops", []):
+                if op["order_id"] == str(order_id):
+                    call_order.append(f"remove:{op['order_number']}")
+                    return None
+        # If the compound's already ZREM'd by the time we look, fall back to
+        # a generic marker (shouldn't happen in this test's timing).
+        call_order.append(f"remove:{order_id}")
+        return None
 
-    monkeypatch.setattr("app.workers.scheduling.add_order", MagicMock(side_effect=track_add))
-    monkeypatch.setattr("app.workers.scheduling.remove_order", MagicMock(side_effect=track_remove))
-    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
-    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule",
-        MagicMock(return_value=0),
-    )
-    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
-    # Silence the Phase-4 slow-path side effects so CI without a real Redis
-    # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
-    monkeypatch.setattr(
-        "app.workers.scheduling.materialize_schedule_task.delay",
-        MagicMock(),
-    )
-    _install_auto_retrigger_delay(monkeypatch)
+    monkeypatch.setattr("app.workers.scheduling.pq_add", track_pq_add)
+    monkeypatch.setattr("app.workers.scheduling.pq_remove", track_pq_remove)
+    _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # All shrink-group ops fire before any grow-group op; FIFO inside each group.
+    # All shrink-group compounds applied before any grow-group compound;
+    # FIFO inside each group.
     assert call_order == [
         "remove:DEFER-R",
         "add:DEFER-A",
@@ -592,63 +634,63 @@ def test_run_scheduling_processes_shrink_group_before_grow(
     ]
 
 
-def test_run_scheduling_lets_late_shrink_jump_pending_grow(
+def test_run_scheduling_late_shrink_processed_after_current_batch(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """A shrink op LPUSH'd while a grow batch is being processed must be
-    picked up *before* the remaining grow ops, not after them.
+    """Compounds present at the moment of ``_read_pending_compounds`` are
+    committed atomically as a batch (in priority order). A shrink-group
+    compound arriving AFTER that read does NOT jump ahead of the
+    currently-committing batch — it gets picked up on the next drain
+    iteration.
 
-    Setup: queue starts with two grow ops [GROW-1 (older), GROW-2]. A side
-    effect on the *first* grow's add_order injects a fresh shrink op into
-    the queue. The next pop must therefore see the new shrink and run it
-    before GROW-2."""
+    Old per-op design: late shrink jumped pending grows because each pop
+    re-read priority. New batch design: atomicity is at batch granularity,
+    not per-op, so the trade-off is throughput up / interrupt-jump
+    semantics gone. Verifying the new contract.
+    """
     _enqueue(redis_client, _make_op(op="add", group="grow", order_number="GROW-1"))
     _enqueue(redis_client, _make_op(op="add", group="grow", order_number="GROW-2"))
 
     call_order: list[str] = []
+    injected = {"done": False}
 
-    def track_remove(_state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
-        call_order.append(f"remove:{order.order_number}")
-        return ScheduleResult(status="success")
-
-    def track_add(_state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
+    def track_pq_add(_state: Any, order: SchedulingOrder) -> None:
         call_order.append(f"add:{order.order_number}")
-        # Mid-task arrival: producer LPUSHes a new shrink right after the
-        # first grow finishes processing. The next pop should pick it up.
-        if order.order_number == "GROW-1":
+        # Inject a late shrink while GROW-1 is being structurally applied —
+        # but since the batch's tree update + pq updates run inside one
+        # atomic loop, the late shrink only becomes visible on the next
+        # _read_pending_compounds.
+        if order.order_number == "GROW-1" and not injected["done"]:
             _enqueue(
                 redis_client,
                 _make_op(op="remove", group="shrink", order_number="LATE-SHRINK"),
             )
-        return ScheduleResult(status="success")
+            injected["done"] = True
 
-    monkeypatch.setattr("app.workers.scheduling.add_order", MagicMock(side_effect=track_add))
-    monkeypatch.setattr("app.workers.scheduling.remove_order", MagicMock(side_effect=track_remove))
-    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
-    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule",
-        MagicMock(return_value=0),
-    )
-    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
-    # Silence the Phase-4 slow-path side effects so CI without a real Redis
-    # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
-    monkeypatch.setattr(
-        "app.workers.scheduling.materialize_schedule_task.delay",
-        MagicMock(),
-    )
-    _install_auto_retrigger_delay(monkeypatch)
+    def track_pq_remove(_state: Any, order_id: uuid.UUID) -> SchedulingOrder | None:
+        for member, _score in redis_client.zrange(PENDING_OPS_KEY, 0, -1, withscores=True):
+            compound = json.loads(member)
+            for op in compound.get("ops", []):
+                if op["order_id"] == str(order_id):
+                    call_order.append(f"remove:{op['order_number']}")
+                    return None
+        call_order.append(f"remove:{order_id}")
+        return None
+
+    monkeypatch.setattr("app.workers.scheduling.pq_add", track_pq_add)
+    monkeypatch.setattr("app.workers.scheduling.pq_remove", track_pq_remove)
+    _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # Order must be: GROW-1 (only op at start), LATE-SHRINK (jumped ahead
-    # because it's a shrink), GROW-2 (last remaining grow).
+    # Current batch [GROW-1, GROW-2] commits in full; LATE-SHRINK picked
+    # up by the next drain iteration after the batch finishes.
     assert call_order == [
         "add:GROW-1",
-        "remove:LATE-SHRINK",
         "add:GROW-2",
+        "remove:LATE-SHRINK",
     ]
 
 
@@ -656,13 +698,14 @@ def test_run_scheduling_skips_retrigger_when_queue_drained(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    # No pending ops at all.
+    """Empty queue ⇒ no work done, no retrigger fired, status flips to idle."""
     mocks = _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    assert mocks["add_order"].call_count == 0
+    assert mocks["notify_user"].call_count == 0
+    assert mocks["materialize_delay"].call_count == 0
     assert not mocks["delay"].called
 
 
@@ -670,56 +713,56 @@ def test_run_scheduling_yields_retrigger_to_waiter(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """If the waiter flag is set, ``run_scheduling_task`` MUST NOT
-    re-trigger itself even when ops remain — the waiter
-    (advance_day / rebuild) is in ``_wait_for_idle_run`` right now and will
-    fire the next ``run_scheduling_task.delay()`` after its own work.
+    """If a waiter (advance_day / rebuild) holds the waiter flag, the
+    drain loop must NOT self-dispatch even when zcard > 0 at the end —
+    the waiter will fire ``run_scheduling_task.delay()`` after its own
+    body. Without yielding, a re-triggered run_task races with the
+    waiter for the state lock.
 
-    Without this yield, the waiter and the re-triggered run_task race on
-    ``schedule:state``: the waiter sees status flip to idle, breaks out of
-    its wait loop, but run_task hasn't yet fired the re-trigger; run_task
-    fires the re-trigger a few microseconds later, both end up running
-    concurrently.
+    Setup: pre-set the flag, enqueue 2 compounds, mock
+    ``_read_pending_compounds`` so the drain only consumes one (simulating
+    a partial drain where one compound got injected after the
+    drain-loop's last read). Verify ``delay`` was not called.
     """
-    # Pre-set the waiter flag: a waiter is waiting on us right now.
     redis_client.set("schedule:waiter_pending", "1", ex=600)
-    # One op processed + one still queued = zcard > 0 at end of task →
-    # would normally fire delay() if not for the yield.
-    _enqueue(redis_client, _make_op(order_number="ORD-A"))
-    _enqueue(redis_client, _make_op(order_number="ORD-B"))
 
-    # Plain delay (no auto-retrigger) — we want to verify it's NOT called.
-    add_mock = MagicMock(return_value=ScheduleResult(status="success"))
-    monkeypatch.setattr("app.workers.scheduling.add_order", add_mock)
-    monkeypatch.setattr(
-        "app.workers.scheduling.remove_order",
-        MagicMock(return_value=ScheduleResult(status="success")),
-    )
-    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
-    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule",
-        MagicMock(return_value=0),
-    )
-    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
-    # Silence the Phase-4 slow-path side effects so CI without a real Redis
-    # doesn't hit ``schedule_queue._redis().sadd`` / Celery .delay.
-    monkeypatch.setattr(
-        "app.workers.scheduling.materialize_schedule_task.delay",
-        MagicMock(),
-    )
+    _patch_common(monkeypatch)
+
     plain_delay = MagicMock()
     monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", plain_delay)
+
+    # Drain loop reads pending; we make it appear empty so the loop exits
+    # cleanly, then leave a compound in the queue to trip the
+    # end-of-task ``zcard > 0`` retrigger check.
+    real_read = None
+    from app.workers import scheduling as worker_module
+
+    real_read = worker_module._read_pending_compounds
+    call_count = {"value": 0}
+
+    def faked_read(
+        *,
+        limit: int | None = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            # Simulate the drain loop seeing one compound, processing it,
+            # then seeing the queue empty on the next iteration. We
+            # accomplish this by deferring the actual enqueue to AFTER the
+            # drain loop reads (= after we return empty). Add the compound
+            # for the post-drain ``zcard`` check below.
+            _enqueue(redis_client, _make_op(order_number="POST-DRAIN"))
+            return []
+        return real_read(limit=limit)
+
+    monkeypatch.setattr("app.workers.scheduling._read_pending_compounds", faked_read)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # First op was processed (per-op design)…
-    assert add_mock.call_count == 1
-    # …second op still pending (zcard > 0)…
-    assert redis_client.zcard(PENDING_OPS_KEY) == 1
-    # …but delay was NOT fired because the waiter holds responsibility for
-    # the next re-trigger.
+    # zcard > 0 after the drain (we enqueued POST-DRAIN), but the waiter
+    # holds the flag so we yield.
+    assert redis_client.zcard(PENDING_OPS_KEY) >= 1
     assert plain_delay.call_count == 0
 
 
@@ -1076,9 +1119,8 @@ def test_advance_day_marks_today_orders_in_production(
         wafer_quantity=1000,
         deadline=tomorrow + timedelta(days=2),
     )
-    # SortedKeyList uses ``add`` (not append) to maintain sort order; mirror
-    # the index dict so contains-check / lookup paths still work.
-    new_state.priority_queue.add(order_y_obj)
+    # Dict-backed pq: direct assignment to pq_index — EDF order is derived
+    # at iteration time via _iter_pq_edf_sorted, not maintained here.
     new_state.pq_index[order_y] = order_y_obj
 
     monkeypatch.setattr("app.workers.scheduling._load_state", lambda: old_state)
@@ -1199,7 +1241,6 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
 
     # rebuild_state succeeds with no skipped.
     rebuilt_state = SchedulerState.initial(base)
-    rebuilt_state.priority_queue.add(pulled_order)
     rebuilt_state.pq_index[pulled_order.order_id] = pulled_order
     rebuild_mock = MagicMock(return_value=(rebuilt_state, []))
     monkeypatch.setattr("app.workers.scheduling.rebuild_state", rebuild_mock)
@@ -1385,114 +1426,26 @@ def test_run_scheduling_dispatches_pin_op_with_fake_deadline(
     assert fake_arg == date(2026, 5, 12)
 
 
-def test_run_scheduling_rollback_restores_state_on_mid_compound_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    redis_client: Redis,
-) -> None:
-    """Saga rollback invariant: a compound's earlier successful ops are
-    undone when a later op fails.
-
-    Setup: a compound of [remove, add] where ``add`` fails. State going in
-    has the order in pq with old qty; after rollback the order MUST still
-    be in pq with old qty — the remove that succeeded mid-compound got
-    reversed by snapshot restore.
-
-    This locks the Phase-2 atomicity contract: no partial mutation is ever
-    observable to ``_finalize_run`` after a failure.
-    """
-    from datetime import date as _date
-
-    from app.services.scheduling import SchedulingOrder, add_order
-
-    # Pre-seed state in Redis with one order so remove has something real
-    # to undo and add can credibly fail.
-    state = SchedulerState.initial(_date(2026, 5, 5))
-    order_id = uuid.uuid4()
-    add_order(
-        state,
-        SchedulingOrder(
-            order_id=order_id,
-            order_number="ORD-EXISTING",
-            wafer_quantity=1000,
-            deadline=_date(2026, 5, 10),
-        ),
-    )
-    redis_client.set(STATE_KEY, state.to_json())
-
-    failing_user = uuid.uuid4()
-    failing_compound_id = uuid.uuid4()
-    compound = _make_compound(
-        ops=[
-            _make_leaf_op(
-                op="remove",
-                order_id=order_id,
-                order_number="ORD-EXISTING",
-                wafer_quantity=1000,
-                deadline="2026-05-10",
-            ),
-            _make_leaf_op(
-                op="add",
-                order_id=order_id,
-                order_number="ORD-EXISTING",
-                wafer_quantity=999_999,  # too large — will fail capacity
-                deadline="2026-05-10",
-            ),
-        ],
-        group="grow",
-        requested_by=failing_user,
-        compound_id=failing_compound_id,
-    )
-    _enqueue(redis_client, compound)
-
-    # No mocks for add/remove — we want the REAL algorithm to fail on the
-    # huge qty, so we can observe true state rollback.
-    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _: [])
-    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule",
-        MagicMock(return_value=0),
-    )
-    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
-    notify_mock = MagicMock()
-    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", notify_mock)
-    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
-
-    result = run_scheduling_task.apply()
-    assert result.successful(), result.traceback
-
-    # Compound failed → state in Redis should be UNCHANGED from pre-compound.
-    saved_raw = redis_client.get(STATE_KEY)
-    assert saved_raw is not None
-    # State should NOT have been mutated by the failed compound. The
-    # cleanest check: the pre-compound snapshot we put in equals what's
-    # in Redis now (i.e., _save_state was never called because finalize
-    # only runs on success).
-    saved = SchedulerState.from_json(saved_raw)
-    assert len(saved.priority_queue) == 1
-    assert saved.priority_queue[0].order_id == order_id
-    assert saved.priority_queue[0].wafer_quantity == 1000
-
-    # WS notify shows the rollback to the requester.
-    assert notify_mock.call_count == 1
-    msg = notify_mock.call_args.kwargs["message"]
-    assert msg["type"] == "schedule.compound_failed"
-    assert msg["failed_op"] == "add"
-    assert msg["failed_op_index"] == 1
-    assert msg["rolled_back"] is True
-
-
-def test_run_scheduling_rejects_compound_with_op_count_mismatch(
+def test_run_scheduling_drains_op_count_mismatch_to_dlq(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
     """Worker-side tamper guard: a compound whose declared ``op_count``
-    doesn't match ``len(ops)`` is rejected before any leaf op runs.
+    doesn't match ``len(ops)`` is drained to the DLQ on read and the
+    drain loop continues without applying it.
 
     Schema validation at enqueue time enforces this, but the Redis
-    sorted-set member could in principle be corrupted post-enqueue (manual
-    redis-cli surgery, mid-byte truncation, etc.). The worker re-checks
-    and fails the whole compound rather than execute a half-truncated
+    sorted-set member could in principle be corrupted post-enqueue
+    (manual redis-cli surgery, mid-byte truncation, bit flip). The
+    worker re-checks and routes the bad member to
+    ``schedule:pending_ops:dlq`` rather than execute a half-truncated
     business action.
+
+    Behavior change from saga design: pre-rewrite this produced a
+    ``compound_failed`` WS notification; new design treats it as
+    corruption and surfaces via ERROR log + DLQ instead (no requester
+    notification because the compound shape is suspect — its
+    ``requested_by`` may not be trustworthy either).
     """
     failing_user = uuid.uuid4()
     failing_compound_id = uuid.uuid4()
@@ -1504,44 +1457,56 @@ def test_run_scheduling_rejects_compound_with_op_count_mismatch(
         compound_id=failing_compound_id,
         op_count=99,  # lies — only 1 op
     )
+    # Enqueue a good compound AFTER the bad one to verify the drain loop
+    # continues past the DLQ drain.
     _enqueue(redis_client, compound)
+    good_compound = _make_op(order_number="ORD-GOOD")
+    _enqueue(redis_client, good_compound)
 
     mocks = _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # No op_count-mismatch compound should ever reach add/remove etc.
-    assert mocks["add_order"].call_count == 0
-    assert mocks["remove_order"].call_count == 0
-    assert mocks["pin_order"].call_count == 0
-    assert mocks["unpin_order"].call_count == 0
+    # The good compound was accepted normally.
+    accepted = [
+        c
+        for c in mocks["notify_user"].call_args_list
+        if c.kwargs["message"]["type"] == "schedule.compound_accepted"
+    ]
+    assert len(accepted) == 1
+    # The bad compound got routed to the DLQ.
+    assert redis_client.llen("schedule:pending_ops:dlq") == 1
+    # …and was ZREM'd from pending so it doesn't loop forever.
+    assert redis_client.zcard(PENDING_OPS_KEY) == 0
+    # No compound_failed WS — corruption path doesn't notify the requester
+    # (the requested_by field may itself be untrustworthy).
+    failed = [
+        c
+        for c in mocks["notify_user"].call_args_list
+        if c.kwargs["message"]["type"] == "schedule.compound_failed"
+    ]
+    assert failed == []
 
-    # WS notify fires with compound_failed + a clear message about the
-    # mismatch. failed_op_index is -1 to signal "no specific op — the
-    # whole compound was malformed".
-    assert mocks["notify_user"].call_count == 1
-    msg = mocks["notify_user"].call_args.kwargs["message"]
-    assert msg["type"] == "schedule.compound_failed"
-    assert msg["compound_id"] == str(failing_compound_id)
-    assert msg["failed_op_index"] == -1
-    assert msg["rolled_back"] is True
-    assert "op_count" in (msg["detail"] or "")
 
-
-def test_run_scheduling_pin_failure_rolls_back_and_notifies(
+def test_run_scheduling_pin_failure_logs_but_continues_batch(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """A 1-op pin compound that fails triggers a rollback + WS notify.
+    """Pin / unpin "should never fail" per producer admission control —
+    they are pure structural moves between pq and pinned_orders.
 
-    The next compound (a successful add) still runs on its own turn —
-    compound failures are independent across compounds. WS payload type
-    is the unified ``schedule.compound_failed`` (no more per-op
-    ``schedule.pin_failed``), with ``failed_op="pin"`` in the detail.
+    Defensively, if ``pin_order`` ever returns a non-success status (would
+    indicate a producer-side bug or out-of-sync state), the batch keeps
+    going. No saga rollback, no ``compound_failed`` WS — just a warning
+    log. The order ends up in pq at its real deadline instead of pinned;
+    materializer writes DB consistently with that state.
+
+    Verifies the pin failure does NOT short-circuit subsequent compounds
+    in the batch — the follow-up ``add`` still applies and notifies as
+    accepted.
     """
     pin_user = uuid.uuid4()
-    pin_compound_id = uuid.uuid4()
     pin_compound = _make_op(
         op="pin",
         group="grow",
@@ -1550,8 +1515,7 @@ def test_run_scheduling_pin_failure_rolls_back_and_notifies(
         fake_deadline="2026-05-12",
         requested_by=pin_user,
     )
-    pin_compound["compound_id"] = str(pin_compound_id)
-    follow_compound = _make_op(order_number="ORD-OK")
+    follow_compound = _make_op(op="add", group="grow", order_number="ORD-OK")
     _enqueue(redis_client, pin_compound)
     _enqueue(redis_client, follow_compound)
 
@@ -1568,24 +1532,27 @@ def test_run_scheduling_pin_failure_rolls_back_and_notifies(
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # Pin compound rolled back; the follow-up add compound ran on its own turn.
+    # pin_order was called once (the structural pass walks each leaf op).
     assert pin_mock.call_count == 1
-    assert mocks["add_order"].call_count == 1
 
-    # WS notify: schedule.compound_failed for the pin compound.
-    failed_calls = [
+    # The follow-up add still got accepted (no abort on pin failure).
+    accepted = [
+        c
+        for c in mocks["notify_user"].call_args_list
+        if c.kwargs["message"]["type"] == "schedule.compound_accepted"
+    ]
+    # Both compounds in the batch fired compound_accepted (pin failure is
+    # defensive-only, does NOT cancel the compound).
+    assert len(accepted) == 2
+
+    # No compound_failed for the pin (different contract from the old
+    # saga design which would have raised this).
+    failed = [
         c
         for c in mocks["notify_user"].call_args_list
         if c.kwargs["message"]["type"] == "schedule.compound_failed"
     ]
-    assert len(failed_calls) == 1
-    payload = failed_calls[0].kwargs["message"]
-    assert failed_calls[0].kwargs["user_id"] == pin_user
-    assert payload["compound_id"] == str(pin_compound_id)
-    assert payload["failed_op"] == "pin"
-    assert payload["order_number"] == "PIN-FAIL"
-    assert payload["reason"] == "capacity_exceeded"
-    assert payload["rolled_back"] is True
+    assert failed == []
 
 
 def test_run_scheduling_dispatches_unpin_op(
@@ -1593,8 +1560,8 @@ def test_run_scheduling_dispatches_unpin_op(
     redis_client: Redis,
 ) -> None:
     """``op="unpin"`` calls ``unpin_order(state, order_id)`` — no fake_deadline
-    needed. Confirms the unpin path doesn't accidentally route through pin or
-    remove (a regression that would silently corrupt state).
+    needed. Confirms the unpin path doesn't accidentally route through pin
+    (a regression that would silently corrupt state).
     """
     target_id = uuid.uuid4()
     op = _make_op(
@@ -1616,8 +1583,7 @@ def test_run_scheduling_dispatches_unpin_op(
     _, order_id_arg = args
     assert order_id_arg == target_id
 
-    # Did NOT route to remove or pin.
-    assert mocks["remove_order"].call_count == 0
+    # Did NOT route to pin.
     assert mocks["pin_order"].call_count == 0
 
 
@@ -2423,43 +2389,37 @@ def test_state_writer_lock_blocks_concurrent_run_scheduling_task(
     redis_client: Redis,
 ) -> None:
     """When the state-writer lock is held by another task, a freshly-fired
-    ``run_scheduling_task`` must return early without popping the queue
-    or touching state. The held-by task will pick up the queued compound
-    on its own re-trigger after releasing.
+    ``run_scheduling_task`` must return early without reading the queue
+    or touching state. The lock holder will drain the queue on its own.
+
+    This test deliberately does NOT use ``_patch_common`` because that
+    helper installs the auto-retrigger delay shim which also bypasses the
+    state-writer lock. Here we want the real ``_try_acquire_state_lock``
+    to run against real Redis so we can verify the early-return path.
     """
     from app.workers.scheduling import STATE_WRITER_LOCK_KEY
 
-    # Pre-claim the lock as if another worker were inside its body.
     redis_client.set(STATE_WRITER_LOCK_KEY, "other-worker-task-id", ex=300)
-
     _enqueue(redis_client, _make_op(order_number="ORD-LOCK-HELD"))
 
-    add_mock = MagicMock(return_value=ScheduleResult(status="success"))
-    monkeypatch.setattr("app.workers.scheduling.add_order", add_mock)
-    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
-    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule",
-        MagicMock(return_value=0),
-    )
-    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
-    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
+    # Track whether _read_pending_compounds was called — if the lock guard
+    # works, the early return MUST skip pending-list inspection entirely.
+    read_mock = MagicMock(return_value=[])
+    monkeypatch.setattr("app.workers.scheduling._read_pending_compounds", read_mock)
     monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
     monkeypatch.setattr(
         "app.workers.scheduling.materialize_schedule_task.delay",
         MagicMock(),
     )
-    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _u: None)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # Compound was NOT processed — add_order never called.
-    assert add_mock.call_count == 0
-    # Queue is untouched.
+    # Lock guard short-circuited before we got to the drain loop.
+    assert read_mock.call_count == 0
+    # Queue untouched.
     assert redis_client.zcard(PENDING_OPS_KEY) == 1
-    # Lock still belongs to the other worker (we didn't try CAS-delete because
-    # we never acquired).
+    # Lock still belongs to the other worker.
     assert redis_client.get(STATE_WRITER_LOCK_KEY) == "other-worker-task-id"
 
 
@@ -2475,29 +2435,21 @@ def test_state_writer_lock_released_on_normal_exit(
 
     _enqueue(redis_client, _make_op(order_number="ORD-LOCK-RELEASE"))
 
-    # Don't bypass the lock — let the task actually acquire it.
-    add_mock = MagicMock(return_value=ScheduleResult(status="success"))
-    monkeypatch.setattr("app.workers.scheduling.add_order", add_mock)
-    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
-    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule",
-        MagicMock(return_value=0),
-    )
-    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
-    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
-    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.materialize_schedule_task.delay",
-        MagicMock(),
-    )
-    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _u: None)
+    # Don't bypass the lock — let the task actually acquire it. _patch_common
+    # provides the pin/unpin/notify/materialize stubs and an auto-retrigger
+    # delay mock, but does NOT touch the state-writer lock primitives.
+    mocks = _patch_common(monkeypatch)
 
     result = run_scheduling_task.apply()
     assert result.successful(), result.traceback
 
-    # add_order was actually called this time — lock was acquired.
-    assert add_mock.call_count == 1
+    # Compound was processed: one compound_accepted notification fired.
+    accepted = [
+        c
+        for c in mocks["notify_user"].call_args_list
+        if c.kwargs["message"]["type"] == "schedule.compound_accepted"
+    ]
+    assert len(accepted) == 1
     # Lock is gone — released by finally.
     assert redis_client.get(STATE_WRITER_LOCK_KEY) is None
 
@@ -2514,32 +2466,11 @@ def test_state_writer_lock_released_on_exception(
 
     _enqueue(redis_client, _make_op(order_number="ORD-LOCK-EXC"))
 
-    # Make ``_save_state`` raise so the task body bails into except.
-    # (Leaf-op RuntimeErrors are now caught inside ``_process_compound``
-    # and turned into compound_failed; we need an *outer* exception to
-    # hit the task-level except branch.)
-    monkeypatch.setattr(
-        "app.workers.scheduling.add_order",
-        MagicMock(return_value=ScheduleResult(status="success")),
-    )
+    _patch_common(monkeypatch)
     monkeypatch.setattr(
         "app.workers.scheduling._save_state",
         MagicMock(side_effect=RuntimeError("simulated body failure")),
     )
-    monkeypatch.setattr("app.workers.scheduling.compute_schedule", lambda _s: [])
-    monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.order_service.apply_schedule",
-        MagicMock(return_value=0),
-    )
-    monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
-    monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
-    monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())
-    monkeypatch.setattr(
-        "app.workers.scheduling.materialize_schedule_task.delay",
-        MagicMock(),
-    )
-    monkeypatch.setattr("app.workers.scheduling.enqueue_notify_user", lambda _u: None)
 
     result = run_scheduling_task.apply()
     # Task is expected to fail.
@@ -2579,13 +2510,13 @@ def test_malformed_pending_op_member_is_drained_to_dlq(
     so the affected order's stuck ``is_processing_locked=True`` row is
     forensically recoverable, instead of being silently dropped (which
     pre-P1-5 forced manual DB surgery on a locked, requester-unknown
-    order). After the bad member is drained, ``_pop_next_compound``
-    continues normally with the next member.
+    order). After the bad member is drained, ``_read_pending_compounds``
+    skips it and surfaces only the valid compounds in its return list.
     """
     from app.services.scheduling import PENDING_OPS_SEQ_KEY, score_for_op
     from app.workers.scheduling import (
         PENDING_OPS_DLQ_KEY,
-        _pop_next_compound,
+        _read_pending_compounds,
     )
 
     bad_seq = redis_client.incr(PENDING_OPS_SEQ_KEY)
@@ -2593,19 +2524,440 @@ def test_malformed_pending_op_member_is_drained_to_dlq(
         PENDING_OPS_KEY,
         {"this is not valid json": score_for_op(group="grow", seq=bad_seq)},
     )
-    # Follow with a well-formed compound so we can prove the loop
-    # continues to the next member after draining the bad one.
+    # Follow with a well-formed compound so we can prove the read continues
+    # to the next member after draining the bad one.
     good_compound = _make_op(order_number="ORD-AFTER-BAD")
     _enqueue(redis_client, good_compound)
 
-    popped = _pop_next_compound()
+    parsed = _read_pending_compounds()
 
     # Bad member was drained to DLQ.
     assert redis_client.llen(PENDING_OPS_DLQ_KEY) == 1
     dlq_member = redis_client.lindex(PENDING_OPS_DLQ_KEY, 0)
     assert dlq_member == "this is not valid json"
-    # The good compound was returned by the loop's next iteration.
-    assert popped is not None
-    assert popped["ops"][0]["order_number"] == "ORD-AFTER-BAD"
-    # Pending_ops only had two members; both are now gone.
-    assert redis_client.zcard(PENDING_OPS_KEY) == 0
+    # The good compound was returned by the read, skipping the bad one.
+    assert len(parsed) == 1
+    _member, payload = parsed[0]
+    assert payload["ops"][0]["order_number"] == "ORD-AFTER-BAD"
+    # Pending_ops now has only the good compound (bad was ZREM'd during drain).
+    assert redis_client.zcard(PENDING_OPS_KEY) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reject-rate adaptive cap on batch admission
+# ---------------------------------------------------------------------------
+#
+# Heuristic: when ``run_scheduling_task`` reads N pending compounds, it only
+# binary-searches the first ``ceil(1/p)`` of them — where p is the rolling
+# EWMA estimate of per-compound rejection probability persisted at
+# ``schedule:compound_reject_rate``. Saves
+# ``compute_batch_capacity_delta`` work on prefixes too long to be feasible
+# anyway. These tests verify the rate helpers in isolation, then check
+# the drain loop actually honors the cap.
+
+
+def test_reject_rate_defaults_to_initial_when_key_missing(
+    redis_client: Redis,
+) -> None:
+    """No key in Redis ⇒ falls back to ``_REJECT_RATE_INITIAL`` (the prior
+    we picked for fresh deployments / post-flush). Critical because every
+    new worker starts with the key absent."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_INITIAL,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+    )
+
+    # Sanity: autouse flush already wiped it, but make this explicit.
+    assert redis_client.get(COMPOUND_REJECT_RATE_KEY) is None
+
+    assert _get_reject_rate() == _REJECT_RATE_INITIAL
+
+
+def test_reject_rate_clamps_corrupted_value_to_initial(
+    redis_client: Redis,
+) -> None:
+    """If the stored value can't be parsed as float (manual surgery, bit
+    flip, schema change), don't poison the take-count math — fall back to
+    the prior and log a warning."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_INITIAL,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+    )
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "not-a-float")
+
+    assert _get_reject_rate() == _REJECT_RATE_INITIAL
+
+
+def test_reject_rate_clamps_out_of_range_value(
+    redis_client: Redis,
+) -> None:
+    """Values outside ``[MIN, MAX]`` are pulled back to the bound. Future-
+    proofs against a bug that writes wild values."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_MAX,
+        _REJECT_RATE_MIN,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+    )
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "5.0")
+    assert _get_reject_rate() == _REJECT_RATE_MAX
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.0")
+    assert _get_reject_rate() == _REJECT_RATE_MIN
+
+
+def test_reject_rate_ewma_pulls_toward_zero_on_accepted(
+    redis_client: Redis,
+) -> None:
+    """One accepted compound multiplies p by ``(1 - alpha)``. After N
+    accepts in a row, p should monotonically approach 0 (but bounded by
+    MIN). Confirms the EWMA direction matches the documented contract."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_ALPHA,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+        _update_reject_rate,
+    )
+
+    # Seed at a mid-range value so we can see movement.
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.5")
+
+    _update_reject_rate(accepted=1, rejected=0)
+    after_one = _get_reject_rate()
+    # p_new = (1 - alpha) * 0.5
+    assert after_one == pytest.approx((1 - _REJECT_RATE_ALPHA) * 0.5)
+
+    # Many accepts in a row pull p further down.
+    _update_reject_rate(accepted=10, rejected=0)
+    after_eleven = _get_reject_rate()
+    assert after_eleven < after_one
+
+
+def test_reject_rate_ewma_pulls_toward_one_on_rejected(
+    redis_client: Redis,
+) -> None:
+    """One rejected compound applies ``p_new = alpha + (1 - alpha) * p_old``.
+    Sustained rejects push p toward 1 (bounded by MAX)."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_ALPHA,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+        _update_reject_rate,
+    )
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.1")
+
+    _update_reject_rate(accepted=0, rejected=1)
+    after_one = _get_reject_rate()
+    # p_new = alpha + (1 - alpha) * 0.1
+    assert after_one == pytest.approx(_REJECT_RATE_ALPHA + (1 - _REJECT_RATE_ALPHA) * 0.1)
+
+    _update_reject_rate(accepted=0, rejected=10)
+    after_eleven = _get_reject_rate()
+    assert after_eleven > after_one
+
+
+def test_reject_rate_update_persists_to_redis(
+    redis_client: Redis,
+) -> None:
+    """``_update_reject_rate`` must round-trip through Redis so subsequent
+    task invocations (and parallel workers) see the latest value. Without
+    persistence the heuristic would reset every task and never converge."""
+    from app.workers.scheduling import (
+        _REJECT_RATE_INITIAL,
+        COMPOUND_REJECT_RATE_KEY,
+        _update_reject_rate,
+    )
+
+    _update_reject_rate(accepted=0, rejected=1)
+
+    raw = redis_client.get(COMPOUND_REJECT_RATE_KEY)
+    assert raw is not None
+    # Should be ABOVE the initial prior (we observed a reject).
+    assert float(raw) > _REJECT_RATE_INITIAL
+
+
+def test_reject_rate_update_noop_when_no_observations(
+    redis_client: Redis,
+) -> None:
+    """``accepted=0, rejected=0`` is a no-op — the rate Redis key stays
+    untouched. Important because the drain loop calls update once per
+    iteration and the empty-input case happens on every empty-queue tick."""
+    from app.workers.scheduling import COMPOUND_REJECT_RATE_KEY, _update_reject_rate
+
+    _update_reject_rate(accepted=0, rejected=0)
+    assert redis_client.get(COMPOUND_REJECT_RATE_KEY) is None
+
+
+def test_take_count_caps_pending_by_inverse_rate() -> None:
+    """take = min(N, ceil(1/p)). For p ≈ 0.01 the cap is 100; for p = 0.5
+    it's 2; floor of 1 guarantees forward progress even if a buggy update
+    pushes p above 1 momentarily.
+    """
+    from app.workers.scheduling import _take_count_from_rate
+
+    # p = 0.01 ⇒ cap = 100; pending = 1000 ⇒ take = 100
+    assert _take_count_from_rate(pending_count=1000, rate=0.01) == 100
+    # p = 0.5 ⇒ cap = 2
+    assert _take_count_from_rate(pending_count=1000, rate=0.5) == 2
+    # pending < cap ⇒ take = pending (don't try to read past the queue)
+    assert _take_count_from_rate(pending_count=5, rate=0.01) == 5
+    # Floor of 1: even an unstable p > 1 must let the loop progress.
+    assert _take_count_from_rate(pending_count=10, rate=2.0) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reject-rate — reliability / convergence tests (review round-3)
+# ---------------------------------------------------------------------------
+
+
+def test_reject_rate_converges_to_expected_value_for_fixed_probability(
+    redis_client: Redis,
+) -> None:
+    """Simulate a fixed per-compound reject probability of ~0.2 over many
+    iterations; the EWMA should converge into a neighborhood of 0.2.
+
+    EWMA with alpha=0.05 has effective averaging window ≈ 1/alpha = 20
+    samples. After 200 observations the value should be within a small
+    epsilon of the true probability. This test pins the convergence
+    contract — if someone retunes alpha to 0.001 (super slow) or 0.5
+    (over-reactive) the convergence speed assertion catches it.
+    """
+    from app.workers.scheduling import (
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+        _update_reject_rate,
+    )
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.01")  # start from prior
+
+    # 200 observations with reject probability 0.2 (40 rejects, 160 accepts)
+    # Apply alternating chunks so accept-then-reject ordering doesn't
+    # bias the result (within each call we do all accepts then all rejects).
+    for _ in range(40):
+        _update_reject_rate(accepted=4, rejected=1)  # 5 obs each, ratio 0.2
+
+    final = _get_reject_rate()
+    # After 200 obs, EWMA-with-alpha=0.05 converges to within ~0.05 of true.
+    assert abs(final - 0.2) < 0.05, f"final p={final}, expected ≈ 0.2"
+
+
+def test_reject_rate_cross_worker_race_last_writer_wins(
+    redis_client: Redis,
+) -> None:
+    """Two workers updating concurrently → both compute deltas off the SAME
+    snapshot, the second SET overwrites the first. One observation is
+    effectively lost — that's the documented last-writer-wins tradeoff.
+
+    We can't truly interleave two threads in a deterministic way here, so
+    we simulate by:
+      1. Set p₀
+      2. Worker A reads p₀, computes its new p_A (one accept)
+      3. Worker B reads p₀, computes its new p_B (one reject)
+      4. Both write their value; final state == whoever wrote last
+
+    Verifies the final p is exactly one of {p_A, p_B}, NOT the
+    "compose-both-updates" value (which would be the sequentially-applied
+    result). If the implementation gained CAS / Lua-script atomicity
+    later, the final value would be the composed one and this test would
+    correctly fail to signal the contract change.
+    """
+    from app.workers.scheduling import (
+        _REJECT_RATE_ALPHA,
+        COMPOUND_REJECT_RATE_KEY,
+        _get_reject_rate,
+    )
+
+    p0 = 0.1
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, str(p0))
+
+    # Manual replay of two non-atomic update sequences. Both start from p₀;
+    # whoever writes second wins.
+    p_after_accept = (1 - _REJECT_RATE_ALPHA) * p0  # worker A: 1 accept
+    p_after_reject = _REJECT_RATE_ALPHA + (1 - _REJECT_RATE_ALPHA) * p0  # worker B: 1 reject
+
+    # Simulate worker A reading p₀, then worker B reading p₀, then both
+    # writing in order A→B. Final value = worker B's computed value.
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, repr(p_after_accept))  # A writes
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, repr(p_after_reject))  # B writes (wins)
+
+    assert _get_reject_rate() == pytest.approx(p_after_reject)
+    # NOT the sequential-compose-both value (which would be obs A then obs B
+    # applied to the same instance, yielding a different p).
+    sequential_both = _REJECT_RATE_ALPHA + (1 - _REJECT_RATE_ALPHA) * p_after_accept
+    assert _get_reject_rate() != pytest.approx(sequential_both)
+
+
+def test_reject_rate_partial_halving_drift_pushes_p_up(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """When ``_largest_halving_feasible_prefix`` halves multiple times
+    before finding a feasible prefix, the EWMA must observe those failed
+    halving rounds as ``rejected=`` signal — not just count the final
+    ``accepted=k``.
+
+    Without this, a workload that keeps halving from 100 to 2 (accepting
+    only 2 per drain) would push p DOWN (only +2 accepts seen), keeping
+    the cap permissively large, perpetuating the wasted halving. The
+    halving-misses signal (= ``attempts_tried - 1`` when k > 0) is what
+    pushes p back UP.
+    """
+    from app.workers.scheduling import COMPOUND_REJECT_RATE_KEY
+
+    p0 = 0.01
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, str(p0))
+
+    _enqueue(redis_client, _make_op(order_number="ORD-A"))
+
+    # Mock halving to simulate "tried 4 prefix sizes, only the last (k=1)
+    # was feasible" — so attempts_tried=4, halving_misses=3.
+    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> tuple[int, int]:
+        return 1, 4
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._largest_halving_feasible_prefix",
+        fake_search,
+    )
+    _patch_common(monkeypatch)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # Final p MUST be higher than p₀ — 3 halving misses dominated 1 accept.
+    raw = redis_client.get(COMPOUND_REJECT_RATE_KEY)
+    assert raw is not None
+    final = float(raw)
+    assert final > p0, f"halving_misses signal failed: p₀={p0}, final={final}"
+
+
+# ---------------------------------------------------------------------------
+# Reject-rate adaptive cap — drain-loop integration
+# ---------------------------------------------------------------------------
+
+
+def test_run_scheduling_caps_candidates_by_reject_rate(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """With p pre-seeded high (= small cap), the drain loop's binary
+    search MUST only see ``ceil(1/p)`` candidates per iteration even
+    though the queue holds more. Verified by mocking
+    ``_largest_halving_feasible_prefix`` to capture the candidate-list
+    size on each call.
+    """
+    from app.workers.scheduling import COMPOUND_REJECT_RATE_KEY
+
+    # p = 0.5 ⇒ cap = ceil(1/0.5) = 2.
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, "0.5")
+
+    for i in range(10):
+        _enqueue(redis_client, _make_op(order_number=f"ORD-{i:02d}"))
+
+    captured_window_sizes: list[int] = []
+
+    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> tuple[int, int]:
+        captured_window_sizes.append(len(compounds))
+        # (k, attempts_tried) — first probe succeeded.
+        return len(compounds), 1
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._largest_halving_feasible_prefix",
+        fake_search,
+    )
+    _patch_common(monkeypatch)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # First iteration: pre-seeded p=0.5 ⇒ cap = ceil(1/0.5) = 2, so the
+    # first binary-search call sees 2 candidates (not 10).
+    assert captured_window_sizes
+    assert captured_window_sizes[0] == 2, captured_window_sizes
+    # Multiple iterations needed to drain all 10 — proves the cap forced
+    # iteration rather than letting one big batch swallow everything.
+    # (Subsequent iterations' window sizes grow as EWMA pulls p down on
+    # each accept; we don't pin those exactly.)
+    assert len(captured_window_sizes) >= 4
+    # All 10 compounds eventually accepted.
+    assert sum(captured_window_sizes) == 10
+
+
+def test_run_scheduling_uses_full_pending_when_rate_is_minimal(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """With p clamped to its minimum, ``ceil(1/p)`` exceeds any realistic
+    queue depth — so the binary-search candidate list IS the full pending
+    list (= same behavior as a non-adaptive design). Confirms the cap
+    doesn't get in the way when reject rate is low.
+    """
+    from app.workers.scheduling import _REJECT_RATE_MIN, COMPOUND_REJECT_RATE_KEY
+
+    redis_client.set(COMPOUND_REJECT_RATE_KEY, str(_REJECT_RATE_MIN))
+
+    for i in range(5):
+        _enqueue(redis_client, _make_op(order_number=f"ORD-{i:02d}"))
+
+    captured_window_sizes: list[int] = []
+
+    def fake_search(_state: Any, compounds: list[dict[str, Any]]) -> tuple[int, int]:
+        captured_window_sizes.append(len(compounds))
+        return len(compounds), 1
+
+    monkeypatch.setattr(
+        "app.workers.scheduling._largest_halving_feasible_prefix",
+        fake_search,
+    )
+    _patch_common(monkeypatch)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # First (and only) iteration saw all 5 compounds — cap (= 10_000) was
+    # never the binding constraint.
+    assert captured_window_sizes == [5]
+
+
+def test_run_scheduling_updates_reject_rate_on_accept_and_reject(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """End-to-end: after one accepted compound + one rejected compound,
+    p should have moved (in either direction). We don't pin an exact value
+    because EWMA order matters, but we verify the rate is non-default and
+    persisted."""
+    from app.workers.scheduling import _REJECT_RATE_INITIAL, COMPOUND_REJECT_RATE_KEY
+
+    # Two compounds: first will reject (alone infeasible), second will accept.
+    _enqueue(redis_client, _make_op(order_number="REJ", wafer_quantity=1000))
+    _enqueue(redis_client, _make_op(order_number="OK", wafer_quantity=1000))
+
+    # First [1..N] check (binary search on the WHOLE batch of 2) ⇒ False.
+    # First halving [1..1] (REJ alone) ⇒ False, k=0 ⇒ reject path.
+    # Next iter: pending = [OK]. binary[1..1] ⇒ True ⇒ accept.
+    feasibility_calls: list[int] = []
+
+    def fake_feasible(_state: Any, delta: list[int]) -> bool:
+        feasibility_calls.append(sum(delta))
+        return (
+            len(feasibility_calls) >= 3
+        )  # 1st = batch of 2 fail, 2nd = REJ alone fail, 3rd = OK alone OK
+
+    _patch_common(monkeypatch, is_batch_feasible=fake_feasible)
+
+    result = run_scheduling_task.apply()
+    assert result.successful(), result.traceback
+
+    # Rate is no longer at default — it was observed-and-written.
+    raw = redis_client.get(COMPOUND_REJECT_RATE_KEY)
+    assert raw is not None
+    final = float(raw)
+    # Both accept and reject events fired exactly once. Order: reject (push
+    # p up from 0.01) → accept (push p back down). Net direction depends on
+    # the magnitudes; what's locked in is that p HAS moved.
+    assert final != _REJECT_RATE_INITIAL

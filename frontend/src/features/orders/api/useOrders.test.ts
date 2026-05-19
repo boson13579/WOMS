@@ -1,8 +1,5 @@
 /**
- * useOrders — role-based assigned_to filtering.
- *
- * Verifies that the hook injects `assigned_to=<userId>` for non-root users
- * and omits it for root users.
+ * useOrders — error handling.
  */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, renderHook, waitFor } from '@testing-library/react';
@@ -21,15 +18,10 @@ const mockAuth = {
     username: string;
     role: string;
   } | null,
-  role: 'scheduler' as string | null,
-  userId: 'user-uuid-001' as string | null,
 };
 
 vi.mock('@/lib/auth', () => ({
   useCurrentUser: () => mockAuth.user,
-  useCurrentRole: () => mockAuth.role,
-  useCurrentUserId: () => mockAuth.userId,
-  useCanWrite: () => mockAuth.role === 'scheduler' || mockAuth.role === 'root',
 }));
 
 // ---------------------------------------------------------------------------
@@ -48,18 +40,13 @@ function makeWrapper() {
   return Wrapper;
 }
 
-function capturedUrl(): string {
-  const { calls } = (global.fetch as ReturnType<typeof vi.fn>).mock;
-  return String(calls[calls.length - 1][0]);
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('useOrders — role-based assigned_to filtering', () => {
+describe('useOrders', () => {
   afterEach(() => {
-    cleanup(); // unmount hook first (removes observer), then clear cache
+    cleanup();
     qc.clear();
     vi.clearAllMocks();
   });
@@ -72,43 +59,32 @@ describe('useOrders — role-based assigned_to filtering', () => {
       }),
     );
     mockAuth.user = { id: 'user-uuid-001', username: 'alice', role: 'scheduler' };
-    mockAuth.role = 'scheduler';
-    mockAuth.userId = 'user-uuid-001';
   });
 
-  it('scheduler — adds assigned_to=userId to the request', async () => {
+  it('no assigned_to filter is added automatically', async () => {
     const { result } = renderHook(() => useOrders({ page: 1 }), { wrapper: makeWrapper() });
 
     await waitFor(() => {
       expect(result.current.isSuccess).toBe(true);
     });
 
-    expect(capturedUrl()).toContain('assigned_to=user-uuid-001');
+    const url = String((global.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    expect(url).not.toContain('assigned_to');
   });
 
-  it('order_manager — adds assigned_to=userId to the request', async () => {
-    mockAuth.role = 'order_manager';
-    mockAuth.user = { id: 'user-uuid-001', username: 'alice', role: 'order_manager' };
+  it('401 response surfaces as an error — no mock data fallback', async () => {
+    vi.mocked(global.fetch).mockResolvedValue(
+      new Response(JSON.stringify({ detail: 'Unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
 
     const { result } = renderHook(() => useOrders({ page: 1 }), { wrapper: makeWrapper() });
 
     await waitFor(() => {
-      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isError).toBe(true);
     });
-
-    expect(capturedUrl()).toContain('assigned_to=user-uuid-001');
-  });
-
-  it('root — does NOT add assigned_to (sees all orders)', async () => {
-    mockAuth.role = 'root';
-    mockAuth.user = { id: 'user-uuid-001', username: 'admin', role: 'root' };
-
-    const { result } = renderHook(() => useOrders({ page: 1 }), { wrapper: makeWrapper() });
-
-    await waitFor(() => {
-      expect(result.current.isSuccess).toBe(true);
-    });
-
-    expect(capturedUrl()).not.toContain('assigned_to');
+    expect(result.current.data).toBeUndefined();
   });
 });

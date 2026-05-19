@@ -10,13 +10,16 @@ import type { OrderStatus, SortField } from '../types';
 interface OrderFilterState {
   status: OrderStatus | null;
   search: string;
+  assignedTo: string[];
+  createdBy: string[];
   page: number;
   sortBy: SortField;
   sortOrder: 'asc' | 'desc';
   setStatus: (v: OrderStatus | null) => void;
   setSearch: (v: string) => void;
+  setAssignedTo: (v: string[]) => void;
+  setCreatedBy: (v: string[]) => void;
   setPage: (v: number) => void;
-  // toggles sortOrder when the same field is selected again
   setSort: (field: SortField) => void;
   reset: () => void;
 }
@@ -24,6 +27,8 @@ interface OrderFilterState {
 export const useOrderStore = create<OrderFilterState>()((set) => ({
   status: null,
   search: '',
+  assignedTo: [],
+  createdBy: [],
   page: 1,
   sortBy: 'order_number',
   sortOrder: 'asc',
@@ -33,6 +38,12 @@ export const useOrderStore = create<OrderFilterState>()((set) => ({
   },
   setSearch: (search) => {
     set({ search, page: 1 });
+  },
+  setAssignedTo: (assignedTo) => {
+    set({ assignedTo, page: 1 });
+  },
+  setCreatedBy: (createdBy) => {
+    set({ createdBy, page: 1 });
   },
   setPage: (page) => {
     set({ page });
@@ -45,6 +56,14 @@ export const useOrderStore = create<OrderFilterState>()((set) => ({
     }));
   },
   reset: () => {
-    set({ status: null, search: '', page: 1, sortBy: 'order_number', sortOrder: 'asc' });
+    set({
+      status: null,
+      search: '',
+      assignedTo: [],
+      createdBy: [],
+      page: 1,
+      sortBy: 'order_number',
+      sortOrder: 'asc',
+    });
   },
 }));

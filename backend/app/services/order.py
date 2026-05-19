@@ -38,6 +38,7 @@ from app.schemas.schedule import (
     ScheduleOpInCompound,
     ScheduleResultResponse,
 )
+from app.services import notification as notification_service
 from app.services.schedule_queue import enqueue_compound
 from app.services.scheduling import ScheduledResult, SchedulingOrder
 
@@ -219,10 +220,20 @@ def _build_patch_compound(
         condition failing means the pin day's capacity might be exceeded
         if we forced the re-pin; we silent-drop the pin (per case 13/14).
 
-    Group selection: ``shrink`` if any of (qty smaller, deadline later);
-    otherwise ``grow``. This matches the existing CRUD-to-op rules for
-    non-pinned PATCH and falls through cleanly when pin/unpin ops are
-    prepended/appended — every op in a compound shares one group anyway.
+    Group selection: ``shrink`` only when **both** axes monotonically
+    release capacity — qty doesn't increase (``new_qty <= old_qty``) AND
+    deadline doesn't move earlier (``new_deadline >= old_deadline``).
+    Otherwise ``grow``. The strict-AND keeps the per-day cumulative
+    delta of a shrink-group compound non-positive everywhere, which is
+    the invariant the worker's batch-admission halving relies on: a
+    contiguous prefix of feasible compounds stays feasible when we
+    drop tail compounds. Pre-rewrite this used OR (``qty_smaller OR
+    deadline_later``), which mis-classified e.g. ``qty=100→10000,
+    deadline=day3→day5`` as shrink even though it adds +9900 to day5's
+    cumulative demand; that broke halving's prefix-feasibility
+    monotonicity assumption and let self-infeasible compounds slip
+    through admission. Every op in a compound shares one group, so
+    pin / unpin ops prepended / appended inherit this classification.
     """
     old_qty = order.wafer_quantity
     old_deadline = order.requested_delivery_date
@@ -234,9 +245,11 @@ def _build_patch_compound(
         # the scheduler.
         return None
 
-    qty_smaller = new_qty < old_qty
-    deadline_later = new_deadline > old_deadline
-    group: Literal["shrink", "grow"] = "shrink" if (qty_smaller or deadline_later) else "grow"
+    qty_non_growing = new_qty <= old_qty
+    deadline_non_earlier = new_deadline >= old_deadline
+    group: Literal["shrink", "grow"] = (
+        "shrink" if (qty_non_growing and deadline_non_earlier) else "grow"
+    )
 
     is_pinned_before = order.is_pinned
     pin_day = order.pinned_production_date
@@ -395,7 +408,8 @@ def list_orders(
     db: Session,
     *,
     status: list[OrderStatus] | None = None,
-    assigned_to: uuid.UUID | None = None,
+    assigned_to: list[uuid.UUID] | None = None,
+    created_by: uuid.UUID | None = None,
     search: str | None = None,
     page: int = 1,
     page_size: int = 20,
@@ -407,6 +421,7 @@ def list_orders(
         db,
         status=status,
         assigned_to=assigned_to,
+        created_by=created_by,
         search=search,
         page=page,
         page_size=page_size,
@@ -429,7 +444,7 @@ def get_order(db: Session, order_id: uuid.UUID) -> OrderResponse:
     return OrderResponse.model_validate(order)
 
 
-def update_order(  # noqa: PLR0912
+def update_order(  # noqa: PLR0912, PLR0915
     db: Session, order_id: uuid.UUID, req: UpdateOrderRequest, actor: User
 ) -> OrderResponse:
     """Update a mutable order with optimistic-lock and status guard.
@@ -568,6 +583,21 @@ def update_order(  # noqa: PLR0912
     db.refresh(order)
 
     enqueue_compound(compound)
+    try:
+        notification_service.create_notification(
+            db,
+            user_id=order.created_by,
+            order_id=order.id,
+            type="order_locked",
+            message=f"訂單 {order.order_number} 已被鎖定處理中",
+        )
+    except Exception:
+        logger.warning(
+            "notification.create_failed",
+            order_id=str(order.id),
+            user_id=str(order.created_by),
+            exc_info=True,
+        )
     return OrderResponse.model_validate(order)
 
 
@@ -616,6 +646,21 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     db.refresh(order)
 
     enqueue_compound(compound)
+    try:
+        notification_service.create_notification(
+            db,
+            user_id=order.created_by,
+            order_id=order.id,
+            type="order_locked",
+            message=f"訂單 {order.order_number} 已被鎖定處理中",
+        )
+    except Exception:
+        logger.warning(
+            "notification.create_failed",
+            order_id=str(order.id),
+            user_id=str(order.created_by),
+            exc_info=True,
+        )
 
     logger.info("order.cancel_requested", order_id=str(order_id), actor_id=str(actor.id))
     return OrderResponse.model_validate(order)
@@ -857,6 +902,8 @@ def apply_schedule(
         per_order.setdefault(sr.order_id, []).append(sr)
 
     applied = 0
+    # Collect data for notifications before commit; attributes expire after commit.
+    _notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, str]] = []
     for order_id, results in per_order.items():
         results.sort(key=lambda x: x.scheduled_date)
         earliest = results[0].scheduled_date
@@ -881,6 +928,7 @@ def apply_schedule(
             )
             continue
         applied += 1
+        _notif_queue.append((order.created_by, order.id, order.order_number, order.status.value))
         # Read status from the refreshed row, not a hard-coded constant —
         # ``set_schedule_dates`` preserves ``in_production`` (see its
         # docstring for why), so an in-production order being re-materialized
@@ -914,4 +962,22 @@ def apply_schedule(
 
     db.commit()
     logger.info("order.schedule.applied", applied=applied)
+
+    for notif_user_id, notif_order_id, order_number, status_val in _notif_queue:
+        try:
+            notification_service.create_notification(
+                db,
+                user_id=notif_user_id,
+                order_id=notif_order_id,
+                type="order_status_changed",
+                message=f"訂單 {order_number} 狀態已變更為 {status_val}",
+            )
+        except Exception:
+            logger.warning(
+                "notification.create_failed",
+                order_id=str(notif_order_id),
+                user_id=str(notif_user_id),
+                exc_info=True,
+            )
+
     return applied

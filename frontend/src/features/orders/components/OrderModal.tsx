@@ -21,7 +21,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
-import { useUsers } from '@/features/auth/api/users';
+import { useAssignableUsers } from '@/features/auth/api/users';
 
 import { useCreateOrder, useUpdateOrder } from '../api/orders';
 import type { Order } from '../types';
@@ -39,7 +39,7 @@ const formSchema = z.object({
     .max(2500, '最多 2500 片'),
   requested_delivery_date: z.string().min(1, '請選擇要求交貨日'),
   notes: z.string().max(2000).nullable().optional(),
-  assigned_to_email: z.string().min(1, '請選擇負責人'),
+  assigned_to_email: z.string().optional(),
 });
 
 type FormValues = z.infer<typeof formSchema>;
@@ -59,7 +59,8 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const createMutation = useCreateOrder();
   const updateMutation = useUpdateOrder();
   const isPending = createMutation.isPending || updateMutation.isPending;
-  const users = useUsers();
+  const users = useAssignableUsers();
+  const assignedToDisabled = isEdit;
 
   const {
     register,
@@ -212,13 +213,13 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="assigned_to_email">負責人{!isEdit && ' *'}</Label>
+            <Label htmlFor="assigned_to_email">負責人</Label>
             <Input
               id="assigned_to_email"
               list="users-datalist"
               placeholder="輸入 email 搜尋"
               autoComplete="off"
-              disabled={isEdit}
+              disabled={assignedToDisabled}
               aria-invalid={!!errors.assigned_to_email}
               aria-describedby={errors.assigned_to_email ? 'assigned_to_email-error' : undefined}
               {...register('assigned_to_email')}
