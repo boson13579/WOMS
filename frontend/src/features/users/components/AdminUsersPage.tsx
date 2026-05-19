@@ -17,7 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { useCurrentRole } from '@/lib/auth';
+import { useCurrentRole, useCurrentUserId } from '@/lib/auth';
 
 import { deactivateUser, listUsers, updateUser } from '../api/users';
 import { userRoleSchema, type UserResponse, type UserRole } from '../types/user';
@@ -47,9 +47,12 @@ function roleBadgeVariant(role: UserRole): 'destructive' | 'secondary' | 'outlin
   return 'secondary';
 }
 
+const OWN_ROW_TOOLTIP = 'Cannot modify your own account';
+
 export function AdminUsersPage(): JSX.Element {
   const queryClient = useQueryClient();
   const currentRole = useCurrentRole();
+  const currentUserId = useCurrentUserId();
   const [search, setSearch] = useState('');
   const [edit, setEdit] = useState<EditState | null>(null);
 
@@ -172,13 +175,19 @@ export function AdminUsersPage(): JSX.Element {
 
                 {usersQuery.data?.users.map((user) => {
                   const isEditing = edit?.user.id === user.id;
+                  // Self-action guard: root cannot edit their own row.
+                  // Backend ``_guard_last_root`` only blocks the last-root
+                  // case; this guard is broader (prevents any self
+                  // demote / deactivate) and is purely additive defence.
+                  const isOwnRow = currentUserId !== null && user.id === currentUserId;
+                  const ownRowTooltip = isOwnRow ? OWN_ROW_TOOLTIP : undefined;
                   return (
                     <TableRow key={user.id}>
                       <TableCell className="font-medium">{user.username}</TableCell>
                       <TableCell className="text-muted-foreground">
                         {user.email ?? 'No email'}
                       </TableCell>
-                      <TableCell>
+                      <TableCell title={ownRowTooltip} aria-disabled={isOwnRow || undefined}>
                         {isEditing ? (
                           <Select
                             aria-label={`Role for ${user.username}`}
@@ -189,6 +198,7 @@ export function AdminUsersPage(): JSX.Element {
                                 current ? { ...current, role: nextRole } : current,
                               );
                             }}
+                            disabled={isOwnRow}
                             className="w-40"
                           >
                             {userRoleSchema.options.map((role) => (
@@ -203,7 +213,7 @@ export function AdminUsersPage(): JSX.Element {
                           </Badge>
                         )}
                       </TableCell>
-                      <TableCell>
+                      <TableCell title={ownRowTooltip} aria-disabled={isOwnRow || undefined}>
                         {isEditing ? (
                           <div className="inline-flex items-center gap-2">
                             <input
@@ -217,6 +227,7 @@ export function AdminUsersPage(): JSX.Element {
                                     : current,
                                 );
                               }}
+                              disabled={isOwnRow}
                               className="h-4 w-4 rounded border-border accent-primary"
                             />
                             <Label htmlFor={`user-active-${user.id}`} className="text-sm">
@@ -229,7 +240,7 @@ export function AdminUsersPage(): JSX.Element {
                           </Badge>
                         )}
                       </TableCell>
-                      <TableCell>
+                      <TableCell title={ownRowTooltip} aria-disabled={isOwnRow || undefined}>
                         <div className="flex justify-end gap-2">
                           {isEditing ? (
                             <>
@@ -239,7 +250,7 @@ export function AdminUsersPage(): JSX.Element {
                                 onClick={() => {
                                   updateMutation.mutate(edit);
                                 }}
-                                disabled={updateMutation.isPending}
+                                disabled={updateMutation.isPending || isOwnRow}
                               >
                                 Save
                               </Button>
@@ -277,7 +288,9 @@ export function AdminUsersPage(): JSX.Element {
                                 onClick={() => {
                                   deactivateMutation.mutate(user.id);
                                 }}
-                                disabled={!user.is_active || deactivateMutation.isPending}
+                                disabled={
+                                  !user.is_active || deactivateMutation.isPending || isOwnRow
+                                }
                               >
                                 Deactivate
                               </Button>

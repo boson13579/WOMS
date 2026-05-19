@@ -37,7 +37,7 @@ const EMPTY_USERS: UserOption[] = [];
  * Root-only listing of all users. Gated on role so non-root sessions don't
  * hammer `/api/v1/users` with 401s that just resolve to the same empty array.
  * Callers that need name lookups for any logged-in user should use
- * `useUsernames` from the dashboard feature instead.
+ * `useUsernames` from `@/features/users/api/useUsernames` instead.
  */
 export function useUsers(): UserOption[] {
   const role = useCurrentRole();

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from app.models.user import UserRole
 
 __all__ = [
+    "AssignableUserResponse",
     "LoginRequest",
     "LoginResponse",
     "RegisterRequest",
@@ -67,6 +68,16 @@ class UserUpdateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class AssignableUserResponse(BaseModel):
+    """Minimal user view returned by GET /users/assignable."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    username: str
+    email: str | None
+
+
 class LoginResponse(BaseModel):
     """Returned on successful login."""
 
@@ -86,6 +97,7 @@ class UserResponse(BaseModel):
     is_active: bool
     version_id: int
     created_at: datetime
+    last_login_at: datetime | None = None
 
 
 class UserListResponse(BaseModel):

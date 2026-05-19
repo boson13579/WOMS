@@ -40,12 +40,12 @@ from redis.exceptions import RedisError, ResponseError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.core.logger import audit_log as emit_audit_log
 from app.models.order import Order, OrderStatus
-from app.repositories import audit_log as audit_log_repo
 from app.repositories import order as order_repo
+from app.services import notification as notification_service
 from app.services import order as order_service
 from app.services import websocket
 from app.services.schedule_queue import enqueue_notify_user
@@ -950,12 +950,37 @@ def _perform_compound_db_action(
             )
             return
 
+        # Capture before commit — attributes expire after Session.commit().
+        _order_number = order.order_number
+        _created_by = order.created_by
+        _oid = order.id
+
         if accepted:
             _apply_db_action_accept(db, order, kind, db_action_raw, actor_id)
         else:
             _apply_db_action_reject(order, kind)
 
         db.commit()
+
+        # Send cancellation notification after commit (best-effort).
+        # Triggers for: explicit user delete accepted, or orphan create rejected.
+        _is_cancel = (kind == "delete" and accepted) or (kind == "create" and not accepted)
+        if _is_cancel:
+            try:
+                notification_service.create_notification(
+                    db,
+                    user_id=_created_by,
+                    order_id=_oid,
+                    type="order_cancelled",
+                    message=f"訂單 {_order_number} 已被取消",
+                )
+            except Exception:
+                logger.warning(
+                    "notification.create_failed",
+                    order_id=str(_oid),
+                    user_id=str(_created_by),
+                    exc_info=True,
+                )
     finally:
         db.close()
 
@@ -1092,25 +1117,20 @@ def _worker_audit(
 ) -> None:
     """Write an audit row + ECS stdout record from inside the worker.
 
-    Mirrors ``order_service._write_audit`` but takes an ``actor_id``
-    directly (not a ``User`` row) because the worker doesn't load the
-    user — the id rides in the compound's ``db_action`` payload.
+    Thin wrapper around :func:`app.core.audit.record_audit` that keeps the
+    ``actor_id`` / ``order_id`` signature contract — the worker doesn't
+    load the ``User`` row, the id rides in the compound's ``db_action``
+    payload, so we take a raw UUID instead of the ``actor: User`` shape
+    used by ``services/order._write_audit``.
     """
-    audit_log_repo.create(
+    record_audit(
         db,
         action=action,
-        user_id=actor_id,
+        actor_id=actor_id,
         resource_type="order",
         resource_id=order_id,
         old_value=old_value,
         new_value=new_value,
-    )
-    emit_audit_log(
-        action=action,
-        actor_id=str(actor_id) if actor_id else None,
-        resource_type="order",
-        resource_id=str(order_id),
-        changes={"old": old_value, "new": new_value},
     )
 
 
