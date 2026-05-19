@@ -40,11 +40,10 @@ from redis.exceptions import RedisError, ResponseError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.core.logger import audit_log as emit_audit_log
 from app.models.order import Order, OrderStatus
-from app.repositories import audit_log as audit_log_repo
 from app.repositories import order as order_repo
 from app.services import notification as notification_service
 from app.services import order as order_service
@@ -1118,25 +1117,20 @@ def _worker_audit(
 ) -> None:
     """Write an audit row + ECS stdout record from inside the worker.
 
-    Mirrors ``order_service._write_audit`` but takes an ``actor_id``
-    directly (not a ``User`` row) because the worker doesn't load the
-    user — the id rides in the compound's ``db_action`` payload.
+    Thin wrapper around :func:`app.core.audit.record_audit` that keeps the
+    ``actor_id`` / ``order_id`` signature contract — the worker doesn't
+    load the ``User`` row, the id rides in the compound's ``db_action``
+    payload, so we take a raw UUID instead of the ``actor: User`` shape
+    used by ``services/order._write_audit``.
     """
-    audit_log_repo.create(
+    record_audit(
         db,
         action=action,
-        user_id=actor_id,
+        actor_id=actor_id,
         resource_type="order",
         resource_id=order_id,
         old_value=old_value,
         new_value=new_value,
-    )
-    emit_audit_log(
-        action=action,
-        actor_id=str(actor_id) if actor_id else None,
-        resource_type="order",
-        resource_id=str(order_id),
-        changes={"old": old_value, "new": new_value},
     )
 
 

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.security import get_current_user, require_roles
 from app.models.user import User, UserRole
+from app.schemas.audit import UserAuditLogListResponse
 from app.schemas.user import (
     AssignableUserResponse,
     UserListResponse,
@@ -77,6 +78,39 @@ def get_user(
         404: user not found.
     """
     return user_service.get_user(db, user_id)
+
+
+@router.get("/{user_id}/audit", response_model=UserAuditLogListResponse)
+def get_user_audit_log(
+    user_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = _root_only,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> UserAuditLogListResponse:
+    """Return the paginated audit-log history for a single user, newest first.
+
+    Permission: root only — audit history can leak PII and account
+    metadata, so even deactivated accounts must only be queryable by root.
+    Deactivated users still appear: root must be able to review the trail
+    after disabling an account.
+
+    Pagination uses ``page``/``page_size`` to match ``GET /orders``; the
+    sibling ``GET /orders/{id}/audit-log`` returns a bare list because its
+    history is short. Admin audit views may scroll through long histories,
+    so paginate.
+
+    Errors:
+        401: missing or invalid bearer token.
+        403: authenticated user does not have the root role.
+        404: user not found.
+    """
+    return user_service.get_user_audit_log(
+        db,
+        user_id,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.patch("/me", response_model=UserResponse)
