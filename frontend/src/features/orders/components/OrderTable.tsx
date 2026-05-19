@@ -264,7 +264,8 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
                             onClick={() => {
                               onEdit(order);
                             }}
-                            title="編輯"
+                            title={order.is_processing_locked ? '排程處理中，請稍候' : '編輯'}
+                            disabled={order.is_processing_locked}
                           >
                             <Pencil className="h-4 w-4" />
                           </Button>

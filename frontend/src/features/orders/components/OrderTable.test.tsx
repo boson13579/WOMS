@@ -278,13 +278,15 @@ describe('OrderTable', () => {
       expect(screen.queryByLabelText('排程處理中')).not.toBeInTheDocument();
     });
 
-    it('disables the delete button when locked', () => {
+    it('disables both edit and delete buttons when locked', () => {
       const order = makeOrder({ is_processing_locked: true });
       mockUseOrders.mockReturnValue({ isPending: false, isError: false, data: makeList([order]) });
 
       render(<OrderTable onEdit={onEdit} />);
 
-      expect(screen.getByTitle('排程處理中，請稍候')).toBeDisabled();
+      const lockedButtons = screen.getAllByTitle('排程處理中，請稍候');
+      expect(lockedButtons).toHaveLength(2);
+      lockedButtons.forEach((btn) => expect(btn).toBeDisabled());
     });
   });
 
