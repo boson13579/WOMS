@@ -22,10 +22,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.security import get_current_user
-from app.models.user import User
-from app.schemas.system import SystemHealthResponse, UsernamesLookupResponse
-from app.services.system import gather_system_health, lookup_usernames
+from app.core.security import get_current_user, require_roles
+from app.models.user import User, UserRole
+from app.schemas.system import (
+    RedMetricsResponse,
+    SloComplianceResponse,
+    SystemHealthResponse,
+    SystemResourcesResponse,
+    UsernamesLookupResponse,
+)
+from app.services import red_metrics as red_metrics_service
+from app.services.system import gather_resources, gather_system_health, lookup_usernames
 
 router = APIRouter()
 
@@ -54,6 +61,90 @@ def get_system_health(
     """
     del current_user  # FastAPI dependency is the authn check — value unused.
     return gather_system_health(db)
+
+
+@router.get(
+    "/resources",
+    response_model=SystemResourcesResponse,
+    summary="USE (utilization / saturation / errors) snapshot of DB, Redis, Celery.",
+)
+def get_system_resources(
+    current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),
+) -> SystemResourcesResponse:
+    """Operator-grade resource snapshot for the observability page.
+
+    Permission: scheduler + root only (viewer / order_manager → 403).
+    Returns ``db_pool`` / ``redis`` / ``celery`` sections; each is
+    independently nullable so a single probe failure degrades that
+    section only — the endpoint still returns 200.
+    """
+    del current_user  # role check is done by ``require_roles`` — value not needed.
+    return gather_resources()
+
+
+@router.get(
+    "/red",
+    response_model=RedMetricsResponse,
+    summary="RED (rate / errors / duration) metrics over a trailing window.",
+)
+def get_red_metrics(
+    window_seconds: int = Query(
+        default=60,
+        ge=1,
+        description=(
+            "Trailing window in seconds. The underlying ZSET is trimmed to "
+            "the last 5 minutes, so windows wider than 300s return only the "
+            "samples that are physically present (no error)."
+        ),
+    ),
+    current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),
+) -> RedMetricsResponse:
+    """Return aggregated RED metrics for the trailing window.
+
+    Permission: scheduler + root only — RED data is operator-grade and
+    not meaningful to viewers / order managers.
+
+    Empty windows return zero values (not 404) so the dashboard can render
+    a stable envelope. Window seconds outside the underlying 5-minute
+    retention silently fall back to whatever samples exist.
+    """
+    del current_user  # role check is done by ``require_roles``; value unused.
+    return red_metrics_service.compute_window(window_seconds)
+
+
+@router.get(
+    "/slo",
+    response_model=SloComplianceResponse,
+    summary="SLO compliance + error-budget snapshot over a trailing window.",
+)
+def get_slo_compliance(
+    window_hours: int = Query(
+        default=24,
+        ge=1,
+        le=168,
+        description=(
+            "Trailing window in hours. The underlying ZSET is trimmed to "
+            "the last 1 hour by the RED middleware, so longer windows "
+            "report against the available sample slice rather than a true "
+            "24h history. The response carries ``data_window_seconds_actual`` "
+            "so the caller can see exactly how much of the requested window "
+            "is actually backed by data."
+        ),
+    ),
+    current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),
+) -> SloComplianceResponse:
+    """Return SLO compliance + error-budget remaining for the trailing window.
+
+    Permission: scheduler + root only (matches ``/system/red``).
+
+    Empty windows report ``success_pct=100`` and full budget remaining
+    — no traffic means no budget consumed. The response also carries
+    ``data_window_seconds_actual`` so the frontend can surface a
+    "Showing Xm of data (requested Yh)" hint when the requested window
+    exceeds the underlying ZSET retention (1h).
+    """
+    del current_user
+    return red_metrics_service.compute_slo(window_hours)
 
 
 @router.get(

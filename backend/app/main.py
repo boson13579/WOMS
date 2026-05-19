@@ -23,6 +23,7 @@ from app.api.v1 import api_router as api_v1_router
 from app.api.v1.websocket import event_consumer_loop
 from app.core.config import get_settings
 from app.core.logger import configure_logging, correlation_id_middleware
+from app.core.red_metrics import red_metrics_middleware
 
 logger = structlog.get_logger(__name__)
 
@@ -75,6 +76,17 @@ def create_app() -> FastAPI:
     )
 
     # --- Middleware (order matters — added bottom-up at runtime) -------------
+    # FastAPI executes ``middleware("http")`` registrations in REVERSE order
+    # of registration: the *last* one registered runs FIRST on the way in
+    # and LAST on the way out. We want ``correlation_id_middleware`` to run
+    # first (so every downstream log carries ``trace.id``), so it must be
+    # registered LAST among the HTTP middlewares.
+    #
+    # ``red_metrics_middleware`` is inside ``correlation_id_middleware`` so
+    # the contextvar is already populated when samples are recorded — any
+    # warning log emitted by the Redis writer carries the same trace id as
+    # the request that produced it.
+    app.middleware("http")(red_metrics_middleware)
     app.middleware("http")(correlation_id_middleware)
 
     app.add_middleware(
@@ -83,6 +95,12 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # ``X-Request-Id`` is emitted by ``correlation_id_middleware`` on every
+        # response. Browsers hide all response headers by default; without
+        # ``expose_headers`` frontend code cannot read it via
+        # ``res.headers.get('X-Request-Id')`` from a fetch response. Plan B's
+        # error toast surfaces this id to support, so it must be exposed.
+        expose_headers=["X-Request-Id"],
     )
 
     # --- Routers --------------------------------------------------------------

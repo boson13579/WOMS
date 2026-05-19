@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import Select
 
 from app.models.audit_log import AuditLog
 
 __all__ = [
     "count_by_resource_id",
+    "count_events",
     "create",
     "get_by_resource_id",
+    "list_events",
 ]
 
 
@@ -118,4 +122,110 @@ def count_by_resource_id(
     stmt = select(func.count()).select_from(AuditLog).where(AuditLog.resource_id == resource_id)
     if resource_type is not None:
         stmt = stmt.where(AuditLog.resource_type == resource_type)
+    return int(db.scalar(stmt) or 0)
+
+
+def _events_filter_stmt(
+    stmt: Select[Any],
+    *,
+    actor_id: uuid.UUID | None,
+    action: str | None,
+    resource_type: str | None,
+    resource_id: uuid.UUID | None,
+    from_ts: datetime | None,
+    to_ts: datetime | None,
+) -> Select[Any]:
+    """Apply the shared global-feed filter set to *stmt* and return it.
+
+    Kept private + parameterised on the base ``stmt`` so ``list_events`` and
+    ``count_events`` cannot drift on the filter semantics (e.g. accidentally
+    adding a filter to one but not the other and producing a paginator with
+    a wrong ``total``).
+    """
+    if actor_id is not None:
+        stmt = stmt.where(AuditLog.user_id == actor_id)
+    if action is not None:
+        stmt = stmt.where(AuditLog.action == action)
+    if resource_type is not None:
+        stmt = stmt.where(AuditLog.resource_type == resource_type)
+    if resource_id is not None:
+        stmt = stmt.where(AuditLog.resource_id == resource_id)
+    if from_ts is not None:
+        # Inclusive lower bound — typical "show events FROM X onwards" UX.
+        stmt = stmt.where(AuditLog.created_at >= from_ts)
+    if to_ts is not None:
+        # Exclusive upper bound — half-open interval [from, to) is the
+        # least-surprising convention for date ranges and avoids the
+        # "is the last second included?" ambiguity of inclusive ranges.
+        stmt = stmt.where(AuditLog.created_at < to_ts)
+    return stmt
+
+
+def list_events(
+    db: Session,
+    *,
+    actor_id: uuid.UUID | None = None,
+    action: str | None = None,
+    resource_type: str | None = None,
+    resource_id: uuid.UUID | None = None,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    oldest_first: bool = False,
+) -> list[AuditLog]:
+    """Return the paginated global audit-log feed for ``GET /audit/events``.
+
+    All filter args are optional; passing none returns every row (paginated).
+    Defaults match the global-feed UX (newest-first, page=1, page_size=20).
+
+    Pagination uses the same ``(created_at, id)`` tie-breaker as
+    :func:`get_by_resource_id` so seeding N rows in a single transaction
+    (where ``func.now()`` collapses to one timestamp) still pages
+    deterministically. ``id`` (UUIDv4) doesn't carry semantic order but it
+    *does* total-order the rows, which is all we need.
+    """
+    stmt = _events_filter_stmt(
+        select(AuditLog),
+        actor_id=actor_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        from_ts=from_ts,
+        to_ts=to_ts,
+    )
+    if oldest_first:
+        stmt = stmt.order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+    else:
+        stmt = stmt.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+    effective_page = max(page, 1)
+    stmt = stmt.offset((effective_page - 1) * page_size).limit(page_size)
+    return list(db.scalars(stmt).all())
+
+
+def count_events(
+    db: Session,
+    *,
+    actor_id: uuid.UUID | None = None,
+    action: str | None = None,
+    resource_type: str | None = None,
+    resource_id: uuid.UUID | None = None,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+) -> int:
+    """Return the total row count for the global audit-log feed.
+
+    Mirror of :func:`list_events`'s filter signature — kept in lockstep so
+    a paginated response's ``total`` always matches the same filter the
+    items page was drawn from. See :func:`_events_filter_stmt`.
+    """
+    stmt = _events_filter_stmt(
+        select(func.count()).select_from(AuditLog),
+        actor_id=actor_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        from_ts=from_ts,
+        to_ts=to_ts,
+    )
     return int(db.scalar(stmt) or 0)

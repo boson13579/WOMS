@@ -107,6 +107,22 @@ class Settings(BaseSettings):
     # --- Logging --------------------------------------------------------------
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
+    # --- Observability (RED / SLO) -------------------------------------------
+    # Availability target consumed by ``GET /api/v1/system/slo``. 99.5% gives
+    # a 0.5%-of-traffic error budget per rolling window — meaningful on a
+    # student-load app where one 5xx spike is visible but the system doesn't
+    # get punished for sub-second blips. Override via ``SLO_AVAILABILITY_TARGET_PCT``
+    # in ``.env`` if a deployment wants a different bar.
+    SLO_AVAILABILITY_TARGET_PCT: float = Field(
+        default=99.5,
+        gt=0,
+        lt=100,
+        description=(
+            "Availability SLO target (percent). Used by /api/v1/system/slo "
+            "to compute the error budget remaining for the window."
+        ),
+    )
+
     # ------------------------------------------------------------------ helpers
     @field_validator("CORS_ORIGINS")
     @classmethod

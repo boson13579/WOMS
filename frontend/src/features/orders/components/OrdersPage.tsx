@@ -5,6 +5,7 @@ import { toast } from 'sonner';
 import { Header } from '@/components/layout/Header';
 import { Button } from '@/components/ui/button';
 import { useCanSchedule, useCanWrite } from '@/lib/auth';
+import { toastApiError } from '@/lib/toastApiError';
 
 import { useTriggerSchedule } from '../api/orders';
 import { useScheduleWs } from '../hooks/useScheduleWs';
@@ -42,7 +43,7 @@ export function OrdersPage(): JSX.Element {
         toast.success('排程已啟動', { description: res.message });
       },
       onError: (err) => {
-        toast.error('排程啟動失敗', { description: err.message });
+        toastApiError('排程啟動失敗', err);
       },
     });
   }, [triggerSchedule]);

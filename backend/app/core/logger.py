@@ -8,10 +8,10 @@ We achieve both with `structlog`:
   * `configure_logging()` installs ECS-compatible processors so every record
     carries `@timestamp`, `service.name`, `log.level`, and a `correlation_id`
     propagated across async boundaries via a `ContextVar`.
-  * `correlation_id_middleware` accepts an inbound `X-Correlation-ID` header
-    or generates a UUID, stores it in the contextvar, and stamps it onto the
-    outbound response — so a single request can be traced from frontend log
-    through Celery worker logs.
+  * `correlation_id_middleware` accepts an inbound `X-Request-Id` header (or
+    legacy `X-Correlation-ID` for back-compat) or generates a UUID, stores it
+    in the contextvar, and stamps it onto the outbound response — so a single
+    request can be traced from frontend log through Celery worker logs.
 
 ECS field reference: https://www.elastic.co/guide/en/ecs/current/index.html
 """
@@ -37,7 +37,17 @@ from app.core.config import get_settings
 # ---------------------------------------------------------------------------
 _correlation_id_ctx: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 
-CORRELATION_HEADER = "X-Correlation-ID"
+# Outbound spec name the frontend reads (Plan A4 rename — see
+# notes/agent_progress/Observability_plan_a_backend.md §A4). Both the request
+# header lookup *and* the response stamp use this name.
+REQUEST_ID_HEADER = "X-Request-Id"
+# Legacy inbound header — still honored so older clients / load balancers /
+# upstream services that haven't migrated yet can keep stamping trace ids.
+# The response is always emitted under `REQUEST_ID_HEADER`.
+LEGACY_REQUEST_ID_HEADER = "X-Correlation-ID"
+# Backwards-compatible alias kept for any code/tests that still import the
+# old name. New call sites should prefer ``REQUEST_ID_HEADER``.
+CORRELATION_HEADER = REQUEST_ID_HEADER
 
 
 # ---------------------------------------------------------------------------
@@ -139,18 +149,26 @@ async def correlation_id_middleware(
     request: Request,
     call_next: Any,
 ) -> Response:
-    """Propagate a correlation ID across the request lifecycle.
+    """Propagate a request ID across the request lifecycle.
 
-    Reads `X-Correlation-ID` from the inbound headers (so a load balancer,
-    ingress, or upstream service can stamp it first); otherwise generates a
-    fresh UUIDv4. Echoes the value back in the response for client logs.
+    Prefers the inbound ``X-Request-Id`` header (the public spec name the
+    frontend reads). Falls back to the legacy ``X-Correlation-ID`` header so
+    older clients / upstream services that haven't migrated yet keep working.
+    Otherwise generates a fresh UUIDv4.
+
+    The chosen id is bound to the ``correlation_id`` contextvar (so structlog
+    emits it under ECS ``trace.id``) and *always* stamped onto the outbound
+    response under ``X-Request-Id`` — even when the inbound used the legacy
+    header — so clients can rely on a single response header name.
     """
-    incoming = request.headers.get(CORRELATION_HEADER)
+    incoming = request.headers.get(REQUEST_ID_HEADER) or request.headers.get(
+        LEGACY_REQUEST_ID_HEADER
+    )
     cid = incoming or str(uuid.uuid4())
     token = _correlation_id_ctx.set(cid)
     try:
         response: Response = await call_next(request)
     finally:
         _correlation_id_ctx.reset(token)
-    response.headers[CORRELATION_HEADER] = cid
+    response.headers[REQUEST_ID_HEADER] = cid
     return response
