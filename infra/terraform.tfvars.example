@@ -1,0 +1,10 @@
+# Copy this file to `terraform.tfvars` (gitignored) and fill in real values.
+# `terraform apply` automatically picks up `terraform.tfvars` from the
+# current directory.
+
+aws_region  = "ap-northeast-1"
+project     = "woms"
+environment = "dev"
+
+# DB / Redis passwords will be added here when we get to rds.tf / elasticache.tf.
+# Keep them OUT of git — that's why `*.tfvars` is in .gitignore.
