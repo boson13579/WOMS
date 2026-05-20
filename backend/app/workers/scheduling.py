@@ -59,6 +59,7 @@ from app.services.scheduling import (
     BatchOp,
     SchedulerState,
     SchedulingOrder,
+    SegmentTreeInvariantError,
     advance_day,
     apply_batch_to_capacity,
     apply_batch_to_deadline,
@@ -777,7 +778,13 @@ def _commit_accepted_batch(
        per batch.
     2. Per-compound, leaf-by-leaf: ``_apply_compound_leaf_structural``
        updates pq / pinned_orders only (or delegates to pin_order /
-       unpin_order for swaps).
+       unpin_order for swaps). Wrapped in try/except so a single
+       compound hitting ``SegmentTreeInvariantError`` (= tree state
+       diverged from this compound's expected ``wafer_quantity``,
+       typically caused by a producer-side concurrency race that slipped
+       a stale compound into the queue) only fails THAT compound, not
+       the entire batch. Failed compounds get ``compound_failed`` WS +
+       ``db_action(accepted=False)``; the rest of the batch proceeds.
     3. ``ZREM`` all accepted members from the pending queue (one round-trip).
     4. ``_save_state`` once for the whole batch.
     5. Per-compound: drop secondary-index entry, run db_action, notify_user.
@@ -787,6 +794,17 @@ def _commit_accepted_batch(
     drained and state advanced (no double-apply on restart) — at worst
     a few users miss the immediate WS ack and pick it up on the next
     state refresh.
+
+    **Trade-off on per-leaf invariant break**: the batch tree delta is
+    applied ONCE up-front for ALL accepted compounds (step 1), so when
+    a later structural pass on one compound raises, that compound's
+    contribution to the tree was already committed and we can't easily
+    roll just it back. The tree carries the "phantom" contribution until
+    the next ``POST /schedule/rebuild`` reconciles state with DB. This
+    is acceptable because ``SegmentTreeInvariantError`` itself signals
+    "state was already inconsistent before we started" — preserving
+    rough tree state is no worse than the inconsistency we already had.
+    The win is that one bad compound no longer abort the whole task.
     """
     rds = _get_redis()
 
@@ -795,9 +813,22 @@ def _commit_accepted_batch(
     apply_batch_to_capacity(state, delta)
     apply_batch_to_deadline(state, delta)
 
-    for _, compound in accepted:
-        for leaf in compound.get("ops", []):
-            _apply_compound_leaf_structural(state, leaf)
+    succeeded: list[tuple[str, dict[str, Any]]] = []
+    failed: list[tuple[str, dict[str, Any]]] = []
+    for member, compound in accepted:
+        try:
+            for leaf in compound.get("ops", []):
+                _apply_compound_leaf_structural(state, leaf)
+        except SegmentTreeInvariantError as exc:
+            logger.error(
+                "schedule.batch.invariant_break_skipping_compound",
+                compound_id=compound.get("compound_id"),
+                error=str(exc),
+                exc_info=True,
+            )
+            failed.append((member, compound))
+            continue
+        succeeded.append((member, compound))
 
     members = [member for member, _ in accepted]
     if members:
@@ -805,15 +836,24 @@ def _commit_accepted_batch(
 
     _save_state(state)
 
-    for _, compound in accepted:
+    for _, compound in succeeded:
         _drop_compound_index_entry(compound.get("compound_id"))
         _perform_compound_db_action(compound, accepted=True)
         _notify_compound_accepted(compound)
 
+    for _, compound in failed:
+        _drop_compound_index_entry(compound.get("compound_id"))
+        # Run reject db_action so producer's ``is_processing_locked`` flag
+        # is cleared (and create-orphans are soft-deleted). Without this
+        # the user would see their order stuck in "processing" forever.
+        _perform_compound_db_action(compound, accepted=False)
+        _notify_compound_batch_rejected(compound)
+
     logger.info(
         "schedule.batch.committed",
-        compound_count=len(accepted),
-        total_ops=sum(len(c.get("ops", [])) for _, c in accepted),
+        compound_count=len(succeeded),
+        failed_count=len(failed),
+        total_ops=sum(len(c.get("ops", [])) for _, c in succeeded),
     )
 
 
@@ -1011,6 +1051,12 @@ def _apply_db_action_accept(
             "requested_delivery_date": str(order.requested_delivery_date),
             "notes": order.notes,
             "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+            "is_pinned": order.is_pinned,
+            "pinned_production_date": (
+                str(order.pinned_production_date)
+                if order.pinned_production_date is not None
+                else None
+            ),
         }
         new_qty = db_action.get("new_wafer_quantity")
         if new_qty is not None:
@@ -1023,12 +1069,32 @@ def _apply_db_action_accept(
         if db_action.get("new_assigned_to_set"):
             raw_assignee = db_action.get("new_assigned_to")
             order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
+        # Pin columns: only touch when producer asked us to. ``_set=False``
+        # means "client didn't change pin status" — leave is_pinned /
+        # pinned_production_date alone so the auto-re-pin / silent-drop
+        # logic in the algorithm's pin_order / unpin_order calls stays
+        # authoritative on the in-memory side (DB matches whatever
+        # apply_schedule writes next).
+        if db_action.get("new_pinned_production_date_set"):
+            raw_pin_day = db_action.get("new_pinned_production_date")
+            if raw_pin_day is None:
+                order.is_pinned = False
+                order.pinned_production_date = None
+            else:
+                order.is_pinned = True
+                order.pinned_production_date = date.fromisoformat(str(raw_pin_day))
         order.is_processing_locked = False
         new_value: dict[str, Any] = {
             "wafer_quantity": order.wafer_quantity,
             "requested_delivery_date": str(order.requested_delivery_date),
             "notes": order.notes,
             "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+            "is_pinned": order.is_pinned,
+            "pinned_production_date": (
+                str(order.pinned_production_date)
+                if order.pinned_production_date is not None
+                else None
+            ),
         }
         _worker_audit(
             db,

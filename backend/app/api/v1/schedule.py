@@ -2,13 +2,21 @@
 
 Endpoints
 ---------
-- ``POST /schedule/trigger`` — manual fire of ``run_scheduling_task``.
-- ``POST /schedule/operations`` — Order CRUD pushes pending ops here.
-- ``GET  /schedule/status`` — current scheduler lifecycle snapshot.
-- ``GET  /schedule/result`` — every order currently in ``scheduled`` state.
-- ``POST /schedule/rebuild`` — queue ``rebuild_schedule_task`` (waits for any
+- ``POST   /schedule/trigger`` — manual fire of ``run_scheduling_task``.
+- ``DELETE /schedule/operations/{compound_id}`` — cancel a still-queued compound.
+- ``GET    /schedule/status`` — current scheduler lifecycle snapshot.
+- ``GET    /schedule/result`` — every order currently in ``scheduled`` state.
+- ``GET    /schedule/pending-ops`` — queued compounds in priority order.
+- ``GET    /schedule/capacity`` — 30-day prefix-sum capacity snapshot.
+- ``POST   /schedule/rebuild`` — queue ``rebuild_schedule_task`` (waits for any
   in-flight run to finish, rebuilds state from DB, then re-triggers
   ``run_scheduling_task``).
+
+The previous ``POST /schedule/operations`` raw-compound endpoint has been
+removed — pin / unpin is now folded into ``PATCH /orders/{id}`` via the
+``pinned_production_date`` field so it inherits the same row-level lock
+that protects qty / deadline changes. See the comment block where the
+endpoint used to live for the full rationale.
 
 All Redis access goes through a lazy module-level client; the worker module
 does the same so the two stay decoupled (worker can run without the API
@@ -36,7 +44,6 @@ from app.schemas.schedule import (
     CapacityPrefixEntry,
     PendingOpsEntry,
     ScheduleCapacityResponse,
-    ScheduleCompoundRequest,
     ScheduleCompoundResponse,
     ScheduleRebuildResponse,
     ScheduleResultResponse,
@@ -47,7 +54,6 @@ from app.services import order as order_service
 from app.services.schedule_queue import (
     CancelResult,
     cancel_compound,
-    enqueue_compound,
     list_pending_ops,
 )
 from app.services.scheduling import (
@@ -129,78 +135,29 @@ def trigger_scheduling(
 
 
 # ---------------------------------------------------------------------------
-# POST /operations
+# POST /operations — REMOVED
 # ---------------------------------------------------------------------------
-
-
-@router.post(
-    "/operations",
-    response_model=ScheduleCompoundResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-def enqueue_operation(
-    request: ScheduleCompoundRequest,
-    current_user: User = Depends(_WRITE_ROLES),
-) -> ScheduleCompoundResponse:
-    """Queue a scheduler compound for the next ``run_scheduling_task``.
-
-    A compound is an atomic business action containing one or more leaf
-    ops (add / remove / pin / unpin). See :class:`ScheduleCompoundRequest`
-    for the full contract; in brief:
-
-    - Ops within a compound may target one or more order_ids — typical
-      single-order flows (PATCH / DELETE / CREATE) generate one order
-      per compound, while a multi-order batch business action is also
-      a legal shape.
-    - The compound has a single ``group`` (shrink or grow). Shrink
-      compounds sort before grow compounds in the worker queue; FIFO
-      within each group.
-    - Worker processes the compound atomically — any leaf-op failure
-      triggers a snapshot rollback of ``SchedulerState`` and a
-      ``schedule.compound_failed`` WebSocket message to ``requested_by``.
-
-    Backed by a Redis **sorted set** scored by ``score_for_op(group, seq)``
-    where ``seq`` is the next value of ``schedule:pending_ops:seq``.
-    Worker ``ZPOPMIN``s one compound per ``run_scheduling_task``
-    invocation. All Redis I/O is delegated to
-    ``services.schedule_queue.enqueue_compound``.
-
-    A new ``run_scheduling_task`` fires only if the worker is currently
-    idle; if it is already running, the in-flight task will pick up this
-    compound when it loops back to drain ``pending_ops`` at the end of
-    its cycle.
-
-    Permission: scheduler+.
-
-    Identity overrides: the body-supplied ``requested_by`` and (when
-    present) ``db_action.actor_id`` are silently rewritten to
-    ``current_user.id`` before enqueue. The HTTP boundary is the only
-    trust line — a producer bug or a malicious scheduler must not be
-    able to forge audit-log attribution or WS impersonation by stuffing
-    a different UUID into the request body. The override is a no-op
-    when the body already matches; a single ``debug`` log is emitted on
-    disagreement so producer drift surfaces without breaking clients.
-    """
-    if request.requested_by != current_user.id:
-        logger.debug(
-            "schedule.operations.requested_by_overridden",
-            body_value=str(request.requested_by),
-            actual=str(current_user.id),
-        )
-    request.requested_by = current_user.id
-    if request.db_action is not None:
-        if request.db_action.actor_id != current_user.id:
-            logger.debug(
-                "schedule.operations.actor_id_overridden",
-                body_value=str(request.db_action.actor_id),
-                actual=str(current_user.id),
-            )
-        request.db_action.actor_id = current_user.id
-    enqueue_compound(request)
-    return ScheduleCompoundResponse(
-        compound_id=request.compound_id,
-        message="Compound queued",
-    )
+#
+# The raw "build a compound, send it" endpoint used to be the only way for
+# the frontend to issue pin / unpin. It had a structural weakness: it
+# accepted any client-constructed compound and enqueued it directly,
+# bypassing the per-row ``SELECT ... FOR UPDATE`` lock that ``update_order``
+# / ``delete_order`` use to serialize concurrent producer-side writes. Two
+# concurrent compounds for the same order could both build off the same
+# pre-PATCH snapshot, both enqueue, and the worker would later trip a
+# ``SegmentTreeInvariantError`` on the stale half (because the in-memory
+# tree no longer matched the compound's ``wafer_quantity``).
+#
+# Pin / unpin is now folded into ``PATCH /orders/{id}`` via the
+# ``pinned_production_date`` field — that path goes through ``update_order``
+# which holds the row lock for the whole producer transaction and emits the
+# right ``[unpin?, remove?, add?, pin?]`` compound shape based on the pin
+# transition. Frontend ``OrdersCalendarDialog`` calls PATCH directly; the
+# raw endpoint has no remaining caller.
+#
+# The internal ``enqueue_compound`` service function is unchanged — it's
+# still the single Redis writer used by the order CRUD service layer.
+# Only the *HTTP wrapper* is removed.
 
 
 # ---------------------------------------------------------------------------

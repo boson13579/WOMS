@@ -57,6 +57,7 @@ type DraggableOrder = Pick<
   | 'is_pinned'
   | 'pinned_production_date'
   | 'is_processing_locked'
+  | 'version_id'
 >;
 
 interface PendingMove {

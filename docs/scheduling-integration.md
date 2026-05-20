@@ -19,164 +19,93 @@
 
 ## 2. 訂單 CRUD 接入
 
-訂單在 DB 寫成功之後，**必須**告訴排程模組「有訂單變了」。怎麼說：把一筆 op 推進排程 queue。
+訂單模組告訴排程模組「有訂單變了」的方式是把一個 **compound**（一組 1~N 筆 leaf ops）推進 Redis sorted set，worker 端用 batch admission 把可行的 prefix 一次接受。
 
-### 2.1 兩種推 op 的方法
+> **唯一入口：Order CRUD**。**沒有對外的 raw 排程操作 endpoint**。`POST /api/v1/schedule/operations` 已在 P1-2 後移除（pin / unpin 改用 PATCH 的 `pinned_production_date` 欄位）。所有 compound 都由 backend Order CRUD service 內部 build 並 enqueue — 前端只要正常呼叫 `POST/PATCH/DELETE /api/v1/orders/...`，scheduler 就會跟著動。
 
-| 方法 | 適用情境 | 優點 | 缺點 |
-|---|---|---|---|
-| **A. HTTP** `POST /api/v1/schedule/operations` | 訂單 service 跟排程在不同進程 / 不同 container | 標準介面、走 auth、log 完整 | 多一次 HTTP round-trip |
-| **B. 直連 Redis** | 訂單 service 跟排程在**同一個進程** | 沒網路成本 | service 多耦合一個 Redis client |
+### 2.1 Order CRUD → compound 自動對照
 
-**強烈建議用 A**，除非你確定要省那一次 RTT 而且能接受耦合。
+| Order CRUD 動作 | 自動 build 的 compound | Group |
+|---|---|---|
+| `POST /api/v1/orders` | `[add(新)]` | grow |
+| `DELETE /api/v1/orders/{id}`（非 pinned） | `[remove]` | shrink |
+| `DELETE /api/v1/orders/{id}`（pinned） | `[unpin, remove]` | shrink |
+| `PATCH /api/v1/orders/{id}` 改 qty / deadline（非 pinned） | `[remove(舊), add(新)]` | qty 不增 AND deadline 不前 → shrink；否則 grow |
+| `PATCH` 改 qty / deadline（pinned，沒明示 `pinned_production_date`） | 自動 re-pin（新 deadline ≥ 舊 pin 日 AND 新 qty ≤ 舊 qty）→ `[unpin, remove, add, pin(原 pin 日)]`；不滿足條件 → `[unpin, remove, add]`（silent drop pin） | 同上 |
+| `PATCH` 帶 `pinned_production_date: "YYYY-MM-DD"`（pin / 改 pin 日） | unpinned → `[(remove,add 如有), pin(新)]`；已 pinned 改日 → `[unpin, (remove,add 如有), pin(新)]` | 任一 axis（qty / deadline / pin 日）變緊 → grow；全部不變緊才 shrink |
+| `PATCH` 帶 `pinned_production_date: null`（unpin） | `[unpin, (remove,add 如有)]` | unpin 本身屬 shrink；同時 qty/deadline 變緊則 grow |
+| `PATCH` 只改 `notes` / `assigned_to` | 不推 compound，producer 直接 commit + audit | — |
+| `PATCH /orders/batch-update` | 每筆訂單獨立 1 個 compound，規則同上 | 每筆獨立判斷 |
 
-> **Phase 2 變更**：endpoint shape 從「一次接一筆 op」改成「一次接一個 compound」。一個 compound = 一組 1-4 筆 leaf ops，worker 端 **atomic 執行 + snapshot rollback**（任何一筆 op 失敗就把整個 compound 連已成功的部分一起 undo）。Order CRUD service 內部已自動 build 對應 compound（見 `app/services/order.py::_build_*_compound`），多數情況**前端 / 第三方服務只在「手動 pin / unpin」**時需要直接戳這支 endpoint。
+**Strict-AND group classification**：`shrink` 只在 **qty 不增 AND deadline 不前 AND pin 日不前** 全部成立時標；否則 `grow`。Newly-pinning 視為「pin 日往前移」（把 demand 從 EDF 分布拉到單一天 → 屬於 grow）。這個保證讓 worker batch-admission halving 的不變式成立（shrink compound 的每天 cumulative delta 必非正，drop 尾巴 prefix 不會把可行性翻盤）。
 
-### 2.2 方法 A — HTTP（推薦）
+### 2.2 Pin / Unpin — PATCH 的一個欄位（**不再有獨立 endpoint**）
 
-```python
-import httpx
-import uuid
+```ts
+// UI 按「把訂單 pin 到 5/12」按鈕
+await fetch(`/api/v1/orders/${order.id}`, {
+    method: "PATCH",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+        pinned_production_date: "2026-05-12",  // ← 想 pin 的日期
+        version_id: order.version_id,           // 樂觀鎖
+    }),
+});
 
-# 建立訂單後（如果 backend Order CRUD 已自動處理，這段可以略）
-def on_order_created(order, actor):
-    ops = [
-        {
-            "op": "add",
-            "order_id": str(order.id),
-            "order_number": order.order_number,
-            "wafer_quantity": order.wafer_quantity,
-            "deadline": order.requested_delivery_date.isoformat(),
-        },
-    ]
-    httpx.post(
-        "http://backend/api/v1/schedule/operations",
-        json={
-            "compound_id": str(uuid.uuid4()),
-            "group": "grow",
-            "op_count": len(ops),  # 必須等於 len(ops)，schema 會驗
-            "requested_by": str(actor.id),
-            "ops": ops,
-        },
-        headers={"Authorization": f"Bearer {service_token}"},
-    )
-
-# 手動把訂單 pin 到 5/12
-def on_user_pinned(order, actor, pin_day):
-    ops = [
-        {
-            "op": "pin",
-            "order_id": str(order.id),
-            "order_number": order.order_number,
-            "wafer_quantity": order.wafer_quantity,
-            "deadline": order.requested_delivery_date.isoformat(),
-            "fake_deadline": pin_day.isoformat(),
-        },
-    ]
-    httpx.post(
-        "http://backend/api/v1/schedule/operations",
-        json={
-            "compound_id": str(uuid.uuid4()),
-            "group": "grow",
-            "op_count": len(ops),
-            "requested_by": str(actor.id),
-            "ops": ops,
-        },
-        headers={"Authorization": f"Bearer {service_token}"},
-    )
+// 解 pin
+await fetch(`/api/v1/orders/${order.id}`, {
+    method: "PATCH",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+        pinned_production_date: null,           // ← 明示 null = unpin
+        version_id: order.version_id,
+    }),
+});
 ```
 
-**Response 202**：`{"compound_id": "...", "message": "Compound queued"}`。實際結果走 WS：
-- 成功 → `schedule.updated` broadcast。
-- 失敗 → `schedule.compound_failed` notify\_user 給 `requested_by`，state 已 rollback。
+關鍵差異「欄位省略」vs「明示 null」：
+- **欄位缺席**（body 沒有 `pinned_production_date` 這個 key）：pin 狀態維持原樣，僅在 qty/deadline 變動時觸發 case-14 auto-re-pin / silent-drop。
+- **明示 `null`**：unpin。
+- **明示日期**：pin 到那一天（如果已 pinned 就是改 pin 日）。
 
-### 2.3 方法 B — 直連 Redis（不推薦，僅在無法走 HTTP 時用）
+Pydantic `model_fields_set` 區分這兩種「`None`」— body 沒寫 vs explicit null 在 schema 層是不同事件，service 拿來決定要不要走 pin transition 邏輯。
+
+**同步驗證**：`pinned_production_date > requested_delivery_date` 在 PATCH 同步回 422，user 立刻看到錯誤、不用等 WebSocket。
+
+**Pin 失敗（worker 端）**：因為改用 batch admission，**沒有 compound-level rollback**。Producer 端 PATCH 進場前已做兩件事：(1) `SELECT FOR UPDATE` row lock 序列化同訂單的併發 PATCH（避免兩個 producer 各自讀到 stale row 後 enqueue 互斥 compound、worker trip `SegmentTreeInvariantError`）、(2) `is_processing_locked=True` + `status=pending` 預先寫到 DB。Worker 接受該 compound 後才把 `is_pinned` / `pinned_production_date` 寫進 DB；compound 被 batch 二分搜尋 reject 時，worker 走 `_apply_db_action_reject` 清掉 lock、不寫業務欄位 — DB 仍是 pre-PATCH 狀態。
+
+### 2.3 注意事項
+
+- **不再戳 `/schedule/operations`**：raw compound endpoint 已撤掉，前端不會也不該直接打到排程 queue。所有 schema-level 驗證、權限檢查、row lock、`db_action` 都長在 Order CRUD endpoint 裡。
+- **`is_processing_locked` 是 UI 編輯鎖**：Order CRUD 進場時 producer 寫 true、worker accept / reject 後寫 false。前端在這段時間 disable 該列的 inline edit；第二次 PATCH/DELETE 撞到 locked row 會被 producer 直接 409。
+- **`version_id` 是樂觀鎖**：每次寫入自動 bump；client 拿到 409「stale version」要重抓 row 再試。bombard 模式內建 `call_with_retry` 在 409 時自動 re-fetch `version_id` 重試。
+- **`requested_by` 自動帶**：scheduler compound 失敗時 `schedule.compound_failed` 通知該 user，producer 從 JWT 帶 actor_id 過去，**前端不用自己塞**。
+- **非 scheduling 的 PATCH**（只改 notes / assigned_to）：producer 直接 commit + audit，**不推 compound、不過 worker**，沒有 latency penalty。
+- **Internal `enqueue_compound`**：backend 同 process 內寫測試 / scripts 時可以 `from app.services.schedule_queue import enqueue_compound`；但**跨 process / 第三方 service 沒有對外 endpoint 可走**。
+
+### 2.x 給 Order CRUD service 開發者（內部實作 reference）
+
+下面這段給維護 `app/services/order.py` 的人看 — 一般前端 / 第三方使用者跳過。
 
 ```python
+# app/services/order.py — 內部 builder
 from app.services.schedule_queue import enqueue_compound
-from app.schemas.schedule import ScheduleCompoundRequest, ScheduleOpInCompound
-# ↑ 這條路徑只有同進程 Python 才走得通；微服務之間請用 HTTP。
+
+# create_order: producer 寫 is_processing_locked=True + commit → 自動推 [add]
+# update_order: get_by_id_for_update 取 row lock → 預先寫 status=pending /
+#   is_processing_locked=True + commit → _build_patch_compound 依 qty / deadline /
+#   pin 三軸 build ops + db_action（new_pinned_production_date_set 標 worker 該不該
+#   寫 pin columns）→ enqueue_compound
+# delete_order: 同 update_order 走 row lock，build [unpin?, remove]
 ```
 
-直接戳 Redis 不會 self-validate（schema 跳過），請避免。
+`get_by_id_for_update` 是 `app/repositories/order.py` 新加的 helper（`.with_for_update()`）— 對同一筆訂單的併發 PATCH/DELETE 在 SELECT 階段就序列化。沒有這把 row lock，兩個快速連續 PATCH 可以各自從同一份 row state 出發 build compound、雙雙 enqueue 進 Redis，worker 處理第二個時觸發 `SegmentTreeInvariantError`。
 
-### 2.4 修改訂單 — Order CRUD 已自動處理
+**Worker 端互補防禦（`SegmentTreeInvariantError` per-leaf 隔離）**：萬一 invariant break 還是發生（producer 沒走 lock 的歷史路徑、或真的 state corruption），`_commit_accepted_batch` 對每筆 leaf op 包 try/except — 受影響的 compound 收進 `failed` bucket、走 reject path（清 lock、不寫業務欄位）、WS 推 `schedule.compound_failed`；同 batch 其他 compound 繼續處理，不會被毒到。原本的設計是 raise 冒到 task 外層 → 整支 task fail → 整批 N 個 healthy compound 一起死，bombard pin race 偶爾炸一個會把整輪 drain 雪崩。
 
-Phase 2 之後，**只要呼叫 backend 的 Order CRUD endpoint，scheduler compound 會自動建好推進佇列**，不需要第三方服務 / 前端額外打 `/schedule/operations`：
-
-| Order CRUD | service 自動 build 的 compound |
-|---|---|
-| `POST /api/v1/orders` | `[add(新)]` |
-| `PATCH /api/v1/orders/{id}` 改 qty / deadline（非 pinned） | `[remove(舊), add(新)]` |
-| `PATCH /api/v1/orders/{id}`（pinned，新 deadline ≥ pin 日 AND 新 qty ≤ 舊 qty） | `[unpin, remove, add, pin(原 pin 日)]` — 自動 re-pin |
-| `PATCH /api/v1/orders/{id}`（pinned，其他情況） | `[unpin, remove, add]` — silent drop pin |
-| `PATCH /orders/batch-update` | 每筆訂單獨立 compound，內部規則同上 |
-| `DELETE /api/v1/orders/{id}`（非 pinned） | `[remove]` |
-| `DELETE /api/v1/orders/{id}`（pinned） | `[unpin, remove]` |
-
-「`group` 是 shrink 還是 grow」由 service 端按 `defer / qty 變小 → shrink`、`advance / qty 變大 → grow` 自動推導，所有 ops 都標同一個 group 進 compound。
-
-**直接戳 `/schedule/operations` 的場景**只剩兩種：
-1. **手動 pin / unpin**（user 在 UI 上按「鎖到 5/12」按鈕） — 前端送 1-op compound 帶 `pin` 或 `unpin`。
-2. **第三方非標準業務 op**（譬如另一條 service 想直接動排程）。
-
-### 2.5 注意事項
-
-- **`requested_by` 一定要填**：compound 失敗時用這個 user id 推 `schedule.compound_failed` 通知。
-- **`op_count` 必須等於 `len(ops)`**：schema 跟 worker 都會驗，不一致直接 422 / `schedule.compound_failed`。這是 producer 對 payload 自我宣告長度的契約，網路截斷或人工改 payload 漏掉一筆 op 都能立刻被偵測到。
-- **`ops` 沒上限**：compound 可以是 1 筆 op（pin 單筆訂單）也可以是 30 筆 op（複雜的 batch 改動）— 業務動作要做幾步就放幾步。worker atomic 處理整個 compound。
-- **不需要等排程跑完**：endpoint 回 202 就可以接著做事，排程是 async。
-- **同 compound 內 ops 必須同 `order_id`**：schema 自帶 validator，多 order 一次直接 422。
-- **Compound 內 ops 順序由 producer 決定**（worker 不重排）；service 內建 builder 已經把順序排好。手動戳的話注意 `unpin → remove → add → pin`（如有）的拓樸。
-- **權限**：`POST /schedule/operations` 要 `scheduler+`。從 Order CRUD 內部呼叫時要帶 scheduler 等級的 service token。
-
-### 2.6 Pin / Unpin 手動操作
-
-```python
-import httpx
-import uuid
-
-# UI 按「把訂單 pin 到 5/12」按鈕
-def pin_order(order, actor, pin_day):
-    ops = [{
-        "op": "pin",
-        "order_id": str(order.id),
-        "order_number": order.order_number,
-        "wafer_quantity": order.wafer_quantity,
-        "deadline": order.requested_delivery_date.isoformat(),
-        "fake_deadline": pin_day.isoformat(),
-    }]
-    httpx.post(URL, json={
-        "compound_id": str(uuid.uuid4()),
-        "group": "grow",
-        "op_count": len(ops),
-        "requested_by": str(actor.id),
-        "ops": ops,
-    })
-
-# 解 pin
-def unpin_order(order, actor):
-    ops = [{
-        "op": "unpin",
-        "order_id": str(order.id),
-        "order_number": order.order_number,
-        "wafer_quantity": order.wafer_quantity,
-        "deadline": order.requested_delivery_date.isoformat(),
-    }]
-    httpx.post(URL, json={
-        "compound_id": str(uuid.uuid4()),
-        "group": "shrink",
-        "op_count": len(ops),
-        "requested_by": str(actor.id),
-        "ops": ops,
-    })
-```
-
-失敗時拿到 `schedule.compound_failed`（`failed_op="pin"` 或 `"unpin"`），**state 已 rollback** — pin 失敗的訂單仍保持原樣（未 pinned）；unpin 失敗的訂單仍是原 pin 狀態。
-
-`is_pinned` / `pinned_production_date` 由 worker 處理完 compound 之後 `apply_schedule` 寫回 DB；compound 失敗就不會寫，DB 維持舊值。
-
-`is_processing_locked` 是獨立的「UI 編輯鎖」flag — Order CRUD 時設 true、`apply_schedule` 跑完設 false。前端拿來在那段時間 disable 該列的 inline edit。
+**Materializer 端互補防禦（`apply_schedule` SAVEPOINT）**：`rebuild_schedule_task` 跟 `materialize_schedule_task` 跑完整 `apply_schedule` 時，逐筆 `set_schedule_dates` 在 `db.begin_nested()`（PostgreSQL SAVEPOINT）內執行。某筆撞到 `StaleDataError`（producer race bump version_id）只 rollback 該筆 SAVEPOINT、不毒到 outer session，繼續處理下一筆 — 不然 `PendingRollbackError` 會卡死整批寫入跟 audit log。
 
 ---
 
@@ -196,8 +125,9 @@ def unpin_order(order, actor):
 | `GET` | `/capacity` | order_manager+ | 未來 30 天剩餘產能的**前綴和**序列，dashboard 畫產能圖用 |
 | `GET` | `/pending-ops` | order_manager+ | 排隊中 compound 的 drain 順位快照（rank=1 = 下一個會被 worker 處理） |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建排程 state（async；不會 block） |
-| `POST` | `/operations` | scheduler+ | 推 compound 進佇列（Phase 2 後 Order CRUD 自動處理大部分情況，前端只在「手動 pin / unpin」時直接打） |
 | `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound（前端「取消」按鈕）。200 = 取消成功；409 = worker 已開始處理，無法取消；404 = compound id 未知 |
+
+> Raw `POST /schedule/operations` 已移除。pin / unpin 改用 PATCH 的 `pinned_production_date` 欄位，所有 compound 由 Order CRUD service 內部 enqueue（§2.1）。`DELETE /operations/{compound_id}` 保留，給前端「取消尚未處理的動作」按鈕用 — secondary index `schedule:pending_ops:by_compound_id` 由 `enqueue_compound` 一邊維護。
 
 錯誤回應一律走 unified envelope：
 ```json
@@ -523,11 +453,11 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 **Q: 我推了 op 但前端沒收到 `schedule.updated`？**
 A: 檢查 (1) Celery worker 在跑嗎、(2) `schedule:status` 卡在 `running` 嗎、(3) WebSocket 連線還在嗎、(4) Redis pub/sub 通的嗎（用 §4.5 偷看）。
 
-**Q: `schedule.add_failed` 的訊息收不到？**
-A: 通常是推 op 時 `requested_by` 沒填，或填的 user_id 沒連 WebSocket。
+**Q: `schedule.compound_failed` 的訊息收不到？**
+A: 通常是 (1) 該 user 沒連 WebSocket，或 (2) Redis pub/sub 中斷。`requested_by` 是後端從 JWT 帶的，前端不用自己填。
 
 **Q: 改 deadline 之後排程結果不對？**
-A: 確認你拆成 `remove` + `add` 兩筆，且兩筆 `group` 一致。詳見 §2.4。
+A: 後端 service 已經自動拆 `remove + add` 並標 group；如果結果還是不對，先看 `GET /schedule/pending-ops` 確認 compound 進佇列了沒，再看 worker log 有沒有 `schedule.compound_failed`。手動改前端組 compound 已沒有意義（raw endpoint 已撤）。
 
 **Q: 我能不能直接讀 / 寫 Redis state？**
 A: **不要**。state 是序列化的 `SchedulerState`，外人改它幾乎一定會破壞線段樹的不變式。要寫 state 就走 `POST /schedule/rebuild`。要讀的話可以 `from app.services.scheduling import SchedulerState; SchedulerState.from_json(raw)`。

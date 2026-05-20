@@ -86,15 +86,19 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 
 全部以 `/api/v1/schedule` 為 prefix，定義在 `backend/app/api/v1/schedule.py`。錯誤一律走 unified envelope `{"error": {"code": <int>, "message": "...", "details": [...]}}`。
 
-五個 endpoint 一覽（細節見下方各節）：
+endpoint 一覽（細節見下方各節）：
 
 | Method | Path | 權限 | 一句話 |
 |---|---|---|---|
 | `POST` | `/trigger` | scheduler+ | 手動補觸發排程任務 |
-| `POST` | `/operations` | scheduler+ | 推一筆訂單操作進 `pending_ops` |
 | `GET`  | `/status` | order_manager+ | 排程 worker 的 lifecycle snapshot |
 | `GET`  | `/result` | order_manager+ | 目前已排定的訂單清單 |
+| `GET`  | `/capacity` | order_manager+ | 未來 30 天剩餘產能前綴和 |
+| `GET`  | `/pending-ops` | order_manager+ | 排隊中 compound 的順位快照 |
+| `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建線段樹與 pq（async；任務自己等 in-flight 結束） |
+
+> **`POST /schedule/operations` 已於 P1-2 移除**。原本給「raw 推 compound 進佇列」用的對外 endpoint 沒有了 — pin / unpin 折進 PATCH 的 `pinned_production_date` 欄位、其他 compound 都由 Order CRUD service 內部 `enqueue_compound`。動機：raw endpoint 沒走 row lock / `db_action` / business validation，跟 PATCH/DELETE 比起來是「結構上較弱保護」的併排入口；折掉它讓 producer surface 收斂到單一條，所有 race 都用同一道 row lock 防守。詳見 §3.3。
 
 #### `POST /schedule/trigger` — 手動補觸發排程
 
@@ -120,72 +124,91 @@ WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：
 - 演算法 / state schema 升版後想 reset 一次完整跑。
 - QA、開發本機除錯重跑驗證。
 
-> 正常運作下根本不會被呼叫 — Order CRUD 推 op 時 `POST /operations` 自己就會 `.delay()`，worker 跑完還會自我 re-trigger 直到 `pending_ops` 清空。`/trigger` 是「自動鏈斷掉」或「不經 op 想強制重排」的逃生口。
+> 正常運作下根本不會被呼叫 — Order CRUD service 內部呼叫 `enqueue_compound` 時就會條件式 `.delay()`，worker 跑完還會自我 re-trigger 直到 `pending_ops` 清空。`/trigger` 是「自動鏈斷掉」或「不經 op 想強制重排」的逃生口。
 
 ---
 
-#### `POST /schedule/operations` — 推訂單 compound 進 pending_ops
+#### ~~`POST /schedule/operations`~~ — 已移除（P1-2）
 
-> **Phase 2 變更**：endpoint 已從「一次接一筆 op」改成「一次接一個 compound」。Compound 是一組 N 筆 leaf ops（沒上限，常見的 PATCH-pinned-order 是 3-4 筆、batch 動作可以更多）。**worker 端走 batch admission**：一次撈全部 pending compound、二分搜尋最大可行 prefix `[1..k]`、整批接受。可行性檢查在 state 變動前就做，所以單筆 compound 內部不需要 saga / rollback。第一筆 compound 自己塞不下時走 reject + WS `schedule.compound_failed`。詳見 §4.2。Order CRUD 內部已自動 build 對應 compound（見下表），多數 producer 不必直接戳這支 endpoint。
+原本給「外部推 compound」用的對外 endpoint 已撤掉。所有 compound 改由 Order CRUD endpoint 內部 build + enqueue。動機與遷移路徑：
 
-**功能**：接收一筆 `ScheduleCompoundRequest`，透過 `services.schedule_queue.enqueue_compound` 推進 sorted set（一個 compound = 一個 member）。`schedule:status` 是 `idle` / `failed` 就 `celery_app.send_task("scheduling.run")` 觸發 worker；`running` 就讓 in-flight task 自己 re-trigger 撿。
+| 原本的場景 | 現在怎麼做 |
+|---|---|
+| 建單 / 改單 / 刪單 推 compound | Order CRUD endpoint 本身：`POST /api/v1/orders` / `PATCH /api/v1/orders/{id}` / `DELETE /api/v1/orders/{id}` — service 層內部呼叫 `enqueue_compound` |
+| 手動 pin 訂單到某天 | `PATCH /api/v1/orders/{id}` body `{"pinned_production_date": "YYYY-MM-DD", "version_id": ...}` |
+| 手動 unpin 訂單 | `PATCH /api/v1/orders/{id}` body `{"pinned_production_date": null, "version_id": ...}` |
+| 第三方非標準 op | 沒有對外路徑了 — 改寫成走 Order CRUD，或在 backend 同 process 用 `from app.services.schedule_queue import enqueue_compound` |
+| 取消尚未處理的 compound | **保留**：`DELETE /api/v1/schedule/operations/{compound_id}`（見下一節） |
+
+**為什麼撤掉而不是保留**：raw `POST /operations` 沒走 row lock、沒帶 `db_action`、沒 business validation（沒查 `is_processing_locked`、沒查 status 是不是 mutable、沒驗 pin 日 ≤ deadline），跟 PATCH/DELETE 比起來是同一個 producer surface 上「結構上比較弱」的併排入口。bombard 的 pin race 之所以一直炸 `SegmentTreeInvariantError`，就是它走 raw endpoint 繞過了 PATCH 的 row lock。把 raw 收掉之後所有 producer 都被同一道 row lock 守住，race 被根除。
+
+**為什麼 `DELETE /operations/{compound_id}` 留著**：取消尚未處理的 compound 是 read-only 操作（從 sorted set 移掉 member、清 secondary index），不會 mutate 訂單 row，所以不需要 row lock 保護。前端「取消」按鈕還會用到。
+
+---
+
+#### `enqueue_compound` — 內部 compound schema（給維護者）
+
+> Raw `POST /schedule/operations` 已撤掉，但**內部** `ScheduleCompoundRequest` schema + `enqueue_compound` helper 還在用 — Order CRUD service 內部 build 完 compound 後呼這支 helper 推進 sorted set。下面是它的 schema 文件。
+
+**呼叫點**：`app/services/order.py::_build_create_compound` / `_build_patch_compound` / `_build_delete_compound` → `enqueue_compound(compound)`（同 process Redis client，沒 HTTP round-trip）。
+
+> **batch admission**：一次撈全部 pending compound、二分搜尋最大可行 prefix `[1..k]`、整批接受。可行性檢查在 state 變動前就做，**沒有 compound-level rollback**。第一筆 compound 自己塞不下時走 reject + WS `schedule.compound_failed`。詳見 §4.2。
+
+**`enqueue_compound` 做的事**：透過 `services.schedule_queue.enqueue_compound` 推進 sorted set（一個 compound = 一個 member）。`schedule:status` 是 `idle` / `failed` 就 `celery_app.send_task("scheduling.run")` 觸發 worker；`running` 就讓 in-flight task 自己 re-trigger 撿。
 
 > sorted-set 的 score 同時編碼了「shrink compound 先於 grow compound」跟「組內 FIFO」（seq），所以 worker 端只是 `ZPOPMIN` 拿下一個 compound 處理。Compound 內 ops 順序由 producer 安排，worker 不重排。
 
-**權限**：`scheduler+`。
-
-**Request body** (`ScheduleCompoundRequest`)：
-```json
-{
-  "compound_id": "uuid",          // 系統會 default_factory 產生；cancel 時要用
-  "group": "shrink" | "grow",
-  "op_count": 3,                  // 必須等於 len(ops)，tamper / truncation 守門
-  "requested_by": "uuid",
-  "ops": [
-    {
-      "op": "add" | "remove" | "pin" | "unpin",
-      "order_id": "uuid",            // 同 compound 內所有 ops 必須同一個 order_id
-      "order_number": "ORD-...",
-      "wafer_quantity": 200,
-      "deadline": "2026-06-15",
-      "fake_deadline": "2026-06-12"  // 只 op="pin" 才填，其他 op 必須省略
-    }
-  ]
-}
+**Compound 物件** (`ScheduleCompoundRequest`，定義在 `app/schemas/schedule.py`)：
+```python
+ScheduleCompoundRequest(
+    compound_id=uuid.UUID(...),     # default_factory 產生；cancel 時要用
+    group="shrink" | "grow",
+    op_count=len(ops),              # 必須等於 len(ops)，tamper / truncation 守門
+    requested_by=uuid.UUID(...),    # 失敗時 schedule.compound_failed 通知這位 user
+    ops=[
+        ScheduleOpInCompound(
+            op="add" | "remove" | "pin" | "unpin",
+            order_id=uuid.UUID(...),    # 同 compound 內所有 ops 必須同一個 order_id
+            order_number="ORD-...",
+            wafer_quantity=200,
+            deadline=date(2026, 6, 15),
+            fake_deadline=date(2026, 6, 12),  # 只 op="pin" 才填，其他 op 必須省略
+        ),
+    ],
+    db_action=CompoundDbAction(...),  # worker 用來決定 accept/reject 時要在 DB 上寫什麼
+)
 ```
+
+`db_action` 三種 `kind`：`"create"` / `"update"` / `"delete"`。Worker accept 時依 spec 把業務欄位（`new_wafer_quantity` / `new_requested_delivery_date` / `new_notes` / `new_assigned_to`、若 `new_pinned_production_date_set=True` 還寫 `is_pinned` + `pinned_production_date`）寫進 row、append audit log；reject 時只清 `is_processing_locked`、不寫業務欄位 — DB 仍是 pre-PATCH 狀態。Spec 詳見 `CompoundDbAction` schema。
 
 Schema-level validation：
 - `ops` 至少 1 筆（沒上限 — 想塞 3 筆、30 筆都行，看業務動作要做幾步）。
-- `op_count` 必須等於 `len(ops)`。不一致就 422。這是 producer 端對 payload「自我宣告長度」的契約，網路截斷或人工改 payload 漏掉一筆 op 時，後端能立刻偵測到。
+- `op_count` 必須等於 `len(ops)`。不一致 → Pydantic raises ValidationError。
 - 所有 ops 必須對同一個 `order_id`（多 order 一次 = 業務 bug）。
 - `op="pin"` 必須帶 `fake_deadline`，其他 op 不得帶。
 
-**Worker 端 double-check**：worker pop 出 compound member 後 也驗一次 `op_count == len(ops)`，不對就直接 `schedule.compound_failed`（`failed_op_index=-1` 表示「不是哪一筆 op 的錯、而是整個 payload 壞掉」），不執行任何 op。這層是給 Redis member 在 enqueue 之後被改壞 / 人工 surgery 弄錯時做的兜底。
+**Worker 端 double-check**：worker pop 出 compound member 後 也驗一次 `op_count == len(ops)`，不對就走 DLQ（ZREM + RPUSH 到 `schedule:pending_ops:dlq` + ERROR log）。這層是給 Redis member 在 enqueue 之後被改壞 / 人工 surgery 弄錯時做的兜底。
 
-**Response 202** (`ScheduleCompoundResponse`)：
-```json
-{ "compound_id": "uuid", "message": "Compound queued" }
-```
-永遠 202 — 結果經 WebSocket 通知。成功 → `schedule.updated` broadcast；失敗 → `schedule.compound_failed` notify\_user（envelope 含 `compound_id` / `failed_op_index` / `failed_op` / `reason` / `rolled_back: true`）。
-
-**Order CRUD 自動 build 的 compound**（service 層的 case-8 smart routing）：
+**Order CRUD 自動 build 的 compound**：
 
 | Order CRUD 動作 | 自動 build 的 compound 內容 | Group |
 |---|---|---|
 | `POST /api/v1/orders` 新增訂單 | `[add(新)]` | grow |
 | `DELETE /api/v1/orders/{id}` 軟刪除（非 pinned） | `[remove(舊)]` | shrink |
 | `DELETE /api/v1/orders/{id}` 軟刪除（**pinned**） | `[unpin, remove(舊)]` | shrink |
-| `PATCH` 改 `wafer_quantity` / `requested_delivery_date`（非 pinned） | `[remove(舊), add(新)]` | shrink（defer / qty 變小）或 grow（advance / qty 變大） |
-| `PATCH` 改（**pinned**，新 deadline ≥ pin 日 AND 新 qty ≤ 舊 qty） | `[unpin, remove(舊), add(新), pin(原 pin 日)]` — **自動 re-pin** | 同上 |
-| `PATCH` 改（**pinned**，其他情況） | `[unpin, remove(舊), add(新)]` — **silent drop pin** | 同上 |
+| `PATCH` 改 `wafer_quantity` / `requested_delivery_date`（非 pinned，沒明示 pin 欄位） | `[remove(舊), add(新)]` | qty 不增 AND deadline 不前 → shrink；否則 grow |
+| `PATCH` 改 qty/deadline（**pinned**，沒明示 pin 欄位）— case-14 auto-re-pin（新 deadline ≥ 舊 pin 日 AND 新 qty ≤ 舊 qty） | `[unpin, remove(舊), add(新), pin(原 pin 日)]` | 同上 |
+| `PATCH` 改 qty/deadline（**pinned**，沒明示 pin 欄位，不滿足 auto-re-pin 條件） | `[unpin, remove(舊), add(新)]` — silent drop pin | 同上 |
+| `PATCH` 帶 `pinned_production_date: "YYYY-MM-DD"`（手動 pin / 改 pin 日） | unpinned → `[(remove,add 如有), pin(新)]`；已 pinned 改日 → `[unpin, (remove,add 如有), pin(新)]` | 三軸 strict-AND；newly-pinning 視為 grow |
+| `PATCH` 帶 `pinned_production_date: null`（手動 unpin） | `[unpin, (remove,add 如有)]` | unpin 本身屬 shrink；若同時 qty/deadline 變緊則 grow |
 | `PATCH` 只改 `notes` / `assigned_to` / `customer_name` 等 | 不推 compound | — |
 | `PATCH /orders/batch-update` | **每筆訂單獨立 1 個 compound**，內部規則同上 | 每筆獨立判斷 |
 
-Auto-re-pin 條件（case 14）：**兩個都要成立**才會在 compound 末尾加上 `pin(舊 pin 日)`：
-1. 新 deadline ≥ 舊 pin 日（否則 pin 日落到 deadline 之後，pin 在物理上不可能滿足）
-2. 新 qty ≤ 舊 qty（否則 pin 那天的 capacity 可能不夠，pin 會在 worker 那邊 fail，整個 compound rollback）
+**Auto-re-pin 條件**（case 14）：兩個都要成立才在 compound 末尾加 `pin(舊 pin 日)` — (1) 新 deadline ≥ 舊 pin 日；(2) 新 qty ≤ 舊 qty。
 
-「把訂單 pin 到某天」或「解除 pin」這兩個獨立 user action 目前**沒有專屬 endpoint**，前端直接打 `POST /schedule/operations` 帶單筆 `[pin]` 或 `[unpin]` 的 compound 就好。
+**Group strict-AND 規則**：shrink 必須 **qty 不增 AND deadline 不前 AND pin 日不前** 全成立；newly-pinning 視為「pin 日往前移」（pull demand from EDF 分布 onto one day → grow）。這保證 shrink compound 的每天 cumulative delta ≤ 0，符合 worker batch-admission halving 的不變式。
+
+**手動 pin / unpin 改用 PATCH**：以前要打 raw `POST /schedule/operations` 帶單筆 `[pin]` 或 `[unpin]` 的 compound — 現在前端送 `PATCH /api/v1/orders/{id}` body `{pinned_production_date: ..., version_id: ...}`。詳見 [`scheduling-integration.md`](./scheduling-integration.md) §2.2。
 
 ---
 
@@ -420,7 +443,9 @@ Auto-re-pin 條件（case 14）：**兩個都要成立**才會在 compound 末�
 
 | Schema | 對應欄位 |
 |---|---|
-| `ScheduleOperationRequest` | `op` (`"add"`\|`"remove"`)、**`group`** (`"shrink"`\|`"grow"`，可省略 — 詳見 §4.3 處理順序)、`order_id`、`order_number`、`wafer_quantity`、`deadline`、`requested_by` |
+| `ScheduleCompoundRequest` | `compound_id`、`group` (`"shrink"`\|`"grow"`)、`op_count`、`requested_by`、`ops: list[ScheduleOpInCompound]`、`db_action: CompoundDbAction`（compound 內部用；raw endpoint 已撤掉，僅內部 `enqueue_compound` 使用） |
+| `ScheduleOpInCompound` | `op` (`"add"`\|`"remove"`\|`"pin"`\|`"unpin"`)、`order_id`、`order_number`、`wafer_quantity`、`deadline`、`fake_deadline`（僅 op=pin） |
+| `CompoundDbAction` | `kind` (`"create"`\|`"update"`\|`"delete"`)、`actor_id`、`new_*` / `old_*` 業務欄位（worker accept 時依此寫 row + audit） |
 | `ScheduleTriggerResponse` | `task_id`、`message` |
 | `ScheduleStatusResponse` | `state` (`"idle"`\|`"running"`\|`"failed"`)、`started_at`、`finished_at`、`task_id`、`error`、`message` |
 | `ScheduleRebuildResponse` | `task_id`、`message`（rebuild 已改 async；skipped 訂單透過 WebSocket `schedule.rebuild_skipped` 抵達） |
@@ -610,15 +635,17 @@ WebSocket 整套已經實作完成，**你不用寫 backend code**。前端只�
 
 > 如果你之後要在 backend 加新的 WebSocket 訊息類型（例如「訂單即將到期」之類），只要在 worker / service 那邊呼叫 `app.services.websocket.broadcast(...)` 或 `notify_user(...)`，傳一個帶獨立 `type` 字串的 payload，前端自動會收到。後端的 endpoint / connection manager / Redis 訂閱端一律不用改。
 
-### 3.3 在 Order CRUD 把操作推進 pending_ops
+### 3.3 Order CRUD 怎麼把操作推進 pending_ops（**唯一入口**）
 
 > ⚠ **重要：使用者欄位的 DB 寫入由 worker 負責，不是 producer**。
 >
-> Producer (`create_order` / `update_order` / `delete_order` / `batch_update_orders`) 只做三件事：(1) 驗證 status + optimistic-lock `version_id`，(2) 把 `is_processing_locked=True`（+ `status=pending` for update）寫進 DB 並 commit（這是 OL 邊界），(3) 帶著 new + old values 把 compound enqueue 進去（schema 新欄位 `db_action: CompoundDbAction`）。`wafer_quantity` / `requested_delivery_date` / `notes` / `is_deleted` / audit log **都在 worker 接受 compound 後才寫**。
+> Producer (`create_order` / `update_order` / `delete_order` / `batch_update_orders`) 只做四件事：(1) `get_by_id_for_update` 取 row-level lock，(2) 驗證 status + optimistic-lock `version_id` + `is_processing_locked` guard，(3) 把 `is_processing_locked=True`（+ `status=pending` for update）寫進 DB 並 commit（這是 OL + row-lock 釋放邊界），(4) 帶著 new + old values build compound 後 `enqueue_compound(compound)`（同 process Redis call）。`wafer_quantity` / `requested_delivery_date` / `notes` / `is_pinned` / `pinned_production_date` / `is_deleted` / audit log **都在 worker 接受 compound 後才寫**。
 >
-> **為什麼**：原本 producer 是「先 commit DB 新值 → 再 enqueue compound」。compound 在 worker 端失敗（capacity_exceeded / deadline_too_far）時 saga rollback 把 state 還原成舊值，但 DB 已經寫了新值 → 永久脫節。例：PATCH qty 1000→9999，worker 拒絕，state 回 1000，DB 留 9999，前端看到 `wafer_quantity=9999` 但 `daily_breakdown` 加總 = 1000，8999 wafer 憑空消失。改成 worker single-owner：DB 只在 state 接受時寫，永遠跟 state 一致；失敗時 producer 從沒寫過 → 零補償、零脫節。
+> **為什麼 worker single-writer**：原本 producer 是「先 commit DB 新值 → 再 enqueue compound」。compound 在 worker 端失敗（capacity_exceeded / deadline_too_far）時 saga rollback 把 state 還原成舊值，但 DB 已經寫了新值 → 永久脫節。例：PATCH qty 1000→9999，worker 拒絕，state 回 1000，DB 留 9999，前端看到 `wafer_quantity=9999` 但 `daily_breakdown` 加總 = 1000，8999 wafer 憑空消失。改成 worker single-owner：DB 只在 state 接受時寫，永遠跟 state 一致；失敗時 producer 從沒寫過 → 零補償、零脫節。
 >
 > 不選「producer 先 commit、worker 失敗時補償寫回舊值」是因為補償方案需要兩處 ownership（每加一個 column 就要兩邊同步維護），而且 producer commit 跟 compound enqueue 之間若 process crash，DB 已寫新值但 compound 沒進 queue → 永久脫節、沒地方補償。
+>
+> **為什麼 `get_by_id_for_update` row lock**（P1-2 round-2 加的）：兩個快速 PATCH（或 PATCH + DELETE）打到同一筆訂單時，沒 row lock 的話兩個 producer 可以**同時讀到同一份 row state**、各自 build compound 帶相同的 old values、兩個都 enqueue 進 Redis。Worker 跑第一個 compound 時 `remove(舊)` + `add(新)` 把 state 改了；跑第二個時 `remove(舊)` 拿舊 qty / deadline 去 forward give-back，但訂單已經是新 qty / deadline → trees 對不上 → `SegmentTreeInvariantError`。`SELECT FOR UPDATE` 讓兩個併發 PATCH 在 SELECT 階段就 serialize，第二個會 block 到第一個 commit、然後讀到 `is_processing_locked=True` → 直接 409，永遠不會 build 出 stale compound。
 >
 > **API 契約變化**（前端要知道）：
 > - `PATCH /orders/{id}` 仍回 200，但 body 是 **locked + pre-PATCH values**；新值要等 `schedule.compound_accepted` WebSocket 後 refetch。
@@ -627,75 +654,65 @@ WebSocket 整套已經實作完成，**你不用寫 backend code**。前端只�
 >
 > 純改 `notes` / `assigned_to`（不影響排程）的 PATCH 不走 compound，producer 直接 commit + audit；不為了一致性付額外延遲。`is_processing_locked` 仍由 producer 寫，因為它只是 UI lock hint（避免 user 連按兩下）、不是 source of truth，原子寫 lock + `version_id` bump 就達到 PATCH-twice 防呆。
 >
-> **Producer 端還有一道 explicit guard：`is_processing_locked=True` 的 row 第二次 PATCH/DELETE 直接 409**（`update_order` / `delete_order` 開頭檢查；`batch_update_orders` 把 locked row 加進 skipped）。原本只靠 `version_id` bump 偷防 — 兩個快速 PATCH 落地時，第二個會因為 stale version_id 失敗。但這個保護不夠：如果第二個 PATCH **沒**帶 version_id（例如 batch update 或 future API 變動），就會繞過防呆、enqueue 第二個 compound 疊在第一個之上，audit log 順序變混亂、前端 lock UI 失效。所以多加一條顯式 409 既快又清楚。
+> **Producer 端還有一道 explicit guard：`is_processing_locked=True` 的 row 第二次 PATCH/DELETE 直接 409**（`update_order` / `delete_order` 開頭檢查；`batch_update_orders` 把 locked row 加進 skipped）。Row lock + 這個 explicit 409 是兩道互補的防禦 — row lock 防 read race，explicit 409 防「第二個 PATCH 沒帶 version_id 繞過 OL」。
 >
-> **`db_action.old_*` 欄位在 delete compound 內被 worker 用於 audit**：`_build_delete_compound` 把 pre-delete 的 `wafer_quantity` / `requested_delivery_date` / `notes` / `assigned_to` 都塞進 `db_action`；worker accept 時把這四個欄位填進 `audit_logs.old_value`。沒有這個 snapshot 的話，`order.cancelled` 那筆 audit 只記 `status: scheduled → cancelled` + `is_deleted: false → true`，要回答「這張訂單被取消時 qty / deadline 是多少」就得 cross-reference 別的 audit 紀錄 — self-contained 比較好查。
+> **`db_action.old_*` 欄位在 delete compound 內被 worker 用於 audit**：`_build_delete_compound` 把 pre-delete 的 `wafer_quantity` / `requested_delivery_date` / `notes` / `assigned_to` 都塞進 `db_action`；worker accept 時把這四個欄位填進 `audit_logs.old_value`。Update compound 也帶 `old_pinned_production_date` / `old_is_pinned` 給 worker 寫 audit。
 >
 > **`_apply_db_action_reject` 防禦 `in_production` status**：reject path 預設「DB 沒被產品端寫過 → 清 lock + 用 `scheduled_production_date` 推導 status」。但若未來放寬 `MUTABLE_STATUSES` 讓 in_production row 也能 PATCH（例如改 notes），這條 reject 路徑會把 in_production 訂單默默 demote 回 `scheduled` — 跟 §4.4 P0-1 為 `set_schedule_dates` 加的防禦對稱。所以 reject path 顯式 `if status == in_production: return`，今天不可達、明天放寬時也不會踩雷。
 
-訂單**送進 producer service** 後推 compound + 觸發排程。**操作對應**（每個 compound 都要帶 `group` 標記，省略時 worker 退回 `op`-based 預設，單純 add / delete 沒問題、複合更新就會錯）：
+訂單**送進 producer service** 後推 compound + 觸發排程。**沒有對外 raw 排程 API** — 從 `app/api/v1/orders.py` 進來的 Order CRUD endpoint 是唯一寫入路徑。**操作對應**：
 
-| Order 動作 | 推進 `pending_ops` 的 op | `group` |
+| Order 動作 | 推進 `pending_ops` 的 ops | `group` |
 |---|---|---|
-| 新增訂單 | 1 筆 `add` | `grow` |
-| 取消 / 軟刪除 | 1 筆 `remove`（用刪除前的 quantity / deadline） | `shrink` |
-| 延後 deadline（更晚的 `requested_delivery_date`） | `remove`（舊 deadline）+ `add`（新 deadline） | 兩筆都 `shrink` |
-| 縮減 quantity（更小的 `wafer_quantity`） | `remove`（舊 qty）+ `add`（新 qty） | 兩筆都 `shrink` |
-| 提前 deadline | `remove`（舊）+ `add`（新） | 兩筆都 `grow` |
-| 增加 quantity | `remove`（舊）+ `add`（新） | 兩筆都 `grow` |
-| 同時改：qty 跟 deadline 反向變化（一邊鬆一邊緊） | `remove` + `add` | **兩邊都不變緊才標 `shrink`**（讓所有 demand 真的變鬆的先跑完，整個 horizon 騰出空間，再讓 grow phase 動）。`_build_patch_compound` 的實作：`group = "shrink" if (qty_non_growing AND deadline_non_earlier) else "grow"`。Strict-AND 規則保證 shrink-group compound 的每天 cumulative delta ≤ 0，這是 worker batch-admission halving 的不變式前提（drop 尾巴 compound 不會把 prefix 從 feasible 變 infeasible）；早期版本用 OR 規則會把「qty 變大但 deadline 延後」之類的 net-additive compound 誤標 shrink，導致 self-infeasible compound 進 queue 後被 binary-search 直接 reject。 |
+| `POST /orders` 新增 | 1 筆 `add` | `grow` |
+| `DELETE /orders/{id}` 軟刪除（非 pinned） | 1 筆 `remove`（用刪除前的 qty / deadline） | `shrink` |
+| `DELETE /orders/{id}` 軟刪除（pinned） | `unpin + remove` | `shrink` |
+| `PATCH /orders/{id}` 延後 deadline 或縮減 qty | `remove`（舊）+ `add`（新），加上 pin 相關 ops | strict-AND ↓ |
+| `PATCH /orders/{id}` 提前 deadline 或增加 qty | `remove`（舊）+ `add`（新），加上 pin 相關 ops | `grow` |
+| `PATCH /orders/{id}` `pinned_production_date: "YYYY-MM-DD"` | `pin(target)`（若需要 qty/deadline 改，前面接 `unpin?, remove, add`） | strict-AND ↓ |
+| `PATCH /orders/{id}` `pinned_production_date: null` | `unpin`（若需要 qty/deadline 改，後面接 `remove, add`） | strict-AND ↓ |
+| `PATCH /orders/batch-update` | 每筆訂單獨立 1 個 compound | 每筆獨立判斷 |
 
-> 演算法不認得 modify，由呼叫方拆成 `remove` + `add`，且**兩筆必須打進同一個 group**（worker 是「shrink 全跑完才開始 grow」、組內 FIFO，§4.3 解釋為什麼）。
-> `requested_by` 必填 — `add` 失敗時 worker 用它呼叫 `websocket.notify_user(...)`。
-
-兩種接法擇一：
-
-**3.3.A（推薦）打 `POST /schedule/operations`**
-
+**Group strict-AND 規則**（`_build_patch_compound` 的實作）：
 ```python
-import httpx
-
-httpx.post(
-    "http://backend/api/v1/schedule/operations",
-    json={
-        "op": "add",
-        "group": "grow",            # 新增 / 提前 / 增量 → grow；刪除 / 延後 / 縮減 → shrink
-        "order_id": str(order.id),
-        "order_number": order.order_number,
-        "wafer_quantity": order.wafer_quantity,
-        "deadline": order.requested_delivery_date.isoformat(),
-        "requested_by": str(actor.id),
-    },
-    headers={"Authorization": f"Bearer {service_token}"},
-)
+qty_non_growing      = new_qty      <= old_qty
+deadline_non_earlier = new_deadline >= old_deadline
+pin_non_earlier      = (final_pin_day >= old_pin_day) if both_pinned
+                       else False if newly_pinning
+                       else True
+group = "shrink" if (qty_non_growing and deadline_non_earlier and pin_non_earlier) else "grow"
 ```
 
-`POST /schedule/operations` 自動處理 INCR + ZADD 與條件式 `.delay()`（status 不為 `running` 才觸發）。權限 `scheduler+`。
+三軸都不變緊才 shrink；任一變緊 → grow。保證 shrink compound 的每天 cumulative delta ≤ 0，符合 worker batch-admission halving 的不變式（drop 尾巴 prefix 不會把可行性翻盤）。早期 OR 規則會把「qty 變大但 deadline 延後」之類 net-additive compound 誤標 shrink，導致 self-infeasible compound 進 queue 後 binary-search 直接 reject。
 
-**3.3.B 程序內直連 Redis**
+> 演算法不認得 modify，由 service 拆成 `remove` + `add`，**兩筆同 group 同 compound**（worker 是「shrink 全跑完才開始 grow」、組內 FIFO，§4.3 解釋為什麼）。
+> `requested_by` 必填 — compound 失敗時 worker 用它呼叫 `websocket.notify_user(...)`，producer 從 JWT actor 帶過去。
 
-省 HTTP round-trip，但 service 層多 Redis / Celery 耦合：
+**唯一接法：producer 內呼叫 `enqueue_compound`**
 
 ```python
-import json
-from redis import Redis
-from app.core.config import get_settings
-from app.services.scheduling import (
-    PENDING_OPS_KEY,
-    PENDING_OPS_SEQ_KEY,
-    score_for_op,
-)
-from app.workers.scheduling import run_scheduling_task
+# app/services/order.py 內部範例：update_order
+order = order_repo.get_by_id_for_update(db, order_id)   # ← row lock
+# ... validation: status / version_id / is_processing_locked / pin_day <= deadline ...
 
-_redis = Redis.from_url(str(get_settings().REDIS_URL), decode_responses=True)
-seq = _redis.incr(PENDING_OPS_SEQ_KEY)
-payload = {"op": "add", "group": "grow", "_seq": seq, ...}
-_redis.zadd(PENDING_OPS_KEY, {json.dumps(payload): score_for_op(group="grow", seq=seq)})
-run_scheduling_task.delay()
+compound = _build_patch_compound(
+    order=order,
+    new_qty=new_qty,
+    new_deadline=new_deadline,
+    actor_id=actor.id,
+    pin_day_set=("pinned_production_date" in req.model_fields_set),
+    new_pin_day=req.pinned_production_date,
+    # ... notes / assigned_to passthrough ...
+)
+
+order.status = OrderStatus.pending
+order.is_processing_locked = True
+db.commit()   # ← producer 邊界：lock 釋放、version_id bump、row 對其他 producer 可見
+
+enqueue_compound(compound)   # ← 同 process Redis call；條件式 .delay() 觸發 worker
 ```
 
 > Redis key 常數跟 `score_for_op` 編碼住在 `app/services/scheduling.py`（producer ↔ consumer 的契約屬於 services 層），不在 `app/workers/scheduling.py`。Celery task object（`run_scheduling_task` / `rebuild_schedule_task`）才從 `workers/` 進來 — 這是 api → workers 唯一允許的依賴方向。
-
 > 排程執行中又有新操作進來不需要特別處理 — task 結束時會自動檢查 `pending_ops` 並再次 `.delay()` 自己。
 
 ---
@@ -721,13 +738,17 @@ run_scheduling_task.delay()
 
 所以「pinned 把今天吃滿但 pq 還有 dl=today 訂單」這個 state 在 admission 正確的前提下**不可達**。reviewer 提出的 P1-1 場景（advance_day 之後該 pq 訂單卡死）的前提條件因此排除掉。`tests/services/test_scheduling.py::test_p1_1_invariant_*` 三個測試把這個 invariant 鎖住 — 如果後續有人改 admission control 把這個保證打破，test 立刻紅燈。
 
-**Invariant break 時的處理：`_apply_remove_to_trees` 殘餘 → raise**
+**Invariant break 時的處理：`SegmentTreeInvariantError` per-leaf 隔離**
 
 remove 的 forward give-back 走完還有 `remaining > 0`，代表線段樹的 obligation 跟訂單實際 quantity 對不上 — state 已腐化。如果只 log warning 然後讓演算法繼續跑，後續所有 `compute_schedule` 結果都會被污染，materializer 還會把錯誤 schedule 寫進 DB，前端看到不對的數字、完全沒人會發現出錯。
 
-選擇 raise `RuntimeError("invariant broken")` 而不是 return 一個 `status="capacity_exceeded"` 的 `ScheduleResult`：invariant break 是 programming bug / state corruption，不是業務 input 錯誤。用 exception 是要讓 stack trace 進 Sentry / log shipper，讓 ops 知道「這次失敗不是 user 的問題」。`status` 是業務語意失敗的 channel，混用會誤導。
+選擇 raise `SegmentTreeInvariantError(RuntimeError)`（subclass 以便 worker 精準 catch）而不是 return 一個 `status="capacity_exceeded"` 的 `ScheduleResult`：invariant break 是 programming bug / state corruption，不是業務 input 錯誤。用 exception 是要讓 stack trace 進 Sentry / log shipper，讓 ops 知道「這次失敗不是 user 的問題」。`status` 是業務語意失敗的 channel，混用會誤導。
 
-Batch admission 改寫之後，這個 raise 會冒到 `run_scheduling_task` 的外層 except，把整支 task 寫 `status=failed` 並 re-raise。注意這跟舊 saga 設計差異很大：以前一個 compound 的 invariant break 只壞那一個 compound、其他 compound 繼續；現在 batch tree update 是一次性的，一旦 invariant 出問題代表整個 state 已經污染，整支 task 失敗是正確姿勢（state 不該繼續被汙染的演算法操作，ops 介入手動 rebuild）。實務上不會發生（`is_batch_feasible` 已經先驗過容量），這條 path 純粹是 defensive — 如果觸發了，就是真有 state corruption 要查。
+**Worker 端 per-leaf try/except 隔離**（Bug 1 C 修法）：原本 `_apply_remove_to_trees` raise 會冒到 `run_scheduling_task` 外層 except，**整支 task 寫 status=failed 並 re-raise — 整批 batch 都被毒到、後面 N 個 healthy compound 一起死**。實務上看到的失敗模式是 bombard pin race：上千個併發 PATCH 偶爾炸一個 invariant break，連帶把同一輪 drain 的其他 compound 一起拒，狀態雪崩。修法是 `_commit_accepted_batch` 內逐 leaf `try: _apply_compound_leaf_structural(...) except SegmentTreeInvariantError: failed.append(compound); logger.error(...)`，把被毒到的 compound 收進 `failed` bucket、繼續處理其餘 compound。Failed compound 的 `db_action` 走 reject path（清 `is_processing_locked`、不寫業務欄位），WS 推 `schedule.compound_failed`。
+
+**為什麼用 subclass 而不是直接 `except RuntimeError`**：subclass 讓 worker 只精準 catch 演算法 invariant break，**不會誤吃** Python 標準 `RuntimeError`（例如 segfault、deadlock 之類的 system-level error）— 那種真的要冒到外層讓 task fail。`except RuntimeError` 太粗、`except Exception` 更粗，subclass 是「精準 catch」的標準姿勢。
+
+**Producer 端：row lock 防 read race**：如 §3.3 所述，`update_order` / `delete_order` 用 `get_by_id_for_update`（`SELECT FOR UPDATE`）序列化同訂單的併發 PATCH，避免兩個 producer 各自讀到同一份 stale row 後 build 互斥 compound、最後 worker 第二個 compound trip invariant。Row lock + per-leaf try/except 是兩道互補防禦 — row lock 把 race 從 producer 端杜絕；per-leaf try/except 是萬一還是觸發（其他 producer 沒走 lock，或者真有 state corruption），blast radius 限縮到單一 compound。
 
 #### 4.1.2 PQ / pinned 資料結構與複雜度
 
@@ -942,7 +963,7 @@ waiter flag 解掉了「run_task #1 retrigger 跟 waiter 同時跑」這條 race
 修法：waiter 在 `_wait_for_idle_run` 結束之後、開始動 state 之前先 `_set_status("running")`，body 正常結束時在 inner success path 清回 `idle`。從這時起：
 
 - `POST /schedule/trigger` 看到 `running` → 直接回 409，不會在背後偷偷打另一支 run_task
-- `POST /schedule/operations` 也只會把新 op ZADD 進佇列，**不會** `run_scheduling_task.delay()`（同一支 endpoint 也是 status != running 才 delay），等到 waiter 結束、status 回 idle、且 zcard > 0 時 waiter 自己會 `.delay()`，所以也不會丟 op
+- Order CRUD service 內部 `enqueue_compound` 也只會把新 compound ZADD 進佇列，**不會** `run_scheduling_task.delay()`（helper 內部也是 status != running 才 delay），等到 waiter 結束、status 回 idle、且 zcard > 0 時 waiter 自己會 `.delay()`，所以也不會丟 op
 - inner exit 跟 outer waiter-flag finally 是兩層，先還 status 再清 flag，順序剛好讓「有人剛好在 status 還沒翻 idle 之前 retrigger」這個邊界永遠看到 status=running
 
 例外處理（PR-review 補強之後的契約）：waiter body 任何一步丟例外時，inner `except` 會把 status 寫成 **`failed`**（不是 `idle`），帶著 `error=str(exc)` 跟 `finished_at`，然後 re-raise。這跟舊版「不論成敗都還 idle」是有意的差異：原本的設計把 `failed` 當成 run_task 專屬的 sentinel，但實務上 `GET /schedule/status` 是 ops 唯一能看到「排程是否健康」的地方，把 advance_day / rebuild 失敗藏成 idle 等於是在掩蓋錯誤。改成 `failed` 之後：
@@ -1090,11 +1111,15 @@ worker 端的實作是「**每跑完一筆就重新挑下一筆**」而不是「
 
 1. `order_repo.clear_scheduled_dates(db)` 一次性清空所有 `status='scheduled'` 訂單的 `scheduled_production_date` 與 `expected_delivery_date`
 2. 把同一張 order 跨多天的 `ScheduledResult` 折成 `(earliest, latest)`
-3. 對每筆訂單呼叫 `order_repo.set_schedule_dates(db, ...)` 寫回兩個日期、把 `status` 改為 `scheduled`
+3. 對每筆訂單在 **SAVEPOINT**（`db.begin_nested()`）內呼叫 `order_repo.set_schedule_dates(db, ...)` 寫回兩個日期、把 `status` 改為 `scheduled`；遇到 `StaleDataError` 就 `logger.warning("order.schedule.apply_stale_skipped", ...)` continue，**不毒到 outer transaction**
 4. 對每筆訂單**雙寫**稽核：
    - `audit_log_repo.create(db, ..., user_id=None, resource_type="order", resource_id=order_id, new_value={…})` 把一筆 row 寫進 `audit_logs` 資料表（與 commit 同 transaction），確保「這張訂單什麼時候被排到哪天」可以從 DB 直接查出（`docs/DEVELOPMENT_GUIDELINES.md §6` 對 user-visible mutation 的稽核要求 — 只寫 stdout 在 log shipper 掉資料時就找不到了）
    - `emit_audit_log(action="order.scheduled", actor_id=None, ...)` 額外發一筆 ECS-compliant stdout log 給 Kibana / Elastic
 5. `db.commit()`（同時 flush DB 上面新增的 audit_log row）
+
+**為什麼 step 3 要 SAVEPOINT**（Bug 2 修法）：`set_schedule_dates` 對單筆訂單做 `UPDATE` 時可能撞到 `StaleDataError`（樂觀鎖：worker 上次讀的 `version_id` 已被 producer 端 PATCH bump 過）。原本只有一道 outer transaction，任何一筆訂單 raise 都會把 session 推進 `PendingRollbackError` 狀態 — **後續所有訂單的寫入都會被拒、加上 audit log 也寫不進去**。`rebuild_schedule_task` 觸發完整 apply_schedule 時，這個失敗模式在 bombard 場景偶爾出現：一筆 stale 整批毀。
+
+修法用 `db.begin_nested()`（PostgreSQL SAVEPOINT），每筆訂單一個內部小 transaction：stale 那筆 raise → SAVEPOINT rollback 只回到該筆訂單寫入前、outer session 仍可用 → continue 處理下一筆。Log line `order.schedule.apply_stale_skipped` 帶 `order_id` 給 ops 排查。Stale skip 不是資料遺失：那筆訂單的 producer 正好在 race，下次排程 / materializer 跑時會用 fresh row 重寫。
 
 **為什麼 `set_schedule_dates` 不能無條件覆寫 `status`**：`advance_day_task` 會把今天要做的訂單 status 標成 `in_production`；接下來任何 compound 被 accept、materializer 跑 `apply_schedule` 時，如果 `set_schedule_dates` 無條件把 status 寫回 `scheduled`，前端「正在做」就會突然變回「排隊中」 — 更嚴重的是 `mark_completed_outside_set` 只抓 `status='in_production'`，被 demote 後永遠收不到尾，訂單卡死在 `scheduled` 不會被歸檔成 `completed`。所以 `set_schedule_dates` 寫入前讀目前 status，是 `in_production` 就只更新排程欄位（dates / daily_breakdown / pin cols），status 不動。`apply_schedule` audit log 的 status 也從 hard-coded `"scheduled"` 改成讀 refreshed row 的真實狀態。
 
@@ -1648,7 +1673,7 @@ Worker 有三個外部依賴 — Redis、DB、純演算法函式。如果跑整�
 
 ---
 
-#### `backend/tests/api/test_schedule.py` — HTTP endpoint × 權限矩陣（21 個）
+#### `backend/tests/api/test_schedule.py` — HTTP endpoint × 權限矩陣（13 個，P1-2 後）
 
 這組測試的目的是驗「HTTP 路由層的行為」：request 有沒有被正確解析、狀態判斷有沒有走對分支、權限有沒有正確執行、response schema 有沒有符合 contract。DB 用真實 Postgres（testcontainers），確保 SQL query 能真的跑通；Redis 和 Celery 換成 mock，把測試速度和隔離性拉到合理水準。
 
@@ -1679,15 +1704,9 @@ Worker 有三個外部依賴 — Redis、DB、純演算法函式。如果跑整�
 
 ---
 
-**`POST /schedule/operations`**
+**~~`POST /schedule/operations`~~（endpoint 已移除）**
 
-- **`test_operations_enqueues_and_triggers_when_idle`**
-
-  驗完整的「CRUD → 排程」鏈路：op 有進 `pending_ops` 佇列（`llen == 1`）、idle 狀態下有觸發 `delay()`。這兩個斷言一起才完整 — 只驗佇列長度但不驗 delay 被呼叫，沒辦法確認訂單的排程請求真的送出去了。
-
-- **`test_operations_skips_trigger_while_running`**
-
-  驗「task 在跑的時候 CRUD 推 op 不重複觸發」的保護。op 仍然要進佇列（這樣 in-flight task 結尾才能撿到），但不重新 delay。斷言 `llen == 1` 且 `delay` 沒被呼叫，確認「enqueue」和「trigger」是兩個獨立的判斷，不能因為不 trigger 就連 enqueue 也跳過。
+P1-2 後 raw `POST /schedule/operations` 撤掉，這支 endpoint 的 8 個 test case 一併刪除（涵蓋 enqueue/trigger 行為、`requested_by` 驗證、權限矩陣、compound shape validation）。**enqueue → trigger 行為仍受保護**，由 `tests/services/test_order.py` 的 compound build 測試（驗證 `enqueue_compound` 在 PATCH/DELETE/POST orders 時帶正確的 group / ops / db_action）+ `tests/workers/test_scheduling_task.py` 的 worker 行為測試覆蓋。Cancel 路徑 `DELETE /schedule/operations/{compound_id}` 的 4 個 test case 保留。
 
 ---
 
@@ -1914,7 +1933,7 @@ uv run pytest tests/services tests/workers tests/api      # 全部
 - WebSocket 是 in-memory `ConnectionManager`：每個 FastAPI worker 進程各自持有自己的連線，靠 Redis pub/sub fan-out 同步事件。橫向擴展（uvicorn `--workers N` 或多台機器）時是 fan-out 模式（每個 worker 都收訊息但只送給自己手上的連線），不需要 sticky session；要把 `ConnectionManager` 的 metrics 暴露給 Prometheus 之類的監控時要 per-process aggregate。
 - WebSocket 是 best-effort：worker `publish` 失敗會被 `services/websocket.py` 內部 catch 起來只 log warning，不會擋住 caller 的 transaction。如果 Redis pub/sub 中斷時段較長要保證訊息不漏，請另外加持久化（例如 Redis Streams + consumer group），目前的 `pub/sub` 不重送。
 - `apply_schedule` 用 ORM session 更新每筆訂單，會 bump `version_id` 但不檢查它，理論上會跟同時的人工 PATCH 撞到 — 演算法有最終決定權，前端讀到時請以 server 值為準。
-- `POST /schedule/operations` 的權限是 `scheduler+`，從另一個 backend 服務（例如 Order CRUD）打過來時要用 scheduler 權限的 token；如果 Order CRUD 跟排程跑在同一個程序內，建議用 §3.3.B 直連 Redis 省一次 HTTP。
+- Raw `POST /schedule/operations` 已於 P1-2 移除 — 沒有對外 endpoint 可直接推 compound。所有 compound 都從 Order CRUD endpoint 進來、走同一道 row lock + `db_action` 保護。手動 pin / unpin 改用 `PATCH /orders/{id}` 的 `pinned_production_date` 欄位（明示日期 / 明示 null）。詳見 §3.3。
 - `compute_schedule` 是 forward-fill 結果（給前端看的時間表）；`capacity_tree` 的內部分布是 backward-fill（feasibility 檢查用），兩者語義不同，不要混用。
 - `GET /schedule/result` 的 `daily_breakdown` 現在**直接讀 `orders.daily_breakdown` JSONB 欄位**，由 `materialize_schedule_task` 在每次排程被 accept 後寫入。讀路徑不再碰 Redis，所以 Redis state 被清也不影響 `daily_breakdown` 內容；但反過來說，如果 DB 跟 Redis state 脫節（極少見、通常代表 materializer 失敗或 DB rollback），這時 `POST /schedule/rebuild` 可以把 Redis state 拉回 DB 一致，再跑一次 materializer 把 `daily_breakdown` 改寫回正確值。
 - `pending_ops` 的 `group` 欄位是 producer 的責任。複合更新（defer / shrink-qty / advance / grow-qty）兩筆 op 沒標到同一個 group 時 worker 不會擋，但會走錯 phase 影響可排程性。

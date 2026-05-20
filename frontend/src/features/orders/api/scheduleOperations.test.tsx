@@ -33,20 +33,26 @@ const baseOrder = {
   status: 'scheduled' as const,
   is_pinned: false,
   pinned_production_date: null,
+  version_id: 1,
 };
 
-describe('usePinScheduleOperation', () => {
+function mockPatchOk(orderId: string, versionId: number = 2): Response {
+  return new Response(
+    JSON.stringify({ id: orderId, version_id: versionId }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  );
+}
+
+describe('usePinScheduleOperation (PATCH /orders/{id} flow)', () => {
   beforeEach(() => {
     mockAuth.userId = '33333333-3333-4333-8333-333333333333';
-    vi.mocked(global.fetch).mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          compound_id: '44444444-4444-4444-8444-444444444444',
-          message: 'Compound queued',
-        }),
-        { status: 202, headers: { 'Content-Type': 'application/json' } },
-      ),
-    );
+    vi.mocked(global.fetch).mockImplementation(async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      // Extract order id from URL path: /api/v1/orders/{id}
+      const m = /\/api\/v1\/orders\/([^/?]+)/.exec(url);
+      const orderId = m?.[1] ?? 'unknown';
+      return mockPatchOk(orderId);
+    });
   });
 
   afterEach(() => {
@@ -55,7 +61,7 @@ describe('usePinScheduleOperation', () => {
     vi.clearAllMocks();
   });
 
-  it('queues a pin compound for an existing scheduled order', async () => {
+  it('PATCHes /orders/{id} with pinned_production_date when pinning to a day', async () => {
     const { result } = renderHook(() => usePinScheduleOperation(), { wrapper: makeWrapper() });
     const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
 
@@ -70,53 +76,21 @@ describe('usePinScheduleOperation', () => {
       expect(result.current.isSuccess).toBe(true);
     });
 
-    const [, init] = vi.mocked(global.fetch).mock.calls[0];
-    expect(global.fetch).toHaveBeenCalledWith(
-      '/api/v1/schedule/operations',
-      expect.objectContaining({ method: 'POST', credentials: 'include' }),
-    );
-    expect(JSON.parse(init?.body as string)).toMatchObject({
-      compound_id: '44444444-4444-4444-8444-444444444444',
-      group: 'grow',
-      op_count: 1,
-      requested_by: '33333333-3333-4333-8333-333333333333',
-      ops: [
-        {
-          op: 'pin',
-          order_id: baseOrder.id,
-          order_number: baseOrder.order_number,
-          wafer_quantity: 500,
-          deadline: '2026-06-01',
-          fake_deadline: '2026-05-10',
-        },
-      ],
+    // Single PATCH against the order's own endpoint, not /schedule/operations.
+    const [url, init] = vi.mocked(global.fetch).mock.calls[0];
+    expect(url).toBe(`/api/v1/orders/${baseOrder.id}`);
+    expect(init).toMatchObject({ method: 'PATCH', credentials: 'include' });
+    expect(JSON.parse(init?.body as string)).toEqual({
+      pinned_production_date: '2026-05-10',
+      version_id: 1,
     });
+
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['orders'] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['schedule', 'capacity'] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['schedule', 'result'] });
   });
 
-  it('queues add then pin for an unscheduled pending order', async () => {
-    const { result } = renderHook(() => usePinScheduleOperation(), { wrapper: makeWrapper() });
-
-    act(() => {
-      result.current.mutate({
-        compoundId: '44444444-4444-4444-8444-444444444444',
-        targets: [{ order: { ...baseOrder, status: 'pending' }, targetDate: '2026-05-10' }],
-      });
-    });
-
-    await waitFor(() => {
-      expect(result.current.isSuccess).toBe(true);
-    });
-
-    const [, init] = vi.mocked(global.fetch).mock.calls[0];
-    const body = JSON.parse(init?.body as string) as { op_count: number; ops: { op: string }[] };
-    expect(body.ops.map((op) => op.op)).toEqual(['add', 'pin']);
-    expect(body.op_count).toBe(2);
-  });
-
-  it('queues unpin then pin for an already pinned order', async () => {
+  it('PATCHes with pinned_production_date=null when targetDate is null (unpin)', async () => {
     const { result } = renderHook(() => usePinScheduleOperation(), { wrapper: makeWrapper() });
 
     act(() => {
@@ -125,7 +99,7 @@ describe('usePinScheduleOperation', () => {
         targets: [
           {
             order: { ...baseOrder, is_pinned: true, pinned_production_date: '2026-05-09' },
-            targetDate: '2026-05-10',
+            targetDate: null,
           },
         ],
       });
@@ -136,28 +110,28 @@ describe('usePinScheduleOperation', () => {
     });
 
     const [, init] = vi.mocked(global.fetch).mock.calls[0];
-    const body = JSON.parse(init?.body as string) as { op_count: number; ops: { op: string }[] };
-    expect(body.ops.map((op) => op.op)).toEqual(['unpin', 'pin']);
-    expect(body.op_count).toBe(2);
+    expect(JSON.parse(init?.body as string)).toEqual({
+      pinned_production_date: null,
+      version_id: 1,
+    });
   });
 
-  it('queues multiple orders in one ordered compound', async () => {
+  it('fans out parallel PATCHes for multi-target pin (one per order)', async () => {
     const { result } = renderHook(() => usePinScheduleOperation(), { wrapper: makeWrapper() });
+
+    const order2 = {
+      ...baseOrder,
+      id: '22222222-2222-4222-8222-222222222222',
+      order_number: 'ORD-20260504-0002',
+      version_id: 4,
+    };
 
     act(() => {
       result.current.mutate({
         compoundId: '44444444-4444-4444-8444-444444444444',
         targets: [
-          { order: { ...baseOrder, status: 'pending' }, targetDate: '2026-05-10' },
-          {
-            order: {
-              ...baseOrder,
-              id: '22222222-2222-4222-8222-222222222222',
-              order_number: 'ORD-20260504-0002',
-              status: 'pending',
-            },
-            targetDate: '2026-05-11',
-          },
+          { order: baseOrder, targetDate: '2026-05-10' },
+          { order: order2, targetDate: '2026-05-11' },
         ],
       });
     });
@@ -166,23 +140,66 @@ describe('usePinScheduleOperation', () => {
       expect(result.current.isSuccess).toBe(true);
     });
 
-    const [, init] = vi.mocked(global.fetch).mock.calls[0];
-    const body = JSON.parse(init?.body as string) as {
-      op_count: number;
-      ops: { op: string; order_number: string }[];
+    // Two PATCH calls, one per order. Each carries that order's own
+    // version_id and target date — no shared compound payload.
+    const calls = vi.mocked(global.fetch).mock.calls;
+    expect(calls).toHaveLength(2);
+
+    const urls = calls.map((c) => c[0]).sort();
+    expect(urls).toEqual(
+      [`/api/v1/orders/${baseOrder.id}`, `/api/v1/orders/${order2.id}`].sort(),
+    );
+
+    const bodies = calls.map((c) => JSON.parse(c[1]?.body as string));
+    const byOrder = Object.fromEntries(
+      calls.map((c, i) => [(c[0] as string).split('/').pop()!, bodies[i]]),
+    );
+    expect(byOrder[baseOrder.id]).toEqual({
+      pinned_production_date: '2026-05-10',
+      version_id: 1,
+    });
+    expect(byOrder[order2.id]).toEqual({
+      pinned_production_date: '2026-05-11',
+      version_id: 4,
+    });
+  });
+
+  it('rejects the mutation if one of the PATCHes fails', async () => {
+    vi.mocked(global.fetch).mockImplementation(async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      // First call ok, second call 409 (concurrent PATCH bumped version_id).
+      if (url.endsWith(baseOrder.id)) {
+        return mockPatchOk(baseOrder.id);
+      }
+      return new Response(
+        JSON.stringify({
+          error: { code: 409, message: 'Order was modified by another user. Refresh and try again.' },
+        }),
+        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      );
+    });
+
+    const { result } = renderHook(() => usePinScheduleOperation(), { wrapper: makeWrapper() });
+
+    const order2 = {
+      ...baseOrder,
+      id: '22222222-2222-4222-8222-222222222222',
+      order_number: 'ORD-20260504-0002',
     };
-    expect(body.ops.map((op) => `${op.order_number}:${op.op}`)).toEqual([
-      'ORD-20260504-0001:add',
-      'ORD-20260504-0001:pin',
-      'ORD-20260504-0002:add',
-      'ORD-20260504-0002:pin',
-    ]);
-    expect(body.ops.map((op) => ('fake_deadline' in op ? op.fake_deadline : null))).toEqual([
-      null,
-      '2026-05-10',
-      null,
-      '2026-05-11',
-    ]);
-    expect(body.op_count).toBe(4);
+
+    act(() => {
+      result.current.mutate({
+        compoundId: '44444444-4444-4444-8444-444444444444',
+        targets: [
+          { order: baseOrder, targetDate: '2026-05-10' },
+          { order: order2, targetDate: '2026-05-11' },
+        ],
+      });
+    });
+
+    await waitFor(() => {
+      expect(result.current.isError).toBe(true);
+    });
+    expect(result.current.error?.message).toContain('modified by another user');
   });
 });

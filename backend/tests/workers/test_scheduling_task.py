@@ -1587,6 +1587,131 @@ def test_run_scheduling_dispatches_unpin_op(
     assert mocks["pin_order"].call_count == 0
 
 
+# ---------------------------------------------------------------------------
+# Bug 1 — SegmentTreeInvariantError per-leaf containment
+# ---------------------------------------------------------------------------
+
+
+def test_run_scheduling_invariant_break_in_one_compound_isolated_from_others(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+) -> None:
+    """A ``SegmentTreeInvariantError`` raised during one compound's
+    structural leaf application must NOT crash the whole task.
+
+    Pre-fix: the RuntimeError bubbled out of ``_commit_accepted_batch``,
+    got caught by ``run_scheduling_task``'s top-level ``except Exception``,
+    flipped ``schedule:status='failed'``, re-raised, and Celery marked the
+    task FAILED — leaving the remaining N pending compounds stuck in the
+    queue. ``bombard --mode variety`` reproduces this in ~30s.
+
+    Post-fix: ``_commit_accepted_batch`` wraps the per-leaf apply in
+    try/except SegmentTreeInvariantError. The offending compound is moved
+    to the "failed" bucket (db_action(rejected) + ``compound_failed`` WS),
+    the rest of the batch's leaves continue normally, the task succeeds.
+    """
+    from app.services.scheduling import SegmentTreeInvariantError
+
+    # Two compounds: bad one first (will trip invariant break in pin_order's
+    # _apply_remove_to_trees), good one second (should still process).
+    bad_user = uuid.uuid4()
+    bad_compound_id = uuid.uuid4()
+    bad_compound = _make_op(
+        op="pin",
+        group="grow",
+        order_number="BAD-PIN",
+        deadline="2026-05-15",
+        fake_deadline="2026-05-12",
+        requested_by=bad_user,
+    )
+    bad_compound["compound_id"] = str(bad_compound_id)
+    good_compound = _make_op(order_number="GOOD")
+    _enqueue(redis_client, bad_compound)
+    _enqueue(redis_client, good_compound)
+
+    # pin_order raises SegmentTreeInvariantError for the bad compound,
+    # ScheduleResult(success) for everything else. Use the order_number
+    # to discriminate.
+    def pin_side_effect(_state: Any, order: Any, _fake: Any) -> ScheduleResult:
+        if order.order_number == "BAD-PIN":
+            raise SegmentTreeInvariantError("simulated invariant break")
+        return ScheduleResult(status="success")
+
+    mocks = _patch_common(monkeypatch)
+    monkeypatch.setattr("app.workers.scheduling.pin_order", MagicMock(side_effect=pin_side_effect))
+
+    result = run_scheduling_task.apply()
+    # The whole task succeeds — the invariant break was contained.
+    assert result.successful(), result.traceback
+
+    # Status is idle (not failed) — the task did not crash.
+    status_doc = json.loads(redis_client.get(STATUS_KEY))
+    assert status_doc["state"] == "idle", status_doc
+
+    # Both compounds were removed from the queue.
+    assert redis_client.zcard(PENDING_OPS_KEY) == 0
+
+    # WS notifications: bad compound got compound_failed; good compound
+    # got compound_accepted.
+    notify_calls_by_type: dict[str, list[Any]] = {}
+    for c in mocks["notify_user"].call_args_list:
+        notify_calls_by_type.setdefault(c.kwargs["message"]["type"], []).append(c.kwargs)
+    assert "schedule.compound_failed" in notify_calls_by_type
+    assert "schedule.compound_accepted" in notify_calls_by_type
+    failed_msg = notify_calls_by_type["schedule.compound_failed"][0]["message"]
+    assert failed_msg["compound_id"] == str(bad_compound_id)
+    assert notify_calls_by_type["schedule.compound_failed"][0]["user_id"] == bad_user
+
+
+def test_apply_remove_to_trees_raises_segment_tree_invariant_error_subclass() -> None:
+    """The exception type ``_apply_remove_to_trees`` raises on residual
+    must be ``SegmentTreeInvariantError`` (subclass of ``RuntimeError``).
+    Worker's per-leaf ``except SegmentTreeInvariantError`` relies on this
+    exact type; if a future refactor reverts to plain ``RuntimeError``
+    the worker would no longer contain the failure and we'd regress to
+    the pre-fix task-crash behavior.
+
+    Residual > 0 only happens when state is already corrupted —
+    ``add_order`` + ``remove_order`` maintain the cap-tree/deadline-tree
+    invariant perfectly under normal flow. We seed corruption by pushing
+    extra weight into ``deadline_tree`` without matching ``capacity_tree``
+    consumption (= "a phantom obligation exists in deadline_tree but no
+    capacity was reserved"). This simulates the producer-side race
+    outcome the bug doc describes — stale compound's ``remove(qty)``
+    can't find that qty's worth of capacity to give back.
+    """
+    from app.services.scheduling import (
+        SchedulerState,
+        SchedulingOrder,
+        SegmentTreeInvariantError,
+        _apply_remove_to_trees,
+    )
+
+    state = SchedulerState.initial(date(2026, 5, 5))
+
+    # Corrupt: pretend there's a 1000-wafer obligation at day 3 that no
+    # ``add_order`` ever registered (so ``capacity_tree`` is still at
+    # full). When we then try to remove an order at day 6, the forward
+    # walk finds negative slack at days 3..6 (because deadline_tree's
+    # phantom obligation eats the slack) and exits the loop with the
+    # full qty as residual.
+    state.deadline_tree.point_update(3, 1000)
+
+    phantom = SchedulingOrder(
+        order_id=uuid.uuid4(),
+        order_number="GHOST",
+        wafer_quantity=500,
+        deadline=date(2026, 5, 10),  # rel = 6
+    )
+
+    with pytest.raises(SegmentTreeInvariantError):
+        _apply_remove_to_trees(state, phantom)
+
+    # Also verify the exception subclasses RuntimeError so existing
+    # ``except RuntimeError:`` blocks elsewhere still catch it.
+    assert issubclass(SegmentTreeInvariantError, RuntimeError)
+
+
 def test_materialize_task_drains_pending_users_and_notifies(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
