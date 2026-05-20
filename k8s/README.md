@@ -16,15 +16,31 @@ Files are prefixed with numbers so `kubectl apply -f k8s/` sorts them in
 dependency order:
 
 | File | What it does |
-|---|---|
+| --- | --- |
 | `00-namespace.yaml` | Create the `woms` namespace |
 | `10-configmap.yaml` | Non-secret env (APP_ENV, LOG_LEVEL, CORS_ORIGINS) |
 | `20-migration-job.yaml` | One-shot `alembic upgrade head` Job |
+| `25-seed-admin-job.yaml` | One-shot Job that creates the demo root admin (idempotent) |
 | `30-backend-deployment.yaml` | FastAPI pods (2 replicas) |
 | `31-backend-service.yaml` | ClusterIP `backend.woms.svc` |
 | `40-worker-deployment.yaml` | Celery worker pod (1 replica) |
 | `50-frontend-deployment.yaml` | Nginx pods (2 replicas) |
 | `51-frontend-service.yaml` | ClusterIP `frontend.woms.svc` |
+| `60-ingress.yaml` | ALB Ingress (path-based routing: /api/* → backend, else → frontend) |
+
+## Demo admin
+
+After a fresh deploy, `25-seed-admin-job.yaml` runs and creates a root user
+with these credentials so reviewers can log in without registering:
+
+```text
+username: admin
+password: testpassword123
+```
+
+The Job is idempotent — it checks for an existing `admin` user and exits 0
+without changes. For production, delete this Job and create the admin
+manually via `kubectl exec` into a backend pod.
 
 ## Deploy (first time)
 
