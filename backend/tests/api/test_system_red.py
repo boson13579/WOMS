@@ -211,6 +211,10 @@ def test_red_returns_zero_for_empty_window(
         "error_pct": 0.0,
         "latency_ms": {"p50": 0, "p95": 0, "p99": 0, "max": 0},
         "by_endpoint": [],
+        # Healthy Redis + no traffic → "ok" (legitimate empty window).
+        # The "degraded" variant is covered in
+        # ``test_red_data_status_degraded_when_redis_unavailable``.
+        "data_status": "ok",
     }
 
 
@@ -372,3 +376,61 @@ def test_red_window_seconds_above_retention_still_accepted(
     body = res.json()
     assert body["window_seconds"] == 600
     assert body["total_requests"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# data_status — distinguishes "empty window" from "Redis dead"
+# ---------------------------------------------------------------------------
+
+
+def test_red_data_status_ok_on_empty_window(
+    client: TestClient, db_session: Session, redis_client: Redis
+) -> None:
+    """No traffic + healthy Redis → ``data_status == "ok"``.
+
+    Pairs with ``test_red_data_status_degraded_when_redis_unavailable`` to
+    pin the distinction: the zero envelope is reported with ``"ok"`` when
+    we *know* there was no traffic, vs ``"degraded"`` when we can't tell.
+    """
+    _make_user(db_session, username="red_ds_ok", role=UserRole.scheduler)
+    token = _login(client, "red_ds_ok")
+    redis_client.delete(METRICS_KEY)
+
+    res = client.get("/api/v1/system/red?window_seconds=60", headers=_auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total_requests"] == 0
+    assert body["data_status"] == "ok"
+
+
+def test_red_data_status_degraded_when_redis_unavailable(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redis read raises → response is a zero envelope with ``data_status == "degraded"``.
+
+    Monkeypatches the cached Redis accessor on the service module so the
+    ``compute_window`` Redis-exception branch fires. The endpoint still
+    returns 200 (degrades gracefully) but the response now warns callers
+    that the numbers aren't backed by live data.
+    """
+    _make_user(db_session, username="red_ds_deg", role=UserRole.scheduler)
+    token = _login(client, "red_ds_deg")
+
+    def _boom() -> object:
+        raise RuntimeError("redis is dead")
+
+    # ``compute_window`` imports ``_get_metrics_redis`` from
+    # ``app.core.red_metrics`` into its own namespace, so patching the
+    # service-module attribute is what actually intercepts the call.
+    monkeypatch.setattr("app.services.red_metrics._get_metrics_redis", _boom)
+
+    res = client.get("/api/v1/system/red?window_seconds=60", headers=_auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    # Zero envelope shape preserved so the dashboard still renders.
+    assert body["total_requests"] == 0
+    assert body["by_endpoint"] == []
+    # But the degraded flag is set — the frontend banner uses this.
+    assert body["data_status"] == "degraded"

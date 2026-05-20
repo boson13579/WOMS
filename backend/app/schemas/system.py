@@ -231,6 +231,14 @@ class RedMetricsResponse(BaseModel):
     Empty windows return zeros (not 404 / null) — the frontend prefers a
     stable envelope so it can keep rendering "0 req/s" instead of an
     error state.
+
+    ``data_status`` distinguishes the two zero-envelope cases the
+    aggregator can emit: ``"ok"`` (Redis healthy, no traffic in window)
+    vs ``"degraded"`` (Redis unreachable / read failed — numbers are not
+    live state). The frontend banner surfaces the degraded case so an
+    operator does not mistake an outage for a quiet weekend. Corrupted
+    individual JSON samples are not flagged here — they are skipped at
+    decode time and the remaining samples still aggregate cleanly.
     """
 
     window_seconds: int
@@ -240,6 +248,7 @@ class RedMetricsResponse(BaseModel):
     error_pct: float
     latency_ms: LatencyPercentiles
     by_endpoint: list[EndpointStat] = Field(default_factory=list)
+    data_status: Literal["ok", "degraded"] = "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -275,3 +284,9 @@ class SloComplianceResponse(BaseModel):
     error_budget_pct_remaining: float
     error_budget_consumed_pct: float
     data_window_seconds_actual: int
+    # See ``RedMetricsResponse.data_status`` — same semantics: ``"ok"``
+    # means the empty / populated envelope is backed by a healthy Redis
+    # read, ``"degraded"`` means we returned the empty envelope because
+    # Redis was unreachable. SLO and RED share the same data source so
+    # the two responses degrade together.
+    data_status: Literal["ok", "degraded"] = "ok"

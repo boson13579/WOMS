@@ -262,6 +262,9 @@ def test_slo_zero_traffic(client: TestClient, db_session: Session, redis_client:
     # No samples → no data window. The frontend uses this to skip the
     # "data: last Xm" hint when the SLO card is in the empty state.
     assert body["data_window_seconds_actual"] == 0
+    # Healthy Redis + zero traffic → "ok" (not "degraded"). The degraded
+    # path is exercised in ``test_slo_data_status_degraded_when_redis_unavailable``.
+    assert body["data_status"] == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -323,3 +326,168 @@ def test_slo_data_window_capped_at_requested(
     res = client.get("/api/v1/system/slo?window_hours=1", headers=_auth(token))
     body = res.json()
     assert body["data_window_seconds_actual"] <= 3600
+
+
+# ---------------------------------------------------------------------------
+# data_status — distinguishes "empty window" from "Redis dead"
+# ---------------------------------------------------------------------------
+
+
+def test_slo_data_status_ok_on_empty_window(
+    client: TestClient, db_session: Session, redis_client: Redis
+) -> None:
+    """No traffic + healthy Redis → ``data_status == "ok"``.
+
+    Same contract as the RED endpoint: the zero / full-budget envelope is
+    reported with ``"ok"`` when we *know* the window is empty, vs
+    ``"degraded"`` when Redis itself is unreachable.
+    """
+    _make_user(db_session, username="slo_ds_ok", role=UserRole.scheduler)
+    token = _login(client, "slo_ds_ok")
+    redis_client.delete(METRICS_KEY)
+
+    res = client.get("/api/v1/system/slo?window_hours=24", headers=_auth(token))
+    body = res.json()
+    assert body["total_requests"] == 0
+    assert body["data_status"] == "ok"
+
+
+def test_slo_data_status_degraded_when_redis_unavailable(
+    client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Redis read raises → SLO returns the empty envelope flagged ``"degraded"``.
+
+    Prevents the dashboard from rendering a healthy 100%-budget bar
+    during a Redis outage. Endpoint still returns 200; only the data_status
+    flag changes so the frontend can show its banner.
+    """
+    _make_user(db_session, username="slo_ds_deg", role=UserRole.scheduler)
+    token = _login(client, "slo_ds_deg")
+
+    def _boom() -> object:
+        raise RuntimeError("redis is dead")
+
+    monkeypatch.setattr("app.services.red_metrics._get_metrics_redis", _boom)
+
+    res = client.get("/api/v1/system/slo?window_hours=24", headers=_auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total_requests"] == 0
+    assert body["data_status"] == "degraded"
+
+
+# ---------------------------------------------------------------------------
+# Boundary cases — "right on the bar", catastrophic failure, perfect target
+# ---------------------------------------------------------------------------
+
+
+def test_slo_at_target_boundary(
+    client: TestClient, db_session: Session, redis_client: Redis
+) -> None:
+    """``success_pct == slo_target_pct`` → budget exactly exhausted (0 remaining, 100 consumed).
+
+    With the default 99.5% target, 199/200 successes is exactly 99.5%
+    success_pct. The "right on the bar" arithmetic: consumed = (100-99.5)
+    / (100-99.5) * 100 = 100. We're not over-budget (consumed shouldn't
+    clamp), and we're not under (it shouldn't read 0.0 either). The math
+    has to land on the edge cleanly.
+    """
+    _make_user(db_session, username="slo_boundary", role=UserRole.scheduler)
+    token = _login(client, "slo_boundary")
+    redis_client.delete(METRICS_KEY)
+
+    base = int(time.time() * 1000) - 500
+    for i in range(199):
+        _seed_sample(redis_client, status=200, ts_ms=base + i)
+    _seed_sample(redis_client, status=500, ts_ms=base + 199)
+
+    res = client.get("/api/v1/system/slo?window_hours=24", headers=_auth(token))
+    body = res.json()
+    assert body["total_requests"] == 200
+    assert body["successful_requests"] == 199
+    assert body["success_pct"] == 99.5
+    assert body["slo_target_pct"] == 99.5
+    # On the bar → all of the budget is gone, but not over.
+    assert body["error_budget_pct_remaining"] == 0.0
+    assert body["error_budget_consumed_pct"] == 100.0
+
+
+def test_slo_catastrophic(client: TestClient, db_session: Session, redis_client: Redis) -> None:
+    """All requests fail (``success_pct == 0``) → budget fully consumed, shape still valid.
+
+    Edge of the clamp: success_pct = 0 would yield consumed >> 100 (in
+    fact 20000% at the default target). The clamp to ``[0, 100]`` should
+    pin it to 100% consumed / 0% remaining without producing NaN / inf,
+    and the surrounding response shape stays intact.
+    """
+    _make_user(db_session, username="slo_catastrophic", role=UserRole.scheduler)
+    token = _login(client, "slo_catastrophic")
+    redis_client.delete(METRICS_KEY)
+
+    base = int(time.time() * 1000) - 200
+    for i in range(50):
+        _seed_sample(redis_client, status=500, ts_ms=base + i)
+
+    res = client.get("/api/v1/system/slo?window_hours=24", headers=_auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total_requests"] == 50
+    assert body["successful_requests"] == 0
+    assert body["success_pct"] == 0.0
+    assert body["error_budget_consumed_pct"] == 100.0
+    assert body["error_budget_pct_remaining"] == 0.0
+    # Shape: every field is still present + non-null after the clamp.
+    for field in (
+        "window_hours",
+        "slo_target_pct",
+        "data_window_seconds_actual",
+        "data_status",
+    ):
+        assert field in body
+
+
+def test_slo_perfect_target(
+    client: TestClient, db_session: Session, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``slo_target_pct == 100`` → division-by-zero guard fires, no crash.
+
+    The budget math divides by ``(100 - slo_target_pct)``. When the
+    target is 100 the denominator is 0; the implementation must guard
+    that branch. The Settings field declares ``lt=100`` to forbid this
+    in config, but the service code still has a defensive ``if headroom
+    <= 0`` clause — this test pokes the runtime value directly so the
+    guard is exercised.
+
+    Expected behaviour: any error → 100% consumed, no error → 0%
+    consumed. Either way the response shape stays valid and there is no
+    ``ZeroDivisionError``.
+    """
+    _make_user(db_session, username="slo_perfect", role=UserRole.scheduler)
+    token = _login(client, "slo_perfect")
+    redis_client.delete(METRICS_KEY)
+
+    # Bypass the ``Field(lt=100)`` constraint by mutating the cached
+    # Settings instance after it has been validated. ``get_settings``
+    # returns a singleton via ``lru_cache``; mutating that attribute is
+    # safe for the duration of the test because the autouse fixture
+    # below (see ``backend/tests/conftest.py``) restores it on teardown.
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "SLO_AVAILABILITY_TARGET_PCT", 100.0)
+
+    base = int(time.time() * 1000) - 200
+    # Mixed traffic: 19 successes + 1 error. Any error at all should
+    # consume the entire budget when the target is 100 (you have no
+    # headroom).
+    for i in range(19):
+        _seed_sample(redis_client, status=200, ts_ms=base + i)
+    _seed_sample(redis_client, status=500, ts_ms=base + 19)
+
+    res = client.get("/api/v1/system/slo?window_hours=24", headers=_auth(token))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["slo_target_pct"] == 100.0
+    # Any non-100% success at a 100% target = budget gone.
+    assert body["error_budget_consumed_pct"] == 100.0
+    assert body["error_budget_pct_remaining"] == 0.0

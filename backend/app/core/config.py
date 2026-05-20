@@ -123,6 +123,23 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Audit log retention --------------------------------------------------
+    # Audit log is write-heavy + append-only. Without retention the table
+    # grows unboundedly; on a long-running deployment that bloats backups
+    # and slows the operator-facing audit feed. The daily Celery task
+    # ``audit.cleanup_old_logs`` deletes rows older than this many days.
+    # 90 days matches typical SOC-2 audit retention requirements and is
+    # easy to override per environment via the env var.
+    AUDIT_LOG_RETENTION_DAYS: int = Field(
+        default=90,
+        ge=1,
+        le=3650,
+        description=(
+            "Audit log retention in days; rows older than this are deleted "
+            "by the daily cleanup task ``audit.cleanup_old_logs``."
+        ),
+    )
+
     # ------------------------------------------------------------------ helpers
     @field_validator("CORS_ORIGINS")
     @classmethod

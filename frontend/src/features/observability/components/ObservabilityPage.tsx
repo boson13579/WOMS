@@ -112,6 +112,27 @@ export function ObservabilityPage(): JSX.Element {
                 <TimeRangeSelector value={windowSeconds} onChange={setWindowSeconds} />
               </div>
             </div>
+            {/*
+             * Degraded-data banner. Both RED and SLO read the same Redis
+             * ZSET — if the source is unreachable, the backend returns the
+             * zero envelope with ``data_status === 'degraded'``. Without
+             * this banner, the dashboard would silently render an all-
+             * green "0 req/s · 100% SLO" state during a metrics outage and
+             * the operator would mistake the outage for healthy quiet.
+             * Placed above the KPI cards so it dominates the eye before
+             * the numbers do; one banner per page since RED and SLO
+             * degrade together.
+             */}
+            {(red.data?.data_status === 'degraded' || slo.data?.data_status === 'degraded') && (
+              <div
+                role="status"
+                data-testid="metrics-degraded-banner"
+                className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-200"
+              >
+                Metrics data is currently unavailable (Redis unreachable). Numbers shown may not
+                reflect live state.
+              </div>
+            )}
             <RedKpiCards
               red={red.data}
               redLoading={red.isLoading}

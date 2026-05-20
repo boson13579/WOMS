@@ -79,6 +79,7 @@ const RED_RESPONSE = {
       p99_ms: 64,
     },
   ],
+  data_status: 'ok',
 };
 
 const RESOURCES_RESPONSE = {
@@ -112,6 +113,7 @@ const SLO_RESPONSE = {
   error_budget_pct_remaining: 84,
   error_budget_consumed_pct: 16,
   data_window_seconds_actual: 24 * 3600,
+  data_status: 'ok',
 };
 
 let qc: QueryClient;
@@ -202,5 +204,47 @@ describe('ObservabilityPage', () => {
       expect(screen.getByRole('button', { name: '1m' })).toBeInTheDocument();
     });
     expect(screen.getByRole('button', { name: '1m' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('does NOT render the degraded banner when data_status is "ok"', async () => {
+    render(makeWrapper(<ObservabilityPage />));
+    await waitFor(() => {
+      expect(screen.getByText('12.40')).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('metrics-degraded-banner')).not.toBeInTheDocument();
+  });
+
+  it('renders the degraded banner when RED data_status is "degraded"', async () => {
+    // Override the fetch mock for RED only — SLO stays "ok", but the
+    // banner should still fire because either side flipping degraded is
+    // enough to warrant the warning.
+    vi.mocked(global.fetch).mockImplementation((url) => {
+      const target = String(url);
+      if (target.startsWith('/api/v1/system/health')) {
+        return Promise.resolve(new Response(JSON.stringify(HEALTH_RESPONSE), { status: 200 }));
+      }
+      if (target.startsWith('/api/v1/system/red')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ ...RED_RESPONSE, data_status: 'degraded' }), {
+            status: 200,
+          }),
+        );
+      }
+      if (target.startsWith('/api/v1/system/resources')) {
+        return Promise.resolve(new Response(JSON.stringify(RESOURCES_RESPONSE), { status: 200 }));
+      }
+      if (target.startsWith('/api/v1/system/slo')) {
+        return Promise.resolve(new Response(JSON.stringify(SLO_RESPONSE), { status: 200 }));
+      }
+      return Promise.resolve(new Response('Not Found', { status: 404 }));
+    });
+
+    render(makeWrapper(<ObservabilityPage />));
+    await waitFor(() => {
+      expect(screen.getByTestId('metrics-degraded-banner')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('metrics-degraded-banner')).toHaveTextContent(
+      /metrics data is currently unavailable/i,
+    );
   });
 });

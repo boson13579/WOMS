@@ -42,6 +42,17 @@ export const endpointStatSchema = z.object({
 
 export type EndpointStat = z.infer<typeof endpointStatSchema>;
 
+/**
+ * Backend can flag the response as ``"degraded"`` when the underlying
+ * Redis source is unreachable (so the zero envelope does NOT mean "no
+ * traffic", it means "we don't know"). The frontend surfaces this with
+ * an amber banner above the KPI cards. Default ``"ok"`` keeps older
+ * payloads forward-compatible.
+ */
+export const dataStatusSchema = z.enum(['ok', 'degraded']).default('ok');
+
+export type DataStatus = z.infer<typeof dataStatusSchema>;
+
 export const redMetricsResponseSchema = z.object({
   window_seconds: z.number().int().positive(),
   total_requests: z.number().int().nonnegative(),
@@ -50,6 +61,7 @@ export const redMetricsResponseSchema = z.object({
   error_pct: z.number().min(0).max(100),
   latency_ms: latencyPercentilesSchema,
   by_endpoint: z.array(endpointStatSchema),
+  data_status: dataStatusSchema,
 });
 
 export type RedMetricsResponse = z.infer<typeof redMetricsResponseSchema>;
@@ -130,6 +142,13 @@ export const sloComplianceSchema = z.object({
    * 0 means no samples are present at all.
    */
   data_window_seconds_actual: z.number().int().nonnegative(),
+  /**
+   * Same semantics as ``RedMetricsResponse.data_status``: ``"degraded"``
+   * means the underlying Redis source was unreachable, so the headline
+   * "100% available" is actually "we don't know". Defaulted so older
+   * backend revisions remain wire-compatible.
+   */
+  data_status: dataStatusSchema,
 });
 
 export type SloCompliance = z.infer<typeof sloComplianceSchema>;

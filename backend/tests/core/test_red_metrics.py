@@ -365,3 +365,33 @@ def test_middleware_uses_route_template_not_url(
     # Both UUIDs collapse to the same template — the histogram bucket is
     # `/api/v1/users/{user_id}` regardless of the path parameter value.
     assert paths == {"/api/v1/users/{user_id}"}
+
+
+def test_route_template_collapses_unmatched_routes(
+    client: TestClient,
+    redis_client: Redis,
+    _wait_for_metrics: _Waiter,
+) -> None:
+    """Unmatched (404) paths collapse into a single ``"(no route)"`` bucket.
+
+    Cardinality-attack protection: returning the raw URL for unmatched
+    requests would let any caller enumerate distinct histogram buckets
+    by probing random paths (``/abc-1``, ``/abc-2``, ...). We instead
+    bucket every unmatched request under the literal label
+    ``"(no route)"`` so operators still see ambient 404 noise without
+    the histogram or the ``metrics:requests`` ZSET growing unboundedly.
+    """
+    redis_client.delete(METRICS_KEY)
+
+    # Two random, definitely-unmatched paths. The middleware should record
+    # both samples but BOTH must collapse to the same ``"(no route)"`` bucket.
+    res1 = client.get("/does-not-exist-1")
+    res2 = client.get("/does-not-exist-2/nested")
+    assert res1.status_code == 404
+    assert res2.status_code == 404
+
+    _wait_for_metrics.wait_for_count(2)
+
+    samples = _read_samples(redis_client)
+    paths = {s["p"] for s in samples}
+    assert paths == {"(no route)"}, f"unmatched routes must collapse to (no route); got: {paths}"

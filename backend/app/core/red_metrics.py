@@ -129,22 +129,27 @@ def _should_skip(request: Request) -> bool:
 
 
 def _route_template(request: Request) -> str:
-    """Return the FastAPI route template for *request* or the raw path.
+    """Return the FastAPI route template for *request* or a fixed no-route bucket.
 
     Why template: ``/orders/{order_id}`` is one bucket regardless of the
     actual UUID. Raw paths would explode the per-endpoint histogram into
     thousands of one-hit rows and ruin both the top-10 view and Redis
     memory.
 
-    Why fall back to ``request.url.path``: requests that didn't match a
-    route (404s, mis-typed paths) still deserve a sample so operators can
-    see ambient bad traffic; we just record the URL as-is in that case.
+    Why ``"(no route)"`` for unmatched requests: returning ``request.url.path``
+    here is a high-cardinality injection vector. An attacker (or a buggy
+    crawler) probing ``/random-uuid-1``, ``/random-uuid-2``, ... would create
+    one fresh bucket per URL, blowing up ``by_endpoint`` and bloating the
+    ``metrics:requests`` ZSET (which is otherwise memory-bound only by
+    :data:`RETENTION_MS`). Collapsing all unmatched paths into a single
+    ``"(no route)"`` bucket preserves visibility of "we are seeing 404 noise"
+    without giving the caller any ability to enumerate buckets.
     """
     route = request.scope.get("route")
     template: Any = getattr(route, "path", None)
     if isinstance(template, str) and template:
         return template
-    return request.url.path
+    return "(no route)"
 
 
 async def _record_sample(

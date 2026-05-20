@@ -25,6 +25,7 @@ function makeRed(overrides: Partial<RedMetricsResponse> = {}): RedMetricsRespons
     error_pct: 0.4,
     latency_ms: { p50: 12, p95: 45, p99: 95, max: 320 },
     by_endpoint: [],
+    data_status: 'ok',
     ...overrides,
   };
 }
@@ -41,6 +42,7 @@ function makeSlo(overrides: Partial<SloCompliance> = {}): SloCompliance {
     // Default: actual matches the full 24h window so the "data: last Xm"
     // hint is hidden. Individual tests override this when they care.
     data_window_seconds_actual: 24 * 3600,
+    data_status: 'ok',
     ...overrides,
   };
 }

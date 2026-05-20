@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import structlog
 from redis import Redis
@@ -141,11 +141,21 @@ def _endpoint_label(sample: dict[str, Any]) -> str:
     return f"{method} {path}"
 
 
-def _empty_response(window_seconds: int) -> RedMetricsResponse:
+def _empty_response(
+    window_seconds: int,
+    *,
+    data_status: Literal["ok", "degraded"] = "ok",
+) -> RedMetricsResponse:
     """Return the all-zero RED envelope for an empty window.
 
     Same shape as the populated response so the frontend never has to
     branch on "no data" — every field is present, just zeroed.
+
+    *data_status* defaults to ``"ok"`` (legitimate "no traffic in
+    window") and is set to ``"degraded"`` by callers in the Redis
+    exception paths so the frontend can warn that the numbers do not
+    reflect live state. Both zero envelopes are otherwise identical so
+    the dashboard's empty-state rendering still works.
     """
     return RedMetricsResponse(
         window_seconds=window_seconds,
@@ -155,6 +165,7 @@ def _empty_response(window_seconds: int) -> RedMetricsResponse:
         error_pct=0.0,
         latency_ms=LatencyPercentiles(p50=0, p95=0, p99=0, max=0),
         by_endpoint=[],
+        data_status=data_status,
     )
 
 
@@ -180,7 +191,7 @@ def compute_window(window_seconds: int) -> RedMetricsResponse:
         rds = _get_metrics_redis()
     except Exception as exc:
         logger.warning("red_metrics.redis_unavailable", error=str(exc))
-        return _empty_response(window_seconds)
+        return _empty_response(window_seconds, data_status="degraded")
 
     now_ms = _now_ms()
     since_ms = now_ms - window_seconds * 1000
@@ -189,7 +200,7 @@ def compute_window(window_seconds: int) -> RedMetricsResponse:
         samples = _read_samples(rds, since_ms=since_ms)
     except Exception as exc:
         logger.warning("red_metrics.read_failed", error=str(exc))
-        return _empty_response(window_seconds)
+        return _empty_response(window_seconds, data_status="degraded")
 
     if not samples:
         return _empty_response(window_seconds)
@@ -281,7 +292,7 @@ def compute_slo(window_hours: int) -> SloComplianceResponse:
         rds = _get_metrics_redis()
     except Exception as exc:
         logger.warning("red_metrics.redis_unavailable", error=str(exc))
-        return _empty_slo_response(window_hours, slo_target_pct)
+        return _empty_slo_response(window_hours, slo_target_pct, data_status="degraded")
 
     now_ms = _now_ms()
     since_ms = now_ms - requested_window_seconds * 1000
@@ -290,7 +301,7 @@ def compute_slo(window_hours: int) -> SloComplianceResponse:
         samples = _read_samples(rds, since_ms=since_ms)
     except Exception as exc:
         logger.warning("red_metrics.read_failed", error=str(exc))
-        return _empty_slo_response(window_hours, slo_target_pct)
+        return _empty_slo_response(window_hours, slo_target_pct, data_status="degraded")
 
     total = len(samples)
     if total == 0:
@@ -334,7 +345,12 @@ def compute_slo(window_hours: int) -> SloComplianceResponse:
     )
 
 
-def _empty_slo_response(window_hours: int, slo_target_pct: float) -> SloComplianceResponse:
+def _empty_slo_response(
+    window_hours: int,
+    slo_target_pct: float,
+    *,
+    data_status: Literal["ok", "degraded"] = "ok",
+) -> SloComplianceResponse:
     """Return the all-zero / full-budget SLO envelope for an empty window.
 
     Per the plan: no traffic → 100% success, 100% budget remaining.
@@ -344,6 +360,12 @@ def _empty_slo_response(window_hours: int, slo_target_pct: float) -> SloComplian
     ``data_window_seconds_actual`` is 0 because no samples means no
     data window at all — the frontend can render the card without a
     "data: last Xm" hint in this case.
+
+    *data_status* defaults to ``"ok"`` (legitimate empty window). The
+    Redis exception paths in :func:`compute_slo` pass ``"degraded"`` so
+    the frontend can warn that the headline "100% available" is actually
+    "we have no data to evaluate" — surfacing a healthy bar during a
+    metrics-source outage would mislead the operator.
     """
     return SloComplianceResponse(
         window_hours=window_hours,
@@ -354,6 +376,7 @@ def _empty_slo_response(window_hours: int, slo_target_pct: float) -> SloComplian
         error_budget_pct_remaining=100.0,
         error_budget_consumed_pct=0.0,
         data_window_seconds_actual=0,
+        data_status=data_status,
     )
 
 
