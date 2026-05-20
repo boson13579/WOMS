@@ -11,6 +11,7 @@ import { useNavigate, useLocation } from 'react-router-dom';
 
 import { ThemeToggle } from '@/components/layout/ThemeToggle';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { safeNextPath } from '@/lib/safeNextPath';
 
 import type { AuthMode } from '../types/auth';
 
@@ -39,9 +40,17 @@ export function AuthPage({ onLoginSuccess }: AuthPageProps): JSX.Element {
   const handleLoginSuccess = () => {
     if (onLoginSuccess) {
       onLoginSuccess();
-    } else {
-      navigate('/');
+      return;
     }
+    // Honour ``?next=`` propagated by the global-401 redirect so a
+    // user bounced to /login lands back where they were after a
+    // successful re-login. ``safeNextPath`` collapses anything that
+    // smells like an open-redirect (absolute URLs, protocol-relative,
+    // non-leading-slash) to ``/`` defensively — see
+    // ``frontend/src/lib/safeNextPath.ts``.
+    const params = new URLSearchParams(location.search);
+    const next = safeNextPath(params.get('next'));
+    navigate(next, { replace: true });
   };
 
   const handleRegisterSuccess = () => {

@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { apiFetch } from './apiFetch';
+import { apiFetch, ApiError, setUnauthorizedHandler } from './apiFetch';
 
 describe('apiFetch', () => {
   afterEach(() => {
     vi.clearAllMocks();
     vi.useRealTimers();
+    setUnauthorizedHandler(null);
   });
 
   it('parses a 200 response through the provided parser', async () => {
@@ -63,6 +64,137 @@ describe('apiFetch', () => {
     await expect(
       apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw),
     ).rejects.toThrow('Unified message.');
+  });
+
+  // RED: setUnauthorizedHandler doesn't exist yet — the import will fail.
+  it('invokes the unauthorized handler on 401 and still throws ApiError(401)', async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Unauthorized.' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(
+      apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw),
+    ).rejects.toBeInstanceOf(ApiError);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  // RED: 403 and 500 must NOT invoke the unauthorized handler.
+  it('does NOT invoke the unauthorized handler on 403/500', async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Forbidden.' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await expect(
+      apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw),
+    ).rejects.toBeInstanceOf(ApiError);
+    expect(handler).not.toHaveBeenCalled();
+
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Boom.' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await expect(
+      apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw),
+    ).rejects.toBeInstanceOf(ApiError);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  // RED: setUnauthorizedHandler(null) should stop further invocations.
+  it('stops invoking the handler once it is unregistered with null', async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    setUnauthorizedHandler(null);
+
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Unauthorized.' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(
+      apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw),
+    ).rejects.toBeInstanceOf(ApiError);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  // RED: A throwing handler must not mask the API error.
+  it('does not mask the API error when the handler throws', async () => {
+    setUnauthorizedHandler(() => {
+      throw new Error('handler exploded');
+    });
+
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Unauthorized.' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(
+      apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw),
+    ).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it('attaches X-Request-Id to ApiError when the header is present', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Bad.' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': 'req-abc' },
+      }),
+    );
+
+    const caught = await apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw)
+      .then(() => null)
+      .catch((err: unknown) => err);
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).requestId).toBe('req-abc');
+  });
+
+  it('leaves requestId undefined when the X-Request-Id header is absent', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Bad.' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const caught = await apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw)
+      .then(() => null)
+      .catch((err: unknown) => err);
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).requestId).toBeUndefined();
+  });
+
+  it('still attaches requestId on 401 responses', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Unauthorized.' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': 'req-401' },
+      }),
+    );
+
+    const caught = await apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw)
+      .then(() => null)
+      .catch((err: unknown) => err);
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).requestId).toBe('req-401');
   });
 
   it('rewrites request timeout aborts to a readable error message', async () => {

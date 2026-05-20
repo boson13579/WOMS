@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import uuid
 
-import structlog
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
-from app.core.logger import audit_log
+from app.core.audit import record_audit
 from app.models.user import User, UserRole
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import user as user_repo
+from app.schemas.audit import AuditLogResponse, UserAuditLogListResponse
 from app.schemas.user import (
     AssignableUserResponse,
     UserListResponse,
@@ -21,8 +21,6 @@ from app.schemas.user import (
     UserSelfUpdateRequest,
     UserUpdateRequest,
 )
-
-logger = structlog.get_logger(__name__)
 
 _LAST_ROOT_MSG = "Cannot demote/deactivate the last active root user."
 
@@ -119,10 +117,10 @@ def update_self(
             email=request.email,
         )
         new_val = {"username": current_user.username, "email": current_user.email}
-        audit_log_repo.create(
+        record_audit(
             db,
             action="user.self_updated",
-            user_id=current_user.id,
+            actor_id=current_user.id,
             resource_type="user",
             resource_id=current_user.id,
             old_value=old_val,
@@ -152,14 +150,6 @@ def update_self(
             status_code=status.HTTP_409_CONFLICT,
             detail="Conflict: username or email already taken.",
         ) from exc
-
-    audit_log(
-        action="user.self_updated",
-        actor_id=str(current_user.id),
-        resource_type="user",
-        resource_id=str(current_user.id),
-        changes={"old": old_val, "new": new_val},
-    )
 
     return UserResponse.model_validate(current_user)
 
@@ -229,10 +219,10 @@ def update_user(
             "role": user.role.value,
             "is_active": user.is_active,
         }
-        audit_log_repo.create(
+        record_audit(
             db,
             action="user.updated",
-            user_id=actor.id,
+            actor_id=actor.id,
             resource_type="user",
             resource_id=user.id,
             old_value=old_val,
@@ -263,14 +253,6 @@ def update_user(
             detail="Conflict: username or email already taken.",
         ) from exc
 
-    audit_log(
-        action="user.updated",
-        actor_id=str(actor.id),
-        resource_type="user",
-        resource_id=str(user.id),
-        changes={"old": old_val, "new": new_val},
-    )
-
     return UserResponse.model_validate(user)
 
 
@@ -287,10 +269,10 @@ def deactivate_user(db: Session, user_id: uuid.UUID, actor: User) -> UserRespons
 
     try:
         user_repo.deactivate(db, user)
-        audit_log_repo.create(
+        record_audit(
             db,
             action="user.deactivated",
-            user_id=actor.id,
+            actor_id=actor.id,
             resource_type="user",
             resource_id=user.id,
             old_value={"is_active": True},
@@ -304,12 +286,50 @@ def deactivate_user(db: Session, user_id: uuid.UUID, actor: User) -> UserRespons
             detail="User was modified concurrently. Please retry.",
         ) from exc
 
-    audit_log(
-        action="user.deactivated",
-        actor_id=str(actor.id),
-        resource_type="user",
-        resource_id=str(user.id),
-        changes={"old": {"is_active": True}, "new": {"is_active": False}},
-    )
-
     return UserResponse.model_validate(user)
+
+
+def get_user_audit_log(
+    db: Session,
+    user_id: uuid.UUID,
+    *,
+    page: int = 1,
+    page_size: int = 20,
+) -> UserAuditLogListResponse:
+    """Return the paginated audit-log history for *user_id*.
+
+    Behaviour:
+      * 404 if no such user exists. Deactivated (``is_active=False``) users
+        intentionally remain visible — root must be able to review the
+        history of accounts they have already disabled.
+      * Filters on ``resource_type='user'`` in addition to ``resource_id``
+        so a hypothetical UUID collision between a user-id and an order-id
+        cannot cross-contaminate the response.
+      * Sorts newest-first (most useful UX for an admin audit view).
+      * Returns a paginated wrapper (``items`` / ``total`` / ``page`` /
+        ``page_size``) — same shape as ``OrderListResponse`` so the FE can
+        reuse its existing paginator widget.
+    """
+    user = user_repo.get_by_id(db, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    logs = audit_log_repo.get_by_resource_id(
+        db,
+        user_id,
+        resource_type="user",
+        page=page,
+        page_size=page_size,
+        oldest_first=False,
+    )
+    total = audit_log_repo.count_by_resource_id(
+        db,
+        user_id,
+        resource_type="user",
+    )
+    return UserAuditLogListResponse(
+        items=[AuditLogResponse.model_validate(log) for log in logs],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )

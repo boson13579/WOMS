@@ -13,8 +13,8 @@
  * persistent sidebar is hidden (`<768px`).
  */
 import {
+  Activity,
   Bell,
-  CalendarClock,
   LayoutDashboard,
   Package,
   ScrollText,
@@ -38,11 +38,9 @@ interface NavItem {
 const PRIMARY_NAV: readonly NavItem[] = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/orders', label: 'Orders', icon: Package },
-  { to: '/scheduling', label: 'Scheduling', icon: CalendarClock, disabled: true },
 ];
 
 const SECONDARY_NAV: readonly NavItem[] = [
-  { to: '/audit', label: 'Audit log', icon: ScrollText, disabled: true },
   { to: '/notifications', label: 'Notifications', icon: Bell, disabled: true },
 ];
 
@@ -98,6 +96,8 @@ const NOOP = (): void => {};
 export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps = {}): JSX.Element {
   const role = useCurrentRole();
   const showUserManagement = role === 'root';
+  const showObservability = role === 'scheduler' || role === 'root';
+  const showAuditLog = role === 'root';
 
   return (
     <div className="flex h-full flex-col">
@@ -124,6 +124,12 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
             {PRIMARY_NAV.map((item) => (
               <NavRow key={item.to} item={item} onNavigate={onNavigate} />
             ))}
+            {showObservability ? (
+              <NavRow
+                item={{ to: '/observability', label: 'Observability', icon: Activity }}
+                onNavigate={onNavigate}
+              />
+            ) : null}
             {showUserManagement ? (
               <NavRow
                 item={{ to: '/users', label: 'Users', icon: Users }}
@@ -141,6 +147,12 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
             {SECONDARY_NAV.map((item) => (
               <NavRow key={item.to} item={item} onNavigate={onNavigate} />
             ))}
+            {showAuditLog ? (
+              <NavRow
+                item={{ to: '/audit', label: 'Audit log', icon: ScrollText }}
+                onNavigate={onNavigate}
+              />
+            ) : null}
           </div>
         </div>
       </nav>
