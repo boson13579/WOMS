@@ -108,3 +108,9 @@ output "github_actions_role_arn" {
   description = "IAM role ARN to put in GitHub repo secrets as AWS_DEPLOY_ROLE_ARN."
   value       = aws_iam_role.github_actions.arn
 }
+
+output "admin_password" {
+  description = "Auto-generated demo admin password. Read with `terraform output -raw admin_password` and share with reviewers out-of-band."
+  value       = random_password.admin_password.result
+  sensitive   = true
+}
