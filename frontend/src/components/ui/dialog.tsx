@@ -11,9 +11,10 @@ interface DialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   children: React.ReactNode;
+  className?: string;
 }
 
-function Dialog({ open, onOpenChange, children }: DialogProps): JSX.Element {
+function Dialog({ open, onOpenChange, children, className }: DialogProps): JSX.Element {
   const ref = React.useRef<HTMLDialogElement>(null);
 
   React.useEffect(() => {
@@ -46,6 +47,7 @@ function Dialog({ open, onOpenChange, children }: DialogProps): JSX.Element {
         'fixed inset-0 z-50 m-auto max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-lg border bg-background p-0 shadow-xl',
         'backdrop:bg-black/50',
         'open:animate-in open:fade-in-0 open:zoom-in-95',
+        className,
       )}
       onClick={(e) => {
         if (e.target === e.currentTarget) onOpenChange(false);
