@@ -7,6 +7,7 @@ import { useCurrentUserId } from '@/lib/auth';
 import type { Order } from '../types';
 
 import { orderKeys } from './orders';
+import { scheduleCapacityKeys } from './scheduleCapacity';
 import { scheduleResultKeys } from './scheduleResult';
 
 const scheduleCompoundResponseSchema = z.object({
@@ -114,6 +115,7 @@ export function usePinScheduleOperation(): ReturnType<
     },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: orderKeys.all });
+      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
       void qc.invalidateQueries({ queryKey: scheduleResultKeys.all });
     },
   });

@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { useCurrentUser } from '@/lib/auth';
 
 import { orderKeys } from '../api/orders';
+import { scheduleCapacityKeys } from '../api/scheduleCapacity';
 import { scheduleResultKeys } from '../api/scheduleResult';
 
 const wsEnvelopeSchema = z
@@ -48,6 +49,7 @@ export function useScheduleWs(): void {
       }
       if (env.type.startsWith('schedule.')) {
         void qc.invalidateQueries({ queryKey: orderKeys.all });
+        void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
         void qc.invalidateQueries({ queryKey: scheduleResultKeys.all });
       }
     };

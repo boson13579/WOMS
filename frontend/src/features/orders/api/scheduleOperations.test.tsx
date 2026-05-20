@@ -57,6 +57,7 @@ describe('usePinScheduleOperation', () => {
 
   it('queues a pin compound for an existing scheduled order', async () => {
     const { result } = renderHook(() => usePinScheduleOperation(), { wrapper: makeWrapper() });
+    const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
 
     act(() => {
       result.current.mutate({
@@ -90,6 +91,9 @@ describe('usePinScheduleOperation', () => {
         },
       ],
     });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['orders'] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['schedule', 'capacity'] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['schedule', 'result'] });
   });
 
   it('queues add then pin for an unscheduled pending order', async () => {

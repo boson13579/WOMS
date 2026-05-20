@@ -7,6 +7,7 @@ import {
   GripVertical,
   Loader2,
   PackageOpen,
+  Zap,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { DragEvent } from 'react';
@@ -19,9 +20,10 @@ import { useCurrentRole } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 
 import { useOrders } from '../api/orders';
+import { useScheduleCapacity } from '../api/scheduleCapacity';
 import { usePinScheduleOperation } from '../api/scheduleOperations';
 import { useScheduleResult } from '../api/scheduleResult';
-import type { Order, OrderStatus, ScheduleResult } from '../types';
+import type { DailyAssignment, Order, OrderStatus, ScheduleResult } from '../types';
 
 interface OrdersCalendarDialogProps {
   open: boolean;
@@ -69,6 +71,13 @@ interface ActiveOperation {
   readyToVerify: boolean;
 }
 
+interface ProductionCalendarItem extends ScheduleResult {
+  productionDate: string;
+  productionQuantity: number;
+  cumulativeQuantity: number;
+  productionState: 'in_progress' | 'complete';
+}
+
 function dateKey(date: Date): string {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -100,12 +109,33 @@ function monthLabel(date: Date): string {
   return new Intl.DateTimeFormat('zh-TW', { year: 'numeric', month: 'long' }).format(date);
 }
 
-function groupByExpectedDate(items: ScheduleResult[]): Record<string, ScheduleResult[]> {
-  return items.reduce<Record<string, ScheduleResult[]>>((acc, item) => {
-    if (!item.expected_delivery_date) return acc;
-    acc[item.expected_delivery_date] = [...(acc[item.expected_delivery_date] ?? []), item];
+function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): number {
+  return assignments
+    .filter((assignment) => assignment.date <= date)
+    .reduce((total, assignment) => total + assignment.quantity, 0);
+}
+
+function groupByProductionDate(items: ScheduleResult[]): Record<string, ProductionCalendarItem[]> {
+  return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
+    item.daily_breakdown.forEach((assignment) => {
+      const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
+      const productionItem: ProductionCalendarItem = {
+        ...item,
+        productionDate: assignment.date,
+        productionQuantity: assignment.quantity,
+        cumulativeQuantity,
+        productionState: cumulativeQuantity >= item.wafer_quantity ? 'complete' : 'in_progress',
+      };
+      acc[assignment.date] = [...(acc[assignment.date] ?? []), productionItem];
+    });
     return acc;
   }, {});
+}
+
+function capacityTone(remaining: number, dailyCapacity: number): string {
+  if (remaining <= 0) return 'text-red-600 dark:text-red-400';
+  if (remaining <= dailyCapacity / 2) return 'text-amber-600 dark:text-amber-400';
+  return 'text-emerald-600 dark:text-emerald-400';
 }
 
 function isTargetAfterDeadline(order: DraggableOrder, targetDate: string): boolean {
@@ -142,7 +172,7 @@ function OrderLine({
   selected,
   onSelectedChange,
 }: {
-  order: ScheduleResult;
+  order: ProductionCalendarItem;
   dragOrder?: DraggableOrder;
   canDrag: boolean;
   onDragStart: (event: DragEvent, order: DraggableOrder) => void;
@@ -180,11 +210,12 @@ function OrderLine({
           <span className="truncate">{order.order_number}</span>
         </span>
         <Badge variant="secondary" className="shrink-0">
-          {STATUS_LABEL[order.status]}
+          {order.productionState === 'complete' ? '已完成' : '生產中'}
         </Badge>
       </div>
       <div className="mt-1 truncate text-muted-foreground">
-        {order.customer_name} · {order.wafer_quantity.toLocaleString()} 片
+        {order.customer_name} · 今日 {order.productionQuantity.toLocaleString()} / 累計{' '}
+        {order.cumulativeQuantity.toLocaleString()} / {order.wafer_quantity.toLocaleString()}
       </div>
     </div>
   );
@@ -260,6 +291,7 @@ export function OrdersCalendarDialog({
   const role = useCurrentRole();
 
   const scheduleResult = useScheduleResult();
+  const scheduleCapacity = useScheduleCapacity();
   const pinSchedule = usePinScheduleOperation();
   const pendingOrders = useOrders({
     status: 'pending',
@@ -282,9 +314,29 @@ export function OrdersCalendarDialog({
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
   const grouped = useMemo(
-    () => groupByExpectedDate(scheduleResult.data ?? []),
+    () => groupByProductionDate(scheduleResult.data ?? []),
     [scheduleResult.data],
   );
+  const dailyCapacityByDate = useMemo(() => {
+    if (!scheduleCapacity.data)
+      return new Map<string, { remaining: number; dailyCapacity: number }>();
+
+    return new Map(
+      scheduleCapacity.data.entries.map((entry) => {
+        const used = (grouped[entry.date] ?? []).reduce(
+          (total, order) => total + order.productionQuantity,
+          0,
+        );
+        return [
+          entry.date,
+          {
+            remaining: Math.max(scheduleCapacity.data.daily_capacity - used, 0),
+            dailyCapacity: scheduleCapacity.data.daily_capacity,
+          },
+        ];
+      }),
+    );
+  }, [grouped, scheduleCapacity.data]);
   const scheduledOrderById = useMemo(
     () => new Map((scheduledOrders.data?.items ?? []).map((order) => [order.id, order])),
     [scheduledOrders.data],
@@ -494,7 +546,7 @@ export function OrdersCalendarDialog({
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h3 className="text-base font-semibold">{monthLabel(visibleMonth)}</h3>
-                <p className="text-sm text-muted-foreground">依預估完成日顯示已排程訂單</p>
+                <p className="text-sm text-muted-foreground">依生產日期顯示已排程訂單</p>
               </div>
               <div className="flex items-center gap-2">
                 <Button
@@ -556,6 +608,7 @@ export function OrdersCalendarDialog({
                   {days.map((day) => {
                     const key = dateKey(day);
                     const items = grouped[key] ?? [];
+                    const capacity = dailyCapacityByDate.get(key);
                     const isCurrentMonth = day.getMonth() === visibleMonth.getMonth();
                     const isSelected = key === selectedDate;
                     return (
@@ -582,11 +635,25 @@ export function OrdersCalendarDialog({
                       >
                         <div className="mb-1 flex items-center justify-between">
                           <span className="text-xs font-semibold">{day.getDate()}</span>
-                          {items.length > 0 && (
-                            <span className="rounded-full bg-sky-600 px-1.5 py-0.5 text-[10px] text-white">
-                              {items.length}
-                            </span>
-                          )}
+                          <span className="flex items-center gap-1">
+                            {capacity && (
+                              <span
+                                className={cn(
+                                  'inline-flex items-center gap-0.5 text-[10px] font-medium',
+                                  capacityTone(capacity.remaining, capacity.dailyCapacity),
+                                )}
+                                title="當日剩餘產能"
+                              >
+                                <Zap className="h-3 w-3" />
+                                {capacity.remaining.toLocaleString()}
+                              </span>
+                            )}
+                            {items.length > 0 && (
+                              <span className="rounded-full bg-sky-600 px-1.5 py-0.5 text-[10px] text-white">
+                                {items.length}
+                              </span>
+                            )}
+                          </span>
                         </div>
                         <div className="space-y-1">
                           {items.slice(0, MAX_ITEMS_PER_DAY).map((order) => {
@@ -608,7 +675,7 @@ export function OrdersCalendarDialog({
                                   isDraggable && 'cursor-grab active:cursor-grabbing',
                                 )}
                               >
-                                {order.order_number}
+                                {order.order_number} · {order.productionQuantity.toLocaleString()}
                               </div>
                             );
                           })}
@@ -701,7 +768,23 @@ export function OrdersCalendarDialog({
             )}
 
             <div className="mb-5">
-              <h3 className="text-sm font-semibold">{selectedDate} 完成訂單</h3>
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold">{selectedDate} 生產訂單</h3>
+                {dailyCapacityByDate.get(selectedDate) && (
+                  <span
+                    className={cn(
+                      'inline-flex items-center gap-1 text-xs font-medium',
+                      capacityTone(
+                        dailyCapacityByDate.get(selectedDate)?.remaining ?? 0,
+                        dailyCapacityByDate.get(selectedDate)?.dailyCapacity ?? 1,
+                      ),
+                    )}
+                  >
+                    <Zap className="h-3.5 w-3.5" />
+                    剩餘 {dailyCapacityByDate.get(selectedDate)?.remaining.toLocaleString()}
+                  </span>
+                )}
+              </div>
               <div className="mt-3 space-y-2">
                 {selectedItems.length > 0 ? (
                   selectedItems.map((order) => {
@@ -720,7 +803,7 @@ export function OrdersCalendarDialog({
                   })
                 ) : (
                   <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-                    這一天沒有預估完成的訂單。
+                    這天沒有生產訂單。
                   </div>
                 )}
               </div>

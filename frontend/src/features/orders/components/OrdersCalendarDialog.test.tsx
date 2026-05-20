@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +12,18 @@ const mockScheduleResult = {
   data: [] as ScheduleResult[],
   isPending: false,
   isError: false,
+};
+
+const mockScheduleCapacity = {
+  data: {
+    base_date: '2026-05-09',
+    daily_capacity: 2500,
+    entries: [
+      { date: '2026-05-09', cumulative_remaining: 1500 },
+      { date: '2026-05-10', cumulative_remaining: 2500 },
+      { date: '2026-05-11', cumulative_remaining: 2500 },
+    ],
+  },
 };
 
 const mockOrders = {
@@ -47,6 +59,10 @@ vi.mock('@/lib/auth', () => ({
 
 vi.mock('../api/scheduleResult', () => ({
   useScheduleResult: () => mockScheduleResult,
+}));
+
+vi.mock('../api/scheduleCapacity', () => ({
+  useScheduleCapacity: () => mockScheduleCapacity,
 }));
 
 vi.mock('../api/orders', () => ({
@@ -123,6 +139,18 @@ const scheduledOrderDetail: Order = {
   status: 'scheduled',
 };
 
+const splitScheduledOrder: ScheduleResult = {
+  ...scheduledOrder,
+  id: '44444444-4444-4444-8444-444444444444',
+  order_number: 'ORD-20260504-0004',
+  customer_name: 'ASE',
+  wafer_quantity: 2500,
+  daily_breakdown: [
+    { date: '2026-05-10', quantity: 1000 },
+    { date: '2026-05-11', quantity: 1500 },
+  ],
+};
+
 describe('OrdersCalendarDialog', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -144,16 +172,18 @@ describe('OrdersCalendarDialog', () => {
     });
   });
 
-  it('renders scheduled orders on their expected delivery date', async () => {
+  it('renders scheduled orders on their production date', async () => {
     const user = userEvent.setup();
     renderDialog();
 
-    await user.click(screen.getByRole('button', { name: /2026-05-10/ }));
+    await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
 
-    const selectedPanel = screen.getByText('2026-05-10 完成訂單').closest('div');
-    expect(selectedPanel).not.toBeNull();
-    expect(within(selectedPanel as HTMLElement).getByText('ORD-20260504-0001')).toBeInTheDocument();
-    expect(within(selectedPanel as HTMLElement).getByText(/TSMC/)).toBeInTheDocument();
+    expect(screen.getByText('2026-05-09 生產訂單')).toBeInTheDocument();
+    expect(screen.getAllByText('ORD-20260504-0001').length).toBeGreaterThan(0);
+    expect(screen.getByText(/TSMC/)).toBeInTheDocument();
+    expect(screen.getByText(/今日 500/)).toBeInTheDocument();
+    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.getByText('剩餘 2,000')).toBeInTheDocument();
   });
 
   it('renders pending orders without expected delivery date in the unscheduled panel', () => {
@@ -162,6 +192,24 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText('未排程訂單')).toBeInTheDocument();
     expect(screen.getByText('ORD-20260504-0002')).toBeInTheDocument();
     expect(screen.getByText(/MediaTek/)).toBeInTheDocument();
+  });
+
+  it('shows split production progress across production dates', async () => {
+    const user = userEvent.setup();
+    mockScheduleResult.data = [splitScheduledOrder];
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-10/ }));
+    expect(screen.getByText(/今日 1,000/)).toBeInTheDocument();
+    expect(screen.getByText(/累計 1,000 \/ 2,500/)).toBeInTheDocument();
+    expect(screen.getByText('生產中')).toBeInTheDocument();
+    expect(screen.getByText('剩餘 1,500')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
+    expect(screen.getByText(/今日 1,500/)).toBeInTheDocument();
+    expect(screen.getByText(/累計 2,500 \/ 2,500/)).toBeInTheDocument();
+    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.getByText('剩餘 1,000')).toBeInTheDocument();
   });
 
   it('can navigate between months', async () => {
