@@ -3,9 +3,16 @@
  *
  * All responses are validated through zod `.parse()` at the boundary so the
  * rest of the codebase has compile-time type safety.
+ *
+ * Every endpoint sends `credentials: 'include'` so the httpOnly session
+ * cookie is attached even when the SPA is served from a different origin
+ * (production reverse-proxy mode). Local dev still works because the
+ * Vite proxy serves both UI and API from the same origin.
  */
 import { useMutation } from '@tanstack/react-query';
 import { z } from 'zod';
+
+import { apiFetch, jsonHeaders } from '@/lib/apiFetch';
 
 export const loginRequestSchema = z.object({
   username: z.string().min(1, 'Username is required'),
@@ -47,10 +54,25 @@ export const registerResponseSchema = z.object({
   created_at: z.string().datetime(),
 });
 
+/**
+ * Shape of ``GET /api/v1/auth/me``. Mirrors backend ``UserResponse`` minus
+ * ``created_at`` (the endpoint does not include it; see
+ * ``backend/app/api/v1/auth.py:68``).
+ */
+export const meResponseSchema = z.object({
+  id: z.string().uuid(),
+  username: z.string(),
+  email: z.string().email().nullable(),
+  role: z.enum(['root', 'scheduler', 'order_manager', 'viewer']),
+  is_active: z.boolean(),
+  version_id: z.number().int(),
+});
+
 export type LoginRequest = z.infer<typeof loginRequestSchema>;
 export type LoginResponse = z.infer<typeof loginResponseSchema>;
 export type RegisterRequest = z.infer<typeof registerRequestSchema>;
 export type RegisterResponse = z.infer<typeof registerResponseSchema>;
+export type MeResponse = z.infer<typeof meResponseSchema>;
 
 async function readErrorMessage(response: Response, fallback: string): Promise<string> {
   const errorData = (await response.json().catch(() => null)) as {
@@ -68,7 +90,7 @@ export async function login(payload: LoginRequest): Promise<LoginResponse> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    credentials: 'same-origin',
+    credentials: 'include',
   });
 
   if (!res.ok) {
@@ -89,7 +111,7 @@ export async function register(payload: RegisterRequest): Promise<RegisterRespon
       email: body.email,
       password: body.password,
     }),
-    credentials: 'same-origin',
+    credentials: 'include',
   });
 
   if (!res.ok) {
@@ -111,10 +133,28 @@ export async function logout(): Promise<void> {
   const res = await fetch('/api/v1/auth/logout', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    credentials: 'same-origin',
+    credentials: 'include',
   });
 
   if (!res.ok) {
     throw new Error(await readErrorMessage(res, 'Logout failed'));
   }
+}
+
+/**
+ * Server-confirmed identity probe.
+ *
+ * Goes through ``apiFetch`` so a 401 funnels into the global
+ * ``unauthorizedHandler`` set up by ``installUnauthorizedHandler`` —
+ * clearing the React Query cache, persisting logout, and routing to
+ * ``/login?next=…``. The hook layer (`useMe`) intentionally does NOT
+ * react to ``isError`` for non-401 codes; sustained 5xx is surfaced as
+ * an error-state UI in ``ProtectedRoute``.
+ */
+export async function getMe(): Promise<MeResponse> {
+  return apiFetch(
+    '/api/v1/auth/me',
+    { method: 'GET', headers: jsonHeaders(), credentials: 'include' },
+    (raw) => meResponseSchema.parse(raw),
+  );
 }

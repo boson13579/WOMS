@@ -97,6 +97,7 @@ class UserResponse(BaseModel):
     is_active: bool
     version_id: int
     created_at: datetime
+    last_login_at: datetime | None = None
 
 
 class UserListResponse(BaseModel):

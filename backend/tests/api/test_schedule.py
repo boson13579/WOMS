@@ -283,6 +283,191 @@ def test_operations_without_token_returns_401(client: TestClient) -> None:
     assert res.json()["error"]["code"] == 401
 
 
+# GREEN
+def test_operations_overrides_requested_by_with_caller(
+    client: TestClient,
+    db_session: Session,
+    _autouse_mock_enqueue_compound: MagicMock,
+) -> None:
+    """Body-supplied ``requested_by`` is silently overwritten with the
+    authenticated user's id at the route boundary.
+
+    A user with the ``scheduler`` role can otherwise submit a compound whose
+    ``requested_by`` points at any other user and the WS broadcast / audit
+    trail would misattribute the action. The fix is route-scoped: rewrite
+    the field on the parsed request before handing it to
+    ``enqueue_compound``.
+    """
+    user_a = _make_user(db_session, username="sched_op_override_rb", role=UserRole.scheduler)
+    token = _login(client, "sched_op_override_rb")
+
+    payload = {
+        "group": "grow",
+        "op_count": 1,
+        # Attacker-supplied identity — must be ignored.
+        "requested_by": str(uuid.uuid4()),
+        "ops": [
+            {
+                "op": "add",
+                "order_id": str(uuid.uuid4()),
+                "order_number": "ORD-OVERRIDE-RB",
+                "wafer_quantity": 100,
+                "deadline": "2026-08-01",
+            }
+        ],
+    }
+
+    res = client.post(
+        "/api/v1/schedule/operations",
+        headers=_auth(token),
+        json=payload,
+    )
+
+    assert res.status_code == 202
+    assert _autouse_mock_enqueue_compound.call_count == 1
+    enqueued = _autouse_mock_enqueue_compound.call_args.args[0]
+    # The override happens regardless of what the body said.
+    assert enqueued.requested_by == user_a.id
+
+
+# GREEN
+def test_operations_overrides_db_action_actor_id(
+    client: TestClient,
+    db_session: Session,
+    _autouse_mock_enqueue_compound: MagicMock,
+) -> None:
+    """``db_action.actor_id`` is also overridden with the authenticated user.
+
+    Without this guard a scheduler could forge audit-log entries attributed
+    to any other user (the worker writes ``audit_logs.user_id`` and the ECS
+    ``actor_id`` field straight from the compound payload).
+    """
+    user_a = _make_user(db_session, username="sched_op_override_actor", role=UserRole.scheduler)
+    token = _login(client, "sched_op_override_actor")
+
+    payload = {
+        "group": "grow",
+        "op_count": 1,
+        "requested_by": str(uuid.uuid4()),  # forged
+        "ops": [
+            {
+                "op": "add",
+                "order_id": str(uuid.uuid4()),
+                "order_number": "ORD-OVERRIDE-ACTOR",
+                "wafer_quantity": 100,
+                "deadline": "2026-08-01",
+            }
+        ],
+        "db_action": {
+            "kind": "update",
+            "actor_id": str(uuid.uuid4()),  # also forged
+            "new_wafer_quantity": 200,
+        },
+    }
+
+    res = client.post(
+        "/api/v1/schedule/operations",
+        headers=_auth(token),
+        json=payload,
+    )
+
+    assert res.status_code == 202
+    assert _autouse_mock_enqueue_compound.call_count == 1
+    enqueued = _autouse_mock_enqueue_compound.call_args.args[0]
+    # Both identity fields collapse onto current_user.id.
+    assert enqueued.requested_by == user_a.id
+    assert enqueued.db_action is not None
+    assert enqueued.db_action.actor_id == user_a.id
+
+
+# GREEN
+def test_operations_override_is_noop_when_body_matches_current_user(
+    client: TestClient,
+    db_session: Session,
+    _autouse_mock_enqueue_compound: MagicMock,
+) -> None:
+    """When the body already carries the authenticated user's id, the
+    override is a no-op — the same UUID round-trips into ``enqueue_compound``
+    unchanged. Belt-and-suspenders against a future refactor that would
+    accidentally drop the identity onto the floor.
+    """
+    user_a = _make_user(db_session, username="sched_op_noop", role=UserRole.scheduler)
+    token = _login(client, "sched_op_noop")
+
+    payload = {
+        "group": "grow",
+        "op_count": 1,
+        "requested_by": str(user_a.id),  # honest body
+        "ops": [
+            {
+                "op": "add",
+                "order_id": str(uuid.uuid4()),
+                "order_number": "ORD-OVERRIDE-NOOP",
+                "wafer_quantity": 100,
+                "deadline": "2026-08-01",
+            }
+        ],
+        "db_action": {
+            "kind": "update",
+            "actor_id": str(user_a.id),  # honest body
+            "new_wafer_quantity": 250,
+        },
+    }
+
+    res = client.post(
+        "/api/v1/schedule/operations",
+        headers=_auth(token),
+        json=payload,
+    )
+
+    assert res.status_code == 202
+    assert _autouse_mock_enqueue_compound.call_count == 1
+    enqueued = _autouse_mock_enqueue_compound.call_args.args[0]
+    assert enqueued.requested_by == user_a.id
+    assert enqueued.db_action is not None
+    assert enqueued.db_action.actor_id == user_a.id
+
+
+def test_apply_schedule_audit_row_has_null_user_id_for_system_actor(
+    db_session: Session,
+) -> None:
+    """The ``order.scheduled`` audit row written by ``apply_schedule`` must
+    have ``user_id IS NULL`` — scheduling is system-driven, not user-driven,
+    so there is no human actor to attribute. Pairs with the parallel check
+    in the service-layer test; the verifier called out that this assertion
+    was missing at the API/integration tier.
+    """
+    from datetime import date
+
+    from app.models.audit_log import AuditLog
+    from app.services import order as order_service
+    from app.services.scheduling import ScheduledResult
+    from sqlalchemy import select
+
+    creator = _make_user(db_session, username="sched_audit_sys", role=UserRole.scheduler)
+    order = _make_order(
+        db_session,
+        created_by=creator.id,
+        requested_delivery_date=date(2026, 7, 1),
+    )
+
+    scheduled = [
+        ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 15), quantity=100),
+    ]
+    applied = order_service.apply_schedule(db_session, scheduled)
+    assert applied == 1
+
+    row = db_session.scalars(
+        select(AuditLog)
+        .where(AuditLog.action == "order.scheduled")
+        .where(AuditLog.resource_id == order.id)
+    ).one()
+    # The whole point of this assertion: no forged user id sneaks in for
+    # a system-driven write.
+    assert row.user_id is None
+    assert row.resource_type == "order"
+
+
 # ---------------------------------------------------------------------------
 # DELETE /operations/{compound_id} — cancel
 # ---------------------------------------------------------------------------

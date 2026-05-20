@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 
 import sqlalchemy as sa
@@ -56,4 +57,8 @@ class User(Base):
         sa.Boolean,
         nullable=False,
         server_default="true",
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
     )

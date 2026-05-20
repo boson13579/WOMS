@@ -24,7 +24,7 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
 
-import { useCurrentUser } from '@/lib/auth';
+import { useCurrentRole } from '@/lib/auth';
 
 const WS_PATH = '/api/v1/ws';
 
@@ -87,10 +87,17 @@ function buildWsUrl(): string {
 
 export function useDashboardWs(): void {
   const queryClient = useQueryClient();
-  const user = useCurrentUser();
+  // Gate on role, not the whole user object: viewers never get
+  // actionable events (no run/cancel/rebuild), so opening the socket
+  // would churn the connection without benefit. When the role
+  // transitions non-viewer → viewer mid-session (admin demotes the
+  // user from another tab and ``useMe()`` refetches), this effect
+  // re-runs because ``role`` is in the dep array — the existing
+  // socket is torn down by the cleanup below.
+  const role = useCurrentRole();
 
   useEffect(() => {
-    if (!user) return undefined;
+    if (role === null || role === 'viewer') return undefined;
 
     // ``stopped`` is the unmount latch: prevents an already-scheduled
     // reconnect timer from racing past cleanup.
@@ -159,5 +166,5 @@ export function useDashboardWs(): void {
       }
       ws?.close();
     };
-  }, [user, queryClient]);
+  }, [role, queryClient]);
 }

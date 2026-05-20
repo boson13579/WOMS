@@ -165,6 +165,17 @@ describe('useDashboardWs — connection lifecycle', () => {
     expect(MockWebSocket.instances).toHaveLength(0);
   });
 
+  // RED: viewer currently opens a WS even though it cannot use any
+  // event the backend emits (viewers don't run/cancel/rebuild).
+  // When role transitions non-viewer → viewer mid-session the effect
+  // re-runs because ``role`` is in the dep array (replaces ``user``),
+  // and the existing socket is torn down by the cleanup.
+  it('does NOT open a connection when role is viewer', () => {
+    mockUser.value = { id: 'u', username: 'alice', role: 'viewer' };
+    renderWs();
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
   it('opens a connection to /api/v1/ws when user is authenticated', () => {
     renderWs();
     expect(MockWebSocket.instances).toHaveLength(1);

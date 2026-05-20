@@ -10,12 +10,14 @@ import type { UserResponse, UserRole } from '../types/user';
 
 import { AdminUsersPage } from './AdminUsersPage';
 
-const { mockCurrentRole } = vi.hoisted(() => ({
+const { mockCurrentRole, mockCurrentUserId } = vi.hoisted(() => ({
   mockCurrentRole: vi.fn<() => UserRole | null>(),
+  mockCurrentUserId: vi.fn<() => string | null>(),
 }));
 
 vi.mock('@/lib/auth', () => ({
   useCurrentRole: mockCurrentRole,
+  useCurrentUserId: mockCurrentUserId,
 }));
 
 vi.mock('../api/users', () => ({
@@ -70,8 +72,9 @@ function makeWrapper(): { wrapper: ({ children }: { children: ReactNode }) => JS
   return { wrapper: Wrapper };
 }
 
-function renderPage(role: UserRole = 'root') {
+function renderPage(role: UserRole = 'root', currentUserId: string | null = null) {
   mockCurrentRole.mockReturnValue(role);
+  mockCurrentUserId.mockReturnValue(currentUserId);
 
   const { wrapper: Wrapper } = makeWrapper();
   return render(<AdminUsersPage />, { wrapper: Wrapper });
@@ -268,5 +271,114 @@ describe('AdminUsersPage root operations', () => {
     });
 
     invalidateSpy.mockRestore();
+  });
+});
+
+describe('AdminUsersPage self-action guard', () => {
+  // RED: own-row controls do not yet disable when ``useCurrentUserId``
+  // matches the row's user id. Backend ``_guard_last_root`` is a safety
+  // net for the last-root case only; the UI guard is broader (any self
+  // edit / deactivate by root is disallowed for UX defence-in-depth).
+  const OWN_ROW_TOOLTIP = 'Cannot modify your own account';
+
+  it("disables the role select on the current root user's own row while editing", async () => {
+    mockUserList();
+    // ``USERS[0]`` is root_admin, the current user in this scenario.
+    renderPage('root', USERS[0].id);
+
+    const ownRow = (await screen.findByText('root_admin')).closest('tr');
+    expect(ownRow).not.toBeNull();
+
+    await userEvent.click(within(ownRow as HTMLElement).getByRole('button', { name: /edit/i }));
+
+    const roleSelect = within(ownRow as HTMLElement).getByLabelText(/role for root_admin/i);
+    expect(roleSelect).toBeDisabled();
+    // Tooltip / aria-disabled is on the surrounding cell wrappers so
+    // screen readers can announce why the controls are inert; the row
+    // has three guarded cells (role, status, actions), each carrying
+    // the same title.
+    const tooltipCells = within(ownRow as HTMLElement).getAllByTitle(OWN_ROW_TOOLTIP);
+    expect(tooltipCells.length).toBeGreaterThan(0);
+  });
+
+  it('disables the active checkbox on the own row while editing', async () => {
+    mockUserList();
+    renderPage('root', USERS[0].id);
+
+    const ownRow = (await screen.findByText('root_admin')).closest('tr');
+    expect(ownRow).not.toBeNull();
+    await userEvent.click(within(ownRow as HTMLElement).getByRole('button', { name: /edit/i }));
+
+    const activeCheckbox = within(ownRow as HTMLElement).getByLabelText(/^active$/i);
+    expect(activeCheckbox).toBeDisabled();
+  });
+
+  it('disables the Deactivate button on the own row even when the row is active', async () => {
+    mockUserList();
+    renderPage('root', USERS[0].id);
+
+    const ownRow = (await screen.findByText('root_admin')).closest('tr');
+    expect(ownRow).not.toBeNull();
+
+    const deactivateBtn = within(ownRow as HTMLElement).getByRole('button', {
+      name: /deactivate/i,
+    });
+    expect(deactivateBtn).toBeDisabled();
+    expect(within(ownRow as HTMLElement).getAllByTitle(OWN_ROW_TOOLTIP).length).toBeGreaterThan(0);
+  });
+
+  it('leaves other rows fully editable when the current user is root_admin (regression)', async () => {
+    mockUserList();
+    renderPage('root', USERS[0].id);
+
+    const aliceRow = (await screen.findByText('alice')).closest('tr');
+    expect(aliceRow).not.toBeNull();
+
+    // Deactivate button stays enabled on other active rows.
+    expect(
+      within(aliceRow as HTMLElement).getByRole('button', { name: /deactivate/i }),
+    ).toBeEnabled();
+
+    // Open edit and confirm role + active controls are enabled.
+    await userEvent.click(within(aliceRow as HTMLElement).getByRole('button', { name: /edit/i }));
+    expect(within(aliceRow as HTMLElement).getByLabelText(/role for alice/i)).toBeEnabled();
+    expect(within(aliceRow as HTMLElement).getByLabelText(/^active$/i)).toBeEnabled();
+    // And no own-row tooltip leaked onto alice's row.
+    expect(within(aliceRow as HTMLElement).queryAllByTitle(OWN_ROW_TOOLTIP)).toHaveLength(0);
+  });
+
+  it('does not lock any row when useCurrentUserId returns null (defensive)', async () => {
+    mockUserList();
+    // Defensive path: store user is missing but role is still root (could
+    // only happen via partial state corruption). No row should match
+    // ``null`` so every row stays editable.
+    renderPage('root', null);
+
+    const rootRow = (await screen.findByText('root_admin')).closest('tr');
+    expect(rootRow).not.toBeNull();
+
+    expect(
+      within(rootRow as HTMLElement).getByRole('button', { name: /deactivate/i }),
+    ).toBeEnabled();
+    await userEvent.click(within(rootRow as HTMLElement).getByRole('button', { name: /edit/i }));
+    expect(within(rootRow as HTMLElement).getByLabelText(/role for root_admin/i)).toBeEnabled();
+    expect(within(rootRow as HTMLElement).getByLabelText(/^active$/i)).toBeEnabled();
+    expect(within(rootRow as HTMLElement).queryAllByTitle(OWN_ROW_TOOLTIP)).toHaveLength(0);
+  });
+
+  it('keeps the tooltip text visible on at least one own-row cell (getByTitle)', async () => {
+    // Verifier-suggested polish: assert the explanatory copy literally
+    // renders so a future refactor can't silently drop the title= prop.
+    // Also asserts aria-disabled is set so assistive tech can announce
+    // why the cell is inert.
+    mockUserList();
+    renderPage('root', USERS[0].id);
+
+    const ownRow = (await screen.findByText('root_admin')).closest('tr');
+    expect(ownRow).not.toBeNull();
+
+    const tooltipCells = within(ownRow as HTMLElement).getAllByTitle(OWN_ROW_TOOLTIP);
+    expect(tooltipCells.length).toBeGreaterThan(0);
+    expect(tooltipCells[0]).toHaveAttribute('aria-disabled', 'true');
   });
 });
