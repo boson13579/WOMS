@@ -74,6 +74,10 @@ describe('MobileNav', () => {
     expect(screen.getByRole('dialog', { name: /navigation/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /dashboard/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /orders/i })).toBeInTheDocument();
+    // Regression guard: Observability and Audit log are gated and must
+    // NOT appear for the default order_manager role.
+    expect(screen.queryByRole('link', { name: /observability/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /audit log/i })).not.toBeInTheDocument();
   });
 
   it('closes when the overlay is tapped', () => {
@@ -116,6 +120,53 @@ describe('MobileNav', () => {
     openDrawer();
 
     expect(screen.getByRole('link', { name: /users/i })).toBeInTheDocument();
+  });
+
+  it('shows the Observability link for scheduler', () => {
+    mockRole.value = 'scheduler';
+    renderWithRouter();
+    openDrawer();
+
+    expect(screen.getByRole('link', { name: /observability/i })).toBeInTheDocument();
+  });
+
+  it('shows the Observability link for root', () => {
+    mockRole.value = 'root';
+    renderWithRouter();
+    openDrawer();
+
+    expect(screen.getByRole('link', { name: /observability/i })).toBeInTheDocument();
+  });
+
+  it('hides the Observability link for order_manager and viewer', () => {
+    mockRole.value = 'order_manager';
+    renderWithRouter();
+    openDrawer();
+    expect(screen.queryByRole('link', { name: /observability/i })).not.toBeInTheDocument();
+    cleanup();
+
+    mockRole.value = 'viewer';
+    useMobileNavStore.setState({ open: false });
+    renderWithRouter();
+    openDrawer();
+    expect(screen.queryByRole('link', { name: /observability/i })).not.toBeInTheDocument();
+  });
+
+  it('shows the Audit log link for root only', () => {
+    mockRole.value = 'root';
+    renderWithRouter();
+    openDrawer();
+
+    expect(screen.getByRole('link', { name: /audit log/i })).toBeInTheDocument();
+  });
+
+  it('hides the Audit log link for scheduler (Audit is root-only)', () => {
+    // Regression guard: scheduler sees Observability but not Audit log.
+    mockRole.value = 'scheduler';
+    renderWithRouter();
+    openDrawer();
+
+    expect(screen.queryByRole('link', { name: /audit log/i })).not.toBeInTheDocument();
   });
 
   it('focuses the first nav link on open and restores body scroll on close', () => {

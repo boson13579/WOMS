@@ -10,6 +10,7 @@ Start a worker with:
 from __future__ import annotations
 
 from celery import Celery
+from celery.schedules import crontab
 
 from app.core.config import get_settings
 from app.core.logger import configure_logging
@@ -41,9 +42,25 @@ celery_app.conf.update(
     # works because pytest imports the module directly, but a deployed
     # ``celery -A ... worker`` wouldn't). Listing the module here forces
     # Celery to import it at worker startup so the @task decorators fire.
-    imports=("app.workers.scheduling",),
+    imports=(
+        "app.workers.scheduling",
+        "app.workers.audit_cleanup",
+    ),
 )
 
 # Auto-discovery hook kept for future per-package tasks.py modules. The
 # explicit ``imports`` above is the source of truth for current tasks.
 celery_app.autodiscover_tasks(packages=["app.workers"])
+
+# Periodic-task schedule consumed by ``celery -A app.workers.celery_app beat``.
+# Times are in UTC (matches ``timezone="UTC"`` above). Keep the list small
+# and easy to read — each entry is one well-defined operational concern.
+celery_app.conf.beat_schedule = {
+    # Daily prune of audit_logs older than ``AUDIT_LOG_RETENTION_DAYS``.
+    # Runs at 02:00 UTC so it does not contend with the existing
+    # ``advance_day`` work that scheduling tasks trigger at midnight UTC.
+    "audit-log-cleanup": {
+        "task": "audit.cleanup_old_logs",
+        "schedule": crontab(hour="2", minute="0"),
+    },
+}

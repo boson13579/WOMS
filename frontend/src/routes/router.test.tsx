@@ -82,4 +82,51 @@ describe('router structure', () => {
     const sharesShellLevel = shellChildren.find((r) => r.path === 'users');
     expect(sharesShellLevel).toBeUndefined();
   });
+
+  it('gates /audit behind a RoleProtectedRoute allowing only root', () => {
+    // SessionBoundary → ProtectedRoute (path '/') → AppShell → role gate → audit.
+    const rootRoute = findRoute('/');
+    const appShellRoute = rootRoute?.children?.[0];
+    const shellChildren = appShellRoute?.children ?? [];
+
+    // The role gate that contains 'audit' as a child. Same layout-route
+    // shape as the /users gate — audit log is root-only by design (it
+    // can carry user PII and pre-mutation snapshots).
+    const roleGate = shellChildren.find((r) => r.children?.some((child) => child.path === 'audit'));
+    expect(roleGate).toBeDefined();
+    const gateElement = roleGate?.element;
+    expect(isValidElement(gateElement)).toBe(true);
+    if (!isValidElement(gateElement)) {
+      throw new Error('Role gate element must be a React element.');
+    }
+    expect(gateElement.type).toBe(RoleProtectedRoute);
+    const props = gateElement.props as { allowedRoles?: string[] };
+    expect(props.allowedRoles).toEqual(['root']);
+
+    // The plain 'audit' leaf should NOT be a direct sibling of orders.
+    const sharesShellLevel = shellChildren.find((r) => r.path === 'audit');
+    expect(sharesShellLevel).toBeUndefined();
+  });
+
+  it('gates /observability behind a RoleProtectedRoute allowing scheduler + root', () => {
+    // SessionBoundary → ProtectedRoute (path '/') → AppShell → role gate → observability.
+    const rootRoute = findRoute('/');
+    const appShellRoute = rootRoute?.children?.[0];
+    const shellChildren = appShellRoute?.children ?? [];
+
+    const roleGate = shellChildren.find((r) =>
+      r.children?.some((child) => child.path === 'observability'),
+    );
+    expect(roleGate).toBeDefined();
+    const gateElement = roleGate?.element;
+    expect(isValidElement(gateElement)).toBe(true);
+    if (!isValidElement(gateElement)) {
+      throw new Error('Observability role gate element must be a React element.');
+    }
+    expect(gateElement.type).toBe(RoleProtectedRoute);
+    const props = gateElement.props as { allowedRoles?: string[] };
+    // ``order_manager`` and ``viewer`` are intentionally excluded — they get
+    // redirected to ``/`` by the existing ``RoleProtectedRoute``.
+    expect(props.allowedRoles).toEqual(['root', 'scheduler']);
+  });
 });

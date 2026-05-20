@@ -1,0 +1,42 @@
+/**
+ * useUseResources — fetches DB-pool / Redis / Celery resource snapshot.
+ *
+ * Backed by ``GET /api/v1/system/resources``. Each section
+ * (``db_pool`` / ``redis`` / ``celery``) is independently nullable: a
+ * single probe failure produces ``null`` for that section while the
+ * other two still render. The frontend treats ``null`` as "we have no
+ * signal, show a degraded card" rather than as a request-level error.
+ *
+ * 15-second polling — resource pressure shifts more slowly than RED
+ * traffic, and CPU on the backend's USE probe (Celery ``inspect()``,
+ * Redis ``INFO``) is non-trivial.
+ */
+import { useQuery, type UseQueryResult } from '@tanstack/react-query';
+
+import { apiFetch } from '@/lib/apiFetch';
+import { useCurrentUser } from '@/lib/auth';
+
+import { useResourcesSchema, type UseResources } from '../types';
+
+const REFETCH_INTERVAL_MS = 15_000;
+const STALE_TIME_MS = 10_000;
+
+export const useResourcesQueryKey = ['system', 'resources'] as const;
+
+export function useUseResources(): UseQueryResult<UseResources> {
+  const user = useCurrentUser();
+
+  return useQuery<UseResources>({
+    queryKey: useResourcesQueryKey,
+    queryFn: () =>
+      apiFetch(
+        '/api/v1/system/resources',
+        { credentials: 'include' },
+        (d) => useResourcesSchema.parse(d),
+        10_000,
+      ),
+    enabled: Boolean(user),
+    refetchInterval: REFETCH_INTERVAL_MS,
+    staleTime: STALE_TIME_MS,
+  });
+}
