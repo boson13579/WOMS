@@ -50,9 +50,18 @@ export function useRedMetrics(windowSeconds: number): UseQueryResult<RedMetricsR
   // ``onSuccess`` option, so we mirror it via a tiny ``useEffect``
   // watching ``dataUpdatedAt`` — fires once per successful poll
   // regardless of whether the value changed.
+  //
+  // Skip when ``data_status === 'degraded'``: backend returns all-zero
+  // samples in this state (Redis unreachable). Pushing those zeros into
+  // the ring buffer would draw the sparkline curving down to 0, making
+  // a metrics-availability outage look like a real traffic collapse.
+  // Freezing the buffer keeps the last known good trend visible so an
+  // operator can see what was happening just before visibility was
+  // lost; the page-level degraded banner already communicates "data
+  // unavailable" textually.
   const { data, dataUpdatedAt } = query;
   useEffect(() => {
-    if (data) {
+    if (data && data.data_status !== 'degraded') {
       pushHistory({
         rate: data.rate_per_sec,
         errorPct: data.error_pct,

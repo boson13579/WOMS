@@ -101,4 +101,44 @@ describe('useRedMetrics', () => {
     expect(series.errorPct.at(-1)).toBeCloseTo(0.4);
     expect(series.p95.at(-1)).toBe(45);
   });
+
+  it('does NOT append to the ring buffer when data_status is degraded', async () => {
+    // Backend returns all-zero samples + data_status="degraded" when
+    // Redis is unreachable. Pushing those zeros into the buffer would
+    // make the sparkline collapse to 0 — visually indistinguishable
+    // from a real traffic stop. The hook must skip the push so the
+    // sparkline freezes at the last known good state.
+    const DEGRADED = {
+      ...VALID_RESPONSE,
+      total_requests: 0,
+      rate_per_sec: 0,
+      error_count: 0,
+      error_pct: 0,
+      latency_ms: { p50: 0, p95: 0, p99: 0, max: 0 },
+      data_status: 'degraded',
+    };
+
+    // Seed one healthy sample so we have a baseline to compare against.
+    mockFetchOnce(VALID_RESPONSE);
+    const { result, rerender } = renderHook(() => useRedMetrics(60), {
+      wrapper: makeWrapper(),
+    });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+    });
+    expect(useRedHistoryStore.getState().series.rate.at(-1)).toBeCloseTo(12.4);
+
+    // Now simulate a degraded poll — manually invalidate so a new fetch fires.
+    mockFetchOnce(DEGRADED);
+    void qc.invalidateQueries({ queryKey: redMetricsQueryKey(60) });
+    await waitFor(() => {
+      expect(result.current.data?.data_status).toBe('degraded');
+    });
+    rerender();
+
+    // Buffer's last entry must still be the original healthy 12.4,
+    // not the degraded zero.
+    expect(useRedHistoryStore.getState().series.rate.at(-1)).toBeCloseTo(12.4);
+    expect(useRedHistoryStore.getState().series.p95.at(-1)).toBe(45);
+  });
 });
