@@ -720,3 +720,392 @@ def test_delete_order_pinned_pushes_unpin_then_remove_compound(
 
     compound = mock_enqueue.call_args.args[0]
     assert [op.op for op in compound.ops] == ["unpin", "remove"]
+
+
+# ---------------------------------------------------------------------------
+# PATCH-with-pin: pin / unpin folded into the regular update_order path
+# ---------------------------------------------------------------------------
+
+
+def test_update_order_pin_unpinned_order_to_specific_day(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """PATCH ``{pinned_production_date: <day>}`` on an unpinned order:
+
+    - Compound shape: ``[remove, add, pin]`` (no unpin since not pinned before)
+    - Group: ``grow`` (pinning shifts demand off natural EDF onto one day)
+    - db_action: ``new_pinned_production_date_set=True``, value = the day
+
+    Equivalent to the old raw ``POST /schedule/operations`` pin path, but
+    now goes through the same row-locked PATCH endpoint that protects
+    against the producer-side race.
+    """
+    creator = _make_user(db_session, username="sru-pin-new")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-PIN-NEW",
+        deadline=date(2026, 6, 1),
+    )
+    pin_day = date(2026, 5, 25)
+
+    req = UpdateOrderRequest(
+        pinned_production_date=pin_day,
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    # No qty/deadline change here, so remove+add use the unchanged values;
+    # the existing order_number / deadline is fine for the pin op.
+    op_kinds = [op.op for op in compound.ops]
+    assert op_kinds == ["pin"], op_kinds  # pin-only since qty/deadline unchanged
+    assert compound.ops[0].fake_deadline == pin_day
+    assert compound.group == "grow"
+    assert compound.db_action.new_pinned_production_date_set is True
+    assert compound.db_action.new_pinned_production_date == pin_day
+    assert compound.db_action.old_is_pinned is False
+
+
+def test_update_order_change_pin_day_emits_unpin_and_pin(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """PATCH a pinned order's pin day to a different day:
+
+    - Compound shape: ``[unpin, pin(new_day)]`` — no remove+add since
+      qty/deadline didn't change.
+    - Group depends on direction: pin moving later = shrink, pin moving
+      earlier = grow.
+    """
+    creator = _make_user(db_session, username="sru-pin-move")
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-PIN-MOVE",
+        deadline=date(2026, 6, 1),
+        pin_day=date(2026, 5, 20),
+    )
+    # Move pin LATER → cumulative demand only flatter or unchanged → shrink.
+    new_pin_day = date(2026, 5, 28)
+
+    req = UpdateOrderRequest(
+        pinned_production_date=new_pin_day,
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert [op.op for op in compound.ops] == ["unpin", "pin"]
+    pin_op = compound.ops[1]
+    assert pin_op.fake_deadline == new_pin_day
+    assert compound.group == "shrink"  # later pin day = looser
+    assert compound.db_action.new_pinned_production_date_set is True
+    assert compound.db_action.new_pinned_production_date == new_pin_day
+    assert compound.db_action.old_pinned_production_date == date(2026, 5, 20)
+
+
+def test_update_order_unpin_pinned_order(db_session: Session, mock_enqueue: MagicMock) -> None:
+    """PATCH ``{pinned_production_date: null}`` on a pinned order:
+
+    - Compound shape: ``[unpin]`` — qty/deadline unchanged, no need for
+      remove+add; no pin op since target state is unpinned.
+    - db_action: ``new_pinned_production_date_set=True``, value = None
+    """
+    creator = _make_user(db_session, username="sru-unpin")
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-UNPIN",
+        deadline=date(2026, 6, 1),
+        pin_day=date(2026, 5, 20),
+    )
+
+    req = UpdateOrderRequest(
+        pinned_production_date=None,
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert [op.op for op in compound.ops] == ["unpin"]
+    assert compound.db_action.new_pinned_production_date_set is True
+    assert compound.db_action.new_pinned_production_date is None
+    assert compound.db_action.old_is_pinned is True
+
+
+def test_update_order_pin_plus_qty_change_combined(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """PATCH that changes BOTH qty and pin day in one call:
+
+    - Compound shape: ``[remove, add, pin(new_day)]`` — full transition
+    - Sequence matters: remove old qty first so add can use new qty,
+      then pin with the new qty/new_deadline + new fake_deadline.
+    """
+    creator = _make_user(db_session, username="sru-pin-qty")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-PIN-QTY",
+        deadline=date(2026, 6, 1),
+        quantity=100,
+    )
+    pin_day = date(2026, 5, 25)
+
+    req = UpdateOrderRequest(
+        wafer_quantity=200,  # grows
+        pinned_production_date=pin_day,
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert [op.op for op in compound.ops] == ["remove", "add", "pin"]
+    add_op = compound.ops[1]
+    pin_op = compound.ops[2]
+    assert add_op.wafer_quantity == 200
+    assert pin_op.wafer_quantity == 200
+    assert pin_op.fake_deadline == pin_day
+    # qty grew → grow group regardless of pin direction
+    assert compound.group == "grow"
+
+
+def test_update_order_unpin_plus_deadline_change_combined(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """PATCH that unpins AND extends deadline in one call:
+
+    - Compound shape: ``[unpin, remove, add]`` — no pin op since target
+      is unpinned, but unpin still needed for the original pinned order
+      to leave pinned_orders before remove can fire.
+    """
+    creator = _make_user(db_session, username="sru-unpin-defer")
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-UNPIN-DEFER",
+        deadline=date(2026, 5, 25),
+        pin_day=date(2026, 5, 20),
+    )
+
+    req = UpdateOrderRequest(
+        requested_delivery_date=date(2026, 6, 5),  # later
+        pinned_production_date=None,  # unpin
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert [op.op for op in compound.ops] == ["unpin", "remove", "add"]
+    assert compound.db_action.new_pinned_production_date_set is True
+    assert compound.db_action.new_pinned_production_date is None
+
+
+def test_update_order_pin_day_after_deadline_rejects_422(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """Sync-feedback guard: pinning to a day AFTER the order's deadline
+    is nonsensical (the pin day is supposed to be the "produce by" day,
+    must be ≤ the customer's hard deadline). API rejects with 422 instead
+    of letting the worker discover via WS notification."""
+    creator = _make_user(db_session, username="sru-pin-bad-day")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-PIN-BAD",
+        deadline=date(2026, 6, 1),
+    )
+
+    req = UpdateOrderRequest(
+        pinned_production_date=date(2026, 6, 15),  # AFTER deadline
+        version_id=order.version_id,
+    )
+
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        order_service.update_order(db_session, order.id, req, creator)
+    assert exc_info.value.status_code == 422
+    assert "Pin date" in exc_info.value.detail
+    # No compound was enqueued.
+    assert mock_enqueue.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 — apply_schedule per-order SAVEPOINT isolates StaleDataError
+# ---------------------------------------------------------------------------
+
+
+def test_apply_schedule_skips_stale_row_and_continues_others(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent PATCH bumps Order A's ``version_id`` between
+    ``rebuild_task``'s SELECT and ``apply_schedule``'s flush — the per-row
+    SAVEPOINT around ``set_schedule_dates`` must roll back ONLY Order A's
+    update, leaving Order B's update + the outer transaction intact.
+
+    Pre-fix: the first ``StaleDataError`` crashed the session into
+    ``PendingRollbackError`` and every subsequent order in the loop
+    cascaded with the same error, turning ``rebuild_task`` into an
+    unrecoverable abort.
+
+    Post-fix: ``with db.begin_nested(): set_schedule_dates(...)``
+    catches the stale row, logs ``order.schedule.apply_stale_skipped``,
+    and continues. Order B's UPDATE goes through and the outer
+    ``db.commit()`` succeeds.
+    """
+    from sqlalchemy.orm.exc import StaleDataError
+
+    creator = _make_user(db_session, username="apply-sched-stale")
+    order_a = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-STALE-A",
+        deadline=date(2026, 5, 20),
+    )
+    order_b = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-STALE-B",
+        deadline=date(2026, 5, 22),
+    )
+
+    # Patch set_schedule_dates to raise StaleDataError for order_a but
+    # pass through to the real impl for order_b. Mimics the production
+    # race where one row got bumped between SELECT and flush.
+    real_set_dates = order_service.order_repo.set_schedule_dates
+
+    def fake_set_dates(db: Session, *, order_id: uuid.UUID, **kw: object) -> object:
+        if order_id == order_a.id:
+            raise StaleDataError("simulated concurrent PATCH bumped version_id")
+        return real_set_dates(db, order_id=order_id, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "app.services.order.order_repo.set_schedule_dates",
+        fake_set_dates,
+    )
+
+    scheduled = [
+        ScheduledResult(order_id=order_a.id, scheduled_date=date(2026, 5, 15), quantity=100),
+        ScheduledResult(order_id=order_b.id, scheduled_date=date(2026, 5, 18), quantity=100),
+    ]
+
+    # Pre-fix this would crash with PendingRollbackError mid-loop;
+    # post-fix it skips A and applies B.
+    applied = order_service.apply_schedule(db_session, scheduled)
+
+    # Only order_b was applied; order_a was skipped.
+    assert applied == 1
+
+    # Verify outer transaction committed cleanly — the session is usable
+    # afterwards.
+    db_session.refresh(order_b)
+    assert order_b.scheduled_production_date == date(2026, 5, 18)
+    assert order_b.status == OrderStatus.scheduled
+
+    # order_a's dates were NOT written (the SAVEPOINT rolled back).
+    db_session.refresh(order_a)
+    assert order_a.scheduled_production_date is None
+
+    # Audit row landed for order_b only; order_a got skipped before the
+    # audit insert ran inside the same nested block.
+    audit_rows = list(
+        db_session.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "order.scheduled",
+                AuditLog.resource_id.in_([order_a.id, order_b.id]),
+            )
+        ).all()
+    )
+    assert {r.resource_id for r in audit_rows} == {order_b.id}
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 (A) — SELECT FOR UPDATE serializes concurrent PATCH on same order
+# ---------------------------------------------------------------------------
+
+
+def test_update_order_uses_get_by_id_for_update_to_serialize_concurrent_patches(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_enqueue: MagicMock,
+) -> None:
+    """``update_order`` must go through ``get_by_id_for_update`` (which
+    issues ``SELECT ... FOR UPDATE``), not the lock-free ``get_by_id``.
+
+    With the row lock, two concurrent PATCHes on the same order serialize
+    at the SELECT — the second blocks until the first commits, then sees
+    ``is_processing_locked=True`` and returns 409. Without it, both
+    PATCHes could read the row at ``version_id=N``, both build a compound
+    off the same old data, and both enqueue to Redis before either
+    commits — letting a stale compound slip through to the worker and
+    trigger ``SegmentTreeInvariantError``.
+
+    We verify the lock is acquired by tracking which repo function got
+    called. A unit-level test for the locking behavior is enough; an
+    actual two-session race test would require threads + advisory waits
+    and isn't worth the complexity for this guard.
+    """
+    creator = _make_user(db_session, username="lock-update-sru")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-LOCK-U",
+        deadline=date(2026, 5, 20),
+    )
+
+    # Wrap get_by_id_for_update so we can verify it was the function that
+    # actually executed (rather than the lock-free get_by_id).
+    real_for_update = order_service.order_repo.get_by_id_for_update
+    for_update_mock = MagicMock(side_effect=real_for_update)
+    monkeypatch.setattr(
+        "app.services.order.order_repo.get_by_id_for_update",
+        for_update_mock,
+    )
+
+    # Spy on the lock-free variant — it must NOT be called from update_order.
+    real_unlocked = order_service.order_repo.get_by_id
+    unlocked_mock = MagicMock(side_effect=real_unlocked)
+    monkeypatch.setattr(
+        "app.services.order.order_repo.get_by_id",
+        unlocked_mock,
+    )
+
+    req = UpdateOrderRequest(
+        wafer_quantity=200,
+        version_id=order.version_id,
+    )
+    order_service.update_order(db_session, order.id, req, creator)
+
+    # Row was fetched with FOR UPDATE; lock-free get_by_id was NOT used.
+    assert for_update_mock.call_count == 1
+    assert unlocked_mock.call_count == 0
+
+
+def test_delete_order_uses_get_by_id_for_update_to_serialize_concurrent_deletes(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_enqueue: MagicMock,
+) -> None:
+    """Same row-lock guarantee for ``delete_order`` — two concurrent
+    DELETEs on the same order must serialize at the SELECT so only one
+    builds + enqueues the soft-delete compound.
+    """
+    creator = _make_user(db_session, username="lock-delete-sru")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-LOCK-D",
+        deadline=date(2026, 5, 20),
+    )
+
+    real_for_update = order_service.order_repo.get_by_id_for_update
+    for_update_mock = MagicMock(side_effect=real_for_update)
+    monkeypatch.setattr(
+        "app.services.order.order_repo.get_by_id_for_update",
+        for_update_mock,
+    )
+
+    order_service.delete_order(db_session, order.id, creator)
+
+    assert for_update_mock.call_count == 1

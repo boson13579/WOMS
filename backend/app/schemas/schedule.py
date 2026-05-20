@@ -98,14 +98,17 @@ class CompoundDbAction(BaseModel):
     actor_id: uuid.UUID
 
     # New values to write (None = field absent from the PATCH).
-    # ``notes`` and ``assigned_to`` use a paired "set" boolean because
-    # ``None`` is a legal user-visible value (= "clear the field").
+    # ``notes`` / ``assigned_to`` / ``pinned_production_date`` use a paired
+    # "set" boolean because ``None`` is a legal user-visible value (= "clear
+    # the field" / "unpin").
     new_wafer_quantity: int | None = None
     new_requested_delivery_date: date | None = None
     new_notes_set: bool = False
     new_notes: str | None = None
     new_assigned_to_set: bool = False
     new_assigned_to: uuid.UUID | None = None
+    new_pinned_production_date_set: bool = False
+    new_pinned_production_date: date | None = None
 
     # Pre-PATCH values for audit log diffing. Worker reads ``old_*`` to
     # construct the ``audit_logs.old_value`` JSON. Absent on create.
@@ -113,6 +116,8 @@ class CompoundDbAction(BaseModel):
     old_requested_delivery_date: date | None = None
     old_notes: str | None = None
     old_assigned_to: uuid.UUID | None = None
+    old_pinned_production_date: date | None = None
+    old_is_pinned: bool = False
 
 
 class ScheduleCompoundRequest(BaseModel):

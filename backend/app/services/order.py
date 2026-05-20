@@ -204,59 +204,104 @@ def _build_patch_compound(
     new_notes: str | None = None,
     assigned_to_set: bool = False,
     new_assigned_to: uuid.UUID | None = None,
+    pin_day_set: bool = False,
+    new_pin_day: date | None = None,
 ) -> ScheduleCompoundRequest | None:
-    """Build the schedule compound for a PATCH that may touch qty / deadline.
+    """Build the schedule compound for a PATCH that may touch qty / deadline / pin.
 
-    Implements the **case-8 smart-routing rules** from
-    ``docs/scheduling.md``:
+    Folds **pin / unpin** into the regular PATCH path so the frontend
+    doesn't need a separate raw-compound endpoint just to drag an order to
+    a specific production day. Pin is just another field on the order
+    resource (``is_pinned`` + ``pinned_production_date`` columns); the
+    PATCH semantics for it match the existing ``notes`` / ``assigned_to``
+    "set" pattern:
 
-    * No qty/deadline change → returns ``None``, caller skips the enqueue.
-    * Order not pinned → ``[remove(old), add(new)]``.
-    * Order pinned:
-      * Always prepend ``unpin`` (worker can't process ``remove`` on a
-        pinned order — membership guard would reject it).
-      * Auto-re-pin to the same day **only when both** conditions hold:
-        ``new_deadline >= old_pin_day`` AND ``new_qty <= old_qty``. Either
-        condition failing means the pin day's capacity might be exceeded
-        if we forced the re-pin; we silent-drop the pin (per case 13/14).
+    * ``pin_day_set=False`` (client omitted ``pinned_production_date``) —
+      pin state is left as-is **except** for the existing case-14
+      auto-re-pin / silent-drop logic when qty / deadline change makes
+      the original pin incompatible.
+    * ``pin_day_set=True``, ``new_pin_day=None`` — explicit unpin.
+    * ``pin_day_set=True``, ``new_pin_day=X`` — pin to day X (or change
+      pin day if already pinned).
 
-    Group selection: ``shrink`` only when **both** axes monotonically
-    release capacity — qty doesn't increase (``new_qty <= old_qty``) AND
-    deadline doesn't move earlier (``new_deadline >= old_deadline``).
-    Otherwise ``grow``. The strict-AND keeps the per-day cumulative
-    delta of a shrink-group compound non-positive everywhere, which is
-    the invariant the worker's batch-admission halving relies on: a
-    contiguous prefix of feasible compounds stays feasible when we
-    drop tail compounds. Pre-rewrite this used OR (``qty_smaller OR
-    deadline_later``), which mis-classified e.g. ``qty=100→10000,
-    deadline=day3→day5`` as shrink even though it adds +9900 to day5's
-    cumulative demand; that broke halving's prefix-feasibility
-    monotonicity assumption and let self-infeasible compounds slip
-    through admission. Every op in a compound shares one group, so
-    pin / unpin ops prepended / appended inherit this classification.
+    Compound op sequence is decided by joining three orthogonal axes:
+
+    * ``needs_remove_add`` — qty or deadline changed; need ``[remove, add]``
+    * ``needs_unpin`` — order was pinned before; pin ops can't co-exist
+      with a stale ``[remove]`` on the same order_id in worker pq guard
+    * ``needs_pin`` — final state has the order pinned to some day
+
+    Yielding sequences like ``[unpin, remove, add, pin]`` (pin transition
+    on a qty/deadline change), ``[remove, add, pin]`` (pin a previously-
+    unpinned order while also tweaking qty), ``[unpin]`` (pure unpin, no
+    qty change), etc. Returns ``None`` when nothing material changed and
+    no compound needs to fire.
+
+    Group selection: ``shrink`` only when **all** axes monotonically
+    release capacity — qty doesn't increase, deadline doesn't move
+    earlier, and pin day doesn't move earlier (a pin to an earlier day
+    increases prefix demand). Otherwise ``grow``. The strict-AND keeps
+    a shrink-group compound's per-day cumulative delta non-positive
+    everywhere, which is the invariant the worker's batch-admission
+    halving relies on.
     """
     old_qty = order.wafer_quantity
     old_deadline = order.requested_delivery_date
+    is_pinned_before = order.is_pinned
+    old_pin_day = order.pinned_production_date
 
     qty_changed = new_qty != old_qty
     deadline_changed = new_deadline != old_deadline
-    if not (qty_changed or deadline_changed):
-        # PATCH affected only notes / immaterial fields — no need to bother
-        # the scheduler.
+    needs_remove_add = qty_changed or deadline_changed
+
+    # Decide the final pin state. Two paths:
+    # (a) Client explicitly set ``pinned_production_date`` — honor verbatim
+    # (b) Client didn't touch pin — fall back to case-14 auto-re-pin /
+    #     silent-drop based on qty/deadline change compatibility.
+    if pin_day_set:
+        target_pin_day = new_pin_day  # may be None = "unpin"
+    elif is_pinned_before and old_pin_day is not None and needs_remove_add:
+        # Implicit transition: was pinned + something changed → try auto-re-pin.
+        # Same conditions as the original case-14 gate.
+        can_repin = new_deadline >= old_pin_day and new_qty <= old_qty
+        target_pin_day = old_pin_day if can_repin else None
+    else:
+        # Pin state untouched.
+        target_pin_day = old_pin_day if is_pinned_before else None
+
+    final_is_pinned = target_pin_day is not None
+    pin_state_changed = (final_is_pinned != is_pinned_before) or (target_pin_day != old_pin_day)
+
+    # Nothing material for the scheduler? Return None so caller skips enqueue.
+    if not (needs_remove_add or pin_state_changed):
         return None
 
+    needs_unpin = is_pinned_before
+    needs_pin_op = final_is_pinned
+
+    # Group classification: shrink only when all axes are non-additive.
     qty_non_growing = new_qty <= old_qty
     deadline_non_earlier = new_deadline >= old_deadline
+    # Pin moving to an earlier day shifts demand forward → grow.
+    pin_non_earlier = True
+    if final_is_pinned and is_pinned_before:
+        pin_non_earlier = target_pin_day >= old_pin_day  # type: ignore[operator]
+    elif final_is_pinned and not is_pinned_before:
+        # Newly pinning to ANY day pulls demand off the natural EDF
+        # distribution onto that one day → treat as grow.
+        pin_non_earlier = False
     group: Literal["shrink", "grow"] = (
-        "shrink" if (qty_non_growing and deadline_non_earlier) else "grow"
+        "shrink" if (qty_non_growing and deadline_non_earlier and pin_non_earlier) else "grow"
     )
 
-    is_pinned_before = order.is_pinned
-    pin_day = order.pinned_production_date
+    # Op qty/deadline for the post-remove-add segment use new values when
+    # remove+add fires; if only pin changed (no qty/deadline change), the
+    # add/pin reference the unchanged values.
+    op_qty = new_qty if needs_remove_add else old_qty
+    op_deadline = new_deadline if needs_remove_add else old_deadline
 
     ops: list[ScheduleOpInCompound] = []
-
-    if is_pinned_before:
+    if needs_unpin:
         ops.append(
             ScheduleOpInCompound(
                 op="unpin",
@@ -266,46 +311,40 @@ def _build_patch_compound(
                 deadline=old_deadline,
             )
         )
-
-    ops.append(
-        ScheduleOpInCompound(
-            op="remove",
-            order_id=order.id,
-            order_number=order.order_number,
-            wafer_quantity=old_qty,
-            deadline=old_deadline,
-        )
-    )
-    ops.append(
-        ScheduleOpInCompound(
-            op="add",
-            order_id=order.id,
-            order_number=order.order_number,
-            wafer_quantity=new_qty,
-            deadline=new_deadline,
-        )
-    )
-
-    # Case 14 auto-re-pin gate. ALL of these must hold:
-    #   - order was pinned before the PATCH;
-    #   - the PATCH didn't make the new deadline cross the pin day
-    #     (otherwise pin can't satisfy "fake_deadline ≤ deadline");
-    #   - qty didn't grow (otherwise the pin day's capacity might overflow).
-    # Failing any → silent drop pin (case 13 semantics extended to all
-    # incompatible PATCHes, not just the deadline-before-pin one).
-    if is_pinned_before and pin_day is not None:
-        can_repin = new_deadline >= pin_day and new_qty <= old_qty
-        if can_repin:
-            ops.append(
-                ScheduleOpInCompound(
-                    op="pin",
-                    order_id=order.id,
-                    order_number=order.order_number,
-                    wafer_quantity=new_qty,
-                    deadline=new_deadline,
-                    fake_deadline=pin_day,
-                )
+    if needs_remove_add:
+        ops.append(
+            ScheduleOpInCompound(
+                op="remove",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=old_qty,
+                deadline=old_deadline,
             )
+        )
+        ops.append(
+            ScheduleOpInCompound(
+                op="add",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=new_qty,
+                deadline=new_deadline,
+            )
+        )
+    if needs_pin_op:
+        ops.append(
+            ScheduleOpInCompound(
+                op="pin",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=op_qty,
+                deadline=op_deadline,
+                fake_deadline=target_pin_day,  # type: ignore[arg-type]
+            )
+        )
+
+    # Worker writes the pin columns iff state actually changed. Otherwise
+    # skip the column write so the audit log doesn't show a no-op flip.
+    write_pin_cols = pin_state_changed
 
     return ScheduleCompoundRequest(
         group=group,
@@ -321,10 +360,14 @@ def _build_patch_compound(
             new_notes=new_notes,
             new_assigned_to_set=assigned_to_set,
             new_assigned_to=new_assigned_to,
+            new_pinned_production_date_set=write_pin_cols,
+            new_pinned_production_date=target_pin_day,
             old_wafer_quantity=old_qty,
             old_requested_delivery_date=old_deadline,
             old_notes=order.notes,
             old_assigned_to=order.assigned_to,
+            old_pinned_production_date=old_pin_day,
+            old_is_pinned=is_pinned_before,
         ),
     )
 
@@ -460,8 +503,17 @@ def update_order(  # noqa: PLR0912, PLR0915
     For PATCHes that don't touch scheduling fields (notes / assigned_to
     only), we short-circuit — write everything directly in the producer
     since there's no compound to defer to.
+
+    Uses ``get_by_id_for_update`` to take a row-level lock. Concurrent
+    PATCHes on the same order serialize at the SELECT — the second one
+    blocks until the first commits, then sees ``is_processing_locked=True``
+    and rejects with 409 below. Without the lock, two PATCHes could both
+    read the row at ``version_id=N``, each build a compound with the same
+    "old" values, both enqueue to Redis before either commits — and the
+    worker would later trip ``SegmentTreeInvariantError`` on the second
+    stale compound.
     """
-    order = order_repo.get_by_id(db, order_id)
+    order = order_repo.get_by_id_for_update(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
@@ -507,8 +559,27 @@ def update_order(  # noqa: PLR0912, PLR0915
     if assigned_to_set:
         _validate_assigned_to_user(db, new_assigned_to)
 
+    # Pin field uses the same "set" sentinel pattern — ``None`` is a legal
+    # client input (= "unpin"), distinct from "missing" (= "keep current").
+    pin_day_set = "pinned_production_date" in req.model_fields_set
+    new_pin_day = req.pinned_production_date if pin_day_set else order.pinned_production_date
+    # Surface "pinning to a day after the deadline" as a 422 here so users get
+    # synchronous feedback instead of a delayed WS ``compound_failed``. Pinning
+    # to None (unpin) is always fine.
+    if pin_day_set and new_pin_day is not None and new_pin_day > new_deadline:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Pin date cannot be after the order's delivery deadline.",
+        )
+
+    pin_changed_explicitly = pin_day_set and (
+        (new_pin_day is None) != (not order.is_pinned)
+        or (new_pin_day is not None and new_pin_day != order.pinned_production_date)
+    )
     scheduling_changed = (
-        new_qty != order.wafer_quantity or new_deadline != order.requested_delivery_date
+        new_qty != order.wafer_quantity
+        or new_deadline != order.requested_delivery_date
+        or pin_changed_explicitly
     )
 
     if not scheduling_changed:
@@ -557,6 +628,8 @@ def update_order(  # noqa: PLR0912, PLR0915
         new_notes=new_notes,
         assigned_to_set=assigned_to_set,
         new_assigned_to=new_assigned_to,
+        pin_day_set=pin_day_set,
+        new_pin_day=new_pin_day,
     )
     # ``_build_patch_compound`` returns ``None`` only when no qty/deadline
     # change was detected; we already guarded above (``scheduling_changed``
@@ -609,8 +682,14 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     audit log on accept. On compound failure (the worker's membership
     guard rejects a never-scheduled order's ``remove``, etc.) the worker
     clears the lock without deleting; the order remains alive.
+
+    Uses ``get_by_id_for_update`` to take a row-level lock. Concurrent
+    DELETE / PATCH on the same order serialize at the SELECT — same
+    rationale as ``update_order``: prevents two producers from each
+    building a compound off the same old data and enqueueing duplicate /
+    stale ops into Redis.
     """
-    order = order_repo.get_by_id(db, order_id)
+    order = order_repo.get_by_id_for_update(db, order_id)
     if order is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
 
@@ -910,45 +989,73 @@ def apply_schedule(
             {"date": sr.scheduled_date.isoformat(), "quantity": int(sr.quantity)} for sr in results
         ]
         is_pinned = order_id in pinned_map
-        order = order_repo.set_schedule_dates(
-            db,
-            order_id=order_id,
-            scheduled_production_date=earliest,
-            expected_delivery_date=latest,
-            daily_breakdown=daily_breakdown_payload,
-            is_pinned=is_pinned,
-            pinned_production_date=pinned_map.get(order_id),
-        )
-        if order is None:
+
+        # SAVEPOINT-isolate each per-order write so a single ``StaleDataError``
+        # (= ``version_id`` mismatch because a concurrent PATCH bumped the row
+        # between our SELECT and our flush) only rolls back THAT order's
+        # update, not the whole outer transaction. Without this nested guard
+        # the first stale row crashes the session into
+        # ``PendingRollbackError`` and every subsequent order in the loop
+        # follows, turning rebuild / advance_day into an unrecoverable
+        # task abort.
+        #
+        # Skipping is functionally safe: the concurrent PATCH enqueued a
+        # compound that ``run_scheduling_task`` will process next, which
+        # triggers a fresh ``materialize_schedule_task`` that rewrites the
+        # skipped order's ``scheduled_production_date`` / ``daily_breakdown``
+        # — so the only thing we "lose" by skipping is a redundant DB write.
+        try:
+            with db.begin_nested():
+                order = order_repo.set_schedule_dates(
+                    db,
+                    order_id=order_id,
+                    scheduled_production_date=earliest,
+                    expected_delivery_date=latest,
+                    daily_breakdown=daily_breakdown_payload,
+                    is_pinned=is_pinned,
+                    pinned_production_date=pinned_map.get(order_id),
+                )
+                if order is None:
+                    logger.warning(
+                        "order.schedule.apply_missing",
+                        order_id=str(order_id),
+                    )
+                    continue
+                applied += 1
+                _notif_queue.append(
+                    (order.created_by, order.id, order.order_number, order.status.value)
+                )
+                # Read status from the refreshed row, not a hard-coded constant —
+                # ``set_schedule_dates`` preserves ``in_production`` (see its
+                # docstring for why), so an in-production order being
+                # re-materialized for tomorrow's boundary portion will
+                # audit-log status=in_production, not status=scheduled.
+                new_value: dict[str, Any] = {
+                    "scheduled_production_date": str(earliest),
+                    "expected_delivery_date": str(latest),
+                    "status": order.status.value,
+                }
+                if is_pinned:
+                    new_value["pinned_production_date"] = str(pinned_map[order_id])
+                # Dual-write to audit_logs + stdout. user_id=None marks this as
+                # system-driven (the scheduler, not a human, applied the result).
+                record_audit(
+                    db,
+                    action="order.scheduled",
+                    actor_id=None,
+                    resource_type="order",
+                    resource_id=order_id,
+                    new_value=new_value,
+                )
+        except StaleDataError:
+            # Concurrent PATCH on this row landed between our SELECT and
+            # our flush. The SAVEPOINT is already rolled back; outer
+            # transaction still usable. Log + skip.
             logger.warning(
-                "order.schedule.apply_missing",
+                "order.schedule.apply_stale_skipped",
                 order_id=str(order_id),
             )
             continue
-        applied += 1
-        _notif_queue.append((order.created_by, order.id, order.order_number, order.status.value))
-        # Read status from the refreshed row, not a hard-coded constant —
-        # ``set_schedule_dates`` preserves ``in_production`` (see its
-        # docstring for why), so an in-production order being re-materialized
-        # for tomorrow's boundary portion will audit-log status=in_production,
-        # not status=scheduled.
-        new_value: dict[str, Any] = {
-            "scheduled_production_date": str(earliest),
-            "expected_delivery_date": str(latest),
-            "status": order.status.value,
-        }
-        if is_pinned:
-            new_value["pinned_production_date"] = str(pinned_map[order_id])
-        # Dual-write to audit_logs + stdout. user_id=None marks this as
-        # system-driven (the scheduler, not a human, applied the result).
-        record_audit(
-            db,
-            action="order.scheduled",
-            actor_id=None,
-            resource_type="order",
-            resource_id=order_id,
-            new_value=new_value,
-        )
 
     db.commit()
     logger.info("order.schedule.applied", applied=applied)
