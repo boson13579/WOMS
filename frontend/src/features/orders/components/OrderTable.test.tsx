@@ -286,7 +286,9 @@ describe('OrderTable', () => {
 
       const lockedButtons = screen.getAllByTitle('排程處理中，請稍候');
       expect(lockedButtons).toHaveLength(2);
-      lockedButtons.forEach((btn) => expect(btn).toBeDisabled());
+      lockedButtons.forEach((btn) => {
+        expect(btn).toBeDisabled();
+      });
     });
   });
 
