@@ -106,6 +106,8 @@ class CompoundDbAction(BaseModel):
     new_notes: str | None = None
     new_assigned_to_set: bool = False
     new_assigned_to: uuid.UUID | None = None
+    new_customer_name_set: bool = False
+    new_customer_name: str | None = None
 
     # Pre-PATCH values for audit log diffing. Worker reads ``old_*`` to
     # construct the ``audit_logs.old_value`` JSON. Absent on create.
@@ -113,6 +115,7 @@ class CompoundDbAction(BaseModel):
     old_requested_delivery_date: date | None = None
     old_notes: str | None = None
     old_assigned_to: uuid.UUID | None = None
+    old_customer_name: str | None = None
 
 
 class ScheduleCompoundRequest(BaseModel):

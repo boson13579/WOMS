@@ -51,6 +51,7 @@ class UpdateOrderRequest(BaseModel):
     Only scheduler and root may change assigned_to.
     """
 
+    customer_name: str | None = Field(default=None, min_length=1, max_length=255)
     wafer_quantity: int | None = Field(default=None, ge=25, le=2500)
     requested_delivery_date: date | None = None
     notes: str | None = None

@@ -1007,6 +1007,7 @@ def _apply_db_action_accept(
 
     if kind == "update":
         old_value: dict[str, Any] = {
+            "customer_name": order.customer_name,
             "wafer_quantity": order.wafer_quantity,
             "requested_delivery_date": str(order.requested_delivery_date),
             "notes": order.notes,
@@ -1023,8 +1024,13 @@ def _apply_db_action_accept(
         if db_action.get("new_assigned_to_set"):
             raw_assignee = db_action.get("new_assigned_to")
             order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
+        if db_action.get("new_customer_name_set"):
+            raw_cname = db_action.get("new_customer_name")
+            if raw_cname is not None:
+                order.customer_name = str(raw_cname)
         order.is_processing_locked = False
         new_value: dict[str, Any] = {
+            "customer_name": order.customer_name,
             "wafer_quantity": order.wafer_quantity,
             "requested_delivery_date": str(order.requested_delivery_date),
             "notes": order.notes,

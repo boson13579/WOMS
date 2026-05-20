@@ -532,6 +532,46 @@ def test_update_order_only_delivery_date(client: TestClient, db_session: Session
     assert body["is_processing_locked"] is True
 
 
+def test_update_order_customer_name_pending_success(
+    client: TestClient, db_session: Session
+) -> None:
+    """customer_name is a non-scheduling field — PATCH writes directly
+    (no compound enqueued), so the response already reflects the new value
+    and the row is never locked.
+    """
+    user = _make_user(db_session, username="sched_cname", role=UserRole.scheduler)
+    token = _login(client, "sched_cname")
+    order = _make_order(db_session, created_by=user.id, customer_name="Old Corp")
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"customer_name": "New Corp", "version_id": order.version_id},
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["customer_name"] == "New Corp"
+    assert body["is_processing_locked"] is False
+
+
+def test_update_order_customer_name_in_production_returns_422(
+    client: TestClient, db_session: Session
+) -> None:
+    """in_production is outside MUTABLE_STATUSES — any PATCH must be rejected."""
+    user = _make_user(db_session, username="sched_cname_ip", role=UserRole.scheduler)
+    token = _login(client, "sched_cname_ip")
+    order = _make_order(db_session, created_by=user.id, status=OrderStatus.in_production)
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={"customer_name": "New Corp", "version_id": order.version_id},
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # Delete (soft)
 # ---------------------------------------------------------------------------

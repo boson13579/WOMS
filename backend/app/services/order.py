@@ -204,6 +204,8 @@ def _build_patch_compound(
     new_notes: str | None = None,
     assigned_to_set: bool = False,
     new_assigned_to: uuid.UUID | None = None,
+    customer_name_set: bool = False,
+    new_customer_name: str | None = None,
 ) -> ScheduleCompoundRequest | None:
     """Build the schedule compound for a PATCH that may touch qty / deadline.
 
@@ -321,10 +323,13 @@ def _build_patch_compound(
             new_notes=new_notes,
             new_assigned_to_set=assigned_to_set,
             new_assigned_to=new_assigned_to,
+            new_customer_name_set=customer_name_set,
+            new_customer_name=new_customer_name,
             old_wafer_quantity=old_qty,
             old_requested_delivery_date=old_deadline,
             old_notes=order.notes,
             old_assigned_to=order.assigned_to,
+            old_customer_name=order.customer_name,
         ),
     )
 
@@ -506,24 +511,30 @@ def update_order(  # noqa: PLR0912, PLR0915
     new_assigned_to = req.assigned_to if assigned_to_set else order.assigned_to
     if assigned_to_set:
         _validate_assigned_to_user(db, new_assigned_to)
+    customer_name_set = "customer_name" in req.model_fields_set
+    new_customer_name = req.customer_name if customer_name_set else order.customer_name
 
     scheduling_changed = (
         new_qty != order.wafer_quantity or new_deadline != order.requested_delivery_date
     )
 
     if not scheduling_changed:
-        # Non-scheduling PATCH (notes / assigned_to) — no worker round-trip needed.
-        # Write directly and audit here; the producer remains the single
-        # writer because no compound is ever enqueued.
+        # Non-scheduling PATCH (notes / assigned_to / customer_name) — no worker
+        # round-trip needed. Write directly and audit here; the producer remains
+        # the single writer because no compound is ever enqueued.
         old_val: dict[str, Any] = {
+            "customer_name": order.customer_name,
             "notes": order.notes,
             "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
         }
+        if customer_name_set and req.customer_name is not None:
+            order.customer_name = req.customer_name
         if notes_set:
             order.notes = req.notes
         if assigned_to_set:
             order.assigned_to = req.assigned_to
         new_val_simple: dict[str, Any] = {
+            "customer_name": order.customer_name,
             "notes": order.notes,
             "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
         }
@@ -557,6 +568,8 @@ def update_order(  # noqa: PLR0912, PLR0915
         new_notes=new_notes,
         assigned_to_set=assigned_to_set,
         new_assigned_to=new_assigned_to,
+        customer_name_set=customer_name_set,
+        new_customer_name=new_customer_name,
     )
     # ``_build_patch_compound`` returns ``None`` only when no qty/deadline
     # change was detected; we already guarded above (``scheduling_changed``
