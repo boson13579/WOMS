@@ -110,7 +110,7 @@ output "github_actions_role_arn" {
 }
 
 output "admin_password" {
-  description = "Auto-generated demo admin password. Read with `terraform output -raw admin_password` and share with reviewers out-of-band."
-  value       = random_password.admin_password.result
+  description = "Demo admin password (either from terraform.tfvars or auto-generated). Read with `terraform output -raw admin_password` and share with reviewers out-of-band."
+  value       = local.effective_admin_password
   sensitive   = true
 }

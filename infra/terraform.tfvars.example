@@ -8,3 +8,8 @@ environment = "dev"
 
 # DB / Redis passwords will be added here when we get to rds.tf / elasticache.tf.
 # Keep them OUT of git — that's why `*.tfvars` is in .gitignore.
+
+# Optional: pick a stable demo admin password. Reused across every
+# destroy/apply cycle so reviewers don't get new credentials each time.
+# Leave commented to let Terraform auto-generate (regenerates on each cycle).
+# admin_password = "pick-something-here"
