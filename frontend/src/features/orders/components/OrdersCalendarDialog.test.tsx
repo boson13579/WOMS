@@ -62,6 +62,18 @@ vi.mock('../api/scheduleResult', () => ({
 }));
 
 vi.mock('../api/scheduleCapacity', () => ({
+  toDailyCapacity: (capacity: {
+    daily_capacity: number;
+    entries: { date: string; cumulative_remaining: number }[];
+  }) =>
+    capacity.entries.map((entry, index) => {
+      const previous = index === 0 ? 0 : capacity.entries[index - 1].cumulative_remaining;
+      return {
+        date: entry.date,
+        remaining: entry.cumulative_remaining - previous,
+        dailyCapacity: capacity.daily_capacity,
+      };
+    }),
   useScheduleCapacity: () => mockScheduleCapacity,
 }));
 
@@ -183,7 +195,7 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText(/TSMC/)).toBeInTheDocument();
     expect(screen.getByText(/今日 500/)).toBeInTheDocument();
     expect(screen.getByText('已完成')).toBeInTheDocument();
-    expect(screen.getByText('剩餘 2,000')).toBeInTheDocument();
+    expect(screen.getByText('剩餘 1,500')).toBeInTheDocument();
   });
 
   it('renders pending orders without expected delivery date in the unscheduled panel', () => {
@@ -203,13 +215,13 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText(/今日 1,000/)).toBeInTheDocument();
     expect(screen.getByText(/累計 1,000 \/ 2,500/)).toBeInTheDocument();
     expect(screen.getByText('生產中')).toBeInTheDocument();
-    expect(screen.getByText('剩餘 1,500')).toBeInTheDocument();
+    expect(screen.getByText('剩餘 1,000')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
     expect(screen.getByText(/今日 1,500/)).toBeInTheDocument();
     expect(screen.getByText(/累計 2,500 \/ 2,500/)).toBeInTheDocument();
     expect(screen.getByText('已完成')).toBeInTheDocument();
-    expect(screen.getByText('剩餘 1,000')).toBeInTheDocument();
+    expect(screen.getByText('剩餘 0')).toBeInTheDocument();
   });
 
   it('can navigate between months', async () => {

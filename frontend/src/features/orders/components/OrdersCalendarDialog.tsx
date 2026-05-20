@@ -20,7 +20,7 @@ import { useCurrentRole } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 
 import { useOrders } from '../api/orders';
-import { useScheduleCapacity } from '../api/scheduleCapacity';
+import { toDailyCapacity, useScheduleCapacity } from '../api/scheduleCapacity';
 import { usePinScheduleOperation } from '../api/scheduleOperations';
 import { useScheduleResult } from '../api/scheduleResult';
 import type { DailyAssignment, Order, OrderStatus, ScheduleResult } from '../types';
@@ -321,22 +321,8 @@ export function OrdersCalendarDialog({
     if (!scheduleCapacity.data)
       return new Map<string, { remaining: number; dailyCapacity: number }>();
 
-    return new Map(
-      scheduleCapacity.data.entries.map((entry) => {
-        const used = (grouped[entry.date] ?? []).reduce(
-          (total, order) => total + order.productionQuantity,
-          0,
-        );
-        return [
-          entry.date,
-          {
-            remaining: Math.max(scheduleCapacity.data.daily_capacity - used, 0),
-            dailyCapacity: scheduleCapacity.data.daily_capacity,
-          },
-        ];
-      }),
-    );
-  }, [grouped, scheduleCapacity.data]);
+    return new Map(toDailyCapacity(scheduleCapacity.data).map((entry) => [entry.date, entry]));
+  }, [scheduleCapacity.data]);
   const scheduledOrderById = useMemo(
     () => new Map((scheduledOrders.data?.items ?? []).map((order) => [order.id, order])),
     [scheduledOrders.data],
