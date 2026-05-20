@@ -572,6 +572,46 @@ def test_update_order_customer_name_in_production_returns_422(
     assert res.status_code == 422
 
 
+def test_update_order_customer_name_compound_path(client: TestClient, db_session: Session) -> None:
+    """customer_name is forwarded via CompoundDbAction when the PATCH also
+    touches scheduling fields (wafer_quantity here triggers scheduling_changed).
+
+    The producer enqueues the compound and locks the row immediately; the
+    response reflects pre-PATCH state because the worker hasn't applied yet.
+    Contrast with the non-scheduling path (test_update_order_customer_name_
+    pending_success): there, customer_name is updated synchronously and the
+    response already shows the new value with is_processing_locked=False.
+    The pre-PATCH customer_name in this response is the observable proof that
+    the compound path was taken and the write was deferred to the worker.
+    """
+    user = _make_user(db_session, username="sched_cname_compound", role=UserRole.scheduler)
+    token = _login(client, "sched_cname_compound")
+    order = _make_order(
+        db_session,
+        created_by=user.id,
+        customer_name="Old Corp",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+    )
+
+    res = client.patch(
+        f"/api/v1/orders/{order.id}",
+        json={
+            "customer_name": "New Corp",
+            "wafer_quantity": 200,
+            "version_id": order.version_id,
+        },
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    body = res.json()
+    # Pre-PATCH values — worker hasn't applied the compound yet.
+    assert body["customer_name"] == "Old Corp"
+    assert body["wafer_quantity"] == 100
+    assert body["is_processing_locked"] is True
+
+
 # ---------------------------------------------------------------------------
 # Delete (soft)
 # ---------------------------------------------------------------------------

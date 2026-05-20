@@ -49,6 +49,8 @@ class UpdateOrderRequest(BaseModel):
     `assigned_to` uses model_fields_set as sentinel: omitting the field keeps
     the current assignee; sending null clears it; sending a UUID reassigns.
     Only scheduler and root may change assigned_to.
+    `customer_name` uses the same sentinel: omitting or sending null keeps the
+    current value; only non-null strings are applied.
     """
 
     customer_name: str | None = Field(default=None, min_length=1, max_length=255)
