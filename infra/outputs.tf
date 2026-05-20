@@ -93,3 +93,18 @@ output "kubeconfig_command" {
   description = "Run this to point your local kubectl at the cluster."
   value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks.cluster_name}"
 }
+
+output "alb_controller_role_arn" {
+  description = "IAM role ARN for the AWS Load Balancer Controller. Passed to helm install via --set."
+  value       = module.alb_controller_irsa_role.iam_role_arn
+}
+
+output "cloudfront_url" {
+  description = "HTTPS URL of the CloudFront distribution (only set when alb_dns_name var is provided)."
+  value       = local.cloudfront_enabled ? "https://${aws_cloudfront_distribution.main[0].domain_name}" : "(set var.alb_dns_name and re-apply to provision CloudFront)"
+}
+
+output "github_actions_role_arn" {
+  description = "IAM role ARN to put in GitHub repo secrets as AWS_DEPLOY_ROLE_ARN."
+  value       = aws_iam_role.github_actions.arn
+}
