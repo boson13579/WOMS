@@ -36,22 +36,26 @@ const baseOrder = {
   version_id: 1,
 };
 
-function mockPatchOk(orderId: string, versionId: number = 2): Response {
-  return new Response(
-    JSON.stringify({ id: orderId, version_id: versionId }),
-    { status: 200, headers: { 'Content-Type': 'application/json' } },
-  );
+function mockPatchOk(orderId: string, versionId = 2): Response {
+  return new Response(JSON.stringify({ id: orderId, version_id: versionId }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 describe('usePinScheduleOperation (PATCH /orders/{id} flow)', () => {
   beforeEach(() => {
     mockAuth.userId = '33333333-3333-4333-8333-333333333333';
-    vi.mocked(global.fetch).mockImplementation(async (input) => {
+    // Mock is sync (returns the Response synchronously) but vi.fn().mockImplementation
+    // wraps it for the async fetch signature. Use a non-async function and
+    // wrap the return in Promise.resolve to satisfy both fetch's Promise
+    // return type and lint's "no unused async" rule.
+    vi.mocked(global.fetch).mockImplementation((input) => {
       const url = typeof input === 'string' ? input : (input as Request).url;
       // Extract order id from URL path: /api/v1/orders/{id}
       const m = /\/api\/v1\/orders\/([^/?]+)/.exec(url);
       const orderId = m?.[1] ?? 'unknown';
-      return mockPatchOk(orderId);
+      return Promise.resolve(mockPatchOk(orderId));
     });
   });
 
@@ -142,17 +146,18 @@ describe('usePinScheduleOperation (PATCH /orders/{id} flow)', () => {
 
     // Two PATCH calls, one per order. Each carries that order's own
     // version_id and target date — no shared compound payload.
-    const calls = vi.mocked(global.fetch).mock.calls;
+    const { calls } = vi.mocked(global.fetch).mock;
     expect(calls).toHaveLength(2);
 
     const urls = calls.map((c) => c[0]).sort();
-    expect(urls).toEqual(
-      [`/api/v1/orders/${baseOrder.id}`, `/api/v1/orders/${order2.id}`].sort(),
-    );
+    expect(urls).toEqual([`/api/v1/orders/${baseOrder.id}`, `/api/v1/orders/${order2.id}`].sort());
 
-    const bodies = calls.map((c) => JSON.parse(c[1]?.body as string));
+    const bodies = calls.map((c) => JSON.parse(c[1]?.body as string) as Record<string, unknown>);
     const byOrder = Object.fromEntries(
-      calls.map((c, i) => [(c[0] as string).split('/').pop()!, bodies[i]]),
+      calls.map((c, i) => {
+        const parts = (c[0] as string).split('/');
+        return [parts[parts.length - 1], bodies[i]];
+      }),
     );
     expect(byOrder[baseOrder.id]).toEqual({
       pinned_production_date: '2026-05-10',
@@ -165,17 +170,22 @@ describe('usePinScheduleOperation (PATCH /orders/{id} flow)', () => {
   });
 
   it('rejects the mutation if one of the PATCHes fails', async () => {
-    vi.mocked(global.fetch).mockImplementation(async (input) => {
+    vi.mocked(global.fetch).mockImplementation((input) => {
       const url = typeof input === 'string' ? input : (input as Request).url;
       // First call ok, second call 409 (concurrent PATCH bumped version_id).
       if (url.endsWith(baseOrder.id)) {
-        return mockPatchOk(baseOrder.id);
+        return Promise.resolve(mockPatchOk(baseOrder.id));
       }
-      return new Response(
-        JSON.stringify({
-          error: { code: 409, message: 'Order was modified by another user. Refresh and try again.' },
-        }),
-        { status: 409, headers: { 'Content-Type': 'application/json' } },
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 409,
+              message: 'Order was modified by another user. Refresh and try again.',
+            },
+          }),
+          { status: 409, headers: { 'Content-Type': 'application/json' } },
+        ),
       );
     });
 
