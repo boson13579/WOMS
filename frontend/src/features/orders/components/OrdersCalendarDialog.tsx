@@ -8,6 +8,8 @@ import {
   Loader2,
   Lock,
   PackageOpen,
+  Search,
+  X,
   Zap,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -325,6 +327,8 @@ export function OrdersCalendarDialog({
   const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [selectedOrderIds, setSelectedOrderIds] = useState<string[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const role = useCurrentRole();
 
   const scheduleResult = useScheduleResult();
@@ -354,6 +358,23 @@ export function OrdersCalendarDialog({
     () => groupByProductionDate(scheduleResult.data ?? [], dateKey(new Date())),
     [scheduleResult.data],
   );
+  const filteredGrouped = useMemo(() => {
+    if (!searchQuery) return grouped;
+    const query = searchQuery.toLowerCase();
+    return Object.keys(grouped).reduce<Record<string, ProductionCalendarItem[]>>((acc, date) => {
+      const items = grouped[date];
+      const matched = items.filter(
+        (item) =>
+          item.order_number.toLowerCase().includes(query) ||
+          item.customer_name.toLowerCase().includes(query),
+      );
+      if (matched.length > 0) {
+        acc[date] = matched;
+      }
+      return acc;
+    }, {});
+  }, [grouped, searchQuery]);
+
   const dailyCapacityByDate = useMemo(() => {
     if (!scheduleCapacity.data)
       return new Map<string, { remaining: number; dailyCapacity: number }>();
@@ -364,7 +385,7 @@ export function OrdersCalendarDialog({
     () => new Map((scheduledOrders.data?.items ?? []).map((order) => [order.id, order])),
     [scheduledOrders.data],
   );
-  const selectedItems = grouped[selectedDate] ?? [];
+  const selectedItems = filteredGrouped[selectedDate] ?? [];
   const unscheduled = useMemo(
     () =>
       (pendingOrders.data?.items ?? []).filter(
@@ -372,6 +393,15 @@ export function OrdersCalendarDialog({
       ),
     [pendingOrders.data],
   );
+  const filteredUnscheduled = useMemo(() => {
+    if (!searchQuery) return unscheduled;
+    const query = searchQuery.toLowerCase();
+    return unscheduled.filter(
+      (order) =>
+        order.order_number.toLowerCase().includes(query) ||
+        order.customer_name.toLowerCase().includes(query),
+    );
+  }, [unscheduled, searchQuery]);
   const selectableOrders = useMemo(
     () => [...(scheduledOrders.data?.items ?? []), ...unscheduled],
     [scheduledOrders.data, unscheduled],
@@ -647,7 +677,7 @@ export function OrdersCalendarDialog({
                 <div className="grid grid-cols-7 border-l">
                   {days.map((day) => {
                     const key = dateKey(day);
-                    const items = grouped[key] ?? [];
+                    const items = filteredGrouped[key] ?? [];
                     const capacity = dailyCapacityByDate.get(key);
                     const isCurrentMonth = day.getMonth() === visibleMonth.getMonth();
                     const isSelected = key === selectedDate;
@@ -840,21 +870,55 @@ export function OrdersCalendarDialog({
             )}
 
             <div className="mb-5">
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="text-sm font-semibold">{selectedDate} 生產訂單</h3>
-                {dailyCapacityByDate.get(selectedDate) && (
-                  <span
-                    className={cn(
-                      'inline-flex items-center gap-1 text-xs font-medium',
-                      capacityTone(
-                        dailyCapacityByDate.get(selectedDate)?.remaining ?? 0,
-                        dailyCapacityByDate.get(selectedDate)?.dailyCapacity ?? 1,
-                      ),
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold">{selectedDate} 生產訂單</h3>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="搜尋訂單"
+                      onClick={() => {
+                        setIsSearching((prev) => !prev);
+                        if (isSearching) {
+                          setSearchQuery('');
+                        }
+                      }}
+                      className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                    >
+                      {isSearching ? <X className="h-4 w-4" /> : <Search className="h-4 w-4" />}
+                    </Button>
+                    {dailyCapacityByDate.get(selectedDate) && (
+                      <span
+                        className={cn(
+                          'inline-flex items-center gap-1 text-xs font-medium',
+                          capacityTone(
+                            dailyCapacityByDate.get(selectedDate)?.remaining ?? 0,
+                            dailyCapacityByDate.get(selectedDate)?.dailyCapacity ?? 1,
+                          ),
+                        )}
+                      >
+                        <Zap className="h-3.5 w-3.5" />
+                        剩餘 {dailyCapacityByDate.get(selectedDate)?.remaining.toLocaleString()}
+                      </span>
                     )}
-                  >
-                    <Zap className="h-3.5 w-3.5" />
-                    剩餘 {dailyCapacityByDate.get(selectedDate)?.remaining.toLocaleString()}
-                  </span>
+                  </div>
+                </div>
+
+                {isSearching && (
+                  <div className="relative">
+                    <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
+                    <input
+                      type="text"
+                      placeholder="輸入單號或客戶名稱..."
+                      value={searchQuery}
+                      onChange={(e) => {
+                        setSearchQuery(e.target.value);
+                      }}
+                      className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-1.5 text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                    />
+                  </div>
                 )}
               </div>
               <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
@@ -902,8 +966,8 @@ export function OrdersCalendarDialog({
                 </div>
               ) : (
                 <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
-                  {unscheduled.length > 0 ? (
-                    unscheduled.map((order) => (
+                  {filteredUnscheduled.length > 0 ? (
+                    filteredUnscheduled.map((order) => (
                       <UnscheduledOrderLine
                         key={order.id}
                         order={order}
