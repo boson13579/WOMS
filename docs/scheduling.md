@@ -1225,6 +1225,39 @@ broadcast({...})  ──PUBLISH──▶ schedule:ws:events ──SUBSCRIBE─�
 
 ---
 
+### 4.7 Startup recovery — FastAPI 重啟時補三道缺口
+
+排程模組有三個 runtime 自己補不回來的缺口，全部都跟「server 重啟時 Redis state 跟現實對不齊」有關：
+
+1. **`schedule:state.base_date` 過時**：Celery Beat 每天 00:00 UTC 觸發 `advance_day_task`。Stack 完整關閉跨過 N 個午夜的話，Beat 那 N 次 tick 就漏掉，`base_date` 卡在舊日期 — segment tree 的 day 1 不再是「今天」，後續所有 `add_order` / `compute_schedule` 都用錯誤日曆算。
+2. **`schedule:state` 不見**：Redis 被 flush、首次部署、state schema 升版。worker 會 fallback 到 `SchedulerState.initial(today)` 空狀態，**靜默忘記**現有 scheduled 訂單佔的容量。
+3. **`pending_ops` 卡住 compound**：worker 在 drain 中途 crash，queue 還有 entries 但 `schedule:status` 可能卡在 `running`（死掉的 worker 沒寫 `idle`）。producer 端的 `enqueue_compound` 看到 `running` 就不會 `.delay()`，於是這些 compound 永遠不會被處理。
+
+`app/services/startup_recovery.py::run_startup_recovery()` 在 FastAPI lifespan startup 段呼叫一次，依下面 matrix 派對應 Celery task：
+
+| 偵測條件 | 動作 |
+|---|---|
+| `schedule:state` key 不存在 / JSON 解析失敗 | `rebuild_schedule_task.delay()` |
+| `state.base_date < today` 且 `today - base_date <= HORIZON_DAYS` | `advance_day_task.delay()` × N |
+| `state.base_date < today` 且 `today - base_date > HORIZON_DAYS` | `rebuild_schedule_task.delay()`（catchup 過 horizon = 純 churn 不如直接重建） |
+| `zcard(pending_ops) > 0` AND `status != "running"` | `run_scheduling_task.delay()` |
+
+**Multi-replica 防重複派工**：`SET NX EX 60` 拿 `schedule:startup_recovery_running` mutex；第二個 replica 看到 flag 已存在就 log + skip。沒有這道防護的話 N 個 replica × N 個 advance_day 會把 state **過度推進** N 天。Dispatch 完顯式 `DEL` flag（不靠 TTL 收尾）— 避免 60 秒內連續重啟時第二次被誤擋。
+
+**Best-effort，never raise**：整個函式包在 `try/except Exception: logger.exception(...)`，**任何 recovery 失敗都不會擋 API 起來**。設計取捨：silent miss 的代價是「下次 user 動作會自然觸發補上」（advance_day 例外，因為 Beat 要等到次日 00:00），raise 的代價是「API container 進 CrashLoopBackoff」 — 後者嚴重得多。
+
+**為什麼 lazy import `app.workers.scheduling`**：FastAPI 進程只需要 Celery producer side（`task.delay()`），但 `app.workers.scheduling` module-load 會 transitively import worker-only 程式碼。Lazy import 把這個依賴推到 `run_startup_recovery` 真的被呼叫的那一刻才解析；除了讓 import 圖更乾淨，也讓單元測試能 monkeypatch 三支 task 的 binding（test 在 `app.workers.scheduling` 的命名空間 stub `rebuild_schedule_task` / `advance_day_task` / `run_scheduling_task` 就能驗證「對的 task 派對的次數」）。
+
+**為什麼用 `advance_day_task.delay()` × N 而不是另寫「跳 N 天」task**：`advance_day_task` 已經做了完整的 per-day 工作 — apply_schedule + status workflow (`scheduled → in_production → completed`) 都按天觸發。寫一支「N 步合一」task 會繞過 daily status 轉換，導致應該 `in_production` / `completed` 的訂單沒被升級。N 支 task 透過 `schedule:state_writer_lock` 天然序列化，順序執行不會 race，雖然慢一點但正確。
+
+**為什麼 cap 在 HORIZON_DAYS（=30）**：超過 30 天的 catchup，每一天的 advance_day 都是在空 trees 上 churn（沒有訂單可以 advance、沒有 status 要轉換），跑 50 次 advance_day 不如一次 `rebuild_schedule_task` 直接從 DB 重建。
+
+**沒做的（刻意不自動化）**：
+- **`is_processing_locked=True` 的 orphan row 清掃**：race-prone — 重啟瞬間 worker 可能正在處理某個 compound、那個 lock 不是 orphan；自動 sweep 會誤清。留給人工 SOP 或之後另寫一支 admin endpoint。
+- **強制 reset `schedule:status` 卡 `running`**：status 卡住的場景罕見，下次成功 task 會自然蓋掉；不值得寫額外邏輯。Ops 真要清也是一行 `redis-cli`。
+
+---
+
 ## 5. 開發 / 除錯
 
 ### 5.1 手動觸發
@@ -1904,11 +1937,12 @@ uv run pytest tests/services tests/workers tests/api      # 全部
 | `backend/app/services/scheduling.py` | 演算法核心 | `SegmentTree`、`SchedulerState`、`add_order` / `remove_order` / `compute_schedule` / `advance_day` / `rebuild_state`、日期轉換 helper |
 | `backend/app/services/websocket.py` | WS publisher | 同步 `notify_user` / `broadcast`，把 envelope `PUBLISH` 到 Redis pub/sub channel `schedule:ws:events`；Redis 故障時靜默降級不影響 caller |
 | `backend/app/services/order.py` | 既有 service | 新增 `list_scheduled_orders`、`list_for_scheduler`、`apply_schedule`（內含 audit log emission） |
-| `backend/app/repositories/order.py` | 既有 repo | 新增 `get_scheduled`、`clear_scheduled_dates`、`set_schedule_dates` |
-| `backend/app/workers/scheduling.py` | Celery task | `run_scheduling_task`、`advance_day_task`、`rebuild_schedule_task` |
+| `backend/app/repositories/order.py` | 既有 repo | 新增 `get_scheduled`、`clear_scheduled_dates`、`set_schedule_dates`、`get_by_id_for_update` |
+| `backend/app/services/startup_recovery.py` | Lifespan recovery | `run_startup_recovery()` — FastAPI 起來時 detect stale base_date / missing state / orphan pending_ops 並派對應 task；NX-flag mutex 防 multi-replica 過度推進。詳見 §4.7 |
+| `backend/app/workers/scheduling.py` | Celery task | `run_scheduling_task`、`advance_day_task`、`rebuild_schedule_task`、`materialize_schedule_task` |
 | `backend/app/api/v1/schedule.py` | HTTP router | 5 個 endpoints；已在 `__init__.py` 註冊 prefix `/schedule` |
 | `backend/app/api/v1/websocket.py` | WebSocket endpoint | `GET /api/v1/ws?token=<jwt>`、`ConnectionManager` 連線註冊表、`event_consumer_loop` 訂閱 Redis 把訊息 fan-out 給連線的 client |
-| `backend/app/main.py` | 既有 entrypoint | lifespan 多起一個 `event_consumer_loop()` background task；shutdown 時 cancel |
+| `backend/app/main.py` | 既有 entrypoint | lifespan 多起一個 `event_consumer_loop()` background task + 呼叫 `run_startup_recovery()`；shutdown 時 cancel |
 | `backend/app/api/v1/__init__.py` | 既有 aggregate router | 多註冊 `websocket.router`（無 prefix，最終路徑 `/api/v1/ws`） |
 | `backend/app/schemas/schedule.py` | Pydantic DTO | 6 個 schemas（含 `ScheduleRebuildResponse`、`DailyAssignment`） |
 | `backend/tests/services/test_scheduling.py` | 單元測試 | 純算法 |
@@ -1917,6 +1951,7 @@ uv run pytest tests/services tests/workers tests/api      # 全部
 | `backend/tests/workers/test_scheduling_task.py` | 單元測試 | mock 全包 |
 | `backend/tests/api/test_schedule.py` | 整合測試 | 真 Postgres + mock Redis/Celery |
 | `backend/tests/api/test_websocket.py` | 整合測試 | `ConnectionManager` 純 async 單元 + `_handle_event` 路由 + `TestClient.websocket_connect` 跑 connect / 4401 close |
+| `backend/tests/services/test_startup_recovery.py` | 整合測試 | 11 個 case：state missing / corrupt / stale N days / past horizon / today / orphan pending / running / empty queue / mutex held / flag released |
 | `docs/scheduling.md` | 文件 | **本檔** |
 
 `backend/tests/services/__init__.py` 與 `backend/tests/workers/__init__.py` 是空的 package marker，未列入。

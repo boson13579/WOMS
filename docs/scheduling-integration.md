@@ -376,7 +376,7 @@ uv run celery -A app.workers.celery_app worker --loglevel=INFO
 uv run celery -A app.workers.celery_app beat   --loglevel=INFO   # 換天作業需要 beat
 ```
 
-⚠️ **沒設 beat 換天作業不會跑**，每天 00:00 UTC 應該推進 `base_date` 但實際上會卡住。
+⚠️ **沒設 beat 換天作業不會跑**，每天 00:00 UTC 應該推進 `base_date` 但實際上會卡住。Beat 漏跑的場景（worker 重啟跨日、整個 stack 關過夜）由 FastAPI startup recovery 偵測 + 自動補；但 beat 還是必須設好，不然每天都要靠重啟才會 advance。
 
 ### 4.2 環境變數
 
@@ -428,13 +428,18 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 
 ### 4.6 災難復原
 
+> **跨日重啟 / Redis 被清 / orphan pending_ops 都不需要人工介入**：FastAPI lifespan startup 會自動跑 `run_startup_recovery()`（`app/services/startup_recovery.py`），依現況派 `rebuild_schedule_task` / `advance_day_task` × N / `run_scheduling_task` 之一或多個。Multi-replica 用 `SET NX EX 60` mutex 確保只有一個 replica 派工。詳見 [`scheduling.md`](./scheduling.md) §4.7。
+
 | 症狀 | 怎麼辦 |
 |---|---|
-| `schedule:state` key 不見 / Redis 被 flush | `POST /api/v1/schedule/rebuild` |
+| 重啟跨過一個或多個 00:00 UTC | **自動處理**：startup recovery 偵測 `base_date < today` → 派 `advance_day_task` × (today - base_date)；差超過 30 天直接 rebuild。 |
+| `schedule:state` key 不見 / Redis 被 flush | **自動處理**：startup recovery 偵測缺 state → 派 `rebuild_schedule_task.delay()`。手動觸發仍可用 `POST /api/v1/schedule/rebuild`。 |
+| `pending_ops` 有 compound 但 worker 沒在動 | **自動處理**：startup recovery 偵測 `zcard > 0` AND `status != running` → 派 `run_scheduling_task.delay()`。 |
 | 前端 `daily_breakdown` 一直是空 | 表示 `orders.daily_breakdown` 欄位是 NULL — 通常代表 materializer 還沒跑過或寫入失敗。觸發一次 `POST /api/v1/schedule/trigger` 讓 worker 跑完整流程；如果還是空就 `POST /api/v1/schedule/rebuild` 強制重建。 |
-| `schedule:status` 卡在 `running` 但 worker 已經死了 | 重啟 worker；如果還是卡，手動 `redis-cli set schedule:status '{"state":"idle"}'` |
+| `schedule:status` 卡在 `running` 但 worker 已經死了 | startup recovery **不會自動清**這個（race-prone）；重啟 worker 後若還是卡，手動 `redis-cli set schedule:status '{"state":"idle"}'`。 |
 | `schedule:status.state == "failed"`、`error` 欄位有訊息 | 三支 task（`run_scheduling` / `advance_day` / `rebuild_schedule`）任一條失敗都會留這個記錄，先看 `error` + Celery traceback 找根因。`failed` 不會擋 `/trigger`（409 只擋 `running`），下次成功的 task 會把 status 蓋回 `idle`，不需要先手動清。 |
 | `schedule:waiter_pending` 卡住超過 10 分鐘 | TTL 會自己過期；如果 TTL 被改大可以手動 `redis-cli del schedule:waiter_pending` |
+| `is_processing_locked=true` 的 orphan row（worker 在 compound 處理中途 crash） | startup recovery **不自動清**（race-prone — 真的 worker 在處理中時會誤清），需手動 SQL：`UPDATE orders SET is_processing_locked=false WHERE is_processing_locked=true AND id NOT IN (...)` |
 | 排程結果跟 DB 不同步 | `POST /api/v1/schedule/rebuild` |
 | 前端 WebSocket 通知突然全停 | 看 backend log 有沒有 `websocket.consumer.failed`（ERROR）— 這代表 Redis pub/sub 中斷或訂閱失敗，consumer 已退出且**不會自我重啟**。重啟 FastAPI process 即可（lifespan 會重新建一個 consumer task）。 |
 
