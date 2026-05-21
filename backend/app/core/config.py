@@ -107,6 +107,39 @@ class Settings(BaseSettings):
     # --- Logging --------------------------------------------------------------
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
+    # --- Observability (RED / SLO) -------------------------------------------
+    # Availability target consumed by ``GET /api/v1/system/slo``. 99.5% gives
+    # a 0.5%-of-traffic error budget per rolling window — meaningful on a
+    # student-load app where one 5xx spike is visible but the system doesn't
+    # get punished for sub-second blips. Override via ``SLO_AVAILABILITY_TARGET_PCT``
+    # in ``.env`` if a deployment wants a different bar.
+    SLO_AVAILABILITY_TARGET_PCT: float = Field(
+        default=99.5,
+        gt=0,
+        lt=100,
+        description=(
+            "Availability SLO target (percent). Used by /api/v1/system/slo "
+            "to compute the error budget remaining for the window."
+        ),
+    )
+
+    # --- Audit log retention --------------------------------------------------
+    # Audit log is write-heavy + append-only. Without retention the table
+    # grows unboundedly; on a long-running deployment that bloats backups
+    # and slows the operator-facing audit feed. The daily Celery task
+    # ``audit.cleanup_old_logs`` deletes rows older than this many days.
+    # 90 days matches typical SOC-2 audit retention requirements and is
+    # easy to override per environment via the env var.
+    AUDIT_LOG_RETENTION_DAYS: int = Field(
+        default=90,
+        ge=1,
+        le=3650,
+        description=(
+            "Audit log retention in days; rows older than this are deleted "
+            "by the daily cleanup task ``audit.cleanup_old_logs``."
+        ),
+    )
+
     # ------------------------------------------------------------------ helpers
     @field_validator("CORS_ORIGINS")
     @classmethod

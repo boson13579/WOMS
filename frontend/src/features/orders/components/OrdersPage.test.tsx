@@ -1,9 +1,3 @@
-/**
- * OrdersPage — page composition tests.
- * Strategy: child components (OrderFilters / OrderTable / OrderModal) are
- * mocked so tests focus on page-level state management and callback wiring,
- * not on details already covered by child component tests.
- */
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
@@ -12,10 +6,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Order } from '../types';
 
 import { OrdersPage } from './OrdersPage';
-
-// ---------------------------------------------------------------------------
-// Mock react-router-dom (keep original module, override useNavigate only)
-// ---------------------------------------------------------------------------
 
 const { mockNavigate, mockLogout } = vi.hoisted(() => ({
   mockNavigate: vi.fn(),
@@ -28,10 +18,6 @@ vi.mock('react-router-dom', async (importOriginal) => {
   return { ...mod, useNavigate: () => mockNavigate };
 });
 
-// ---------------------------------------------------------------------------
-// Mock useAuthStore
-// ---------------------------------------------------------------------------
-
 vi.mock('@/features/auth/stores/authStore', () => ({
   useAuthStore: (
     sel: (s: {
@@ -40,10 +26,6 @@ vi.mock('@/features/auth/stores/authStore', () => ({
     }) => unknown,
   ) => sel({ user: { username: 'alice', role: 'scheduler', id: 'uid-001' }, logout: mockLogout }),
 }));
-
-// ---------------------------------------------------------------------------
-// Mock shared Header — stub with title + logout button
-// ---------------------------------------------------------------------------
 
 vi.mock('@/components/layout/Header', () => ({
   Header: ({ title }: { title: string }) => (
@@ -63,10 +45,6 @@ vi.mock('@/components/layout/Header', () => ({
   ),
 }));
 
-// ---------------------------------------------------------------------------
-// Mock API / WS hooks
-// ---------------------------------------------------------------------------
-
 const mockTriggerMutate = vi.fn();
 
 vi.mock('../api/orders', () => ({
@@ -77,15 +55,10 @@ vi.mock('../hooks/useScheduleWs', () => ({
   useScheduleWs: vi.fn(),
 }));
 
-// ---------------------------------------------------------------------------
-// Mock child components
-// ---------------------------------------------------------------------------
-
 vi.mock('./OrderFilters', () => ({
   OrderFilters: () => <div data-testid="order-filters" />,
 }));
 
-// exposes buttons that trigger onEdit / onSchedule so the page's handlers can be tested
 const SAMPLE_ORDER: Order = {
   id: 'order-id-0001',
   order_number: 'ORD-20260504-0001',
@@ -121,7 +94,6 @@ vi.mock('./OrderTable', () => ({
   ),
 }));
 
-// exposes data-open / data-order attributes so tests can assert prop changes
 vi.mock('./OrderModal', () => ({
   OrderModal: ({
     open,
@@ -140,9 +112,26 @@ vi.mock('./OrderModal', () => ({
   ),
 }));
 
-// ---------------------------------------------------------------------------
-// Helper
-// ---------------------------------------------------------------------------
+vi.mock('./OrdersCalendarDialog', () => ({
+  OrdersCalendarDialog: ({
+    open,
+    onOpenChange,
+  }: {
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+  }) => (
+    <div data-testid="orders-calendar-dialog" data-open={String(open)}>
+      <button
+        type="button"
+        onClick={() => {
+          onOpenChange(false);
+        }}
+      >
+        calendar-close
+      </button>
+    </div>
+  ),
+}));
 
 function renderPage(): void {
   render(
@@ -151,10 +140,6 @@ function renderPage(): void {
     </MemoryRouter>,
   );
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe('OrdersPage', () => {
   beforeEach(() => {
@@ -167,21 +152,15 @@ describe('OrdersPage', () => {
     expect(screen.getByRole('heading', { name: '訂單列表', level: 1 })).toBeInTheDocument();
   });
 
-  it('renders all three child components', () => {
+  it('renders filters, table, and the closed order modal', () => {
     renderPage();
 
     expect(screen.getByTestId('order-filters')).toBeInTheDocument();
     expect(screen.getByTestId('order-table')).toBeInTheDocument();
-    expect(screen.getByTestId('order-modal')).toBeInTheDocument();
-  });
-
-  it('modal is closed on initial render', () => {
-    renderPage();
-
     expect(screen.getByTestId('order-modal')).toHaveAttribute('data-open', 'false');
   });
 
-  it('opens the modal with no order when "新增訂單" is clicked', async () => {
+  it('opens the create modal when "新增訂單" is clicked', async () => {
     const user = userEvent.setup();
     renderPage();
 
@@ -192,7 +171,7 @@ describe('OrdersPage', () => {
     expect(modal).toHaveAttribute('data-order', 'none');
   });
 
-  it('opens the modal with the order when OrderTable fires onEdit', async () => {
+  it('opens the edit modal when OrderTable fires onEdit', async () => {
     const user = userEvent.setup();
     renderPage();
 
@@ -203,15 +182,17 @@ describe('OrdersPage', () => {
     expect(modal).toHaveAttribute('data-order', 'order-id-0001');
   });
 
-  it('closes the modal when onClose is called', async () => {
+  it('opens and closes the calendar dialog from the toolbar', async () => {
     const user = userEvent.setup();
     renderPage();
 
-    await user.click(screen.getByRole('button', { name: /新增訂單/ }));
-    expect(screen.getByTestId('order-modal')).toHaveAttribute('data-open', 'true');
+    expect(screen.queryByTestId('orders-calendar-dialog')).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: 'modal-close' }));
-    expect(screen.getByTestId('order-modal')).toHaveAttribute('data-open', 'false');
+    await user.click(screen.getByRole('button', { name: /日曆視圖/ }));
+    expect(screen.getByTestId('orders-calendar-dialog')).toHaveAttribute('data-open', 'true');
+
+    await user.click(screen.getByRole('button', { name: 'calendar-close' }));
+    expect(screen.queryByTestId('orders-calendar-dialog')).not.toBeInTheDocument();
   });
 
   it('calls triggerSchedule.mutate() when the toolbar schedule button is clicked', async () => {
@@ -227,7 +208,7 @@ describe('OrdersPage', () => {
     const user = userEvent.setup();
     renderPage();
 
-    await user.click(screen.getByRole('button', { name: /登出/ }));
+    await user.click(screen.getByRole('button', { name: '登出' }));
 
     expect(mockLogout).toHaveBeenCalledOnce();
     expect(mockNavigate).toHaveBeenCalledWith('/login', { replace: true });

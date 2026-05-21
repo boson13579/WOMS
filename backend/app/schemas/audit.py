@@ -1,13 +1,20 @@
 """Pydantic DTOs for the cross-resource audit-log domain.
 
 Originally lived under ``schemas/order.py`` because the only consumer was the
-``GET /orders/{id}/audit-log`` endpoint. PR B3 introduces a second consumer
+``GET /orders/{id}/audit-log`` endpoint. PR B3 introduced a second consumer
 (``GET /users/{id}/audit``) and ``audit_logs`` rows are written by the auth,
 user, order, scheduler, and worker layers alike. Keeping the DTO under
 ``schemas/order.py`` was a historical accident — moving it here makes the
 cross-resource nature explicit. ``schemas/order.py`` keeps a re-export shim so
 existing imports (``from app.schemas.order import AuditLogResponse``) keep
 working.
+
+PR A3 (Observability) widens the consumer set again with the global
+``GET /audit/events`` admin feed. The list-wrapper DTO is therefore renamed
+from ``UserAuditLogListResponse`` → ``AuditLogListResponse`` (same shape) to
+reflect that it now models any paginated audit-log slice, not just one
+user's history. The old name remains as a re-export alias so the per-user
+endpoint imports (and any downstream consumers) keep working without churn.
 """
 
 from __future__ import annotations
@@ -19,6 +26,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 __all__ = [
+    "AuditActionsResponse",
+    "AuditLogListResponse",
     "AuditLogResponse",
     "UserAuditLogListResponse",
 ]
@@ -42,15 +51,19 @@ class AuditLogResponse(BaseModel):
     created_at: datetime
 
 
-class UserAuditLogListResponse(BaseModel):
-    """Paginated list of audit-log entries for a single user.
+class AuditLogListResponse(BaseModel):
+    """Paginated list of audit-log entries.
 
     Shape mirrors ``OrderListResponse`` (``items`` / ``total`` / ``page`` /
     ``page_size``) so the frontend can reuse its existing paginator widget.
+    Used by both the per-user (``GET /users/{id}/audit``) and global
+    (``GET /audit/events``) audit feeds — the only difference is the filter
+    set applied at the repository layer.
+
     Verifier-mandated decision: pick ``page``/``page_size`` over
     ``limit``/``offset`` to match ``GET /orders`` and minimise FE consumer
     confusion. ``GET /orders/{id}/audit-log`` is unpaginated (bare list);
-    this endpoint is paginated because an admin views may scroll through
+    these endpoints are paginated because an admin view may scroll through
     long histories.
     """
 
@@ -58,3 +71,24 @@ class UserAuditLogListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class AuditActionsResponse(BaseModel):
+    """Sorted, distinct list of ``action`` values present in ``audit_logs``.
+
+    Backs ``GET /api/v1/audit/actions``, which the admin audit page calls
+    on mount to populate the Action filter's typeahead combobox. Replaces
+    the legacy hard-coded ``KNOWN_AUDIT_ACTIONS`` constant on the frontend
+    (which drifted: missed ``user.update``, included ``schedule.*`` that
+    no code emits). Sourced from the live DB so the list is always exact.
+
+    ``actions`` is sorted ASC for stable rendering. Empty list (not a
+    404) when the table is empty — clients render an empty combobox.
+    """
+
+    actions: list[str]
+
+
+# Backwards-compatibility alias for PR B3 callers (per-user audit endpoint
+# imports the old name). New code should prefer ``AuditLogListResponse``.
+UserAuditLogListResponse = AuditLogListResponse

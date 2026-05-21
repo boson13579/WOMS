@@ -106,23 +106,25 @@ curl -i http://localhost:8000/api/v1/health
 預期回應：
 ```
 HTTP/1.1 200 OK
-x-correlation-id: <一個隨機 UUID>
+x-request-id: <一個隨機 UUID>
 content-type: application/json
 
 {"status":"ok"}
 ```
 
-**重點看 `X-Correlation-ID` header** — 這是 logger 中介層自動產生的請求追蹤 ID。
+**重點看 `X-Request-Id` header** — 這是 logger 中介層自動產生的請求追蹤 ID。
 
-### 2.2 自帶 Correlation ID（驗證跨服務追蹤）
+### 2.2 自帶 Request ID（驗證跨服務追蹤）
 
 ```bash
-curl -i -H "X-Correlation-ID: my-test-trace-123" http://localhost:8000/api/v1/health
+curl -i -H "X-Request-Id: my-test-trace-123" http://localhost:8000/api/v1/health
 ```
 
-回應 header 應該回 `x-correlation-id: my-test-trace-123` — 證明系統優先使用上游傳來的 ID（用於從 frontend → backend → Celery worker 的全鏈路追蹤）。
+回應 header 應該回 `x-request-id: my-test-trace-123` — 證明系統優先使用上游傳來的 ID（用於從 frontend → backend → Celery worker 的全鏈路追蹤）。
 
 同時你會在 backend log 裡看到一行 JSON 含 `"trace.id":"my-test-trace-123"`。
+
+> 舊版的 `X-Correlation-ID` header 仍會被接受（向後相容），但回應 header 一律使用新的 `X-Request-Id` 名稱。
 
 ### 2.3 統一錯誤格式（404）
 

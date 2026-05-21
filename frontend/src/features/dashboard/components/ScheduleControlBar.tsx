@@ -17,6 +17,7 @@ import { z } from 'zod';
 
 import { Button } from '@/components/ui/button';
 import { useCurrentRole } from '@/lib/auth';
+import { toastApiError } from '@/lib/toastApiError';
 
 import { apiFetch } from '../api/apiFetch';
 
@@ -54,7 +55,7 @@ export function ScheduleControlBar(): JSX.Element | null {
       toast.success('Scheduling queued', { description: res.message });
     },
     onError: (err) => {
-      toast.error('Failed to trigger scheduling', { description: err.message });
+      toastApiError('Failed to trigger scheduling', err);
     },
   });
 
@@ -64,7 +65,7 @@ export function ScheduleControlBar(): JSX.Element | null {
       toast.success('Rebuild queued', { description: res.message });
     },
     onError: (err) => {
-      toast.error('Failed to queue rebuild', { description: err.message });
+      toastApiError('Failed to queue rebuild', err);
     },
   });
 

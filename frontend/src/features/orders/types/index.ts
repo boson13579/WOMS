@@ -81,3 +81,20 @@ export interface ScheduleTriggerResponse {
   task_id: string;
   message: string;
 }
+
+export interface DailyAssignment {
+  date: string;
+  quantity: number;
+}
+
+export interface ScheduleResult {
+  id: string;
+  order_number: string;
+  customer_name: string;
+  wafer_quantity: number;
+  requested_delivery_date: string;
+  scheduled_production_date: string | null;
+  expected_delivery_date: string | null;
+  status: OrderStatus;
+  daily_breakdown: DailyAssignment[];
+}
