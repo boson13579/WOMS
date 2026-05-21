@@ -346,7 +346,7 @@ def _build_patch_compound(
                 order_number=order.order_number,
                 wafer_quantity=op_qty,
                 deadline=op_deadline,
-                fake_deadline=target_pin_day,  # type: ignore[arg-type]
+                fake_deadline=target_pin_day,
             )
         )
 
