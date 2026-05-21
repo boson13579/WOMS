@@ -17,6 +17,7 @@ import { RoleProtectedRoute } from '@/components/layout/RoleProtectedRoute';
 import { SessionBoundary } from '@/components/layout/SessionBoundary';
 import { AuthPage } from '@/features/auth/components/AuthPage';
 import { DashboardPage } from '@/features/dashboard/components/DashboardPage';
+import { NotificationsPage } from '@/features/notifications/components/NotificationsPage';
 import { OrdersPage } from '@/features/orders/components/OrdersPage';
 import { AdminUsersPage } from '@/features/users/components/AdminUsersPage';
 
@@ -33,6 +34,7 @@ export const routes: RouteObject[] = [
             children: [
               { index: true, element: <DashboardPage /> },
               { path: 'orders', element: <OrdersPage /> },
+              { path: 'notifications', element: <NotificationsPage /> },
               {
                 // Root-only nested group. Layout-route shape so future
                 // root-only routes plug in here without per-page wrapping.

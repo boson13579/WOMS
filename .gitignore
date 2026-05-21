@@ -87,3 +87,5 @@ TODO.local.md
 *.log
 *.pid
 docker-compose.override.yml
+AGENTS.md
+FRONTEND_SPEC.md

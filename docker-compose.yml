@@ -88,6 +88,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      disable: true
 
   frontend:
     build:
@@ -100,7 +102,7 @@ services:
     environment:
       VITE_API_TARGET: http://backend:8000
     ports:
-      - "5173:5173"
+      - "3000:5173"
     volumes:
       # Bind-mount source for HMR; node_modules is kept inside the container
       # to avoid Windows ↔ Linux symlink/permission churn.
@@ -112,7 +114,7 @@ services:
     restart: unless-stopped
     profiles: ["dev"]
     ports:
-      - "8080:8080"
+      - "8888:8080"
     depends_on:
       db: { condition: service_healthy }
 
