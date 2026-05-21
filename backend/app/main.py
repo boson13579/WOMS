@@ -24,6 +24,7 @@ from app.api.v1.websocket import event_consumer_loop
 from app.core.config import get_settings
 from app.core.logger import configure_logging, correlation_id_middleware
 from app.core.red_metrics import red_metrics_middleware
+from app.services.startup_recovery import run_startup_recovery
 
 logger = structlog.get_logger(__name__)
 
@@ -43,6 +44,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         env=settings.APP_ENV,
         version=settings.APP_VERSION,
     )
+
+    # Best-effort scheduler-state recovery: catch up missed advance_day
+    # ticks, rebuild on missing state, kick orphan pending ops. Safe to
+    # run unconditionally — has its own NX-lock so multi-replica deploys
+    # only execute on one replica per restart event.
+    run_startup_recovery()
 
     consumer_task = asyncio.create_task(event_consumer_loop())
 
