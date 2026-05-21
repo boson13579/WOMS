@@ -6,6 +6,7 @@ import {
   ChevronRight,
   GripVertical,
   Loader2,
+  Lock,
   PackageOpen,
   Zap,
 } from 'lucide-react';
@@ -75,7 +76,21 @@ interface ProductionCalendarItem extends ScheduleResult {
   productionDate: string;
   productionQuantity: number;
   cumulativeQuantity: number;
-  productionState: 'in_progress' | 'complete';
+  productionState: 'in_progress' | 'complete' | 'scheduled';
+}
+
+function getProductionStateLabel(state: 'complete' | 'in_progress' | 'scheduled'): string {
+  if (state === 'complete') return '已完成';
+  if (state === 'in_progress') return '生產中';
+  return '已排程';
+}
+
+function getProductionStateVariant(
+  state: 'complete' | 'in_progress' | 'scheduled',
+): 'success' | 'warning' | 'info' | 'secondary' {
+  if (state === 'complete') return 'success';
+  if (state === 'in_progress') return 'warning';
+  return 'info';
 }
 
 function dateKey(date: Date): string {
@@ -115,16 +130,33 @@ function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): 
     .reduce((total, assignment) => total + assignment.quantity, 0);
 }
 
-function groupByProductionDate(items: ScheduleResult[]): Record<string, ProductionCalendarItem[]> {
+function groupByProductionDate(
+  items: ScheduleResult[],
+  baseDate: string,
+): Record<string, ProductionCalendarItem[]> {
   return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
+    const dates = item.daily_breakdown.map((b) => b.date);
+    const finalDate = dates.length > 0 ? dates.reduce((max, d) => (d > max ? d : max)) : '';
+
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
+
+      let productionState: 'complete' | 'in_progress' | 'scheduled';
+
+      if (finalDate < baseDate) {
+        productionState = 'complete';
+      } else if (assignment.date > baseDate) {
+        productionState = 'scheduled';
+      } else {
+        productionState = 'in_progress';
+      }
+
       const productionItem: ProductionCalendarItem = {
         ...item,
         productionDate: assignment.date,
         productionQuantity: assignment.quantity,
         cumulativeQuantity,
-        productionState: cumulativeQuantity >= item.wafer_quantity ? 'complete' : 'in_progress',
+        productionState,
       };
       acc[assignment.date] = [...(acc[assignment.date] ?? []), productionItem];
     });
@@ -208,9 +240,14 @@ function OrderLine({
           )}
           {canDrag && dragOrder && <GripVertical className="h-3.5 w-3.5 shrink-0" />}
           <span className="truncate">{order.order_number}</span>
+          {(order.productionState === 'in_progress' || dragOrder?.is_processing_locked) && (
+            <span title="生產中/處理鎖定中">
+              <Lock className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
+            </span>
+          )}
         </span>
-        <Badge variant="secondary" className="shrink-0">
-          {order.productionState === 'complete' ? '已完成' : '生產中'}
+        <Badge variant={getProductionStateVariant(order.productionState)} className="shrink-0">
+          {getProductionStateLabel(order.productionState)}
         </Badge>
       </div>
       <div className="mt-1 truncate text-muted-foreground">
@@ -314,7 +351,7 @@ export function OrdersCalendarDialog({
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
   const grouped = useMemo(
-    () => groupByProductionDate(scheduleResult.data ?? []),
+    () => groupByProductionDate(scheduleResult.data ?? [], dateKey(new Date())),
     [scheduleResult.data],
   );
   const dailyCapacityByDate = useMemo(() => {
@@ -424,7 +461,22 @@ export function OrdersCalendarDialog({
       },
       {
         onSuccess: () => {
-          toast.success('已送出排程嘗試，等待排程器確認。');
+          toast.success('已送出排程嘗試，等待排程器確認。', {
+            description: (
+              <div className="mt-2 space-y-1.5">
+                {pendingMoves.map((move) => (
+                  <div key={move.order.id} className="flex flex-col gap-0.5">
+                    <span className="font-mono text-[11px] font-semibold text-foreground">
+                      {move.order.order_number}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      拖移至: {move.targetDate}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ),
+          });
           setPendingMoves([]);
           setSelectedOrderIds([]);
         },
@@ -646,15 +698,26 @@ export function OrdersCalendarDialog({
                             const draggableOrder = scheduledOrderById.get(order.id);
                             const isDraggable =
                               canManageSchedule &&
-                              Boolean(draggableOrder) &&
                               order.status === 'scheduled' &&
-                              !draggableOrder?.is_processing_locked;
+                              order.productionState !== 'in_progress' &&
+                              draggableOrder?.is_processing_locked !== true;
                             return (
                               <div
                                 key={order.id}
                                 draggable={isDraggable}
                                 onDragStart={(event) => {
-                                  if (draggableOrder) handleDragStart(event, draggableOrder);
+                                  const fallbackOrder: DraggableOrder = {
+                                    id: order.id,
+                                    order_number: order.order_number,
+                                    customer_name: order.customer_name,
+                                    wafer_quantity: order.wafer_quantity,
+                                    requested_delivery_date: order.requested_delivery_date,
+                                    status: order.status,
+                                    is_pinned: false,
+                                    pinned_production_date: null,
+                                    is_processing_locked: false,
+                                  };
+                                  handleDragStart(event, draggableOrder ?? fallbackOrder);
                                 }}
                                 className={cn(
                                   'truncate rounded bg-sky-100 px-1.5 py-1 text-[11px] text-sky-950 dark:bg-sky-900 dark:text-sky-50',
@@ -683,12 +746,20 @@ export function OrdersCalendarDialog({
             {pendingMoves.length > 0 && (
               <div className="mb-5 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/30">
                 <div className="font-medium">待送出的排程變更</div>
-                <div className="mt-2 space-y-1 text-muted-foreground">
+                <div className="mt-2 space-y-2 text-muted-foreground">
                   {pendingMoves.map((move) => (
-                    <div key={move.order.id} className="flex items-center justify-between gap-2">
-                      <span className="truncate">
-                        {move.order.order_number} → {move.targetDate}
-                      </span>
+                    <div
+                      key={move.order.id}
+                      className="flex items-start justify-between gap-2 border-b border-sky-100 dark:border-sky-900/50 pb-2 last:border-0 last:pb-0"
+                    >
+                      <div className="flex flex-col gap-0.5 min-w-0">
+                        <span className="font-mono text-xs font-semibold text-foreground truncate">
+                          {move.order.order_number}
+                        </span>
+                        <span className="text-[11px] text-muted-foreground">
+                          拖移至: {move.targetDate}
+                        </span>
+                      </div>
                       <Button
                         type="button"
                         variant="ghost"
@@ -697,6 +768,7 @@ export function OrdersCalendarDialog({
                           removePendingMove(move.order.id);
                         }}
                         disabled={pinSchedule.isPending}
+                        className="h-5 px-1.5 text-[10px] text-destructive hover:bg-destructive/10 shrink-0"
                       >
                         移除
                       </Button>
@@ -732,14 +804,26 @@ export function OrdersCalendarDialog({
 
             {activeOperation && (
               <div className="mb-5 rounded-md border bg-background p-3 text-sm text-muted-foreground">
-                <div className="flex items-center gap-2">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>
-                    {activeOperation.targets
-                      .map((target) => `${target.orderNumber} → ${target.targetDate}`)
-                      .join(', ')}{' '}
-                    排程處理中
-                  </span>
+                <div className="flex items-start gap-2">
+                  <Loader2 className="mt-0.5 h-4 w-4 animate-spin shrink-0" />
+                  <div className="space-y-1.5 flex-1 min-w-0">
+                    <div className="font-medium text-foreground">排程處理中...</div>
+                    <div className="space-y-1.5">
+                      {activeOperation.targets.map((target) => (
+                        <div
+                          key={target.orderId}
+                          className="flex flex-col gap-0.5 border-b border-border/50 pb-1.5 last:border-0 last:pb-0"
+                        >
+                          <span className="font-mono text-xs font-semibold text-foreground truncate">
+                            {target.orderNumber}
+                          </span>
+                          <span className="text-[11px] text-muted-foreground">
+                            拖移至: {target.targetDate}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
@@ -771,7 +855,7 @@ export function OrdersCalendarDialog({
                   </span>
                 )}
               </div>
-              <div className="mt-3 space-y-2">
+              <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
                 {selectedItems.length > 0 ? (
                   selectedItems.map((order) => {
                     const dragOrder = scheduledOrderById.get(order.id);
@@ -780,7 +864,12 @@ export function OrdersCalendarDialog({
                         key={order.id}
                         order={order}
                         {...(dragOrder ? { dragOrder } : {})}
-                        canDrag={canManageSchedule && order.status === 'scheduled'}
+                        canDrag={
+                          canManageSchedule &&
+                          order.status === 'scheduled' &&
+                          order.productionState !== 'in_progress' &&
+                          dragOrder?.is_processing_locked !== true
+                        }
                         onDragStart={handleDragStart}
                         selected={selectedOrderIds.includes(order.id)}
                         onSelectedChange={updateSelectedOrder}

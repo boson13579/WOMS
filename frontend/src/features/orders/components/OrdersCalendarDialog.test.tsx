@@ -1,8 +1,15 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-call */
+/* eslint-disable @typescript-eslint/no-unsafe-return */
+/* eslint-disable func-names */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Order, ScheduleResult } from '../types';
 
@@ -164,8 +171,29 @@ const splitScheduledOrder: ScheduleResult = {
 };
 
 describe('OrdersCalendarDialog', () => {
+  let mockSystemDate = new Date('2026-05-09T00:00:00Z');
+
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSystemDate = new Date('2026-05-09T00:00:00Z');
+    const OriginalDate = global.Date;
+    const mockDateSpy = vi.spyOn(global, 'Date').mockImplementation(function (
+      this: any,
+      ...args: any[]
+    ) {
+      if (args.length === 0) {
+        return mockSystemDate;
+      }
+      return new (OriginalDate as any)(...args);
+    } as any);
+
+    // Copy all static properties of OriginalDate onto the spy wrapper!
+    Object.getOwnPropertyNames(OriginalDate).forEach((key) => {
+      if (key !== 'length' && key !== 'name' && key !== 'prototype') {
+        (mockDateSpy as any)[key] = (OriginalDate as any)[key];
+      }
+    });
+
     mockRole.value = 'scheduler';
     mockScheduleResult.data = [scheduledOrder];
     mockScheduleResult.isPending = false;
@@ -184,6 +212,10 @@ describe('OrdersCalendarDialog', () => {
     });
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('renders scheduled orders on their production date', async () => {
     const user = userEvent.setup();
     renderDialog();
@@ -194,7 +226,7 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getAllByText('ORD-20260504-0001').length).toBeGreaterThan(0);
     expect(screen.getByText(/TSMC/)).toBeInTheDocument();
     expect(screen.getByText(/今日 500/)).toBeInTheDocument();
-    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.getByText('生產中')).toBeInTheDocument();
     expect(screen.getByText('剩餘 1,500')).toBeInTheDocument();
   });
 
@@ -209,6 +241,7 @@ describe('OrdersCalendarDialog', () => {
   it('shows split production progress across production dates', async () => {
     const user = userEvent.setup();
     mockScheduleResult.data = [splitScheduledOrder];
+    mockSystemDate = new Date('2026-05-10T00:00:00Z');
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-10/ }));
@@ -220,8 +253,26 @@ describe('OrdersCalendarDialog', () => {
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
     expect(screen.getByText(/今日 1,500/)).toBeInTheDocument();
     expect(screen.getByText(/累計 2,500 \/ 2,500/)).toBeInTheDocument();
-    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.getByText('已排程')).toBeInTheDocument();
     expect(screen.getByText('剩餘 0')).toBeInTheDocument();
+  });
+
+  it('shows split production as completed when base_date is past the final production date', async () => {
+    const user = userEvent.setup();
+    mockScheduleResult.data = [splitScheduledOrder];
+    mockSystemDate = new Date('2026-05-12T00:00:00Z');
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
+    expect(screen.getByText('已完成')).toBeInTheDocument();
+  });
+
+  it('displays a padlock icon for production-active or pinned orders', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
+    expect(screen.getByTitle('生產中/處理鎖定中')).toBeInTheDocument();
   });
 
   it('can navigate between months', async () => {
