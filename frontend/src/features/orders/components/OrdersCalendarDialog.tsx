@@ -550,7 +550,9 @@ export function OrdersCalendarDialog({
           order.is_pinned && order.pinned_production_date === targetByOrderId.get(order.id),
       )
     ) {
-      toast.success('排程日期已套用。');
+      activeOperation.targets.forEach((target) => {
+        toast.success(`訂單 ${target.orderNumber} 已更改日期至 ${target.targetDate}`);
+      });
       setActiveOperation(null);
       setOperationError(null);
       return;
