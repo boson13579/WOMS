@@ -866,7 +866,9 @@ def test_capacity_usage_returns_realized_per_day_view(
         db_session,
         [
             ScheduledResult(order_id=order_a.id, scheduled_date=base, quantity=400),
-            ScheduledResult(order_id=order_a.id, scheduled_date=base + timedelta(days=1), quantity=200),
+            ScheduledResult(
+                order_id=order_a.id, scheduled_date=base + timedelta(days=1), quantity=200
+            ),
             ScheduledResult(order_id=order_b.id, scheduled_date=base, quantity=300),
         ],
     )

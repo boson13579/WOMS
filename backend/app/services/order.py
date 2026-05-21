@@ -1060,8 +1060,8 @@ def apply_schedule(
         # state anyway, so this snapshot is "best-known plan", which is
         # what the capacity-usage dashboard wants.
         for sr in results:
-            daily_totals[sr.scheduled_date] = (
-                daily_totals.get(sr.scheduled_date, 0) + int(sr.quantity)
+            daily_totals[sr.scheduled_date] = daily_totals.get(sr.scheduled_date, 0) + int(
+                sr.quantity
             )
         is_pinned = order_id in pinned_map
 
