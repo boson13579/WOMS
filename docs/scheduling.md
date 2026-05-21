@@ -93,7 +93,8 @@ endpoint 一覽（細節見下方各節）：
 | `POST` | `/trigger` | scheduler+ | 手動補觸發排程任務 |
 | `GET`  | `/status` | order_manager+ | 排程 worker 的 lifecycle snapshot |
 | `GET`  | `/result` | order_manager+ | 目前已排定的訂單清單 |
-| `GET`  | `/capacity` | order_manager+ | 未來 30 天剩餘產能前綴和 |
+| `GET`  | `/capacity` | order_manager+ | 未來 30 天剩餘產能前綴和（Redis state 的 feasibility 視角） |
+| `GET`  | `/capacity-usage` | order_manager+ | 未來 30 天每日 used / remaining（DB snapshot 的 realized 視角） |
 | `GET`  | `/pending-ops` | order_manager+ | 排隊中 compound 的順位快照 |
 | `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建線段樹與 pq（async；任務自己等 in-flight 結束） |
@@ -391,6 +392,50 @@ Schema-level validation：
 
 ---
 
+#### `GET /schedule/capacity-usage` — 30 天每日 used / remaining（DB snapshot）
+
+**功能**：讀 DB 的 `schedule_daily_capacity` 表（`apply_schedule` 寫的 per-day snapshot），對齊到 Redis state 的 `base_date`，組出固定長度 30 天的 `(date, used, remaining)` 系列。Redis 沒有 state 時用今天當 base_date。
+
+**權限**：`order_manager+`
+
+**Response 200**：
+```json
+{
+  "base_date": "2026-05-21",
+  "daily_capacity": 10000,
+  "entries": [
+    {"date": "2026-05-21", "used": 7000, "remaining": 3000},
+    {"date": "2026-05-22", "used": 2000, "remaining": 8000},
+    {"date": "2026-05-23", "used": 0,    "remaining": 10000},
+    // ... 共 30 筆
+  ]
+}
+```
+
+**跟 `/schedule/capacity` 的差別**（兩個 endpoint 看起來很像但語義不同）：
+
+| | `/schedule/capacity` | `/schedule/capacity-usage` |
+|---|---|---|
+| 視角 | feasibility（**還能不能塞**） | realized（**實際每天要做多少**） |
+| 來源 | Redis `capacity_tree` backward-fill 前綴和 | DB `schedule_daily_capacity` snapshot |
+| 算法 | admission control 用的同一棵 tree | EDF forward-fill `compute_schedule()` 的結果 |
+| 數字 | `cumulative_remaining`（從 base_date 累計到該日） | `used` + `remaining`（單日，非前綴） |
+| Redis flush 時 | fallback 到 `SchedulerState.initial` 全空 | 表是空的，回 30 天 `used=0` |
+
+兩個視角會給出**不同的數字**：一張 8000-wafer / deadline +7 天的訂單，segment tree 從 day 7 反向 fill 7000+1000 預留（feasibility 視角看到 day 1-6 都還滿載 10000），但 EDF forward-fill 會把它排在 day 1-2 完成（realized 視角看到 day 1-2 已被占）。前端兩個都會用：feasibility 視角給「能不能再下單」，realized 視角給「實際每天的生產量條形圖」。
+
+**行為細節**：
+- 每筆訂單的 `daily_breakdown` 加總到 `daily_totals[date]`，在 `apply_schedule` per-order loop 同一個 pass 累積、loop 結束後 `replace_all`（truncate-and-insert）寫進 snapshot 表。Single writer 同 transaction commit，跟 `daily_breakdown` 永遠對得上。
+- 列表固定長度 30；snapshot 沒覆蓋的日期回 `used=0, remaining=daily_capacity`，前端不用補白。
+- Snapshot 過期 row（< `base_date` 或 ≥ `base_date + 30d`）會被忽略 — 它們是上一次 materialize 留下的、下次 materialize 跑時會被 truncate 掉。
+- `remaining` clamp 在 ≥ 0（理論上 `used` 不應超過 `daily_capacity`，但 defensively 避免 dashboard 看到負數）。
+
+**什麼時候會被叫**：
+- Dashboard「未來 30 天每天要做多少 wafer」條形圖載入。
+- 收到 `schedule.materialized` WebSocket 後 refetch（snapshot 是 materializer 寫的，所以這個事件之後資料才會更新）。
+
+---
+
 #### `POST /schedule/rebuild` — 從 DB 重建排程狀態（async）
 
 **功能**：dispatch `rebuild_schedule_task` 並立刻回 202。**rebuild 本身是 async**，endpoint 不會 block 等待結果，跟 `advance_day_task` 同一個 pattern。
@@ -451,6 +496,10 @@ Schema-level validation：
 | `ScheduleRebuildResponse` | `task_id`、`message`（rebuild 已改 async；skipped 訂單透過 WebSocket `schedule.rebuild_skipped` 抵達） |
 | `ScheduleResultResponse` | `id`、`order_number`、`customer_name`、`wafer_quantity`、`requested_delivery_date`、`scheduled_production_date`、`expected_delivery_date`、`status`、**`daily_breakdown`** (list of `DailyAssignment`) |
 | `DailyAssignment` | `date`、`quantity`（>0） |
+| `ScheduleCapacityResponse` | `base_date`、`daily_capacity`、`entries: list[CapacityPrefixEntry]`（feasibility 視角，30 筆前綴和） |
+| `CapacityPrefixEntry` | `date`、`cumulative_remaining`（≥ 0） |
+| `ScheduleCapacityUsageResponse` | `base_date`、`daily_capacity`、`entries: list[DailyCapacityUsageEntry]`（realized 視角，30 筆 used/remaining） |
+| `DailyCapacityUsageEntry` | `date`、`used`（≥ 0）、`remaining`（≥ 0） |
 
 ### 2.3 WebSocket endpoint 與 message payloads
 
@@ -1110,16 +1159,23 @@ worker 端的實作是「**每跑完一筆就重新挑下一筆**」而不是「
 `apply_schedule` 詳細流程：
 
 1. `order_repo.clear_scheduled_dates(db)` 一次性清空所有 `status='scheduled'` 訂單的 `scheduled_production_date` 與 `expected_delivery_date`
-2. 把同一張 order 跨多天的 `ScheduledResult` 折成 `(earliest, latest)`
+2. 把同一張 order 跨多天的 `ScheduledResult` 折成 `(earliest, latest)`；**同一個 pass 累積 `daily_totals: dict[date, int]`**（per-day 所有訂單的 quantity 加總）
 3. 對每筆訂單在 **SAVEPOINT**（`db.begin_nested()`）內呼叫 `order_repo.set_schedule_dates(db, ...)` 寫回兩個日期、把 `status` 改為 `scheduled`；遇到 `StaleDataError` 就 `logger.warning("order.schedule.apply_stale_skipped", ...)` continue，**不毒到 outer transaction**
 4. 對每筆訂單**雙寫**稽核：
    - `audit_log_repo.create(db, ..., user_id=None, resource_type="order", resource_id=order_id, new_value={…})` 把一筆 row 寫進 `audit_logs` 資料表（與 commit 同 transaction），確保「這張訂單什麼時候被排到哪天」可以從 DB 直接查出（`docs/DEVELOPMENT_GUIDELINES.md §6` 對 user-visible mutation 的稽核要求 — 只寫 stdout 在 log shipper 掉資料時就找不到了）
    - `emit_audit_log(action="order.scheduled", actor_id=None, ...)` 額外發一筆 ECS-compliant stdout log 給 Kibana / Elastic
-5. `db.commit()`（同時 flush DB 上面新增的 audit_log row）
+5. `daily_cap_repo.replace_all(db, entries=daily_totals)` — truncate `schedule_daily_capacity` 後 bulk INSERT 30 row 以內的 per-day usage snapshot，供 `GET /schedule/capacity-usage` 讀取。**跟 audit log / per-order 寫入同 transaction commit**，不會出現「snapshot 跟 daily_breakdown 對不上」的中間狀態
+6. `db.commit()`（同時 flush DB 上面新增的 audit_log row + snapshot row）
 
 **為什麼 step 3 要 SAVEPOINT**（Bug 2 修法）：`set_schedule_dates` 對單筆訂單做 `UPDATE` 時可能撞到 `StaleDataError`（樂觀鎖：worker 上次讀的 `version_id` 已被 producer 端 PATCH bump 過）。原本只有一道 outer transaction，任何一筆訂單 raise 都會把 session 推進 `PendingRollbackError` 狀態 — **後續所有訂單的寫入都會被拒、加上 audit log 也寫不進去**。`rebuild_schedule_task` 觸發完整 apply_schedule 時，這個失敗模式在 bombard 場景偶爾出現：一筆 stale 整批毀。
 
 修法用 `db.begin_nested()`（PostgreSQL SAVEPOINT），每筆訂單一個內部小 transaction：stale 那筆 raise → SAVEPOINT rollback 只回到該筆訂單寫入前、outer session 仍可用 → continue 處理下一筆。Log line `order.schedule.apply_stale_skipped` 帶 `order_id` 給 ops 排查。Stale skip 不是資料遺失：那筆訂單的 producer 正好在 race，下次排程 / materializer 跑時會用 fresh row 重寫。
+
+**為什麼 `daily_totals` 在 per-order loop 內累積、loop 後一次寫**：snapshot 是「整批 schedule 看完才能算」的全域 aggregate（per-day total across orders），不像 `daily_breakdown` 是 per-order JSONB 可以邊算邊寫。在同一個 pass 內順手 sum 不要再多 iterate 一次；loop 結束才 `replace_all` 是因為 `replace_all` 用 truncate-and-insert 語義 — 如果在 loop 中途 call 它，會把同一輪還沒寫的 row 也清掉。被 SAVEPOINT skip 的訂單仍會貢獻到 `daily_totals`（snapshot 反映「best-known plan」，不是「成功 commit 的子集」）— 下次 materializer 會用 post-PATCH state 重算重寫，誤差是 transient。
+
+**為什麼用 truncate-and-insert 而不是 upsert**：snapshot 是 `compute_schedule()` 結果的完整 re-projection — 上一輪有但這輪沒有的日期（例如 `advance_day` 把昨天的 row 推掉、或者訂單 deadline 提前讓占用日期前移）必須消失。Upsert 會把 stale row 永遠留下，還要額外加一個 "delete dates not in new set" 步驟，正好就是已經在做的 truncate。每次 materialize 寫 ≤ 30 row 成本可忽略。
+
+**為什麼 `schedule_daily_capacity` 不繼承 Base 的語義欄位**：`id` (UUID) / `version_id` / `is_deleted` 對這張「派生 cache 表」沒意義 — `date` 才是 natural PK、單一 writer 已經序列化（在 `state_writer_lock` 內）、沒有 soft delete 需求。為了跟 Alembic autogen 一致仍 inherit `Base` 並保留那些欄位，但只當啞欄位用、不參與業務邏輯。詳見 `app/models/schedule_daily_capacity.py` 模組 docstring。
 
 **為什麼 `set_schedule_dates` 不能無條件覆寫 `status`**：`advance_day_task` 會把今天要做的訂單 status 標成 `in_production`；接下來任何 compound 被 accept、materializer 跑 `apply_schedule` 時，如果 `set_schedule_dates` 無條件把 status 寫回 `scheduled`，前端「正在做」就會突然變回「排隊中」 — 更嚴重的是 `mark_completed_outside_set` 只抓 `status='in_production'`，被 demote 後永遠收不到尾，訂單卡死在 `scheduled` 不會被歸檔成 `completed`。所以 `set_schedule_dates` 寫入前讀目前 status，是 `in_production` 就只更新排程欄位（dates / daily_breakdown / pin cols），status 不動。`apply_schedule` audit log 的 status 也從 hard-coded `"scheduled"` 改成讀 refreshed row 的真實狀態。
 
@@ -1936,8 +1992,11 @@ uv run pytest tests/services tests/workers tests/api      # 全部
 |---|---|---|
 | `backend/app/services/scheduling.py` | 演算法核心 | `SegmentTree`、`SchedulerState`、`add_order` / `remove_order` / `compute_schedule` / `advance_day` / `rebuild_state`、日期轉換 helper |
 | `backend/app/services/websocket.py` | WS publisher | 同步 `notify_user` / `broadcast`，把 envelope `PUBLISH` 到 Redis pub/sub channel `schedule:ws:events`；Redis 故障時靜默降級不影響 caller |
-| `backend/app/services/order.py` | 既有 service | 新增 `list_scheduled_orders`、`list_for_scheduler`、`apply_schedule`（內含 audit log emission） |
+| `backend/app/services/order.py` | 既有 service | 新增 `list_scheduled_orders`、`list_for_scheduler`、`apply_schedule`（內含 audit log emission + capacity-usage snapshot write）、`get_capacity_usage` |
 | `backend/app/repositories/order.py` | 既有 repo | 新增 `get_scheduled`、`clear_scheduled_dates`、`set_schedule_dates`、`get_by_id_for_update` |
+| `backend/app/models/schedule_daily_capacity.py` | Aggregate cache model | 一日一 row 的 used_quantity 快照，apply_schedule 寫、`GET /schedule/capacity-usage` 讀 |
+| `backend/app/repositories/schedule_daily_capacity.py` | Repo for snapshot | `get_all_ordered` + `replace_all`（truncate-and-insert） |
+| `alembic/versions/2026_05_21_*_add_schedule_daily_capacity_table.py` | Migration | 建 `schedule_daily_capacity` 表 |
 | `backend/app/services/startup_recovery.py` | Lifespan recovery | `run_startup_recovery()` — FastAPI 起來時 detect stale base_date / missing state / orphan pending_ops 並派對應 task；NX-flag mutex 防 multi-replica 過度推進。詳見 §4.7 |
 | `backend/app/workers/scheduling.py` | Celery task | `run_scheduling_task`、`advance_day_task`、`rebuild_schedule_task`、`materialize_schedule_task` |
 | `backend/app/api/v1/schedule.py` | HTTP router | 5 個 endpoints；已在 `__init__.py` 註冊 prefix `/schedule` |

@@ -144,6 +144,209 @@ def test_apply_schedule_persists_audit_row_per_order(db_session: Session) -> Non
     }
 
 
+def test_apply_schedule_writes_daily_capacity_snapshot(db_session: Session) -> None:
+    """The per-day capacity-usage snapshot must be written alongside per-order
+    daily_breakdown rows, in the same transaction.
+
+    Aggregation rule: for each scheduled date, ``used_quantity`` is the sum
+    of every order's quantity scheduled on that date. The dashboard endpoint
+    relies on this single source of truth — recomputing on-the-fly would
+    require JSONB aggregation, which is why we cache it eagerly.
+    """
+    from app.models.schedule_daily_capacity import ScheduleDailyCapacity
+
+    creator = _make_user(db_session, username="apply-sched-snapshot")
+    order_a = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-CAP-A",
+        deadline=date(2026, 5, 20),
+    )
+    order_b = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-CAP-B",
+        deadline=date(2026, 5, 21),
+    )
+
+    scheduled = [
+        # Two orders share day 5/12 → 700 wafers; only A is on 5/13;
+        # only B is on 5/14. (Per-day ``ScheduledResult.quantity`` is
+        # independent of ``Order.wafer_quantity``'s [25, 2500] check
+        # constraint — values here just need to be plausible aggregates.)
+        ScheduledResult(order_id=order_a.id, scheduled_date=date(2026, 5, 12), quantity=400),
+        ScheduledResult(order_id=order_a.id, scheduled_date=date(2026, 5, 13), quantity=200),
+        ScheduledResult(order_id=order_b.id, scheduled_date=date(2026, 5, 12), quantity=300),
+        ScheduledResult(order_id=order_b.id, scheduled_date=date(2026, 5, 14), quantity=100),
+    ]
+    order_service.apply_schedule(db_session, scheduled)
+
+    rows = list(
+        db_session.scalars(
+            select(ScheduleDailyCapacity).order_by(ScheduleDailyCapacity.date.asc())
+        ).all()
+    )
+
+    by_date = {row.date: row.used_quantity for row in rows}
+    # 5/12 = a(400) + b(300) = 700
+    assert by_date == {
+        date(2026, 5, 12): 700,
+        date(2026, 5, 13): 200,
+        date(2026, 5, 14): 100,
+    }
+
+
+def test_apply_schedule_snapshot_replaces_previous_run(db_session: Session) -> None:
+    """A second ``apply_schedule`` call must replace the snapshot wholesale —
+    no rows from the prior run can leak through. Guards against the bug where
+    we'd ``upsert`` instead of truncate-and-insert and leave stale dates
+    behind after a schedule change (e.g. an order's deadline moved earlier).
+    """
+    from app.models.schedule_daily_capacity import ScheduleDailyCapacity
+
+    creator = _make_user(db_session, username="apply-sched-snapshot-replace")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-REPL",
+        deadline=date(2026, 6, 1),
+    )
+
+    # First run: order goes on 5/15.
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 5, 15), quantity=100)],
+    )
+    # Sanity: snapshot has 5/15 only.
+    rows = list(db_session.scalars(select(ScheduleDailyCapacity)).all())
+    assert {r.date for r in rows} == {date(2026, 5, 15)}
+
+    # Second run: order moves to 5/16 entirely. 5/15 must vanish.
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 5, 16), quantity=100)],
+    )
+
+    rows = list(db_session.scalars(select(ScheduleDailyCapacity)).all())
+    assert {r.date for r in rows} == {date(2026, 5, 16)}, (
+        "Truncate-and-insert contract broken: stale 5/15 row leaked through"
+    )
+
+
+def test_apply_schedule_with_empty_list_clears_snapshot(db_session: Session) -> None:
+    """Materialize-with-no-orders (entire schedule cleared) must wipe the
+    snapshot too — leaving stale rows would have the dashboard show wafers
+    committed to days that no longer have any orders scheduled.
+    """
+    from app.models.schedule_daily_capacity import ScheduleDailyCapacity
+
+    creator = _make_user(db_session, username="apply-sched-snapshot-empty")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-EMPTY-SNAP",
+        deadline=date(2026, 6, 5),
+    )
+    # Prime the snapshot.
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 5, 20), quantity=50)],
+    )
+    assert db_session.scalars(select(ScheduleDailyCapacity)).all()
+
+    # Now clear.
+    order_service.apply_schedule(db_session, [])
+    assert not db_session.scalars(select(ScheduleDailyCapacity)).all()
+
+
+def test_get_capacity_usage_returns_continuous_horizon(db_session: Session) -> None:
+    """``get_capacity_usage`` must fill the full 30-day window even if the
+    snapshot only has a few dates populated. Dates without snapshot rows come
+    back as ``used=0, remaining=daily_capacity`` so the dashboard renders a
+    contiguous timeline.
+    """
+    creator = _make_user(db_session, username="capacity-usage-fill")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-USAGE-FILL",
+        deadline=date(2026, 6, 30),
+    )
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(order_id=order.id, scheduled_date=date(2026, 5, 22), quantity=3_500),
+            ScheduledResult(order_id=order.id, scheduled_date=date(2026, 5, 25), quantity=500),
+        ],
+    )
+
+    base, capacity, entries = order_service.get_capacity_usage(
+        db_session,
+        base_date=date(2026, 5, 21),
+        daily_capacity=10_000,
+        horizon_days=30,
+    )
+
+    assert base == date(2026, 5, 21)
+    assert capacity == 10_000
+    assert len(entries) == 30
+    # Day 1 (5/21): unused (no snapshot row for this date).
+    assert (entries[0].date, entries[0].used, entries[0].remaining) == (
+        date(2026, 5, 21),
+        0,
+        10_000,
+    )
+    # Day 2 (5/22): 3500 used.
+    assert (entries[1].date, entries[1].used, entries[1].remaining) == (
+        date(2026, 5, 22),
+        3_500,
+        6_500,
+    )
+    # Day 5 (5/25): 500 used.
+    day_5_25 = next(e for e in entries if e.date == date(2026, 5, 25))
+    assert (day_5_25.used, day_5_25.remaining) == (500, 9_500)
+    # Last day (5/21 + 29 = 6/19): unused, no snapshot row.
+    assert (entries[-1].date, entries[-1].used, entries[-1].remaining) == (
+        date(2026, 6, 19),
+        0,
+        10_000,
+    )
+
+
+def test_get_capacity_usage_ignores_dates_outside_window(db_session: Session) -> None:
+    """Snapshot rows for dates before ``base_date`` or past the horizon end
+    must be excluded from the response — those represent yesterday's plan
+    that the next advance_day will wipe, and we don't want them surfacing
+    as "weirdly old" entries on the dashboard.
+    """
+    creator = _make_user(db_session, username="capacity-usage-window")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-USAGE-WIN",
+        deadline=date(2026, 8, 30),
+    )
+    # Seed snapshot rows spanning before-window, in-window, and after-window.
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(order_id=order.id, scheduled_date=date(2026, 5, 1), quantity=1_000),
+            ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 1), quantity=2_000),
+            ScheduledResult(order_id=order.id, scheduled_date=date(2026, 7, 1), quantity=3_000),
+        ],
+    )
+
+    _, _, entries = order_service.get_capacity_usage(
+        db_session,
+        base_date=date(2026, 5, 20),
+        daily_capacity=10_000,
+        horizon_days=30,
+    )
+    used_dates = {e.date for e in entries if e.used > 0}
+    # 5/20 + 29 = 6/18, so 6/1 is in-window; 5/1 and 7/1 are not.
+    assert used_dates == {date(2026, 6, 1)}
+
+
 def test_apply_schedule_persists_daily_breakdown_column(db_session: Session) -> None:
     """``apply_schedule`` must write the per-day quantity split into
     ``orders.daily_breakdown`` (JSONB) alongside the earliest/latest date

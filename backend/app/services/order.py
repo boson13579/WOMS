@@ -8,8 +8,8 @@ It accepts and returns Pydantic schemas — never raw SQLAlchemy rows.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime
-from typing import Any, Literal
+from datetime import UTC, date, datetime, timedelta
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 from fastapi import HTTPException, status
@@ -21,6 +21,7 @@ from app.models.order import MUTABLE_STATUSES, Order, OrderStatus
 from app.models.user import User, UserRole
 from app.repositories import audit_log as audit_log_repo
 from app.repositories import order as order_repo
+from app.repositories import schedule_daily_capacity as daily_cap_repo
 from app.repositories import user as user_repo
 from app.schemas.order import (
     AuditLogResponse,
@@ -42,6 +43,12 @@ from app.services import notification as notification_service
 from app.services.schedule_queue import enqueue_compound
 from app.services.scheduling import ScheduledResult, SchedulingOrder
 
+if TYPE_CHECKING:
+    # Lazy import at runtime (inside ``get_capacity_usage``) keeps the
+    # import-time graph of this module small. Annotations resolve via
+    # ``from __future__ import annotations`` so the lazy import is fine.
+    from app.schemas.schedule import DailyCapacityUsageEntry
+
 logger = structlog.get_logger(__name__)
 
 __all__ = [
@@ -50,6 +57,7 @@ __all__ = [
     "create_order",
     "delete_order",
     "get_audit_log",
+    "get_capacity_usage",
     "get_order",
     "list_for_scheduler",
     "list_orders",
@@ -900,6 +908,55 @@ def list_scheduled_orders(db: Session) -> list[ScheduleResultResponse]:
     return out
 
 
+def get_capacity_usage(
+    db: Session,
+    *,
+    base_date: date,
+    daily_capacity: int,
+    horizon_days: int,
+) -> tuple[date, int, list[DailyCapacityUsageEntry]]:
+    """Return the per-day used / remaining capacity series for the upcoming horizon.
+
+    Looks at the ``schedule_daily_capacity`` cache (written by
+    :func:`apply_schedule`) and joins it against the requested
+    ``[base_date, base_date + horizon_days)`` window to produce a
+    fixed-length entry list. Dates in the window with no snapshot row
+    come back as ``used=0, remaining=daily_capacity`` so the frontend
+    can render a contiguous timeline without filling gaps client-side.
+
+    Pre-base_date snapshot rows are ignored (they represent yesterday
+    and earlier, which the next materialization will clear naturally
+    via ``replace_all``). Post-horizon rows are also ignored — the
+    snapshot may carry a few of those during a fresh materialization
+    before the next ``advance_day_task`` rolls them off, and we don't
+    want them leaking into the dashboard.
+
+    Returns ``(base_date, daily_capacity, entries)`` so the caller can
+    forward the values to the response schema without re-reading
+    settings.
+    """
+    # Local import: schemas/schedule imports DTOs we use here, and that
+    # module imports from models.order — keeping this lazy avoids
+    # adding to the import-time graph of services/order (which is hot
+    # path for nearly every endpoint).
+    from app.schemas.schedule import DailyCapacityUsageEntry  # noqa: PLC0415
+
+    snapshot_rows = daily_cap_repo.get_all_ordered(db)
+    used_by_date: dict[date, int] = {row.date: row.used_quantity for row in snapshot_rows}
+
+    entries: list[DailyCapacityUsageEntry] = []
+    for offset in range(horizon_days):
+        d = base_date + timedelta(days=offset)
+        used = used_by_date.get(d, 0)
+        # Clamp remaining at 0 — used > daily_capacity is logically
+        # impossible (admission control rejects it) but defending here
+        # means a corrupt snapshot row doesn't surface as a negative
+        # number on the dashboard.
+        remaining = max(0, daily_capacity - used)
+        entries.append(DailyCapacityUsageEntry(date=d, used=used, remaining=remaining))
+    return base_date, daily_capacity, entries
+
+
 def list_for_scheduler(
     db: Session,
 ) -> tuple[list[SchedulingOrder], dict[uuid.UUID, uuid.UUID]]:
@@ -979,6 +1036,13 @@ def apply_schedule(
         per_order.setdefault(sr.order_id, []).append(sr)
 
     applied = 0
+    # Per-day capacity-usage accumulator. Same single pass as per-order
+    # daily_breakdown writes — for each ScheduledResult we already iterate
+    # we also bump the matching date's running total. Written via
+    # ``daily_cap_repo.replace_all`` after the loop so the snapshot is
+    # always a single atomic projection of the just-applied schedule
+    # rather than incremental upserts (see repo docstring for why).
+    daily_totals: dict[date, int] = {}
     # Collect data for notifications before commit; attributes expire after commit.
     _notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, str]] = []
     for order_id, results in per_order.items():
@@ -988,6 +1052,17 @@ def apply_schedule(
         daily_breakdown_payload: list[dict[str, str | int]] = [
             {"date": sr.scheduled_date.isoformat(), "quantity": int(sr.quantity)} for sr in results
         ]
+        # Accumulate per-day totals for the snapshot. We do this BEFORE
+        # the SAVEPOINT below so the accumulator reflects what
+        # ``compute_schedule()`` planned, not what actually committed —
+        # if a row gets skipped due to ``StaleDataError`` (concurrent
+        # PATCH), the next materialization re-runs with the post-PATCH
+        # state anyway, so this snapshot is "best-known plan", which is
+        # what the capacity-usage dashboard wants.
+        for sr in results:
+            daily_totals[sr.scheduled_date] = (
+                daily_totals.get(sr.scheduled_date, 0) + int(sr.quantity)
+            )
         is_pinned = order_id in pinned_map
 
         # SAVEPOINT-isolate each per-order write so a single ``StaleDataError``
@@ -1057,8 +1132,23 @@ def apply_schedule(
             )
             continue
 
+    # Write the per-day capacity-usage snapshot in the same transaction
+    # as the per-order daily_breakdown rows. Atomic with respect to the
+    # outer commit — readers either see the previous snapshot or the new
+    # one, never a half-applied mix. Snapshot may include dates where
+    # the corresponding order's row write got SAVEPOINT-skipped above;
+    # that's a tolerable transient (the next materialize will re-write
+    # the snapshot with fresh data) and the alternative — recomputing
+    # daily_totals from only successfully-written rows — adds bookkeeping
+    # complexity for no real user-visible win.
+    daily_cap_repo.replace_all(db, entries=daily_totals)
+
     db.commit()
-    logger.info("order.schedule.applied", applied=applied)
+    logger.info(
+        "order.schedule.applied",
+        applied=applied,
+        snapshot_days=len(daily_totals),
+    )
 
     for notif_user_id, notif_order_id, order_number, status_val in _notif_queue:
         try:
