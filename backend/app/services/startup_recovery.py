@@ -80,7 +80,23 @@ def run_startup_recovery() -> None:
     can both fire on a Redis-flushed-mid-downtime restart (rebuild lands
     state at today; advance_day catchup then becomes a no-op because
     base_date is already today).
+
+    **Skipped under ``APP_ENV=test``**: pytest's ``TestClient(app)`` context
+    manager triggers FastAPI lifespan startup for every ``client`` fixture
+    instantiation, which on a freshly-flushed Redis would call ``.delay()``
+    on Celery tasks ~40 times per CI run. The recovery semantics
+    (catching missed advance_day ticks, rebuilding lost state, kicking
+    orphan pending_ops) target real server restarts — none of those gaps
+    can exist in an isolated test that sets its own Redis state. Tests
+    that want to exercise the dispatcher itself bypass this guard by
+    calling the underlying helper :func:`_dispatch_recovery` directly
+    (see ``tests/services/test_startup_recovery.py``).
     """
+    settings = get_settings()
+    if settings.APP_ENV == "test":
+        logger.debug("schedule.startup_recovery.skipped_test_env")
+        return
+
     try:
         rds = _redis()
         if not _acquire_recovery_flag(rds):

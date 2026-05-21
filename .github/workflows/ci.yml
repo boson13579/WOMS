@@ -80,7 +80,11 @@ jobs:
         run: uv run mypy app
 
       - name: pytest
-        run: uv run pytest
+        # ``--durations=20`` prints the 20 slowest tests in the run summary
+        # so we can spot outliers in CI logs without local repro. Cheap
+        # (one line of output per test) and the durations are otherwise
+        # invisible — pytest never prints them by default.
+        run: uv run pytest --durations=20
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4
