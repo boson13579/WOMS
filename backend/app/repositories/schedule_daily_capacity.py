@@ -62,9 +62,7 @@ def replace_all(db: Session, *, entries: dict[date_type, int]) -> int:
         return 0
 
     rows = [
-        ScheduleDailyCapacity(date=d, used_quantity=q)
-        for d, q in sorted(entries.items())
-        if q > 0
+        ScheduleDailyCapacity(date=d, used_quantity=q) for d, q in sorted(entries.items()) if q > 0
     ]
     db.add_all(rows)
     db.flush()
