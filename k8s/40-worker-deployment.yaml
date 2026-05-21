@@ -1,0 +1,48 @@
+# Celery worker — same image as the backend, different command.
+#
+# 1 replica is enough for demo. WOMS's scheduling task chains into itself
+# when more compounds arrive, so concurrency comes from prefetched tasks
+# inside the single worker process, not from multiple replicas. Scaling
+# to N replicas is fine if needed but each one connects to Redis.
+#
+# No Service needed — the worker pulls jobs from Redis, no inbound traffic.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: woms
+  labels:
+    app: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: ${ECR_URI}/woms-backend:v0.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - celery
+            - -A
+            - app.workers.celery_app
+            - worker
+            - --loglevel=INFO
+          envFrom:
+            - configMapRef:
+                name: woms-config
+            - secretRef:
+                name: woms-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

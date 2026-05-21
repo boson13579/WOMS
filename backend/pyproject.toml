@@ -3,7 +3,6 @@ name = "smart-order-backend"
 version = "0.1.0"
 description = "Smart Order Management System — backend (FastAPI + SQLAlchemy + Celery)"
 requires-python = ">=3.11,<3.12"
-readme = "../README.md"
 license = { text = "Proprietary" }
 authors = [{ name = "NYCU Cloud Final Team" }]
 

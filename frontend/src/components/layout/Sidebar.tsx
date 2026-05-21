@@ -12,7 +12,15 @@
  * (`MobileNav`) can reuse the same markup at viewport widths where the
  * persistent sidebar is hidden (`<768px`).
  */
-import { Bell, LayoutDashboard, Package, Settings, Users } from 'lucide-react';
+import {
+  Activity,
+  Bell,
+  LayoutDashboard,
+  Package,
+  ScrollText,
+  Settings,
+  Users,
+} from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 
@@ -100,6 +108,8 @@ const NOOP = (): void => {};
 export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps = {}): JSX.Element {
   const role = useCurrentRole();
   const showUserManagement = role === 'root';
+  const showObservability = role === 'scheduler' || role === 'root';
+  const showAuditLog = role === 'root';
 
   // Fetch unread count for notifications badge
   const { data: unreadData } = useNotifications({ all: false });
@@ -130,6 +140,12 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
             {PRIMARY_NAV.map((item) => (
               <NavRow key={item.to} item={item} onNavigate={onNavigate} />
             ))}
+            {showObservability ? (
+              <NavRow
+                item={{ to: '/observability', label: 'Observability', icon: Activity }}
+                onNavigate={onNavigate}
+              />
+            ) : null}
             {showUserManagement ? (
               <NavRow
                 item={{ to: '/users', label: 'Users', icon: Users }}
@@ -151,6 +167,12 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
                   : item;
               return <NavRow key={item.to} item={updatedItem} onNavigate={onNavigate} />;
             })}
+            {showAuditLog ? (
+              <NavRow
+                item={{ to: '/audit', label: 'Audit log', icon: ScrollText }}
+                onNavigate={onNavigate}
+              />
+            ) : null}
           </div>
         </div>
       </nav>

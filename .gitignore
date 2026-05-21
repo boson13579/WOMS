@@ -89,3 +89,22 @@ TODO.local.md
 docker-compose.override.yml
 AGENTS.md
 FRONTEND_SPEC.md
+
+# =============================================================================
+# Terraform — never commit local state or *.tfvars (may contain DB passwords,
+# JWT secrets, etc.). The `.terraform.lock.hcl` lock file IS committed so
+# provider versions stay reproducible across machines.
+# =============================================================================
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+*.tfvars
+!*.tfvars.example
+*.tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

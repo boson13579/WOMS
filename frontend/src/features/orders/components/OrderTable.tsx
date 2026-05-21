@@ -2,7 +2,7 @@
  * Paginated order list table.
  * Exposes onEdit callback so the parent page can manage modal open state.
  */
-import { ArrowDown, ArrowUp, ArrowUpDown, Loader2, Pencil, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, Loader2, Lock, Pencil, Trash2 } from 'lucide-react';
 import { useMemo, type ReactNode } from 'react';
 
 import { Badge } from '@/components/ui/badge';
@@ -224,7 +224,14 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
               ) : (
                 data.items.map((order) => (
                   <TableRow key={order.id}>
-                    <TableCell className="font-mono text-xs">{order.order_number}</TableCell>
+                    <TableCell className="font-mono text-xs">
+                      <span className="inline-flex items-center gap-1">
+                        {order.order_number}
+                        {order.is_processing_locked && (
+                          <Lock className="h-3 w-3 text-muted-foreground" aria-label="排程處理中" />
+                        )}
+                      </span>
+                    </TableCell>
                     <TableCell className="font-medium">{order.customer_name}</TableCell>
                     <TableCell className="hidden sm:table-cell text-right">
                       {order.wafer_quantity.toLocaleString()}
@@ -257,7 +264,8 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
                             onClick={() => {
                               onEdit(order);
                             }}
-                            title="編輯"
+                            title={order.is_processing_locked ? '排程處理中，請稍候' : '編輯'}
+                            disabled={order.is_processing_locked}
                           >
                             <Pencil className="h-4 w-4" />
                           </Button>

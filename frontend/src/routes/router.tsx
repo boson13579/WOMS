@@ -15,9 +15,11 @@ import { AuthOnlyRoute } from '@/components/layout/AuthOnlyRoute';
 import { ProtectedRoute } from '@/components/layout/ProtectedRoute';
 import { RoleProtectedRoute } from '@/components/layout/RoleProtectedRoute';
 import { SessionBoundary } from '@/components/layout/SessionBoundary';
+import { AuditPage } from '@/features/audit/components/AuditPage';
 import { AuthPage } from '@/features/auth/components/AuthPage';
 import { DashboardPage } from '@/features/dashboard/components/DashboardPage';
 import { NotificationsPage } from '@/features/notifications/components/NotificationsPage';
+import { ObservabilityPage } from '@/features/observability/components/ObservabilityPage';
 import { OrdersPage } from '@/features/orders/components/OrdersPage';
 import { AdminUsersPage } from '@/features/users/components/AdminUsersPage';
 
@@ -36,10 +38,19 @@ export const routes: RouteObject[] = [
               { path: 'orders', element: <OrdersPage /> },
               { path: 'notifications', element: <NotificationsPage /> },
               {
+                // Operator-grade observability page — scheduler + root only.
+                // Other roles get redirected to ``/`` by ``RoleProtectedRoute``.
+                element: <RoleProtectedRoute allowedRoles={['root', 'scheduler']} />,
+                children: [{ path: 'observability', element: <ObservabilityPage /> }],
+              },
+              {
                 // Root-only nested group. Layout-route shape so future
                 // root-only routes plug in here without per-page wrapping.
                 element: <RoleProtectedRoute allowedRoles={['root']} />,
-                children: [{ path: 'users', element: <AdminUsersPage /> }],
+                children: [
+                  { path: 'audit', element: <AuditPage /> },
+                  { path: 'users', element: <AdminUsersPage /> },
+                ],
               },
             ],
           },
