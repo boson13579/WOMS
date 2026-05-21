@@ -34,6 +34,26 @@ from app.services.startup_recovery import (
 from redis import Redis
 
 
+@pytest.fixture(autouse=True)
+def _override_app_env_for_dispatch_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force ``APP_ENV=dev`` for every test in this file.
+
+    ``run_startup_recovery`` early-returns when ``APP_ENV=="test"`` to keep
+    the FastAPI lifespan fast under pytest's ``TestClient`` (every API test
+    would otherwise re-dispatch Celery tasks on each ``client`` fixture
+    instantiation). But this test file exists **specifically** to exercise
+    the dispatcher itself, so we flip the env back to ``dev`` and bust the
+    settings lru_cache so the new value takes effect.
+
+    The full-suite `APP_ENV=test` env is restored by ``monkeypatch``'s
+    automatic teardown after each test.
+    """
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("APP_ENV", "dev")
+    get_settings.cache_clear()
+
+
 def _patch_tasks(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
     """Mock the three Celery tasks the recovery module dispatches.
 
