@@ -40,10 +40,6 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
 
-# backend/pyproject.toml references ../README.md. The Docker build context is
-# ./backend, so provide the metadata file at the expected absolute path.
-RUN printf "# Smart Order\n" > /README.md
-
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-dev
 

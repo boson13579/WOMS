@@ -320,7 +320,7 @@ def test_broadcast_failure_does_not_rollback(db_session: Session) -> None:
 
 
 def test_apply_schedule_creates_status_notification(db_session: Session) -> None:
-    """order_service.apply_schedule must notify when production date changes."""
+    """order_service.apply_schedule must create an order_status_changed notification."""
     user = _make_user(db_session, username="notif_schedule_user")
     order = _make_order(db_session, created_by=user.id)
 
@@ -343,38 +343,6 @@ def test_apply_schedule_creates_status_notification(db_session: Session) -> None
         )
     ).all()
     assert len(notifs) == 1
-    assert "生產日期已更新" in notifs[0].message
-
-
-def test_apply_schedule_skips_notification_when_production_date_unchanged(
-    db_session: Session,
-) -> None:
-    """Re-materializing the same production date must not create noisy notifications."""
-    user = _make_user(db_session, username="notif_schedule_same_date_user")
-    order = _make_order(db_session, created_by=user.id, status=OrderStatus.scheduled)
-    order.scheduled_production_date = date(2026, 9, 1)
-    order.expected_delivery_date = date(2026, 9, 1)
-    db_session.commit()
-
-    results = [
-        ScheduledResult(
-            order_id=order.id,
-            scheduled_date=date(2026, 9, 1),
-            quantity=100,
-        )
-    ]
-    with patch("app.services.notification.notify_user"):
-        order_service.apply_schedule(db_session, results)
-
-    db_session.expire_all()
-    notifs = db_session.scalars(
-        select(Notification).where(
-            Notification.user_id == user.id,
-            Notification.order_id == order.id,
-            Notification.type == "order_status_changed",
-        )
-    ).all()
-    assert notifs == []
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,6 @@ from typing import Any, Literal
 
 import structlog
 from fastapi import HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
@@ -889,6 +888,9 @@ def apply_schedule(
 
     Returns the number of orders that were marked as scheduled.
     """
+    order_repo.clear_scheduled_dates(db)
+    pinned_map = pinned or {}
+
     # Group ScheduledResults by order_id and remember per-day quantities so
     # we can persist the full breakdown (not just earliest/latest summary)
     # to the JSONB column. Sort each per-order list by date so the stored
@@ -897,23 +899,9 @@ def apply_schedule(
     for sr in scheduled:
         per_order.setdefault(sr.order_id, []).append(sr)
 
-    previous_production_dates: dict[uuid.UUID, date | None] = {}
-    if per_order:
-        previous_production_dates = dict(
-            db.execute(
-                select(Order.id, Order.scheduled_production_date).where(
-                    Order.id.in_(per_order.keys()),
-                    Order.is_deleted.is_(False),
-                )
-            ).all()
-        )
-
-    order_repo.clear_scheduled_dates(db)
-    pinned_map = pinned or {}
-
     applied = 0
     # Collect data for notifications before commit; attributes expire after commit.
-    _notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, date | None, date]] = []
+    _notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, str]] = []
     for order_id, results in per_order.items():
         results.sort(key=lambda x: x.scheduled_date)
         earliest = results[0].scheduled_date
@@ -938,11 +926,7 @@ def apply_schedule(
             )
             continue
         applied += 1
-        previous_production_date = previous_production_dates.get(order_id)
-        if previous_production_date != earliest:
-            _notif_queue.append(
-                (order.created_by, order.id, order.order_number, previous_production_date, earliest)
-            )
+        _notif_queue.append((order.created_by, order.id, order.order_number, order.status.value))
         # Read status from the refreshed row, not a hard-coded constant —
         # ``set_schedule_dates`` preserves ``in_production`` (see its
         # docstring for why), so an in-production order being re-materialized
@@ -969,18 +953,14 @@ def apply_schedule(
     db.commit()
     logger.info("order.schedule.applied", applied=applied)
 
-    for notif_user_id, notif_order_id, order_number, old_date, new_date in _notif_queue:
-        old_date_label = old_date.isoformat() if old_date else "未排程"
+    for notif_user_id, notif_order_id, order_number, status_val in _notif_queue:
         try:
             notification_service.create_notification(
                 db,
                 user_id=notif_user_id,
                 order_id=notif_order_id,
                 type="order_status_changed",
-                message=(
-                    f"訂單 {order_number} 生產日期已更新: "
-                    f"{old_date_label} -> {new_date.isoformat()}"
-                ),
+                message=f"訂單 {order_number} 狀態已變更為 {status_val}",
             )
         except Exception:
             logger.warning(
