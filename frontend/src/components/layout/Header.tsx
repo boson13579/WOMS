@@ -11,8 +11,8 @@ import { useNavigate } from 'react-router-dom';
 import { useMobileNavStore } from '@/components/layout/mobileNavStore';
 import { ThemeToggle } from '@/components/layout/ThemeToggle';
 import { Button } from '@/components/ui/button';
-import { useNotifications } from '@/features/notifications/api/notifications';
 import { useAuthStore } from '@/features/auth/stores/authStore';
+import { useNotifications } from '@/features/notifications/api/notifications';
 
 interface HeaderProps {
   title: string;

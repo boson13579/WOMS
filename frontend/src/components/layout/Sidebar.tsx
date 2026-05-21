@@ -73,8 +73,8 @@ function NavRow({ item, onNavigate }: { item: NavItem; onNavigate: () => void })
         cn(
           'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors relative group',
           isActive
-             ? 'bg-secondary text-secondary-foreground'
-             : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
+            ? 'bg-secondary text-secondary-foreground'
+            : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
         )
       }
     >
@@ -162,9 +162,7 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
           <div className="flex flex-col gap-0.5">
             {SECONDARY_NAV.map((item) => {
               const updatedItem =
-                item.to === '/notifications'
-                  ? { ...item, badgeCount: unreadCount }
-                  : item;
+                item.to === '/notifications' ? { ...item, badgeCount: unreadCount } : item;
               return <NavRow key={item.to} item={updatedItem} onNavigate={onNavigate} />;
             })}
             {showAuditLog ? (
