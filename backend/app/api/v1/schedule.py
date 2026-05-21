@@ -8,6 +8,7 @@ Endpoints
 - ``GET    /schedule/result`` — every order currently in ``scheduled`` state.
 - ``GET    /schedule/pending-ops`` — queued compounds in priority order.
 - ``GET    /schedule/capacity`` — 30-day prefix-sum capacity snapshot.
+- ``GET    /schedule/capacity-usage`` — 30-day realized used/remaining per day.
 - ``POST   /schedule/rebuild`` — queue ``rebuild_schedule_task`` (waits for any
   in-flight run to finish, rebuilds state from DB, then re-triggers
   ``run_scheduling_task``).
@@ -44,6 +45,7 @@ from app.schemas.schedule import (
     CapacityPrefixEntry,
     PendingOpsEntry,
     ScheduleCapacityResponse,
+    ScheduleCapacityUsageResponse,
     ScheduleCompoundResponse,
     ScheduleRebuildResponse,
     ScheduleResultResponse,
@@ -58,6 +60,7 @@ from app.services.schedule_queue import (
 )
 from app.services.scheduling import (
     DAILY_CAPACITY,
+    HORIZON_DAYS,
     STATE_KEY,
     STATUS_KEY,
     SchedulerState,
@@ -342,6 +345,62 @@ def get_schedule_capacity(
     return ScheduleCapacityResponse(
         base_date=state.base_date,
         daily_capacity=DAILY_CAPACITY,
+        entries=entries,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /capacity-usage
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/capacity-usage",
+    response_model=ScheduleCapacityUsageResponse,
+)
+def get_schedule_capacity_usage(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_READ_ROLES),
+) -> ScheduleCapacityUsageResponse:
+    """Per-day used / remaining capacity across the upcoming 30-day horizon.
+
+    Reads the ``schedule_daily_capacity`` snapshot the materializer
+    writes after every accepted compound. Each entry says: "on this
+    date, the EDF forward-fill schedule commits ``used`` wafers, leaving
+    ``remaining = DAILY_CAPACITY - used`` free."
+
+    Distinct from ``GET /schedule/capacity``, which returns the segment
+    tree's backward-fill prefix sums from Redis — that one answers
+    "is there room to admit a new order with this deadline?" (feasibility
+    view), this one answers "for the currently-applied schedule, what
+    does each day actually look like?" (realized view). The numbers can
+    differ: a single 8,000-wafer order with deadline +7 days reserves
+    capacity_tree backward from day 7, but forward-fill compute_schedule
+    plans it on days 1-2.
+
+    Always returns exactly ``HORIZON_DAYS`` entries starting at
+    ``base_date``. We use the Redis ``SchedulerState.base_date`` so the
+    series aligns with the scheduler's own calendar; if state is missing
+    (first deploy / flushed Redis) we fall back to today so the dashboard
+    still gets a usable response.
+
+    Permission: order_manager+.
+    """
+    raw = cast("str | None", _redis().get(STATE_KEY))
+    if raw is None:
+        base_date = datetime.now(tz=UTC).date()
+    else:
+        base_date = SchedulerState.from_json(raw).base_date
+
+    base, capacity, entries = order_service.get_capacity_usage(
+        db,
+        base_date=base_date,
+        daily_capacity=DAILY_CAPACITY,
+        horizon_days=HORIZON_DAYS,
+    )
+    return ScheduleCapacityUsageResponse(
+        base_date=base,
+        daily_capacity=capacity,
         entries=entries,
     )
 

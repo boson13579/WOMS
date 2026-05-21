@@ -122,7 +122,8 @@ from app.services.schedule_queue import enqueue_compound
 | `POST` | `/trigger` | scheduler+ | 手動補觸發排程任務 |
 | `GET` | `/status` | order_manager+ | 排程 worker 的 lifecycle snapshot（`idle`/`running`/`failed`） |
 | `GET` | `/result` | order_manager+ | 目前已排定 / 進行中的訂單清單（含每筆訂單的逐日數量 `daily_breakdown`，包含 `scheduled` 跟 `in_production` 兩種 status） |
-| `GET` | `/capacity` | order_manager+ | 未來 30 天剩餘產能的**前綴和**序列，dashboard 畫產能圖用 |
+| `GET` | `/capacity` | order_manager+ | 未來 30 天剩餘產能的**前綴和**序列（feasibility 視角，從 Redis state） |
+| `GET` | `/capacity-usage` | order_manager+ | 未來 30 天每日 used / remaining（realized 視角，從 DB snapshot；畫每日生產量條形圖用） |
 | `GET` | `/pending-ops` | order_manager+ | 排隊中 compound 的 drain 順位快照（rank=1 = 下一個會被 worker 處理） |
 | `POST` | `/rebuild` | scheduler+ | 從 DB 重建排程 state（async；不會 block） |
 | `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound（前端「取消」按鈕）。200 = 取消成功；409 = worker 已開始處理，無法取消；404 = compound id 未知 |
@@ -234,7 +235,44 @@ for (const it of queued) {
 
 收到 `schedule.compound_accepted` / `schedule.compound_cancelled` / `schedule.updated` 時都可以順便 refetch 這條更新「N 個動作等著被處理」的徽章。
 
-#### 3.2.4 `GET /api/v1/schedule/status` — 顯示排程狀態
+#### 3.2.4 `GET /api/v1/schedule/capacity-usage` — 30 天每日 used / remaining（生產量條形圖用）
+
+```ts
+const res = await fetch("/api/v1/schedule/capacity-usage", {
+    headers: { Authorization: `Bearer ${token}` },
+});
+const usage = await res.json();
+// {
+//   base_date: "2026-05-21",
+//   daily_capacity: 10000,
+//   entries: [
+//     { date: "2026-05-21", used: 7000, remaining: 3000 },
+//     { date: "2026-05-22", used: 2000, remaining: 8000 },
+//     { date: "2026-05-23", used: 0,    remaining: 10000 },
+//     // ... 共 30 筆
+//   ]
+// }
+```
+
+跟 `/capacity` 看起來像、但**語義不同**：
+
+| | `/capacity` | `/capacity-usage` |
+|---|---|---|
+| 視角 | feasibility（**還能不能塞**） | realized（**實際每天要做多少**） |
+| 來源 | Redis `capacity_tree` backward-fill 前綴和 | DB `schedule_daily_capacity` snapshot |
+| 數字 | `cumulative_remaining`（從 base_date 累計） | `used` + `remaining`（單日、非前綴） |
+| 適用 | 「新訂單還能不能下」的容量條 | 「每天實際要做多少 wafer」的生產量條形圖 |
+
+兩個會給出**不同的數字**：一張 8000-wafer / deadline +7 天的訂單，segment tree 從 day 7 反向 reserve（feasibility 視角 day 1-6 看起來都還滿），但 EDF forward-fill 會把它排在 day 1-2 完成（realized 視角 day 1-2 已被占）。前端兩個都會用到，看圖表的目的決定打哪一條。
+
+**行為細節**：
+- 固定 30 筆 entry，沒排程到的日期回 `used=0, remaining=daily_capacity` — 前端可以直接畫圖不用補白
+- 來源是 DB（不是 Redis），由 `apply_schedule` 在 materializer 跑完寫進去，跟 `daily_breakdown` 同一個 transaction commit
+- Redis state 不存在時（首次部署 / flush）改用今天當 base_date，dashboard 仍能拿到完整 30 筆
+
+收到 `schedule.materialized` WebSocket 時 refetch（snapshot 是 materializer 寫的，這個事件之後才會有新資料）。
+
+#### 3.2.5 `GET /api/v1/schedule/status` — 顯示排程狀態
 
 ```ts
 const res = await fetch("/api/v1/schedule/status", {
@@ -246,7 +284,7 @@ const status = await res.json();
 
 通常拿來在 dashboard 顯示「排程中⋯」/「上次跑於 XX」/「失敗了，error 是 …」。
 
-#### 3.2.5 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
+#### 3.2.6 `POST /api/v1/schedule/rebuild` — 災難復原按鈕
 
 當懷疑排程跟現實不同步（例如 DB 跟 Redis state 對不起來，或者 `daily_breakdown` 看起來明顯錯誤）時，叫管理員按這個按鈕：rebuild 會從 DB 重建 Redis state，再跑一輪 materializer 把 `orders.daily_breakdown` 改寫回正確值。
 

@@ -808,6 +808,142 @@ def test_capacity_without_token_returns_401(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GET /capacity-usage
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_usage_returns_realized_per_day_view(
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
+) -> None:
+    """GET /capacity-usage reads the DB snapshot written by ``apply_schedule``
+    and aligns it against the SchedulerState's base_date. Two orders sharing
+    day 1 should aggregate; days the snapshot doesn't cover come back as
+    used=0, remaining=daily_capacity. This verifies the snapshot → endpoint
+    pipeline end-to-end with both populated and empty days.
+    """
+    from app.models.order import Order, OrderStatus
+    from app.services import order as order_service
+    from app.services.scheduling import (
+        DAILY_CAPACITY,
+        HORIZON_DAYS,
+        ScheduledResult,
+        SchedulerState,
+    )
+
+    _patch_delay(monkeypatch)
+    creator = _make_user(db_session, username="mgr_capuse_ok", role=UserRole.order_manager)
+    token = _login(client, "mgr_capuse_ok")
+
+    base = date(2026, 5, 21)
+    redis_client.set("schedule:state", SchedulerState.initial(base).to_json())
+
+    # Two orders share day 1 → 700 used; only A on day 2 → 200.
+    # ``Order.wafer_quantity`` has a [25, 2500] check constraint; per-day
+    # ``ScheduledResult.quantity`` (the aggregation source) is independent
+    # and just needs to be plausible.
+    order_a = Order(
+        order_number="ORD-CU-A",
+        customer_name="X",
+        wafer_quantity=600,
+        requested_delivery_date=date(2026, 5, 25),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+    )
+    order_b = Order(
+        order_number="ORD-CU-B",
+        customer_name="X",
+        wafer_quantity=300,
+        requested_delivery_date=date(2026, 5, 26),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+    )
+    db_session.add_all([order_a, order_b])
+    db_session.commit()
+    db_session.refresh(order_a)
+    db_session.refresh(order_b)
+
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(order_id=order_a.id, scheduled_date=base, quantity=400),
+            ScheduledResult(order_id=order_a.id, scheduled_date=base + timedelta(days=1), quantity=200),
+            ScheduledResult(order_id=order_b.id, scheduled_date=base, quantity=300),
+        ],
+    )
+
+    res = client.get("/api/v1/schedule/capacity-usage", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["base_date"] == base.isoformat()
+    assert body["daily_capacity"] == DAILY_CAPACITY
+    assert len(body["entries"]) == HORIZON_DAYS
+
+    # Day 1: a(400) + b(300) = 700 used.
+    assert body["entries"][0] == {
+        "date": base.isoformat(),
+        "used": 700,
+        "remaining": DAILY_CAPACITY - 700,
+    }
+    # Day 2: a(200) only.
+    assert body["entries"][1] == {
+        "date": (base + timedelta(days=1)).isoformat(),
+        "used": 200,
+        "remaining": DAILY_CAPACITY - 200,
+    }
+    # Day 3 onward: nothing scheduled → used=0.
+    assert body["entries"][2] == {
+        "date": (base + timedelta(days=2)).isoformat(),
+        "used": 0,
+        "remaining": DAILY_CAPACITY,
+    }
+
+
+def test_capacity_usage_without_redis_state_uses_today_as_base(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """When Redis ``schedule:state`` is missing (fresh deploy or flushed
+    cache), the endpoint falls back to today as base_date so the dashboard
+    still gets a usable 30-entry response instead of a 500.
+    """
+    from app.services.scheduling import DAILY_CAPACITY, HORIZON_DAYS
+
+    _patch_delay(monkeypatch)
+    _make_user(db_session, username="mgr_capuse_empty", role=UserRole.order_manager)
+    token = _login(client, "mgr_capuse_empty")
+
+    res = client.get("/api/v1/schedule/capacity-usage", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["daily_capacity"] == DAILY_CAPACITY
+    assert len(body["entries"]) == HORIZON_DAYS
+    # No snapshot rows seeded → every day is fully available.
+    for entry in body["entries"]:
+        assert entry["used"] == 0
+        assert entry["remaining"] == DAILY_CAPACITY
+
+
+def test_capacity_usage_by_viewer_returns_403(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    _patch_delay(monkeypatch)
+    _make_user(db_session, username="viewer_capuse", role=UserRole.viewer)
+    token = _login(client, "viewer_capuse")
+
+    res = client.get("/api/v1/schedule/capacity-usage", headers=_auth(token))
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_capacity_usage_without_token_returns_401(client: TestClient) -> None:
+    res = client.get("/api/v1/schedule/capacity-usage")
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
 # POST /rebuild
 # ---------------------------------------------------------------------------
 
