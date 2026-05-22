@@ -137,15 +137,12 @@ function groupByProductionDate(
   baseDate: string,
 ): Record<string, ProductionCalendarItem[]> {
   return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
-    const dates = item.daily_breakdown.map((b) => b.date);
-    const finalDate = dates.length > 0 ? dates.reduce((max, d) => (d > max ? d : max)) : '';
-
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
 
       let productionState: 'complete' | 'in_progress' | 'scheduled';
 
-      if (finalDate < baseDate) {
+      if (assignment.date < baseDate) {
         productionState = 'complete';
       } else if (assignment.date > baseDate) {
         productionState = 'scheduled';
@@ -243,9 +240,10 @@ function OrderLine({
           {canDrag && dragOrder && <GripVertical className="h-3.5 w-3.5 shrink-0" />}
           <span className="truncate">{order.order_number}</span>
           {(order.productionState === 'in_progress' || dragOrder?.is_processing_locked) && (
-            <span title="生產中/處理鎖定中">
-              <Lock className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
-            </span>
+            <Lock
+              aria-label="處理鎖定中"
+              className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0"
+            />
           )}
         </span>
         <Badge variant={getProductionStateVariant(order.productionState)} className="shrink-0">
@@ -355,8 +353,12 @@ export function OrdersCalendarDialog({
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
   const grouped = useMemo(
-    () => groupByProductionDate(scheduleResult.data ?? [], dateKey(new Date())),
-    [scheduleResult.data],
+    () =>
+      groupByProductionDate(
+        scheduleResult.data ?? [],
+        scheduleCapacity.data?.base_date ?? dateKey(new Date()),
+      ),
+    [scheduleResult.data, scheduleCapacity.data?.base_date],
   );
   const filteredGrouped = useMemo(() => {
     if (!searchQuery) return grouped;
@@ -732,24 +734,14 @@ export function OrdersCalendarDialog({
                               canManageSchedule &&
                               order.status === 'scheduled' &&
                               order.productionState !== 'in_progress' &&
+                              draggableOrder !== undefined &&
                               draggableOrder?.is_processing_locked !== true;
                             return (
                               <div
                                 key={order.id}
                                 draggable={isDraggable}
                                 onDragStart={(event) => {
-                                  const fallbackOrder: DraggableOrder = {
-                                    id: order.id,
-                                    order_number: order.order_number,
-                                    customer_name: order.customer_name,
-                                    wafer_quantity: order.wafer_quantity,
-                                    requested_delivery_date: order.requested_delivery_date,
-                                    status: order.status,
-                                    is_pinned: false,
-                                    pinned_production_date: null,
-                                    is_processing_locked: false,
-                                  };
-                                  handleDragStart(event, draggableOrder ?? fallbackOrder);
+                                  if (draggableOrder) handleDragStart(event, draggableOrder);
                                 }}
                                 className={cn(
                                   'truncate rounded bg-sky-100 px-1.5 py-1 text-[11px] text-sky-950 dark:bg-sky-900 dark:text-sky-50',
@@ -934,6 +926,7 @@ export function OrdersCalendarDialog({
                           canManageSchedule &&
                           order.status === 'scheduled' &&
                           order.productionState !== 'in_progress' &&
+                          dragOrder !== undefined &&
                           dragOrder?.is_processing_locked !== true
                         }
                         onDragStart={handleDragStart}
