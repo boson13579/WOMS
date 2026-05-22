@@ -149,12 +149,10 @@ function groupByProductionDate(
 
       if (baseDate === undefined) {
         productionState = 'scheduled';
+      } else if (assignment.date < baseDate) {
+        productionState = 'complete';
       } else if (assignment.date > baseDate) {
         productionState = 'scheduled';
-      } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
-        // Only the final past row of a fulfilled order earns the "complete"
-        // badge; earlier daily slices of a multi-day split stay in_progress.
-        productionState = 'complete';
       } else {
         productionState = 'in_progress';
       }
