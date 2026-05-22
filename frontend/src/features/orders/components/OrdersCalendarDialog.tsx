@@ -82,9 +82,9 @@ interface ProductionCalendarItem extends ScheduleResult {
 type ProductionState = 'in_progress' | 'complete' | 'scheduled';
 
 function getProductionStateLabel(state: ProductionState): string {
-  if (state === 'complete') return '已生產';
+  if (state === 'complete') return '已完成';
   if (state === 'in_progress') return '生產中';
-  return '待生產';
+  return '已排程';
 }
 
 function getProductionStateVariant(
