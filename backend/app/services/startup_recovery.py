@@ -150,12 +150,15 @@ def _dispatch_recovery(rds: Redis) -> None:
     raw_state = cast("str | None", rds.get(STATE_KEY))
 
     # --- Step 1: state missing → rebuild ------------------------------------
+    # ``rebuild_schedule_task``'s own tail re-triggers ``run_scheduling_task``
+    # when ``pending_ops`` is non-empty (see ``workers/scheduling.py``
+    # rebuild task body). So when we go this branch we MUST NOT call
+    # ``_maybe_kick_run`` ourselves — that would enqueue a second drain
+    # alongside the rebuild's own follow-up, doubling worker load for
+    # nothing. Same reasoning applies to the unparseable-state branch.
     if raw_state is None:
         logger.warning("schedule.startup_recovery.state_missing", action="rebuild")
         rebuild_schedule_task.delay()
-        # Rebuild's first action is to anchor at ``today``, so no
-        # advance_day catchup needed when we go this branch.
-        _maybe_kick_run(rds, run_scheduling_task)
         return
 
     # --- Step 2: stale base_date → catch up via advance_day -----------------
@@ -165,11 +168,25 @@ def _dispatch_recovery(rds: Redis) -> None:
         # Corrupt state — treat like missing state and rebuild.
         logger.exception("schedule.startup_recovery.state_unparseable", action="rebuild")
         rebuild_schedule_task.delay()
-        _maybe_kick_run(rds, run_scheduling_task)
         return
 
     missed_days = (today - state.base_date).days
-    if missed_days > 0:
+    if missed_days < 0:
+        # ``base_date`` is in the future relative to this replica's clock.
+        # Likely cause: NTP drift / a peer replica with a fast clock wrote
+        # state ahead of real time. We deliberately do NOT auto-advance
+        # (would over-roll the calendar past today on the rest of the
+        # fleet) and do NOT rebuild (state may be intentional and rebuild
+        # would clobber the in-flight schedule). Just log a warning so
+        # ops can investigate, then fall through to the orphan-pending
+        # sweep — that branch is safe under either calendar direction.
+        logger.warning(
+            "schedule.startup_recovery.base_date_in_future",
+            base_date=state.base_date.isoformat(),
+            today=today.isoformat(),
+            skew_days=-missed_days,
+        )
+    elif missed_days > 0:
         # Cap at the horizon — beyond that the state is so stale that
         # rebuild is cheaper than walking N advance_days, and most of the
         # work would be no-ops (everything past day-30 is empty).
@@ -185,10 +202,12 @@ def _dispatch_recovery(rds: Redis) -> None:
         if missed_days > HORIZON_DAYS:
             # Past horizon — rebuild is the right tool. Catchup advance_days
             # past HORIZON_DAYS would just be churn over empty trees.
+            # Same reasoning as Step 1: rebuild self-retriggers run_task,
+            # so return early without the kick.
             rebuild_schedule_task.delay()
-        else:
-            for _ in range(catchup_days):
-                advance_day_task.delay()
+            return
+        for _ in range(catchup_days):
+            advance_day_task.delay()
 
     # --- Step 3: orphan pending ops → re-trigger drain ----------------------
     _maybe_kick_run(rds, run_scheduling_task)

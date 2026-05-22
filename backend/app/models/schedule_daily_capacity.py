@@ -58,10 +58,33 @@ class ScheduleDailyCapacity(Base):
     ``is_deleted``) are unused for this aggregate cache (see the module
     docstring). They're left as defaults to keep Alembic auto-generation
     matching the rest of the schema without us hand-editing migrations.
+
+    **Lag note for consumers of ``/schedule/capacity-usage``**: this table
+    reflects the last ``compute_schedule()`` output committed by
+    ``materialize_schedule_task``. Compounds that have been accepted by
+    the worker fast-path but haven't yet been materialized into DB will
+    NOT show up in ``used_quantity`` — there's a one-materialize-cycle
+    lag (typically 50ms-2s) between "compound accepted" and "snapshot
+    reflects it". Frontend should treat the values as "best known plan
+    as of the last materialize", not real-time.
     """
 
     __tablename__ = "schedule_daily_capacity"
     __table_args__ = (sa.UniqueConstraint("date", name="uq_schedule_daily_capacity_date"),)
+
+    # Override the version_id-based optimistic lock inherited from ``Base``.
+    # The lock is meaningful for orders / users / audit logs where multiple
+    # writers can race. This aggregate cache has a single writer
+    # (``replace_all`` in ``apply_schedule``) running inside the worker's
+    # ``schedule:state_writer_lock`` so concurrent writes are already
+    # serialized one layer up. The current ``replace_all`` (DELETE + INSERT)
+    # never triggers the version check, but the moment someone writes an
+    # ``UPDATE schedule_daily_capacity SET ... WHERE date=...`` it will
+    # silently fail with ``StaleDataError`` — and that's exactly the kind
+    # of session-poisoning bug we fixed in ``apply_schedule`` for the
+    # orders table. Disable the lock explicitly here to keep future
+    # writers safe-by-default.
+    __mapper_args__ = {}  # noqa: RUF012
 
     date: Mapped[date] = mapped_column(
         sa.Date,
