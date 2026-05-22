@@ -39,20 +39,48 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.db import get_pool_stats
 from app.models.user import User
 from app.schemas.system import (
+    CeleryStats,
+    DbPoolStats,
+    RedisStats,
     ServiceHealthDetail,
     ServiceHealthEntry,
     SystemHealthResponse,
+    SystemResourcesResponse,
     UsernamesLookupResponse,
+    WorkerBreakdown,
+    WorkerStatus,
 )
+from app.workers.celery_app import celery_app
 
 ServiceId = Literal["api", "postgres", "redis", "celery"]
 HealthStatus = Literal["healthy", "warning", "error"]
 
 logger = structlog.get_logger(__name__)
 
-__all__ = ["gather_system_health", "lookup_usernames"]
+__all__ = ["gather_resources", "gather_system_health", "lookup_usernames"]
+
+# Defensive cap on the per-worker breakdown returned to the dashboard. Course-
+# scale deployments won't get anywhere near this, but a misbehaving production
+# fleet (or a test fixture) could theoretically register thousands of workers
+# and balloon the JSON payload. Slicing the sorted-by-hostname list keeps the
+# response bounded; the ``truncated`` flag on ``CeleryStats`` tells the
+# frontend when it happened.
+_MAX_WORKER_BREAKDOWN = 50
+
+# Celery default queue name; matches ``celery_app.conf.task_default_queue``
+# (Celery falls back to ``"celery"`` when nothing is set, which is exactly
+# what ``app.workers.celery_app`` does today). Queue depth is read via
+# ``LLEN`` because the Redis broker stores tasks as a plain list.
+_CELERY_DEFAULT_QUEUE = "celery"
+
+# Inspect timeout: Celery's default 1.0s blocks the resources endpoint when
+# no worker registers (which is the production posture during a restart).
+# ``inspect(timeout=0.5)`` is a broadcast-and-gather single deadline, not
+# per-worker — adding workers does NOT scale the wall-clock cost.
+_CELERY_INSPECT_TIMEOUT_SECONDS = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -220,20 +248,28 @@ def _probe_celery() -> ServiceHealthEntry:
     the two Redis surfaces it writes:
 
     * ``schedule:status`` — lifecycle JSON (``idle`` / ``running`` /
-      ``failed`` + ``finished_at``). ``failed`` flips us to warning so the
-      dashboard surfaces it immediately.
+      ``failed`` + ``finished_at``). This records the **last task's
+      outcome**, not the current worker health — important for the
+      ``failed`` interpretation below.
     * ``schedule:pending_ops`` — sorted set of queued compounds. Used
-      only as one of the inputs to the stall detector below; deep queue
+      as one of the inputs to the stall detector below; deep queue
       by itself is **not** a warning signal (burst loads of 100s of
       compounds are normal; what matters is whether the worker is
       draining them).
 
-    Stall detection (the case ``state=idle`` + ``queue>0`` + worker
-    actually dead — see frontend ``deriveScheduleDisplay`` for the
-    matching UX logic): if there's queued work but the last task
-    finished more than ``_CELERY_STALL_THRESHOLD_SECONDS`` ago, flip
-    to warning. This catches a crashed worker with backlog regardless
-    of queue size.
+    Severity mapping (queue-aware so the dashboard tile colour matches
+    operational urgency rather than the literal status word):
+
+    * ``state=failed`` AND ``queue_depth > 0`` → ``error`` (red): a
+      task just failed AND there's still work waiting — actively broken.
+    * ``state=failed`` AND ``queue_depth == 0`` → ``warning`` (yellow):
+      a past task failed but nothing's queued, so the failure may be
+      historical (e.g. a transient bug fixed by reset). Summary calls
+      out the failure timestamp so an operator can decide.
+    * ``state=idle`` + ``queue>0`` + last finish >
+      ``_CELERY_STALL_THRESHOLD_SECONDS`` ago → ``warning`` (stall —
+      worker dead with backlog).
+    * Otherwise → ``healthy``.
 
     Any Redis exception → ``error``: better to flag "we have no signal"
     than to silently report healthy.
@@ -277,9 +313,23 @@ def _probe_celery() -> ServiceHealthEntry:
     seconds_since_finish = _seconds_since(finished_at_raw)
 
     status: HealthStatus
-    if worker_state == "failed":
+    if worker_state == "failed" and queue_depth > 0:
+        # Actively broken: a task just failed AND there's queued work
+        # that won't drain until something intervenes.
+        status = "error"
+        summary = (
+            f"Last run failed — {queue_depth} compound{'s' if queue_depth != 1 else ''} "
+            f"still pending"
+        )
+    elif worker_state == "failed":
+        # Past incident: a task failed, but nothing's queued so the
+        # next caller may succeed. Surface the timestamp so operators
+        # know if it's recent (urgent) or old (stale signal).
         status = "warning"
-        summary = "Scheduler reports state=failed"
+        if finished_at_raw:
+            summary = f"Last run failed at {finished_at_raw} — no new tasks since"
+        else:
+            summary = "Last run failed — no new tasks since"
     elif (
         worker_state == "idle"
         and queue_depth > 0
@@ -372,6 +422,175 @@ def gather_system_health(db: Session) -> SystemHealthResponse:
         _safe("celery", "Celery Worker", _probe_celery),
     ]
     return SystemHealthResponse(services=services)
+
+
+# ---------------------------------------------------------------------------
+# /system/resources — DB pool + Redis info + Celery introspection
+# ---------------------------------------------------------------------------
+
+
+def _get_db_pool_stats() -> DbPoolStats | None:
+    """Return a :class:`DbPoolStats` snapshot or ``None`` when unavailable.
+
+    Delegates the heavy lifting to :func:`app.core.db.get_pool_stats` which
+    knows the SQLAlchemy ``QueuePool`` internals. Catching the broader
+    ``Exception`` here is intentional: the resources endpoint must NEVER
+    fail because one probe blew up — we return ``None`` and let the
+    frontend hide the section.
+    """
+    try:
+        raw = get_pool_stats()
+    except Exception as exc:
+        logger.warning("system.resources.db_pool.probe_failed", error=str(exc))
+        return None
+    if raw is None:
+        return None
+    return DbPoolStats(
+        size=int(raw["size"]),
+        checked_out=int(raw["checked_out"]),
+        overflow=int(raw["overflow"]),
+        max_overflow=int(raw["max_overflow"]),
+        utilization_pct=float(raw["utilization_pct"]),
+    )
+
+
+def _get_redis_stats() -> RedisStats | None:
+    """Return a :class:`RedisStats` snapshot or ``None`` when Redis is unreachable.
+
+    Reuses the cached client + port pre-flight from the existing health
+    probes — same fast-fail behaviour when Redis is genuinely down.
+    Calls ``info("memory")``, ``info("clients")``, and ``info("stats")``
+    individually because asking for ``info()`` (all sections) is heavier
+    than necessary and triggers Redis to compute extra slow stats.
+    """
+    if not _redis_port_open():
+        return None
+    try:
+        rds = _get_redis_client()
+        # ``redis-py`` type stubs return ``Awaitable | Any`` for ``info`` to
+        # cover the async client too — we use the sync client, so cast to the
+        # plain ``dict`` shape we know we get. Mirrors the existing pattern
+        # in ``_probe_celery``.
+        info_mem = cast("dict[str, Any]", rds.info("memory"))
+        info_clients = cast("dict[str, Any]", rds.info("clients"))
+        info_stats = cast("dict[str, Any]", rds.info("stats"))
+    except Exception as exc:
+        logger.warning("system.resources.redis.probe_failed", error=str(exc))
+        return None
+    try:
+        return RedisStats(
+            used_memory_bytes=int(info_mem.get("used_memory", 0)),
+            used_memory_peak_bytes=int(info_mem.get("used_memory_peak", 0)),
+            connected_clients=int(info_clients.get("connected_clients", 0)),
+            ops_per_sec=int(info_stats.get("instantaneous_ops_per_sec", 0)),
+            evicted_keys=int(info_stats.get("evicted_keys", 0)),
+        )
+    except (TypeError, ValueError) as exc:
+        # Defensive: if Redis returns a key with unexpected type we'd rather
+        # null the section than 500. (Real Redis always returns ints here.)
+        logger.warning("system.resources.redis.info_parse_failed", error=str(exc))
+        return None
+
+
+def _get_celery_stats() -> CeleryStats | None:
+    """Return a :class:`CeleryStats` snapshot or ``None`` when introspection fails.
+
+    Strategy:
+
+    * Issue one ``inspect()`` with a 0.5s broadcast deadline and call
+      ``.active()`` + ``.ping()`` on it. Each call still incurs the
+      broadcast cost, but we avoid building three separate ``Inspect``
+      objects (cheap object, but conceptually cleaner to share state).
+    * Active task aggregate = ``sum(len(tasks) for tasks in active.values())``.
+    * ``registered_workers`` is derived from the union of hostnames that
+      responded to either ``active()`` or ``ping()``. Using ping as the
+      source of truth (rather than ``registered()`` which lists task
+      *names*) means we count actually-responsive workers.
+    * Per-worker rows are sorted by hostname for stable rendering, then
+      truncated to :data:`_MAX_WORKER_BREAKDOWN` with the ``truncated``
+      flag set.
+    * Queue depth from ``LLEN celery`` against the broker Redis. Falls
+      back to 0 on any Redis error — celery section still serves with
+      worker info, just with a possibly stale queue depth.
+    """
+    try:
+        # ``celery_app`` is imported at module top — tests monkeypatch
+        # ``app.services.system.celery_app`` to inject a fake. The Celery
+        # app is otherwise cheap to import (already pulled in by the FastAPI
+        # entrypoint via ``app.workers.scheduling``).
+        inspector = celery_app.control.inspect(timeout=_CELERY_INSPECT_TIMEOUT_SECONDS)
+        active = inspector.active() or {}
+        ping = inspector.ping() or []
+    except Exception as exc:
+        logger.warning("system.resources.celery.inspect_failed", error=str(exc))
+        return None
+
+    # ``ping()`` returns a list of single-key dicts: [{"celery@h1": {"ok":"pong"}}, ...].
+    # Some Celery versions return a dict keyed by hostname; handle both.
+    ping_hostnames: set[str] = set()
+    if isinstance(ping, list):
+        for entry in ping:
+            if isinstance(entry, dict):
+                ping_hostnames.update(entry.keys())
+    elif isinstance(ping, dict):
+        ping_hostnames.update(ping.keys())
+
+    # Union of every hostname we have any signal for.
+    hostnames: set[str] = set()
+    hostnames.update(active.keys())
+    hostnames.update(ping_hostnames)
+
+    workers: list[WorkerBreakdown] = []
+    for hostname in sorted(hostnames):
+        tasks = active.get(hostname) or []
+        task_count = len(tasks) if isinstance(tasks, list) else 0
+        # ``"active"`` when the worker has in-flight tasks. ``"idle"`` when
+        # it's reachable (ping or active map presence) but has no tasks.
+        # We never emit ``"dead"`` — dead workers drop out of both maps.
+        status: WorkerStatus = "active" if task_count > 0 else "idle"
+        workers.append(WorkerBreakdown(hostname=hostname, active_tasks=task_count, status=status))
+
+    # Aggregate ``active_tasks`` from the source ``active`` map BEFORE
+    # truncation so the headline number is honest even when we truncate
+    # the per-worker rows.
+    total_active = sum(len(tasks) if isinstance(tasks, list) else 0 for tasks in active.values())
+
+    truncated = len(workers) > _MAX_WORKER_BREAKDOWN
+    if truncated:
+        workers = workers[:_MAX_WORKER_BREAKDOWN]
+
+    # Queue depth: best-effort. Failing here only zeros out queue_depth, the
+    # rest of the celery section is still useful.
+    queue_depth = 0
+    try:
+        rds = _get_redis_client()
+        raw_depth = cast("int", rds.llen(_CELERY_DEFAULT_QUEUE))
+        queue_depth = int(raw_depth) if raw_depth is not None else 0
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("system.resources.celery.queue_depth_failed", error=str(exc))
+
+    return CeleryStats(
+        active_tasks=total_active,
+        queue_depth=queue_depth,
+        registered_workers=len(hostnames),
+        workers=workers,
+        truncated=truncated,
+    )
+
+
+def gather_resources() -> SystemResourcesResponse:
+    """Compose the USE resources response from each per-section probe.
+
+    Each section is independent: a Redis outage blanks ``redis`` but
+    ``db_pool`` and ``celery`` still populate. The endpoint stays 200
+    in all cases — the frontend keeps rendering the surviving cards
+    rather than blowing up the whole observability page.
+    """
+    return SystemResourcesResponse(
+        db_pool=_get_db_pool_stats(),
+        redis=_get_redis_stats(),
+        celery=_get_celery_stats(),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -25,10 +25,12 @@ describe('OrdersSnapshotCard', () => {
     expect(screen.getByText('96')).toBeInTheDocument();
     expect(screen.getByText('12')).toBeInTheDocument();
     expect(screen.getByText('65')).toBeInTheDocument();
-    expect(screen.getByText(/pending/i)).toBeInTheDocument();
-    expect(screen.getByText(/scheduled/i)).toBeInTheDocument();
-    expect(screen.getByText(/in production/i)).toBeInTheDocument();
-    expect(screen.getByText(/completed/i)).toBeInTheDocument();
+    // Tile labels — anchor with ^...$ to disambiguate from the card
+    // description which also contains the word "pending".
+    expect(screen.getByText(/^Pending$/)).toBeInTheDocument();
+    expect(screen.getByText(/^Scheduled$/)).toBeInTheDocument();
+    expect(screen.getByText(/^In production$/)).toBeInTheDocument();
+    expect(screen.getByText(/^Completed$/)).toBeInTheDocument();
   });
 
   it('renders skeleton while loading', () => {

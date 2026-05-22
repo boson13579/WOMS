@@ -110,7 +110,7 @@ export function ScheduleStatusCard({
     return (
       <Card className="border-destructive/40">
         <CardContent className="flex items-start gap-3 p-5">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-600 dark:text-red-400" />
           <p className="text-sm">Failed to load scheduler status.</p>
         </CardContent>
       </Card>
@@ -175,7 +175,7 @@ export function ScheduleStatusCard({
         )}
 
         {data.error ? (
-          <p className="rounded-md bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+          <p className="rounded-md bg-red-50 px-2 py-1.5 text-xs text-red-700 dark:bg-red-500/15 dark:text-red-300">
             {data.error}
           </p>
         ) : null}

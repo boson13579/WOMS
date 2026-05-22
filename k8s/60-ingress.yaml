@@ -1,0 +1,50 @@
+# The Ingress that tells AWS Load Balancer Controller to provision a real
+# ALB and wire up path-based routing.
+#
+# How the controller reads this:
+#   - `ingressClassName: alb` — claim this Ingress (vs. nginx ingress etc.)
+#   - `scheme: internet-facing` — public ALB with a DNS name; auto-discovers
+#     the public subnets we tagged `kubernetes.io/role/elb=1` in vpc.tf.
+#   - `target-type: ip` — register pod IPs directly. Better than `instance`
+#     because (a) it works with Fargate, (b) load balances inside the pod
+#     rather than landing on a node and then SNATing.
+#   - Rules in order: `/api/*` → backend Service, then `/*` → frontend.
+#     ALB picks the FIRST matching rule, so order matters here.
+#
+# WebSocket on `/api/v1/ws` works through this Ingress without extra config —
+# ALB supports WS natively on HTTP listeners. The stickiness annotation
+# keeps the same client pinned to the same backend pod for the duration of
+# the connection, which is safer for connections that maintain state.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: woms
+  namespace: woms
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # Per-target-group sticky cookie. Keeps each browser pinned to one pod
+    # for the lifetime of the cookie. Important for the WS endpoint.
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      stickiness.enabled=true,stickiness.type=lb_cookie,stickiness.lb_cookie.duration_seconds=3600
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

@@ -1,0 +1,17 @@
+# Non-secret config consumed by the backend + worker pods.
+#
+# Secrets (DATABASE_URL, REDIS_URL, JWT_SECRET) live in a Secret created
+# imperatively from Terraform outputs — see k8s/README.md.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: woms-config
+  namespace: woms
+data:
+  APP_ENV: "prod"
+  LOG_LEVEL: "INFO"
+  # CORS: in Phase 4 (ALB Ingress) the frontend and backend will share a
+  # domain, so CORS isn't strictly required. For now allow the in-cluster
+  # frontend Service's address so a port-forwarded frontend can call backend.
+  CORS_ORIGINS: "http://localhost,http://localhost:5173,http://localhost:8080"

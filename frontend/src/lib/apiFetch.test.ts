@@ -149,6 +149,54 @@ describe('apiFetch', () => {
     ).rejects.toBeInstanceOf(ApiError);
   });
 
+  it('attaches X-Request-Id to ApiError when the header is present', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Bad.' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': 'req-abc' },
+      }),
+    );
+
+    const caught = await apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw)
+      .then(() => null)
+      .catch((err: unknown) => err);
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).requestId).toBe('req-abc');
+  });
+
+  it('leaves requestId undefined when the X-Request-Id header is absent', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Bad.' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const caught = await apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw)
+      .then(() => null)
+      .catch((err: unknown) => err);
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).requestId).toBeUndefined();
+  });
+
+  it('still attaches requestId on 401 responses', async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: 'Unauthorized.' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': 'req-401' },
+      }),
+    );
+
+    const caught = await apiFetch('/api/v1/example', { credentials: 'include' }, (raw) => raw)
+      .then(() => null)
+      .catch((err: unknown) => err);
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).requestId).toBe('req-401');
+  });
+
   it('rewrites request timeout aborts to a readable error message', async () => {
     vi.useFakeTimers();
     vi.mocked(global.fetch).mockImplementationOnce((_url, init) => {
