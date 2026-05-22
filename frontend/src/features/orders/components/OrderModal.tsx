@@ -6,7 +6,7 @@
  * optimistic-lock protection).
  */
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 
@@ -63,13 +63,32 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const users = useAssignableUsers();
   const assignedToDisabled = isEdit;
 
+  const dynamicSchema = useMemo(() => {
+    // Skip the assignee refinement in edit mode: the field is disabled there
+    // (see `assignedToDisabled` below) so the user can't fix a mismatch
+    // anyway. Without this guard, an order whose original assignee has since
+    // been deactivated would fail validation on a field the user can't edit,
+    // leaving the modal permanently unsubmittable.
+    if (isEdit) return formSchema;
+    return formSchema.refine(
+      (data) => {
+        if (!data.assigned_to_email) return true;
+        return users.some((u) => u.email === data.assigned_to_email);
+      },
+      {
+        message: '負責人必須是系統中現有的使用者',
+        path: ['assigned_to_email'],
+      },
+    );
+  }, [users, isEdit]);
+
   const {
     register,
     handleSubmit,
     reset,
     formState: { errors },
   } = useForm<FormValues>({
-    resolver: zodResolver(formSchema),
+    resolver: zodResolver(dynamicSchema),
     defaultValues: {
       customer_name: '',
       wafer_quantity: 100,
