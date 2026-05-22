@@ -68,3 +68,38 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def get_pool_stats() -> dict[str, int | float] | None:
+    """Snapshot the SQLAlchemy connection pool for the resources endpoint.
+
+    Returns ``None`` if the engine's pool doesn't expose the standard
+    ``QueuePool`` interface (e.g. ``NullPool`` in some test configurations
+    where ``.size()`` would raise). The dashboard treats ``None`` as
+    "hide this section" rather than a hard error.
+
+    ``utilization_pct = checked_out / (size + max_overflow) * 100`` —
+    saturation here means new requests have to wait on a connection,
+    which is exactly the operator-facing signal we want to surface.
+    """
+    settings = get_settings()
+    max_overflow = settings.DB_MAX_OVERFLOW
+    try:
+        pool = engine.pool
+        size = pool.size()  # type: ignore[attr-defined]
+        checked_out = pool.checkedout()  # type: ignore[attr-defined]
+        overflow = pool.overflow()  # type: ignore[attr-defined]
+    except AttributeError:
+        # NullPool (and SingletonThreadPool) don't expose .size() / .overflow().
+        # Returning None here keeps the resources endpoint honest: "we don't
+        # have pool stats for this pool type" rather than fabricating zeros.
+        return None
+    capacity = max(size + max_overflow, 1)
+    utilization_pct = round(checked_out / capacity * 100, 1)
+    return {
+        "size": int(size),
+        "checked_out": int(checked_out),
+        "overflow": int(overflow),
+        "max_overflow": int(max_overflow),
+        "utilization_pct": utilization_pct,
+    }

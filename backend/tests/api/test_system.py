@@ -214,26 +214,53 @@ def test_system_health_celery_healthy_when_queue_deep_but_draining(
     assert celery_entry["status"] == "healthy"
 
 
-def test_system_health_celery_warning_when_status_failed(
+def test_system_health_celery_warning_when_failed_with_empty_queue(
     client: TestClient,
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``schedule:status.state == 'failed'`` → celery warning, regardless
-    of queue depth. The dashboard's primary value here is making this
-    visible without an ops-side log dive."""
-    _make_user(db_session, username="sys_cel_failed", role=UserRole.viewer)
-    token = _login(client, "sys_cel_failed")
+    """``state=failed`` + ``queue_depth=0`` → ``warning`` (past incident,
+    not actively broken). Summary surfaces the failure timestamp so the
+    operator can decide if it's recent enough to investigate."""
+    _make_user(db_session, username="sys_cel_failed_empty", role=UserRole.viewer)
+    token = _login(client, "sys_cel_failed_empty")
 
     fake_redis = MagicMock()
     fake_redis.zcard.return_value = 0
-    fake_redis.get.return_value = '{"state": "failed", "error": "boom"}'
+    fake_redis.get.return_value = (
+        '{"state": "failed", "error": "boom", "finished_at": "2026-05-19T21:47:34Z"}'
+    )
     monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
 
     res = client.get("/api/v1/system/health", headers=_auth(token))
     assert res.status_code == 200
     celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
     assert celery_entry["status"] == "warning"
+    assert "Last run failed" in celery_entry["summary"]
+    assert "2026-05-19T21:47:34Z" in celery_entry["summary"]
+
+
+def test_system_health_celery_error_when_failed_with_pending_queue(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``state=failed`` + ``queue_depth>0`` → ``error`` (actively broken
+    — there's work waiting that won't drain until intervention).
+    Surfaces the queue depth so the urgency is obvious."""
+    _make_user(db_session, username="sys_cel_failed_busy", role=UserRole.viewer)
+    token = _login(client, "sys_cel_failed_busy")
+
+    fake_redis = MagicMock()
+    fake_redis.zcard.return_value = 12
+    fake_redis.get.return_value = '{"state": "failed", "error": "boom"}'
+    monkeypatch.setattr("app.services.system._get_redis_client", lambda: fake_redis)
+
+    res = client.get("/api/v1/system/health", headers=_auth(token))
+    assert res.status_code == 200
+    celery_entry = next(s for s in res.json()["services"] if s["id"] == "celery")
+    assert celery_entry["status"] == "error"
+    assert "12 compounds still pending" in celery_entry["summary"]
 
 
 def test_system_health_celery_healthy_when_idle_empty_queue(
