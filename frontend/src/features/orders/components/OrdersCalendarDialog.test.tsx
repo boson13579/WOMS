@@ -257,7 +257,7 @@ describe('OrdersCalendarDialog', () => {
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
     expect(screen.getByText(/今日 1,500/)).toBeInTheDocument();
     expect(screen.getByText(/累計 2,500 \/ 2,500/)).toBeInTheDocument();
-    expect(screen.getByText('待生產')).toBeInTheDocument();
+    expect(screen.getByText('已排程')).toBeInTheDocument();
     expect(screen.getByText('剩餘 0')).toBeInTheDocument();
   });
 
@@ -268,7 +268,7 @@ describe('OrdersCalendarDialog', () => {
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
-    expect(screen.getByText('已生產')).toBeInTheDocument();
+    expect(screen.getByText('已完成')).toBeInTheDocument();
   });
 
   it('uses server base_date instead of the client clock for production state', async () => {
@@ -280,7 +280,7 @@ describe('OrdersCalendarDialog', () => {
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
 
-    expect(screen.getByText('待生產')).toBeInTheDocument();
+    expect(screen.getByText('已排程')).toBeInTheDocument();
   });
 
   it('displays a padlock icon for production-active or pinned orders', async () => {
