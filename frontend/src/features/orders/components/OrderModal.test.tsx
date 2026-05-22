@@ -175,8 +175,32 @@ describe('OrderModal', () => {
 
     await user.click(screen.getByRole('button', { name: '新增' }));
 
-    expect(screen.getByText('負責人 Email 必須是系統中合法的用戶 Email')).toBeInTheDocument();
+    expect(screen.getByText('負責人必須是系統中現有的使用者')).toBeInTheDocument();
     expect(mockCreateMutate).not.toHaveBeenCalled();
+  });
+
+  it('create mode: a valid email from the list maps to its user id on submit', async () => {
+    const user = userEvent.setup();
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    await user.clear(screen.getByLabelText(/客戶名稱/));
+    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
+
+    await user.clear(screen.getByLabelText(/晶圓數量/));
+    await user.type(screen.getByLabelText(/晶圓數量/), '200');
+
+    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
+    await user.type(screen.getByLabelText(/負責人/), 'bob@example.com');
+
+    await user.click(screen.getByRole('button', { name: '新增' }));
+
+    expect(mockCreateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customer_name: 'Samsung',
+        assigned_to: 'uid-002',
+      }),
+      expect.anything(),
+    );
   });
 
   it('create mode: passes validation if responsible email is empty', async () => {
@@ -220,7 +244,6 @@ describe('OrderModal', () => {
 
   it('edit mode: passes version_id to updateMutation.mutate', async () => {
     const user = userEvent.setup();
-    // assigned_to must match a mock user so the pre-filled email passes validation
     const order = makeOrder({ id: 'edit-id', version_id: 3, assigned_to: 'uid-001' });
     render(<OrderModal open order={order} onClose={onClose} />);
 
@@ -232,6 +255,28 @@ describe('OrderModal', () => {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         payload: expect.objectContaining({ version_id: 3 }),
       }),
+      expect.anything(),
+    );
+  });
+
+  it('edit mode: submit is not blocked when the existing assignee is no longer in the assignable list', async () => {
+    // Simulates an assignee who has since been deactivated/removed: the
+    // assigned_to user id no longer maps to any entry in useAssignableUsers().
+    // The field is disabled in edit mode, so refine must NOT run — otherwise
+    // the modal would be permanently unsubmittable.
+    const user = userEvent.setup();
+    const order = makeOrder({
+      id: 'edit-orphan',
+      version_id: 7,
+      assigned_to: 'uid-DELETED',
+    });
+    render(<OrderModal open order={order} onClose={onClose} />);
+
+    await user.click(screen.getByRole('button', { name: '儲存' }));
+
+    expect(screen.queryByText('負責人必須是系統中現有的使用者')).not.toBeInTheDocument();
+    expect(mockUpdateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'edit-orphan' }),
       expect.anything(),
     );
   });

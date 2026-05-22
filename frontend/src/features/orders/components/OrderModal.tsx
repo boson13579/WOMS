@@ -64,17 +64,23 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const assignedToDisabled = isEdit;
 
   const dynamicSchema = useMemo(() => {
+    // Skip the assignee refinement in edit mode: the field is disabled there
+    // (see `assignedToDisabled` below) so the user can't fix a mismatch
+    // anyway. Without this guard, an order whose original assignee has since
+    // been deactivated would fail validation on a field the user can't edit,
+    // leaving the modal permanently unsubmittable.
+    if (isEdit) return formSchema;
     return formSchema.refine(
       (data) => {
         if (!data.assigned_to_email) return true;
         return users.some((u) => u.email === data.assigned_to_email);
       },
       {
-        message: '負責人 Email 必須是系統中合法的用戶 Email',
+        message: '負責人必須是系統中現有的使用者',
         path: ['assigned_to_email'],
       },
     );
-  }, [users]);
+  }, [users, isEdit]);
 
   const {
     register,
