@@ -79,17 +79,19 @@ interface ProductionCalendarItem extends ScheduleResult {
   productionDate: string;
   productionQuantity: number;
   cumulativeQuantity: number;
-  productionState: 'in_progress' | 'complete' | 'scheduled';
+  productionState: ProductionState;
 }
 
-function getProductionStateLabel(state: 'complete' | 'in_progress' | 'scheduled'): string {
-  if (state === 'complete') return '已完成';
+type ProductionState = 'in_progress' | 'complete' | 'scheduled';
+
+function getProductionStateLabel(state: ProductionState): string {
+  if (state === 'complete') return '已生產';
   if (state === 'in_progress') return '生產中';
-  return '已排程';
+  return '待生產';
 }
 
 function getProductionStateVariant(
-  state: 'complete' | 'in_progress' | 'scheduled',
+  state: ProductionState,
 ): 'success' | 'warning' | 'info' | 'secondary' {
   if (state === 'complete') return 'success';
   if (state === 'in_progress') return 'warning';
@@ -147,7 +149,7 @@ function groupByProductionDate(
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
 
-      let productionState: 'complete' | 'in_progress' | 'scheduled';
+      let productionState: ProductionState;
 
       if (baseDate === undefined) {
         productionState = 'scheduled';
@@ -194,6 +196,20 @@ function capacityTone(remaining: number, dailyCapacity: number): string {
 
 function isTargetAfterDeadline(order: DraggableOrder, targetDate: string): boolean {
   return targetDate > order.requested_delivery_date;
+}
+
+function canDragScheduledOrder(
+  order: ProductionCalendarItem,
+  dragOrder: DraggableOrder | undefined,
+  canManageSchedule: boolean,
+): dragOrder is DraggableOrder {
+  return (
+    canManageSchedule &&
+    order.status === 'scheduled' &&
+    order.productionState !== 'in_progress' &&
+    dragOrder !== undefined &&
+    !dragOrder.is_processing_locked
+  );
 }
 
 function dragOrdersFromEvent(event: DragEvent): DraggableOrder[] {
@@ -375,9 +391,10 @@ export function OrdersCalendarDialog({
   const canReadSchedule = role !== 'viewer';
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
+  const baseDate = scheduleCapacity.data?.base_date;
   const grouped = useMemo(
-    () => groupByProductionDate(scheduleResult.data ?? [], scheduleCapacity.data?.base_date),
-    [scheduleResult.data, scheduleCapacity.data?.base_date],
+    () => groupByProductionDate(scheduleResult.data ?? [], baseDate),
+    [scheduleResult.data, baseDate],
   );
   const filteredGrouped = useMemo(() => {
     if (!searchQuery) return grouped;
@@ -701,12 +718,16 @@ export function OrdersCalendarDialog({
               </div>
             </div>
 
-            {scheduleResult.isPending ? (
+            {!canReadSchedule ? (
+              <div className="flex h-96 items-center justify-center rounded-md border text-sm text-destructive">
+                無法載入排程日曆，請確認帳號權限或稍後再試。
+              </div>
+            ) : scheduleResult.isPending || scheduleCapacity.isPending ? (
               <div className="flex h-96 items-center justify-center text-muted-foreground">
                 <Loader2 className="mr-2 h-5 w-5 animate-spin" />
                 載入日曆中...
               </div>
-            ) : scheduleResult.isError || !canReadSchedule ? (
+            ) : scheduleResult.isError || scheduleCapacity.isError ? (
               <div className="flex h-96 items-center justify-center rounded-md border text-sm text-destructive">
                 無法載入排程日曆，請確認帳號權限或稍後再試。
               </div>
@@ -959,12 +980,13 @@ export function OrdersCalendarDialog({
                 {selectedItems.length > 0 ? (
                   selectedItems.map((order) => {
                     const dragOrder = scheduledOrderById.get(order.id);
+                    const canDrag = canDragScheduledOrder(order, dragOrder, canManageSchedule);
                     return (
                       <OrderLine
                         key={order.id}
                         order={order}
                         {...(dragOrder ? { dragOrder } : {})}
-                        canDrag={canDragScheduledOrder(order, dragOrder, canManageSchedule)}
+                        canDrag={canDrag}
                         onDragStart={handleDragStart}
                         selected={selectedOrderIds.includes(order.id)}
                         onSelectedChange={updateSelectedOrder}
