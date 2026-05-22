@@ -63,6 +63,7 @@ def _make_order(
     order_number: str,
     deadline: date,
     quantity: int = 100,
+    assigned_to: uuid.UUID | None = None,
 ) -> Order:
     order = Order(
         order_number=order_number,
@@ -70,6 +71,7 @@ def _make_order(
         wafer_quantity=quantity,
         requested_delivery_date=deadline,
         created_by=creator_id,
+        assigned_to=assigned_to,
         status=OrderStatus.pending,
     )
     db.add(order)
@@ -257,6 +259,219 @@ def test_apply_schedule_with_empty_list_clears_snapshot(db_session: Session) -> 
     # Now clear.
     order_service.apply_schedule(db_session, [])
     assert not db_session.scalars(select(ScheduleDailyCapacity)).all()
+
+
+def test_apply_schedule_notifies_when_date_changes_from_null_to_set(
+    db_session: Session,
+) -> None:
+    """Promoting a pending order to scheduled (null → date) must create
+    one ``order_status_changed`` notification for ``order.created_by``.
+    First-time scheduling is exactly the case users want to know about.
+    """
+    from app.models.notification import Notification
+
+    creator = _make_user(db_session, username="notif-null-to-date")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-NOTIF-NEW",
+        deadline=date(2026, 7, 1),
+    )
+    # Sanity: order starts unscheduled (no scheduled_production_date).
+    assert order.scheduled_production_date is None
+
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 15), quantity=100)],
+    )
+
+    notifs = list(
+        db_session.scalars(
+            select(Notification)
+            .where(Notification.user_id == creator.id)
+            .where(Notification.order_id == order.id)
+        ).all()
+    )
+    assert len(notifs) == 1
+    assert notifs[0].type == "order_status_changed"
+    # Message should carry the new date so the notification-center row is
+    # self-contained (no click-through to find out which date).
+    assert "2026-06-15" in notifs[0].message
+    assert order.order_number in notifs[0].message
+
+
+def test_apply_schedule_notifies_when_date_changes_from_a_to_b(
+    db_session: Session,
+) -> None:
+    """Rescheduling an already-scheduled order (A → B) must create one
+    notification on the SECOND apply_schedule run. The first run is the
+    null→A promotion (also notifies); we filter to notifications created
+    after that to isolate the A→B case.
+    """
+    from app.models.notification import Notification
+
+    creator = _make_user(db_session, username="notif-a-to-b")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-NOTIF-RESCH",
+        deadline=date(2026, 7, 1),
+    )
+
+    # First apply: null → 6/15. Generates one "promoted" notification.
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 15), quantity=100)],
+    )
+    first_run_count = len(
+        list(
+            db_session.scalars(select(Notification).where(Notification.order_id == order.id)).all()
+        )
+    )
+    assert first_run_count == 1
+
+    # Second apply: 6/15 → 6/20. Must generate exactly one more notification
+    # with both old and new dates in the message.
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 20), quantity=100)],
+    )
+
+    all_notifs = list(
+        db_session.scalars(
+            select(Notification)
+            .where(Notification.order_id == order.id)
+            .order_by(Notification.created_at.asc())
+        ).all()
+    )
+    assert len(all_notifs) == 2
+    reschedule_msg = all_notifs[1].message
+    assert "2026-06-15" in reschedule_msg, "Old date missing from reschedule notification"
+    assert "2026-06-20" in reschedule_msg, "New date missing from reschedule notification"
+
+
+def test_apply_schedule_does_not_notify_when_date_unchanged(
+    db_session: Session,
+) -> None:
+    """Idempotent re-materialize (same scheduled_production_date as before)
+    must NOT create a duplicate notification. This is the core anti-spam
+    contract — every accepted compound triggers materialize_schedule_task,
+    most don't actually move any order's start date, so without this guard
+    the notification center floods with NxN redundant entries.
+    """
+    from app.models.notification import Notification
+
+    creator = _make_user(db_session, username="notif-unchanged")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-NOTIF-NOOP",
+        deadline=date(2026, 7, 1),
+    )
+
+    # First apply: null → 6/15. One "promoted" notification.
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 15), quantity=100)],
+    )
+
+    # Second apply: still 6/15 (same date, possibly different per-day split).
+    # Must not create a second notification.
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 15), quantity=60),
+            ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 16), quantity=40),
+        ],
+    )
+
+    notifs = list(
+        db_session.scalars(select(Notification).where(Notification.order_id == order.id)).all()
+    )
+    assert len(notifs) == 1, (
+        f"expected 1 notification (only the initial null→6/15 promotion), got {len(notifs)}: "
+        f"{[n.message for n in notifs]}"
+    )
+
+
+def test_apply_schedule_notifies_both_creator_and_assignee(db_session: Session) -> None:
+    """When ``assigned_to`` is set AND different from ``created_by``, both
+    users get the ``order_status_changed`` notification. Assignee owns
+    day-to-day production handling, so they need to know when the start
+    date moves; creator usually owns the customer relationship, so they
+    also need to know — both are legitimate stakeholders.
+    """
+    from app.models.notification import Notification
+
+    creator = _make_user(db_session, username="notif-creator")
+    assignee = _make_user(db_session, username="notif-assignee")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        assigned_to=assignee.id,
+        order_number="ORD-NOTIF-DUAL",
+        deadline=date(2026, 7, 1),
+    )
+
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 15), quantity=100)],
+    )
+
+    creator_notifs = list(
+        db_session.scalars(
+            select(Notification)
+            .where(Notification.user_id == creator.id)
+            .where(Notification.order_id == order.id)
+        ).all()
+    )
+    assignee_notifs = list(
+        db_session.scalars(
+            select(Notification)
+            .where(Notification.user_id == assignee.id)
+            .where(Notification.order_id == order.id)
+        ).all()
+    )
+    assert len(creator_notifs) == 1, "creator missed the notification"
+    assert len(assignee_notifs) == 1, "assignee missed the notification"
+    # Same message content for both — single source of truth for the
+    # status-changed event.
+    assert creator_notifs[0].message == assignee_notifs[0].message
+
+
+def test_apply_schedule_dedupes_when_creator_is_also_assignee(
+    db_session: Session,
+) -> None:
+    """When the order's creator self-assigned (``created_by == assigned_to``),
+    they must get exactly ONE notification, not two. Otherwise self-assigned
+    orders become twice as noisy as the rest for no reason.
+    """
+    from app.models.notification import Notification
+
+    creator = _make_user(db_session, username="notif-self-assigned")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        assigned_to=creator.id,  # self-assigned
+        order_number="ORD-NOTIF-SELF",
+        deadline=date(2026, 7, 1),
+    )
+
+    order_service.apply_schedule(
+        db_session,
+        [ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 15), quantity=100)],
+    )
+
+    notifs = list(
+        db_session.scalars(
+            select(Notification)
+            .where(Notification.user_id == creator.id)
+            .where(Notification.order_id == order.id)
+        ).all()
+    )
+    assert len(notifs) == 1, (
+        f"self-assigned order should produce exactly 1 notification, got {len(notifs)}"
+    )
 
 
 def test_get_capacity_usage_returns_continuous_horizon(db_session: Session) -> None:

@@ -1158,14 +1158,22 @@ worker 端的實作是「**每跑完一筆就重新挑下一筆**」而不是「
 
 `apply_schedule` 詳細流程：
 
-1. `order_repo.clear_scheduled_dates(db)` 一次性清空所有 `status='scheduled'` 訂單的 `scheduled_production_date` 與 `expected_delivery_date`
-2. 把同一張 order 跨多天的 `ScheduledResult` 折成 `(earliest, latest)`；**同一個 pass 累積 `daily_totals: dict[date, int]`**（per-day 所有訂單的 quantity 加總）
-3. 對每筆訂單在 **SAVEPOINT**（`db.begin_nested()`）內呼叫 `order_repo.set_schedule_dates(db, ...)` 寫回兩個日期、把 `status` 改為 `scheduled`；遇到 `StaleDataError` 就 `logger.warning("order.schedule.apply_stale_skipped", ...)` continue，**不毒到 outer transaction**
-4. 對每筆訂單**雙寫**稽核：
+1. **快照前一輪的 `scheduled_production_date`**（`prior_scheduled_dates: dict[order_id, date]`） — 用 `order_repo.get_scheduled(db)` 在 clear 之前先讀，給 step 7 通知判斷「日期是否真的改變」用。
+2. `order_repo.clear_scheduled_dates(db)` 一次性清空所有 `status='scheduled'` 訂單的 `scheduled_production_date` 與 `expected_delivery_date`
+3. 把同一張 order 跨多天的 `ScheduledResult` 折成 `(earliest, latest)`；**同一個 pass 累積 `daily_totals: dict[date, int]`**（per-day 所有訂單的 quantity 加總）
+4. 對每筆訂單在 **SAVEPOINT**（`db.begin_nested()`）內呼叫 `order_repo.set_schedule_dates(db, ...)` 寫回兩個日期、把 `status` 改為 `scheduled`；遇到 `StaleDataError` 就 `logger.warning("order.schedule.apply_stale_skipped", ...)` continue，**不毒到 outer transaction**。同時**條件式 enqueue 通知**：`prior_scheduled_dates.get(order_id) != earliest` 才把 `(creator, order_id, order_number, old_date, new_date)` 推進 `_notif_queue`
+5. 對每筆訂單**雙寫**稽核：
    - `audit_log_repo.create(db, ..., user_id=None, resource_type="order", resource_id=order_id, new_value={…})` 把一筆 row 寫進 `audit_logs` 資料表（與 commit 同 transaction），確保「這張訂單什麼時候被排到哪天」可以從 DB 直接查出（`docs/DEVELOPMENT_GUIDELINES.md §6` 對 user-visible mutation 的稽核要求 — 只寫 stdout 在 log shipper 掉資料時就找不到了）
    - `emit_audit_log(action="order.scheduled", actor_id=None, ...)` 額外發一筆 ECS-compliant stdout log 給 Kibana / Elastic
-5. `daily_cap_repo.replace_all(db, entries=daily_totals)` — truncate `schedule_daily_capacity` 後 bulk INSERT 30 row 以內的 per-day usage snapshot，供 `GET /schedule/capacity-usage` 讀取。**跟 audit log / per-order 寫入同 transaction commit**，不會出現「snapshot 跟 daily_breakdown 對不上」的中間狀態
-6. `db.commit()`（同時 flush DB 上面新增的 audit_log row + snapshot row）
+6. `daily_cap_repo.replace_all(db, entries=daily_totals)` — truncate `schedule_daily_capacity` 後 bulk INSERT 30 row 以內的 per-day usage snapshot，供 `GET /schedule/capacity-usage` 讀取。**跟 audit log / per-order 寫入同 transaction commit**，不會出現「snapshot 跟 daily_breakdown 對不上」的中間狀態
+7. `db.commit()`（同時 flush DB 上面新增的 audit_log row + snapshot row）
+8. **Commit 之後**逐筆消化 `_notif_queue`：呼叫 `notification_service.create_notification(type="order_status_changed", ...)`，寫進 `notifications` 表 + 透過既有 WS `notification.created` push 給收件人。**收件人 = `created_by` 必收 + `assigned_to`（若有設定且不等於 creator）**，self-assigned 訂單只通知一次。訊息含新舊日期 — null → date 用「已排定生產日期 YYYY-MM-DD」、A → B 用「生產日期已從 A 變更為 B」
+
+**為什麼通知要先比較舊日期**（防 spam）：fast/slow path 拆分後，每筆 compound 被 accept 都會觸發一次 `materialize_schedule_task`，每次 task 跑完整 `apply_schedule`。如果無條件對每筆 `status='scheduled'` 訂單都 emit `order_status_changed` 通知 — 一個 user 連續改 5 個 PATCH，他自己訂單的通知中心就 5 × N 筆，其他 user 的也跟著被洗版。Step 1 在 clear 之前快照 `prior_scheduled_dates`、step 4 只在 `old != new` 才 enqueue — 把通知收斂成「真的影響到 user-visible production date 的事件」。null → date 算「首次排定」也算改變（user 想知道）；A → B 也算（這是核心場景）；A → A 不通知（idempotent re-materialize）。
+
+**為什麼通知 creator 跟 assignee 都送、self-assigned 要 de-dup**：creator 通常 owns customer relationship（訂單上游、跟客戶承諾交期的人），assignee owns day-to-day production handling（產線上實際排產的人）— 兩個都是合法 stakeholder，少通知任何一邊都會有人錯過。但 self-assigned（`created_by == assigned_to`）佔比不低（小團隊很常見），如果不 de-dup 這些訂單就會比別人吵兩倍，沒道理。判斷規則：`recipients = [created_by] + ([assigned_to] if assigned_to is not None and assigned_to != created_by else [])`。
+
+**為什麼 step 8 要在 commit 之後**：`notification_service.create_notification` 內部會 `db.commit()` 自己那筆 row（notifications 表獨立 transaction），然後 best-effort 呼叫 `notify_user` 走 Redis pub/sub。如果在 step 4-7 還在 outer transaction 時就 emit notification、外面的 transaction 又因為其他原因 rollback（譬如 step 6 的 snapshot write 撞錯），會出現「通知說 X 訂單變了，但 DB 沒寫成」的鬼影通知。後 commit 後 emit 保證**通知出現的時候 DB 一定已落地**。
 
 **為什麼 step 3 要 SAVEPOINT**（Bug 2 修法）：`set_schedule_dates` 對單筆訂單做 `UPDATE` 時可能撞到 `StaleDataError`（樂觀鎖：worker 上次讀的 `version_id` 已被 producer 端 PATCH bump 過）。原本只有一道 outer transaction，任何一筆訂單 raise 都會把 session 推進 `PendingRollbackError` 狀態 — **後續所有訂單的寫入都會被拒、加上 audit log 也寫不進去**。`rebuild_schedule_task` 觸發完整 apply_schedule 時，這個失敗模式在 bombard 場景偶爾出現：一筆 stale 整批毀。
 
