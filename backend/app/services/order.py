@@ -1003,7 +1003,7 @@ def list_for_scheduler(
     return orders, creators
 
 
-def apply_schedule(
+def apply_schedule(  # noqa: PLR0912 — orchestration: each branch is one well-named step
     db: Session,
     scheduled: list[ScheduledResult],
     pinned: dict[uuid.UUID, date] | None = None,
@@ -1024,6 +1024,21 @@ def apply_schedule(
 
     Returns the number of orders that were marked as scheduled.
     """
+    # Capture the pre-materialize ``scheduled_production_date`` for every
+    # ``status='scheduled'`` order BEFORE ``clear_scheduled_dates`` wipes
+    # them to NULL. This lets the per-order loop below tell "real schedule
+    # change" apart from "re-materialize with the same dates" — the
+    # notification spam that fired ``order_status_changed`` on every
+    # materialize even when nothing actually moved.
+    #
+    # Orders not in this map (newly-promoted from pending, or with a NULL
+    # date) get ``None`` from ``.get()`` — treated as "first-time schedule"
+    # which always counts as a change worth notifying.
+    prior_scheduled_dates: dict[uuid.UUID, date] = {
+        row.id: row.scheduled_production_date
+        for row in order_repo.get_scheduled(db)
+        if row.scheduled_production_date is not None
+    }
     order_repo.clear_scheduled_dates(db)
     pinned_map = pinned or {}
 
@@ -1043,8 +1058,10 @@ def apply_schedule(
     # always a single atomic projection of the just-applied schedule
     # rather than incremental upserts (see repo docstring for why).
     daily_totals: dict[date, int] = {}
-    # Collect data for notifications before commit; attributes expire after commit.
-    _notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, str]] = []
+    # Collect data for notifications before commit; attributes expire after
+    # commit. Tuple shape: (recipient_user_id, order_id, order_number,
+    # old_date, new_date) — old_date is None for first-time-scheduled orders.
+    _notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, date | None, date]] = []
     for order_id, results in per_order.items():
         results.sort(key=lambda x: x.scheduled_date)
         earliest = results[0].scheduled_date
@@ -1097,9 +1114,35 @@ def apply_schedule(
                     )
                     continue
                 applied += 1
-                _notif_queue.append(
-                    (order.created_by, order.id, order.order_number, order.status.value)
-                )
+                # Only notify when the user-visible production date actually
+                # moves. Re-materialize-with-same-dates (the common case after
+                # every accepted compound, due to fast/slow split) must not
+                # flood the user's notification center.
+                #
+                # ``None`` in ``prior`` means the order wasn't in
+                # ``status='scheduled'`` before this materialize — either a
+                # fresh promotion from ``pending`` or a return from
+                # ``cancelled``. Both count as "first-time scheduled" and
+                # always notify.
+                old_scheduled_date = prior_scheduled_dates.get(order_id)
+                if old_scheduled_date != earliest:
+                    # Recipients: order.created_by always; order.assigned_to
+                    # also when set and different from creator (de-dup so a
+                    # creator who self-assigned doesn't get the same
+                    # notification twice).
+                    recipients: list[uuid.UUID] = [order.created_by]
+                    if order.assigned_to is not None and order.assigned_to != order.created_by:
+                        recipients.append(order.assigned_to)
+                    for recipient_id in recipients:
+                        _notif_queue.append(
+                            (
+                                recipient_id,
+                                order.id,
+                                order.order_number,
+                                old_scheduled_date,
+                                earliest,
+                            )
+                        )
                 # Read status from the refreshed row, not a hard-coded constant —
                 # ``set_schedule_dates`` preserves ``in_production`` (see its
                 # docstring for why), so an in-production order being
@@ -1150,14 +1193,25 @@ def apply_schedule(
         snapshot_days=len(daily_totals),
     )
 
-    for notif_user_id, notif_order_id, order_number, status_val in _notif_queue:
+    for notif_user_id, notif_order_id, order_number, old_date, new_date in _notif_queue:
+        # Two message templates so the user-facing wording stays natural in
+        # both "first-time scheduled" and "rescheduled" cases. Both include
+        # the order number + the new date so the notification center entry
+        # is self-contained without clicking through.
+        if old_date is None:
+            message = f"訂單 {order_number} 已排定生產日期 {new_date.isoformat()}"
+        else:
+            message = (
+                f"訂單 {order_number} 生產日期已從 "
+                f"{old_date.isoformat()} 變更為 {new_date.isoformat()}"
+            )
         try:
             notification_service.create_notification(
                 db,
                 user_id=notif_user_id,
                 order_id=notif_order_id,
                 type="order_status_changed",
-                message=f"訂單 {order_number} 狀態已變更為 {status_val}",
+                message=message,
             )
         except Exception:
             logger.warning(
