@@ -137,6 +137,8 @@ function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): 
 // (capacity query still loading / errored), every row collapses to `scheduled`
 // so the UI never quietly falls back to the client clock — that fallback
 // would re-introduce the timezone bug this view was rewritten to avoid.
+// so the UI never falls back to the client clock — that fallback would re-
+// introduce the timezone bug this view was rewritten to avoid.
 function groupByProductionDate(
   items: ScheduleResult[],
   baseDate: string | undefined,
