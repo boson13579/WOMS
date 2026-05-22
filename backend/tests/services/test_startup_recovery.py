@@ -196,6 +196,38 @@ def test_recovery_skips_advance_day_when_base_date_already_today(
     tasks["rebuild"].delay.assert_not_called()
 
 
+def test_recovery_does_not_advance_when_base_date_is_in_future(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Clock-skew defensive path: a peer replica with a fast NTP clock
+    wrote ``base_date = tomorrow`` to state. Recovery must NOT auto-advance
+    (would over-roll the calendar past today across the fleet) and must
+    NOT rebuild (state may be intentional). Should just log a warning
+    and fall through to the orphan-pending sweep — which is safe under
+    either calendar direction.
+    """
+    import logging
+
+    tasks = _patch_tasks(monkeypatch)
+    tomorrow = _today() + timedelta(days=1)
+    state = SchedulerState.initial(tomorrow)
+    redis_client.set(STATE_KEY, state.to_json())
+
+    with caplog.at_level(logging.WARNING, logger="app.services.startup_recovery"):
+        run_startup_recovery()
+
+    tasks["advance"].delay.assert_not_called()
+    tasks["rebuild"].delay.assert_not_called()
+    # The warning must surface so ops can investigate NTP / replica drift.
+    assert any(
+        "base_date_in_future" in record.getMessage()
+        or record.__dict__.get("event") == "schedule.startup_recovery.base_date_in_future"
+        for record in caplog.records
+    )
+
+
 # ---------------------------------------------------------------------------
 # orphan pending_ops → kick run_scheduling_task
 # ---------------------------------------------------------------------------
