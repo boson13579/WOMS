@@ -1,10 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-/* eslint-disable @typescript-eslint/no-unsafe-argument */
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
-/* eslint-disable @typescript-eslint/no-unsafe-call */
-/* eslint-disable @typescript-eslint/no-unsafe-return */
-/* eslint-disable func-names */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -171,30 +164,13 @@ const splitScheduledOrder: ScheduleResult = {
 };
 
 describe('OrdersCalendarDialog', () => {
-  let mockSystemDate = new Date('2026-05-09T00:00:00Z');
-
   beforeEach(() => {
     vi.clearAllMocks();
-    mockSystemDate = new Date('2026-05-09T00:00:00Z');
-    const OriginalDate = global.Date;
-    const mockDateSpy = vi.spyOn(global, 'Date').mockImplementation(function (
-      this: any,
-      ...args: any[]
-    ) {
-      if (args.length === 0) {
-        return mockSystemDate;
-      }
-      return new (OriginalDate as any)(...args);
-    } as any);
-
-    // Copy all static properties of OriginalDate onto the spy wrapper!
-    Object.getOwnPropertyNames(OriginalDate).forEach((key) => {
-      if (key !== 'length' && key !== 'name' && key !== 'prototype') {
-        (mockDateSpy as any)[key] = (OriginalDate as any)[key];
-      }
-    });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-05-09T00:00:00Z'));
 
     mockRole.value = 'scheduler';
+    mockScheduleCapacity.data.base_date = '2026-05-09';
     mockScheduleResult.data = [scheduledOrder];
     mockScheduleResult.isPending = false;
     mockScheduleResult.isError = false;
@@ -213,7 +189,7 @@ describe('OrdersCalendarDialog', () => {
   });
 
   afterEach(() => {
-    vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it('renders scheduled orders on their production date', async () => {
@@ -241,7 +217,7 @@ describe('OrdersCalendarDialog', () => {
   it('shows split production progress across production dates', async () => {
     const user = userEvent.setup();
     mockScheduleResult.data = [splitScheduledOrder];
-    mockSystemDate = new Date('2026-05-10T00:00:00Z');
+    mockScheduleCapacity.data.base_date = '2026-05-10';
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-10/ }));
@@ -260,11 +236,23 @@ describe('OrdersCalendarDialog', () => {
   it('shows split production as completed when base_date is past the final production date', async () => {
     const user = userEvent.setup();
     mockScheduleResult.data = [splitScheduledOrder];
-    mockSystemDate = new Date('2026-05-12T00:00:00Z');
+    mockScheduleCapacity.data.base_date = '2026-05-12';
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
     expect(screen.getByText('已完成')).toBeInTheDocument();
+  });
+
+  it('uses server base_date instead of the client clock for production state', async () => {
+    const user = userEvent.setup();
+    vi.setSystemTime(new Date('2026-05-12T00:00:00Z'));
+    mockScheduleCapacity.data.base_date = '2026-05-10';
+    mockScheduleResult.data = [splitScheduledOrder];
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
+
+    expect(screen.getByText('已排程')).toBeInTheDocument();
   });
 
   it('displays a padlock icon for production-active or pinned orders', async () => {
@@ -272,7 +260,24 @@ describe('OrdersCalendarDialog', () => {
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
-    expect(screen.getByTitle('生產中/處理鎖定中')).toBeInTheDocument();
+    expect(screen.getByLabelText('處理鎖定中')).toBeInTheDocument();
+  });
+
+  it('does not drag a scheduled calendar item when the canonical order record is not loaded', () => {
+    mockScheduledOrders.data = { items: [], total: 0, page: 1, page_size: 100 };
+    renderDialog();
+
+    const dragData = new Map<string, string>();
+    const dataTransfer = {
+      effectAllowed: '',
+      dropEffect: '',
+      setData: vi.fn((type: string, value: string) => dragData.set(type, value)),
+      getData: vi.fn((type: string) => dragData.get(type) ?? ''),
+    } as unknown as DataTransfer;
+
+    fireEvent.dragStart(screen.getByText('ORD-20260504-0001'), { dataTransfer });
+
+    expect(dataTransfer.setData).not.toHaveBeenCalled();
   });
 
   it('can navigate between months', async () => {
