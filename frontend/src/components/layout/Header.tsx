@@ -65,7 +65,11 @@ export function Header({
       >
         <Menu className="h-5 w-5" />
         {unreadCount > 0 && (
-          <span className="absolute right-1.5 top-1.5 flex h-2 w-2 rounded-full bg-rose-500 ring-2 ring-background animate-pulse" />
+          <span
+            aria-label={`${unreadCount} unread notifications`}
+            aria-live="polite"
+            className="absolute right-1.5 top-1.5 flex h-2 w-2 rounded-full bg-rose-500 ring-2 ring-background animate-pulse"
+          />
         )}
       </Button>
       <div className="min-w-0 flex-1">

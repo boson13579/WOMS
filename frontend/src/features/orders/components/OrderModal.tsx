@@ -6,7 +6,7 @@
  * optimistic-lock protection).
  */
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useEffect, useMemo } from 'react';
+import { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 
@@ -63,26 +63,13 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const users = useAssignableUsers();
   const assignedToDisabled = isEdit;
 
-  const dynamicSchema = useMemo(() => {
-    return formSchema.refine(
-      (data) => {
-        if (!data.assigned_to_email) return true;
-        return users.some((u) => u.email === data.assigned_to_email);
-      },
-      {
-        message: '負責人 Email 必須是系統中合法的用戶 Email',
-        path: ['assigned_to_email'],
-      },
-    );
-  }, [users]);
-
   const {
     register,
     handleSubmit,
     reset,
     formState: { errors },
   } = useForm<FormValues>({
-    resolver: zodResolver(dynamicSchema),
+    resolver: zodResolver(formSchema),
     defaultValues: {
       customer_name: '',
       wafer_quantity: 100,

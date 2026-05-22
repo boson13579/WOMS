@@ -735,7 +735,7 @@ export function OrdersCalendarDialog({
                               order.status === 'scheduled' &&
                               order.productionState !== 'in_progress' &&
                               draggableOrder !== undefined &&
-                              draggableOrder?.is_processing_locked !== true;
+                              !draggableOrder.is_processing_locked;
                             return (
                               <div
                                 key={order.id}
@@ -927,7 +927,7 @@ export function OrdersCalendarDialog({
                           order.status === 'scheduled' &&
                           order.productionState !== 'in_progress' &&
                           dragOrder !== undefined &&
-                          dragOrder?.is_processing_locked !== true
+                          !dragOrder.is_processing_locked
                         }
                         onDragStart={handleDragStart}
                         selected={selectedOrderIds.includes(order.id)}

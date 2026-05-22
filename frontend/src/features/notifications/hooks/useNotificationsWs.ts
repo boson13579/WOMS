@@ -7,6 +7,12 @@ import { useCurrentUser } from '@/lib/auth';
 
 import { notificationKeys } from '../api/notifications';
 
+const WS_PATH = '/api/v1/ws';
+const RECONNECT_INITIAL_MS = 1_000;
+const RECONNECT_MAX_MS = 30_000;
+const WS_CLOSE_NORMAL = 1000;
+const WS_CLOSE_AUTH_FAILED = 4401;
+
 const wsEnvelopeSchema = z
   .object({
     type: z.string(),
@@ -22,18 +28,26 @@ const wsEnvelopeSchema = z
   })
   .passthrough();
 
+function buildWsUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}${WS_PATH}`;
+}
+
 export function useNotificationsWs(): void {
   const user = useCurrentUser();
+  const userId = user?.id;
   const qc = useQueryClient();
 
   useEffect(() => {
-    if (!user) return undefined;
+    if (!userId) return undefined;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${window.location.host}/api/v1/ws`;
-    const ws = new WebSocket(url);
+    let stopped = false;
+    let isFirstOpen = true;
+    let backoffMs = RECONNECT_INITIAL_MS;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    ws.onmessage = (evt: MessageEvent<string>) => {
+    function handleMessage(evt: MessageEvent<string>): void {
       let env: z.infer<typeof wsEnvelopeSchema>;
       try {
         env = wsEnvelopeSchema.parse(JSON.parse(evt.data));
@@ -51,10 +65,45 @@ export function useNotificationsWs(): void {
           duration: 5000,
         });
       }
-    };
+    }
+
+    function connect(): void {
+      if (stopped) return;
+      ws = new WebSocket(buildWsUrl());
+
+      ws.onopen = () => {
+        backoffMs = RECONNECT_INITIAL_MS;
+        if (!isFirstOpen) {
+          void qc.invalidateQueries({ queryKey: notificationKeys.all });
+        }
+        isFirstOpen = false;
+      };
+
+      ws.onmessage = handleMessage;
+
+      ws.onerror = () => {
+        // Let onclose decide whether to reconnect. Some browsers fire
+        // both events for the same failed socket.
+      };
+
+      ws.onclose = (event: CloseEvent) => {
+        if (stopped) return;
+        if (event.code === WS_CLOSE_AUTH_FAILED || event.code === WS_CLOSE_NORMAL) return;
+
+        reconnectTimer = setTimeout(connect, backoffMs);
+        backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
+      };
+    }
+
+    connect();
 
     return () => {
-      ws.close();
+      stopped = true;
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      ws?.close();
     };
-  }, [user, qc]);
+  }, [userId, qc]);
 }

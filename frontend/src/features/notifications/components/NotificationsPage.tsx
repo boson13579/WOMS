@@ -8,7 +8,7 @@ import {
   Lock,
   XCircle,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { toast } from 'sonner';
 
 import { Header } from '@/components/layout/Header';
@@ -73,9 +73,6 @@ export function NotificationsPage(): JSX.Element {
     all: activeTab === 'all',
   });
 
-  // Fetch unread count exclusively for total header count
-  const { data: unreadData } = useNotifications({ all: false });
-
   // Mutations
   const markRead = useMarkNotificationRead();
   const markAllRead = useMarkAllNotificationsRead();
@@ -104,8 +101,8 @@ export function NotificationsPage(): JSX.Element {
     });
   };
 
-  const listItems = notificationsData?.items ?? [];
-  const unreadCount = unreadData?.total ?? 0;
+  const listItems = useMemo(() => notificationsData?.items ?? [], [notificationsData?.items]);
+  const unreadCount = useMemo(() => listItems.filter((item) => !item.is_read).length, [listItems]);
 
   // Icon selector based on notification type
   const getNotificationIcon = (type: string): JSX.Element => {

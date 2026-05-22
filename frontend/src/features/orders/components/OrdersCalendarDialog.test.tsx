@@ -268,16 +268,17 @@ describe('OrdersCalendarDialog', () => {
     renderDialog();
 
     const dragData = new Map<string, string>();
+    const setData = vi.fn((type: string, value: string) => dragData.set(type, value));
     const dataTransfer = {
       effectAllowed: '',
       dropEffect: '',
-      setData: vi.fn((type: string, value: string) => dragData.set(type, value)),
+      setData,
       getData: vi.fn((type: string) => dragData.get(type) ?? ''),
     } as unknown as DataTransfer;
 
     fireEvent.dragStart(screen.getByText('ORD-20260504-0001'), { dataTransfer });
 
-    expect(dataTransfer.setData).not.toHaveBeenCalled();
+    expect(setData).not.toHaveBeenCalled();
   });
 
   it('can navigate between months', async () => {

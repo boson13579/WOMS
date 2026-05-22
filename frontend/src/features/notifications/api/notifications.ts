@@ -34,7 +34,8 @@ const notificationListSchema = z.object({
 
 export const notificationKeys = {
   all: ['notifications'] as const,
-  list: (all: boolean) => ['notifications', 'list', { all }] as const,
+  list: (all: boolean, userId: string | undefined) =>
+    ['notifications', 'list', { all, userId }] as const,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,14 +51,15 @@ export function useNotifications(
 ): ReturnType<typeof useQuery<NotificationListResponse>> {
   const user = useCurrentUser();
   const allVal = params.all ?? false;
+  const userId = user?.id;
 
   return useQuery<NotificationListResponse>({
-    queryKey: notificationKeys.list(allVal),
+    queryKey: notificationKeys.list(allVal, userId),
     queryFn: () =>
       apiFetch(`/api/v1/notifications?all=${allVal}`, { credentials: 'include' }, (d) =>
         notificationListSchema.parse(d),
       ),
-    enabled: Boolean(user),
+    enabled: Boolean(userId),
   });
 }
 

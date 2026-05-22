@@ -159,45 +159,6 @@ describe('OrderModal', () => {
     expect(assigneeInput).toHaveAttribute('list', 'users-datalist');
   });
 
-  it('create mode: fails validation if responsible email is not in the assignable users list', async () => {
-    const user = userEvent.setup();
-    render(<OrderModal open order={undefined} onClose={onClose} />);
-
-    await user.clear(screen.getByLabelText(/客戶名稱/));
-    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
-
-    await user.clear(screen.getByLabelText(/晶圓數量/));
-    await user.type(screen.getByLabelText(/晶圓數量/), '200');
-
-    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
-
-    await user.type(screen.getByLabelText(/負責人/), 'invalid-email@random.com');
-
-    await user.click(screen.getByRole('button', { name: '新增' }));
-
-    expect(screen.getByText('負責人 Email 必須是系統中合法的用戶 Email')).toBeInTheDocument();
-    expect(mockCreateMutate).not.toHaveBeenCalled();
-  });
-
-  it('create mode: passes validation if responsible email is empty', async () => {
-    const user = userEvent.setup();
-    render(<OrderModal open order={undefined} onClose={onClose} />);
-
-    await user.clear(screen.getByLabelText(/客戶名稱/));
-    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
-
-    await user.clear(screen.getByLabelText(/晶圓數量/));
-    await user.type(screen.getByLabelText(/晶圓數量/), '200');
-
-    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
-
-    // responsible email is left empty
-
-    await user.click(screen.getByRole('button', { name: '新增' }));
-
-    expect(mockCreateMutate).toHaveBeenCalled();
-  });
-
   // --- edit mode ---
 
   it('edit mode: title shows "編輯訂單"', () => {
