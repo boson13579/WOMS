@@ -132,9 +132,13 @@ function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): 
     .reduce((total, assignment) => total + assignment.quantity, 0);
 }
 
+// `baseDate` is the server's production "today" anchor. When it is undefined
+// (capacity query still loading / errored), every row collapses to `scheduled`
+// so the UI never quietly falls back to the client clock — that fallback
+// would re-introduce the timezone bug this view was rewritten to avoid.
 function groupByProductionDate(
   items: ScheduleResult[],
-  baseDate: string,
+  baseDate: string | undefined,
 ): Record<string, ProductionCalendarItem[]> {
   return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
     item.daily_breakdown.forEach((assignment) => {
@@ -142,10 +146,14 @@ function groupByProductionDate(
 
       let productionState: 'complete' | 'in_progress' | 'scheduled';
 
-      if (assignment.date < baseDate) {
-        productionState = 'complete';
+      if (baseDate === undefined) {
+        productionState = 'scheduled';
       } else if (assignment.date > baseDate) {
         productionState = 'scheduled';
+      } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
+        // Only the final past row of a fulfilled order earns the "complete"
+        // badge; earlier daily slices of a multi-day split stay in_progress.
+        productionState = 'complete';
       } else {
         productionState = 'in_progress';
       }
@@ -161,6 +169,20 @@ function groupByProductionDate(
     });
     return acc;
   }, {});
+}
+
+function canDragScheduledOrder(
+  order: ProductionCalendarItem,
+  dragOrder: DraggableOrder | undefined,
+  canManageSchedule: boolean,
+): boolean {
+  return (
+    canManageSchedule &&
+    order.status === 'scheduled' &&
+    order.productionState !== 'in_progress' &&
+    dragOrder !== undefined &&
+    !dragOrder.is_processing_locked
+  );
 }
 
 function capacityTone(remaining: number, dailyCapacity: number): string {
@@ -353,11 +375,7 @@ export function OrdersCalendarDialog({
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
   const grouped = useMemo(
-    () =>
-      groupByProductionDate(
-        scheduleResult.data ?? [],
-        scheduleCapacity.data?.base_date ?? dateKey(new Date()),
-      ),
+    () => groupByProductionDate(scheduleResult.data ?? [], scheduleCapacity.data?.base_date),
     [scheduleResult.data, scheduleCapacity.data?.base_date],
   );
   const filteredGrouped = useMemo(() => {
@@ -582,9 +600,33 @@ export function OrdersCalendarDialog({
           order.is_pinned && order.pinned_production_date === targetByOrderId.get(order.id),
       )
     ) {
-      activeOperation.targets.forEach((target) => {
-        toast.success(`訂單 ${target.orderNumber} 已更改日期至 ${target.targetDate}`);
-      });
+      // One coalesced toast instead of N — bulk operations were spraying a
+      // toast per affected order and competing with the on-screen pending /
+      // active-operation cards that already enumerate each target.
+      const { targets } = activeOperation;
+      toast.success(
+        targets.length === 1
+          ? `訂單 ${targets[0].orderNumber} 已更改日期至 ${targets[0].targetDate}`
+          : `${targets.length} 筆訂單已套用排程`,
+        targets.length > 1
+          ? {
+              description: (
+                <div className="mt-2 space-y-1.5">
+                  {targets.map((target) => (
+                    <div key={target.orderId} className="flex flex-col gap-0.5">
+                      <span className="font-mono text-[11px] font-semibold text-foreground">
+                        {target.orderNumber}
+                      </span>
+                      <span className="text-[10px] text-muted-foreground">
+                        套用至: {target.targetDate}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ),
+            }
+          : undefined,
+      );
       setActiveOperation(null);
       setOperationError(null);
       return;
@@ -730,12 +772,11 @@ export function OrdersCalendarDialog({
                         <div className="space-y-1">
                           {items.slice(0, MAX_ITEMS_PER_DAY).map((order) => {
                             const draggableOrder = scheduledOrderById.get(order.id);
-                            const isDraggable =
-                              canManageSchedule &&
-                              order.status === 'scheduled' &&
-                              order.productionState !== 'in_progress' &&
-                              draggableOrder !== undefined &&
-                              !draggableOrder.is_processing_locked;
+                            const isDraggable = canDragScheduledOrder(
+                              order,
+                              draggableOrder,
+                              canManageSchedule,
+                            );
                             return (
                               <div
                                 key={order.id}
@@ -922,13 +963,7 @@ export function OrdersCalendarDialog({
                         key={order.id}
                         order={order}
                         {...(dragOrder ? { dragOrder } : {})}
-                        canDrag={
-                          canManageSchedule &&
-                          order.status === 'scheduled' &&
-                          order.productionState !== 'in_progress' &&
-                          dragOrder !== undefined &&
-                          !dragOrder.is_processing_locked
-                        }
+                        canDrag={canDragScheduledOrder(order, dragOrder, canManageSchedule)}
                         onDragStart={handleDragStart}
                         selected={selectedOrderIds.includes(order.id)}
                         onSelectedChange={updateSelectedOrder}

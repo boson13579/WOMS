@@ -33,33 +33,33 @@ function getNotificationLabel(type: string): string {
 }
 
 function formatRelativeTime(dateStr: string): string {
-  try {
-    const date = new Date(dateStr);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    if (diffMs < 0) return '剛剛';
+  // `new Date('garbage')` returns Invalid Date rather than throwing, so the
+  // previous try/catch was dead code. Check getTime() for NaN instead.
+  const date = new Date(dateStr);
+  if (Number.isNaN(date.getTime())) return '未知時間';
 
-    const diffMins = Math.floor(diffMs / 60000);
-    if (diffMins < 1) return '剛剛';
-    if (diffMins < 60) return `${diffMins} 分鐘前`;
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  if (diffMs < 0) return '剛剛';
 
-    const diffHours = Math.floor(diffMins / 60);
-    if (diffHours < 24) return `${diffHours} 小時前`;
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return '剛剛';
+  if (diffMins < 60) return `${diffMins} 分鐘前`;
 
-    const diffDays = Math.floor(diffHours / 24);
-    if (diffDays === 1) return '昨天';
-    if (diffDays < 7) return `${diffDays} 天前`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours} 小時前`;
 
-    return date.toLocaleString('zh-TW', {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  } catch {
-    return '未知時間';
-  }
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays === 1) return '昨天';
+  if (diffDays < 7) return `${diffDays} 天前`;
+
+  return date.toLocaleString('zh-TW', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 export function NotificationsPage(): JSX.Element {

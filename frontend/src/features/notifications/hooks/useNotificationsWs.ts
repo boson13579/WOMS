@@ -12,6 +12,10 @@ const RECONNECT_INITIAL_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 const WS_CLOSE_NORMAL = 1000;
 const WS_CLOSE_AUTH_FAILED = 4401;
+// Window used to coalesce toasts when a scheduler run bursts several
+// notification.created events together — one "N 則新通知" toast reads
+// better than N stacked ones.
+const TOAST_COALESCE_MS = 500;
 
 const wsEnvelopeSchema = z
   .object({
@@ -46,6 +50,23 @@ export function useNotificationsWs(): void {
     let backoffMs = RECONNECT_INITIAL_MS;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingMessages: string[] = [];
+    let toastTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function flushPendingToasts(): void {
+      const msgs = pendingMessages;
+      pendingMessages = [];
+      toastTimer = null;
+      if (msgs.length === 0) return;
+      if (msgs.length === 1) {
+        toast.info('新通知', { description: msgs[0], duration: 5000 });
+        return;
+      }
+      toast.info(`${msgs.length} 則新通知`, {
+        description: msgs[0],
+        duration: 5000,
+      });
+    }
 
     function handleMessage(evt: MessageEvent<string>): void {
       let env: z.infer<typeof wsEnvelopeSchema>;
@@ -59,11 +80,11 @@ export function useNotificationsWs(): void {
         // Invalidate all notifications queries to update badge count and list instantly
         void qc.invalidateQueries({ queryKey: notificationKeys.all });
 
-        // Show a premium real-time toast alert
-        toast.info('新通知', {
-          description: env.data.message,
-          duration: 5000,
-        });
+        // Coalesce bursts (e.g. a scheduler run touching several orders) into
+        // a single toast — see TOAST_COALESCE_MS.
+        pendingMessages.push(env.data.message);
+        if (toastTimer !== null) clearTimeout(toastTimer);
+        toastTimer = setTimeout(flushPendingToasts, TOAST_COALESCE_MS);
       }
     }
 
@@ -102,6 +123,10 @@ export function useNotificationsWs(): void {
       if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
+      }
+      if (toastTimer !== null) {
+        clearTimeout(toastTimer);
+        toastTimer = null;
       }
       ws?.close();
     };

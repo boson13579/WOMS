@@ -36,7 +36,10 @@ export function Header({
   const logout = useAuthStore((state) => state.logout);
   const openMobileNav = useMobileNavStore((state) => state.setOpen);
 
-  // Fetch unread count for notifications badge indicator
+  // Backend contract: when called with `all=false`, the `/api/v1/notifications`
+  // endpoint returns only unread items and `total` is the unread count. The
+  // sidebar relies on the same field; if that contract ever changes, both
+  // callers need to switch to counting `items` (and re-evaluate pagination).
   const { data: unreadData } = useNotifications({ all: false });
   const unreadCount = unreadData?.total ?? 0;
 

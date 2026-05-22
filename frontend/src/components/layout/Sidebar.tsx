@@ -111,7 +111,9 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
   const showObservability = role === 'scheduler' || role === 'root';
   const showAuditLog = role === 'root';
 
-  // Fetch unread count for notifications badge
+  // Backend contract: when called with `all=false`, `total` is the unread
+  // count (see Header.tsx for the same assumption). Switch to counting
+  // `items` if that contract ever changes.
   const { data: unreadData } = useNotifications({ all: false });
   const unreadCount = unreadData?.total ?? 0;
 

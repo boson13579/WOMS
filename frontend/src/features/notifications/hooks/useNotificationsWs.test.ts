@@ -132,10 +132,42 @@ describe('useNotificationsWs', () => {
       },
     });
 
+    // Invalidate fires immediately so the badge updates without waiting
+    // for the coalesce window, but the toast is debounced.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: notificationKeys.all });
+    expect(toast.info).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(500);
     expect(toast.info).toHaveBeenCalledWith(
-      expect.any(String),
+      '新通知',
       expect.objectContaining({ description: 'Order date changed' }),
+    );
+  });
+
+  it('coalesces a burst of notification.created into a single toast', () => {
+    renderNotificationsWs();
+
+    const socket = latestSocket();
+    for (let i = 0; i < 3; i += 1) {
+      socket.fireMessage({
+        type: 'notification.created',
+        data: {
+          id: `11111111-1111-4111-8111-11111111111${i}`,
+          type: 'order_status_changed',
+          message: `msg ${i}`,
+          is_read: false,
+          created_at: '2026-05-21T00:00:00.000Z',
+        },
+      });
+    }
+
+    expect(toast.info).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(500);
+
+    expect(toast.info).toHaveBeenCalledTimes(1);
+    expect(toast.info).toHaveBeenCalledWith(
+      '3 則新通知',
+      expect.objectContaining({ description: 'msg 0' }),
     );
   });
 
