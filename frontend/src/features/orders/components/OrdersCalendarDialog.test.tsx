@@ -2,8 +2,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { ScheduleCapacity } from '../api/scheduleCapacity';
 import type { Order, ScheduleResult } from '../types';
 
 import { OrdersCalendarDialog } from './OrdersCalendarDialog';
@@ -23,7 +24,9 @@ const mockScheduleCapacity = {
       { date: '2026-05-10', cumulative_remaining: 2500 },
       { date: '2026-05-11', cumulative_remaining: 2500 },
     ],
-  },
+  } as ScheduleCapacity | undefined,
+  isPending: false,
+  isError: false,
 };
 
 const mockOrders = {
@@ -100,6 +103,13 @@ function renderDialog(): void {
   render(<OrdersCalendarDialog open onOpenChange={vi.fn()} />, { wrapper: makeWrapper() });
 }
 
+function setServerBaseDate(baseDate: string): void {
+  if (!mockScheduleCapacity.data) {
+    throw new Error('mockScheduleCapacity.data must be defined before setting base_date');
+  }
+  mockScheduleCapacity.data = { ...mockScheduleCapacity.data, base_date: baseDate };
+}
+
 const scheduledOrder: ScheduleResult = {
   id: '11111111-1111-4111-8111-111111111111',
   order_number: 'ORD-20260504-0001',
@@ -166,7 +176,21 @@ const splitScheduledOrder: ScheduleResult = {
 describe('OrdersCalendarDialog', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-05-09T00:00:00Z'));
+
     mockRole.value = 'scheduler';
+    mockScheduleCapacity.data = {
+      base_date: '2026-05-09',
+      daily_capacity: 2500,
+      entries: [
+        { date: '2026-05-09', cumulative_remaining: 1500 },
+        { date: '2026-05-10', cumulative_remaining: 2500 },
+        { date: '2026-05-11', cumulative_remaining: 2500 },
+      ],
+    };
+    mockScheduleCapacity.isPending = false;
+    mockScheduleCapacity.isError = false;
     mockScheduleResult.data = [scheduledOrder];
     mockScheduleResult.isPending = false;
     mockScheduleResult.isError = false;
@@ -184,6 +208,10 @@ describe('OrdersCalendarDialog', () => {
     });
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('renders scheduled orders on their production date', async () => {
     const user = userEvent.setup();
     renderDialog();
@@ -194,7 +222,7 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getAllByText('ORD-20260504-0001').length).toBeGreaterThan(0);
     expect(screen.getByText(/TSMC/)).toBeInTheDocument();
     expect(screen.getByText(/今日 500/)).toBeInTheDocument();
-    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.getByText('生產中')).toBeInTheDocument();
     expect(screen.getByText('剩餘 1,500')).toBeInTheDocument();
   });
 
@@ -206,9 +234,20 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText(/MediaTek/)).toBeInTheDocument();
   });
 
+  it('does not render date-based production states before server base_date is loaded', () => {
+    mockScheduleCapacity.data = undefined;
+    mockScheduleCapacity.isPending = true;
+
+    renderDialog();
+
+    expect(screen.getByText('載入日曆中...')).toBeInTheDocument();
+    expect(screen.queryByText('ORD-20260504-0001')).not.toBeInTheDocument();
+  });
+
   it('shows split production progress across production dates', async () => {
     const user = userEvent.setup();
     mockScheduleResult.data = [splitScheduledOrder];
+    setServerBaseDate('2026-05-10');
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-10/ }));
@@ -220,8 +259,72 @@ describe('OrdersCalendarDialog', () => {
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
     expect(screen.getByText(/今日 1,500/)).toBeInTheDocument();
     expect(screen.getByText(/累計 2,500 \/ 2,500/)).toBeInTheDocument();
-    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.getByText('已排程')).toBeInTheDocument();
     expect(screen.getByText('剩餘 0')).toBeInTheDocument();
+  });
+
+  it('shows split production as completed when base_date is past the final production date', async () => {
+    const user = userEvent.setup();
+    mockScheduleResult.data = [splitScheduledOrder];
+    setServerBaseDate('2026-05-12');
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
+    expect(screen.getByText('已完成')).toBeInTheDocument();
+  });
+
+  it('keeps past rows as in_progress while cumulative quantity is below the order total', async () => {
+    // 2026-05-10 is in the past (base_date = 2026-05-11) but only 1,000 of
+    // the 2,500-wafer order has been produced by then. The row must NOT
+    // show "已完成" — earlier slices of an in-flight split stay 生產中.
+    const user = userEvent.setup();
+    mockScheduleResult.data = [splitScheduledOrder];
+    setServerBaseDate('2026-05-11');
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-10/ }));
+    expect(screen.getByText(/累計 1,000 \/ 2,500/)).toBeInTheDocument();
+    expect(screen.getByText('生產中')).toBeInTheDocument();
+    expect(screen.queryByText('已完成')).not.toBeInTheDocument();
+  });
+
+  it('uses server base_date instead of the client clock for production state', async () => {
+    const user = userEvent.setup();
+    vi.setSystemTime(new Date('2026-05-12T00:00:00Z'));
+    setServerBaseDate('2026-05-10');
+    mockScheduleResult.data = [splitScheduledOrder];
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
+
+    expect(screen.getByText('已排程')).toBeInTheDocument();
+  });
+
+  it('displays a padlock icon for production-active or pinned orders', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
+    expect(screen.getAllByLabelText('處理鎖定中').length).toBeGreaterThan(0);
+  });
+
+  it('does not drag a scheduled calendar item when the canonical order record is not loaded', () => {
+    mockScheduledOrders.data = { items: [], total: 0, page: 1, page_size: 100 };
+    renderDialog();
+
+    const dragData = new Map<string, string>();
+    const setData = vi.fn((type: string, value: string) => dragData.set(type, value));
+    const dataTransfer = {
+      effectAllowed: '',
+      dropEffect: '',
+      setData,
+      getData: vi.fn((type: string) => dragData.get(type) ?? ''),
+    } as unknown as DataTransfer;
+
+    fireEvent.dragStart(screen.getByText('ORD-20260504-0001'), { dataTransfer });
+
+    expect(setData).not.toHaveBeenCalled();
+    expect(dataTransfer.effectAllowed).toBe('');
   });
 
   it('can navigate between months', async () => {
