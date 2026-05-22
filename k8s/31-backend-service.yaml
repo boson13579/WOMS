@@ -1,0 +1,31 @@
+# In-cluster address for the backend.
+#
+# Other pods (worker, frontend, ingress) reach it at:
+#   http://backend.woms.svc.cluster.local:80
+#   http://backend.woms:80
+#   http://backend:80      (within the same namespace)
+#
+# Type ClusterIP: only reachable from inside the cluster. External access
+# comes via the ALB Ingress in Phase 4.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: woms
+  labels:
+    app: backend
+  annotations:
+    # Tell the AWS Load Balancer Controller to health-check this target group
+    # against the real liveness endpoint, not the default `/` (which would 404).
+    alb.ingress.kubernetes.io/healthcheck-path: /api/v1/health
+    alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+    alb.ingress.kubernetes.io/success-codes: "200"
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

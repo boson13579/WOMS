@@ -1,0 +1,37 @@
+# One-shot Alembic migration. Apply this BEFORE the backend Deployment;
+# backend pods will fail readiness if the schema isn't current.
+#
+# K8s Job semantics:
+#   - Runs once, pod transitions to Completed (no restart on success).
+#   - On failure, retries up to backoffLimit times.
+#   - Stays as a finished Pod for inspection — delete the Job to clean up,
+#     or rely on ttlSecondsAfterFinished to GC after 10 minutes.
+#
+# Image is the SAME as the backend (the backend image ships alembic CLI +
+# alembic/ folder), just with a different command.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: woms-migrate
+  namespace: woms
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: alembic
+          image: ${ECR_URI}/woms-backend:v0.1
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - secretRef:
+                name: woms-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

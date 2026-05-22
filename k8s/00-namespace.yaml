@@ -1,0 +1,9 @@
+# All WOMS resources live in the `woms` namespace. Keeps them separate from
+# the kube-system / default namespaces and makes a single `kubectl delete
+# namespace woms` enough to wipe the app cleanly.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: woms
+  labels:
+    app.kubernetes.io/part-of: woms
