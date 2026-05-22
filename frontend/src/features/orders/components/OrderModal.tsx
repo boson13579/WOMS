@@ -6,7 +6,7 @@
  * optimistic-lock protection).
  */
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useEffect, useMemo } from 'react';
+import { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 
@@ -88,7 +88,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
     reset,
     formState: { errors },
   } = useForm<FormValues>({
-    resolver: zodResolver(dynamicSchema),
+    resolver: zodResolver(formSchema),
     defaultValues: {
       customer_name: '',
       wafer_quantity: 100,
