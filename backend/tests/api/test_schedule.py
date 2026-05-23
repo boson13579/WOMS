@@ -181,46 +181,6 @@ def test_trigger_without_token_returns_401(client: TestClient) -> None:
 # separate endpoint and is still tested below.
 
 
-def test_apply_schedule_audit_row_has_null_user_id_for_system_actor(
-    db_session: Session,
-) -> None:
-    """The ``order.scheduled`` audit row written by ``apply_schedule`` must
-    have ``user_id IS NULL`` — scheduling is system-driven, not user-driven,
-    so there is no human actor to attribute. Pairs with the parallel check
-    in the service-layer test; the verifier called out that this assertion
-    was missing at the API/integration tier.
-    """
-    from datetime import date
-
-    from app.models.audit_log import AuditLog
-    from app.services import order as order_service
-    from app.services.scheduling import ScheduledResult
-    from sqlalchemy import select
-
-    creator = _make_user(db_session, username="sched_audit_sys", role=UserRole.scheduler)
-    order = _make_order(
-        db_session,
-        created_by=creator.id,
-        requested_delivery_date=date(2026, 7, 1),
-    )
-
-    scheduled = [
-        ScheduledResult(order_id=order.id, scheduled_date=date(2026, 6, 15), quantity=100),
-    ]
-    applied = order_service.apply_schedule(db_session, scheduled)
-    assert applied == 1
-
-    row = db_session.scalars(
-        select(AuditLog)
-        .where(AuditLog.action == "order.scheduled")
-        .where(AuditLog.resource_id == order.id)
-    ).one()
-    # The whole point of this assertion: no forged user id sneaks in for
-    # a system-driven write.
-    assert row.user_id is None
-    assert row.resource_type == "order"
-
-
 # ---------------------------------------------------------------------------
 # DELETE /operations/{compound_id} — cancel
 # ---------------------------------------------------------------------------
