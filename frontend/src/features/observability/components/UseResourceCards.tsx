@@ -151,12 +151,19 @@ export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsP
         value={redisValue}
         ratio={redisRatio}
         caption={redisCaption}
+        // No ``maxmemory`` configured (local docker default) → no
+        // meaningful denominator, hide the bar slot entirely instead
+        // of showing a dashed "no signal" placeholder that the eye
+        // mistakes for "still loading".
+        hideBar={!redis || redis.max_memory_bytes === 0}
         unreachableMessage="Redis unreachable."
       />
       <UseResourceCard
         label="Live connections"
         value={wsValue}
         caption={wsCaption}
+        // No natural saturation denominator — see ``hideBar`` docs.
+        hideBar
         unreachableMessage="WebSocket stats unavailable."
       />
     </div>
