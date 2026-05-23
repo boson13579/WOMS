@@ -14,6 +14,7 @@
  */
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
+import { toast } from 'sonner';
 import { z } from 'zod';
 
 import { useCurrentUser } from '@/lib/auth';
@@ -25,6 +26,9 @@ import { scheduleResultKeys } from '../api/scheduleResult';
 const wsEnvelopeSchema = z
   .object({
     type: z.string(),
+    message: z.string().optional(),
+    reason: z.string().optional(),
+    order_number: z.string().optional(),
   })
   .passthrough();
 
@@ -41,7 +45,7 @@ export function useScheduleWs(): void {
     const ws = new WebSocket(url);
 
     ws.onmessage = (evt: MessageEvent<string>) => {
-      let env: { type: string };
+      let env: z.infer<typeof wsEnvelopeSchema>;
       try {
         env = wsEnvelopeSchema.parse(JSON.parse(evt.data));
       } catch {
@@ -51,6 +55,15 @@ export function useScheduleWs(): void {
         void qc.invalidateQueries({ queryKey: orderKeys.all });
         void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
         void qc.invalidateQueries({ queryKey: scheduleResultKeys.all });
+      }
+      if (env.type === 'schedule.compound_failed') {
+        const description = env.message ?? env.reason ?? '排程器拒絕這次操作，請檢查訂單日期與產能。';
+        toast.error('排程失敗', { description });
+      }
+      if (env.type === 'schedule.materialized') {
+        toast.info('排程結果已更新', {
+          description: '已同步訂單狀態、生產日期與每日剩餘產能。',
+        });
       }
     };
 

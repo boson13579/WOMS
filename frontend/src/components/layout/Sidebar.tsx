@@ -12,11 +12,20 @@
  * (`MobileNav`) can reuse the same markup at viewport widths where the
  * persistent sidebar is hidden (`<768px`).
  */
-import { Activity, Bell, LayoutDashboard, Package, ScrollText, Users } from 'lucide-react';
+import {
+  Activity,
+  Bell,
+  LayoutDashboard,
+  Package,
+  ScrollText,
+  Settings,
+  Users,
+} from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 
 import { Separator } from '@/components/ui/separator';
+import { useNotifications } from '@/features/notifications/api/notifications';
 import { useCurrentRole } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 
@@ -25,6 +34,7 @@ interface NavItem {
   label: string;
   icon: LucideIcon;
   disabled?: boolean;
+  badgeCount?: number;
 }
 
 const PRIMARY_NAV: readonly NavItem[] = [
@@ -33,11 +43,11 @@ const PRIMARY_NAV: readonly NavItem[] = [
 ];
 
 const SECONDARY_NAV: readonly NavItem[] = [
-  { to: '/notifications', label: 'Notifications', icon: Bell, disabled: true },
+  { to: '/notifications', label: 'Notifications', icon: Bell },
 ];
 
 function NavRow({ item, onNavigate }: { item: NavItem; onNavigate: () => void }): JSX.Element {
-  const { to, label, icon: Icon, disabled } = item;
+  const { to, label, icon: Icon, disabled, badgeCount } = item;
 
   if (disabled) {
     return (
@@ -61,15 +71,29 @@ function NavRow({ item, onNavigate }: { item: NavItem; onNavigate: () => void })
       onClick={onNavigate}
       className={({ isActive }) =>
         cn(
-          'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+          'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors relative group',
           isActive
             ? 'bg-secondary text-secondary-foreground'
             : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
         )
       }
     >
-      <Icon className="h-4 w-4" />
-      <span>{label}</span>
+      <Icon
+        className={cn(
+          'h-4 w-4 transition-transform duration-200 group-hover:rotate-12',
+          badgeCount && badgeCount > 0 && 'text-rose-500 animate-pulse',
+        )}
+      />
+      <span className="flex-1">{label}</span>
+      {badgeCount !== undefined && badgeCount > 0 && (
+        <span
+          aria-label={`${badgeCount} unread notifications`}
+          aria-live="polite"
+          className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white transition-all duration-300 group-hover:scale-110"
+        >
+          {badgeCount}
+        </span>
+      )}
     </NavLink>
   );
 }
@@ -90,6 +114,12 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
   const showUserManagement = role === 'root';
   const showObservability = role === 'scheduler' || role === 'root';
   const showAuditLog = role === 'root';
+
+  // Backend contract: when called with `all=false`, `total` is the unread
+  // count (see Header.tsx for the same assumption). Switch to counting
+  // `items` if that contract ever changes.
+  const { data: unreadData } = useNotifications({ all: false });
+  const unreadCount = unreadData?.total ?? 0;
 
   return (
     <div className="flex h-full flex-col">
@@ -136,9 +166,11 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
             Activity
           </p>
           <div className="flex flex-col gap-0.5">
-            {SECONDARY_NAV.map((item) => (
-              <NavRow key={item.to} item={item} onNavigate={onNavigate} />
-            ))}
+            {SECONDARY_NAV.map((item) => {
+              const updatedItem =
+                item.to === '/notifications' ? { ...item, badgeCount: unreadCount } : item;
+              return <NavRow key={item.to} item={updatedItem} onNavigate={onNavigate} />;
+            })}
             {showAuditLog ? (
               <NavRow
                 item={{ to: '/audit', label: 'Audit log', icon: ScrollText }}
@@ -152,7 +184,11 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
       {/* Footer */}
       <div className="p-3">
         <Separator className="mb-3" />
-        <div className="px-3 text-[10px] text-muted-foreground">Phase 2 · v0.2.0</div>
+        <div className="flex cursor-not-allowed items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground/60">
+          <Settings className="h-4 w-4" />
+          <span className="flex-1">Settings</span>
+        </div>
+        <div className="mt-2 px-3 text-[10px] text-muted-foreground">Phase 2 · v0.2.0</div>
       </div>
     </div>
   );
