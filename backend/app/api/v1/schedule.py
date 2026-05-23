@@ -2,13 +2,22 @@
 
 Endpoints
 ---------
-- ``POST /schedule/trigger`` — manual fire of ``run_scheduling_task``.
-- ``POST /schedule/operations`` — Order CRUD pushes pending ops here.
-- ``GET  /schedule/status`` — current scheduler lifecycle snapshot.
-- ``GET  /schedule/result`` — every order currently in ``scheduled`` state.
-- ``POST /schedule/rebuild`` — queue ``rebuild_schedule_task`` (waits for any
+- ``POST   /schedule/trigger`` — manual fire of ``run_scheduling_task``.
+- ``DELETE /schedule/operations/{compound_id}`` — cancel a still-queued compound.
+- ``GET    /schedule/status`` — current scheduler lifecycle snapshot.
+- ``GET    /schedule/result`` — every order currently in ``scheduled`` state.
+- ``GET    /schedule/pending-ops`` — queued compounds in priority order.
+- ``GET    /schedule/capacity`` — 30-day prefix-sum capacity snapshot.
+- ``GET    /schedule/capacity-usage`` — 30-day realized used/remaining per day.
+- ``POST   /schedule/rebuild`` — queue ``rebuild_schedule_task`` (waits for any
   in-flight run to finish, rebuilds state from DB, then re-triggers
   ``run_scheduling_task``).
+
+The previous ``POST /schedule/operations`` raw-compound endpoint has been
+removed — pin / unpin is now folded into ``PATCH /orders/{id}`` via the
+``pinned_production_date`` field so it inherits the same row-level lock
+that protects qty / deadline changes. See the comment block where the
+endpoint used to live for the full rationale.
 
 All Redis access goes through a lazy module-level client; the worker module
 does the same so the two stay decoupled (worker can run without the API
@@ -23,6 +32,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, cast
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from redis import Redis
 from sqlalchemy.orm import Session
@@ -35,7 +45,7 @@ from app.schemas.schedule import (
     CapacityPrefixEntry,
     PendingOpsEntry,
     ScheduleCapacityResponse,
-    ScheduleCompoundRequest,
+    ScheduleCapacityUsageResponse,
     ScheduleCompoundResponse,
     ScheduleRebuildResponse,
     ScheduleResultResponse,
@@ -46,11 +56,11 @@ from app.services import order as order_service
 from app.services.schedule_queue import (
     CancelResult,
     cancel_compound,
-    enqueue_compound,
     list_pending_ops,
 )
 from app.services.scheduling import (
     DAILY_CAPACITY,
+    HORIZON_DAYS,
     STATE_KEY,
     STATUS_KEY,
     SchedulerState,
@@ -67,6 +77,8 @@ from app.workers.scheduling import (
 )
 
 router = APIRouter()
+
+logger = structlog.get_logger(__name__)
 
 # Same role gates as orders.py.
 _READ_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
@@ -126,54 +138,29 @@ def trigger_scheduling(
 
 
 # ---------------------------------------------------------------------------
-# POST /operations
+# POST /operations — REMOVED
 # ---------------------------------------------------------------------------
-
-
-@router.post(
-    "/operations",
-    response_model=ScheduleCompoundResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-def enqueue_operation(
-    request: ScheduleCompoundRequest,
-    current_user: User = Depends(_WRITE_ROLES),
-) -> ScheduleCompoundResponse:
-    """Queue a scheduler compound for the next ``run_scheduling_task``.
-
-    A compound is an atomic business action containing one or more leaf
-    ops (add / remove / pin / unpin). See :class:`ScheduleCompoundRequest`
-    for the full contract; in brief:
-
-    - Ops within a compound may target one or more order_ids — typical
-      single-order flows (PATCH / DELETE / CREATE) generate one order
-      per compound, while a multi-order batch business action is also
-      a legal shape.
-    - The compound has a single ``group`` (shrink or grow). Shrink
-      compounds sort before grow compounds in the worker queue; FIFO
-      within each group.
-    - Worker processes the compound atomically — any leaf-op failure
-      triggers a snapshot rollback of ``SchedulerState`` and a
-      ``schedule.compound_failed`` WebSocket message to ``requested_by``.
-
-    Backed by a Redis **sorted set** scored by ``score_for_op(group, seq)``
-    where ``seq`` is the next value of ``schedule:pending_ops:seq``.
-    Worker ``ZPOPMIN``s one compound per ``run_scheduling_task``
-    invocation. All Redis I/O is delegated to
-    ``services.schedule_queue.enqueue_compound``.
-
-    A new ``run_scheduling_task`` fires only if the worker is currently
-    idle; if it is already running, the in-flight task will pick up this
-    compound when it loops back to drain ``pending_ops`` at the end of
-    its cycle.
-
-    Permission: scheduler+.
-    """
-    enqueue_compound(request)
-    return ScheduleCompoundResponse(
-        compound_id=request.compound_id,
-        message="Compound queued",
-    )
+#
+# The raw "build a compound, send it" endpoint used to be the only way for
+# the frontend to issue pin / unpin. It had a structural weakness: it
+# accepted any client-constructed compound and enqueued it directly,
+# bypassing the per-row ``SELECT ... FOR UPDATE`` lock that ``update_order``
+# / ``delete_order`` use to serialize concurrent producer-side writes. Two
+# concurrent compounds for the same order could both build off the same
+# pre-PATCH snapshot, both enqueue, and the worker would later trip a
+# ``SegmentTreeInvariantError`` on the stale half (because the in-memory
+# tree no longer matched the compound's ``wafer_quantity``).
+#
+# Pin / unpin is now folded into ``PATCH /orders/{id}`` via the
+# ``pinned_production_date`` field — that path goes through ``update_order``
+# which holds the row lock for the whole producer transaction and emits the
+# right ``[unpin?, remove?, add?, pin?]`` compound shape based on the pin
+# transition. Frontend ``OrdersCalendarDialog`` calls PATCH directly; the
+# raw endpoint has no remaining caller.
+#
+# The internal ``enqueue_compound`` service function is unchanged — it's
+# still the single Redis writer used by the order CRUD service layer.
+# Only the *HTTP wrapper* is removed.
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +345,62 @@ def get_schedule_capacity(
     return ScheduleCapacityResponse(
         base_date=state.base_date,
         daily_capacity=DAILY_CAPACITY,
+        entries=entries,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /capacity-usage
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/capacity-usage",
+    response_model=ScheduleCapacityUsageResponse,
+)
+def get_schedule_capacity_usage(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_READ_ROLES),
+) -> ScheduleCapacityUsageResponse:
+    """Per-day used / remaining capacity across the upcoming 30-day horizon.
+
+    Reads the ``schedule_daily_capacity`` snapshot the materializer
+    writes after every accepted compound. Each entry says: "on this
+    date, the EDF forward-fill schedule commits ``used`` wafers, leaving
+    ``remaining = DAILY_CAPACITY - used`` free."
+
+    Distinct from ``GET /schedule/capacity``, which returns the segment
+    tree's backward-fill prefix sums from Redis — that one answers
+    "is there room to admit a new order with this deadline?" (feasibility
+    view), this one answers "for the currently-applied schedule, what
+    does each day actually look like?" (realized view). The numbers can
+    differ: a single 8,000-wafer order with deadline +7 days reserves
+    capacity_tree backward from day 7, but forward-fill compute_schedule
+    plans it on days 1-2.
+
+    Always returns exactly ``HORIZON_DAYS`` entries starting at
+    ``base_date``. We use the Redis ``SchedulerState.base_date`` so the
+    series aligns with the scheduler's own calendar; if state is missing
+    (first deploy / flushed Redis) we fall back to today so the dashboard
+    still gets a usable response.
+
+    Permission: order_manager+.
+    """
+    raw = cast("str | None", _redis().get(STATE_KEY))
+    if raw is None:
+        base_date = datetime.now(tz=UTC).date()
+    else:
+        base_date = SchedulerState.from_json(raw).base_date
+
+    base, capacity, entries = order_service.get_capacity_usage(
+        db,
+        base_date=base_date,
+        daily_capacity=DAILY_CAPACITY,
+        horizon_days=HORIZON_DAYS,
+    )
+    return ScheduleCapacityUsageResponse(
+        base_date=base,
+        daily_capacity=capacity,
         entries=entries,
     )
 

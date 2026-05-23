@@ -9,12 +9,13 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from app.models.order import Order, OrderStatus
 
 __all__ = [
+    "allocate_order_seq",
     "clear_scheduled_dates",
     "create",
     "get_by_id",
@@ -22,7 +23,6 @@ __all__ = [
     "get_many",
     "get_scheduled",
     "get_scheduled_for_rebuild",
-    "get_today_order_count",
     "mark_completed_outside_set",
     "mark_in_production",
     "set_schedule_dates",
@@ -41,6 +41,32 @@ DEFAULT_SORT_ORDER = "asc"
 def get_by_id(db: Session, order_id: uuid.UUID) -> Order | None:
     """Return the order with *order_id*, or None if absent/soft-deleted."""
     stmt = select(Order).where(Order.id == order_id, Order.is_deleted.is_(False))
+    return db.scalars(stmt).first()
+
+
+def get_by_id_for_update(db: Session, order_id: uuid.UUID) -> Order | None:
+    """Like ``get_by_id`` but takes a PostgreSQL row-level exclusive lock.
+
+    Two concurrent transactions both calling this on the same ``order_id``
+    serialize: the second blocks until the first commits / rolls back.
+    After the first commits, the second's SELECT proceeds and sees the
+    updated row state (``version_id`` bumped, ``is_processing_locked``
+    likely set to True).
+
+    Used by ``update_order`` / ``delete_order`` to close the producer-side
+    race where two concurrent PATCH requests both read the row at the
+    same ``version_id``, each build a compound off the same old data, and
+    both enqueue to Redis before either has committed. Without the row
+    lock, PostgreSQL OCC catches the second commit (``StaleDataError``)
+    but the stale compound is already in the Redis queue — worker then
+    processes it with mismatched ``wafer_quantity`` and trips
+    ``SegmentTreeInvariantError``. With the lock, the second transaction
+    blocks before building its compound; when it unblocks it sees
+    ``is_processing_locked=True`` and gets rejected with 409 cleanly.
+
+    Returns ``None`` for absent / soft-deleted orders, matching ``get_by_id``.
+    """
+    stmt = select(Order).where(Order.id == order_id, Order.is_deleted.is_(False)).with_for_update()
     return db.scalars(stmt).first()
 
 
@@ -98,16 +124,22 @@ def get_many(
     return list(rows), total
 
 
-def get_today_order_count(db: Session, today: date) -> int:
-    """Return the number of orders whose order_number starts with today's prefix.
+def allocate_order_seq(db: Session, today: date) -> int:
+    """Atomically allocate the next sequence number for today's orders.
 
-    Used to derive the daily sequence number for new order_numbers.
+    Uses an upsert on order_daily_seq so that concurrent callers always
+    receive distinct values — no TOCTOU race is possible.
     """
-    prefix = f"ORD-{today.strftime('%Y%m%d')}-"
-    stmt = select(func.count()).where(
-        Order.order_number.like(f"{prefix}%"),
+    result = db.execute(
+        text(
+            "INSERT INTO order_daily_seq(date, last_seq) VALUES (:today, 1) "
+            "ON CONFLICT (date) DO UPDATE "
+            "SET last_seq = order_daily_seq.last_seq + 1 "
+            "RETURNING last_seq"
+        ),
+        {"today": today},
     )
-    return db.scalars(stmt).one()
+    return int(result.scalar_one())
 
 
 def create(

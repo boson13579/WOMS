@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.order import OrderStatus
+
+# Re-exported for backward compatibility. The canonical home for the
+# audit-log DTO is now ``app.schemas.audit`` (it's cross-resource, not
+# order-specific); callers may still import it from this module without
+# breakage. New code should prefer the canonical path.
+from app.schemas.audit import AuditLogResponse
 
 __all__ = [
     "AuditLogResponse",
@@ -41,8 +46,18 @@ class UpdateOrderRequest(BaseModel):
     """Payload for PATCH /orders/{order_id} (scheduler+).
 
     `version_id` is required for optimistic-lock validation.
-    `assigned_to` uses model_fields_set as sentinel: omitting the field keeps
-    the current assignee; sending null clears it; sending a UUID reassigns.
+
+    Three fields use ``model_fields_set`` as a "client sent this on purpose"
+    sentinel — needed because their ``None`` value is a legal user input
+    (= "clear it") and Pydantic's default ``None`` would otherwise be
+    indistinguishable from "omitted":
+
+    - ``assigned_to`` — null = unassign; missing = keep current
+    - ``notes`` — null = clear note; missing = keep current
+    - ``pinned_production_date`` — null = unpin the order; missing = keep
+      current pin state; date value = pin to that production day
+      (or change pin day if already pinned)
+
     Only scheduler and root may change assigned_to.
     """
 
@@ -50,6 +65,13 @@ class UpdateOrderRequest(BaseModel):
     requested_delivery_date: date | None = None
     notes: str | None = None
     assigned_to: uuid.UUID | None = Field(default=None, description="Pass null to unassign")
+    pinned_production_date: date | None = Field(
+        default=None,
+        description=(
+            "Pin the order to a specific production day. Pass null to unpin, "
+            "omit the field to keep the current pin state."
+        ),
+    )
     version_id: int = Field(..., description="Current version_id (optimistic lock)")
 
 
@@ -105,17 +127,3 @@ class BatchUpdateResponse(BaseModel):
     updated_count: int
     skipped_count: int
     skipped_ids: list[uuid.UUID]
-
-
-class AuditLogResponse(BaseModel):
-    """Single audit-log entry for an order."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    id: uuid.UUID
-    action: str
-    user_id: uuid.UUID | None
-    resource_id: uuid.UUID
-    old_value: dict[str, Any] | None
-    new_value: dict[str, Any] | None
-    created_at: datetime

@@ -13,6 +13,8 @@ from app.models.order import OrderStatus
 __all__ = [
     "CompoundDbAction",
     "DailyAssignment",
+    "DailyCapacityUsageEntry",
+    "ScheduleCapacityUsageResponse",
     "ScheduleCompoundFailedDetail",
     "ScheduleCompoundRequest",
     "ScheduleCompoundResponse",
@@ -98,14 +100,17 @@ class CompoundDbAction(BaseModel):
     actor_id: uuid.UUID
 
     # New values to write (None = field absent from the PATCH).
-    # ``notes`` and ``assigned_to`` use a paired "set" boolean because
-    # ``None`` is a legal user-visible value (= "clear the field").
+    # ``notes`` / ``assigned_to`` / ``pinned_production_date`` use a paired
+    # "set" boolean because ``None`` is a legal user-visible value (= "clear
+    # the field" / "unpin").
     new_wafer_quantity: int | None = None
     new_requested_delivery_date: date | None = None
     new_notes_set: bool = False
     new_notes: str | None = None
     new_assigned_to_set: bool = False
     new_assigned_to: uuid.UUID | None = None
+    new_pinned_production_date_set: bool = False
+    new_pinned_production_date: date | None = None
 
     # Pre-PATCH values for audit log diffing. Worker reads ``old_*`` to
     # construct the ``audit_logs.old_value`` JSON. Absent on create.
@@ -113,6 +118,8 @@ class CompoundDbAction(BaseModel):
     old_requested_delivery_date: date | None = None
     old_notes: str | None = None
     old_assigned_to: uuid.UUID | None = None
+    old_pinned_production_date: date | None = None
+    old_is_pinned: bool = False
 
 
 class ScheduleCompoundRequest(BaseModel):
@@ -337,6 +344,40 @@ class ScheduleCapacityResponse(BaseModel):
     base_date: date
     daily_capacity: int = Field(gt=0)
     entries: list[CapacityPrefixEntry]
+
+
+class DailyCapacityUsageEntry(BaseModel):
+    """One day's planned-production view in the ``/schedule/capacity-usage`` response.
+
+    ``used`` is the wafer count committed to that day by the current EDF
+    forward-fill schedule (summed across every scheduled order's
+    ``daily_breakdown``). ``remaining`` is ``daily_capacity - used`` —
+    pre-computed so dashboards don't need the capacity constant.
+    """
+
+    date: date
+    used: int = Field(ge=0)
+    remaining: int = Field(ge=0)
+
+
+class ScheduleCapacityUsageResponse(BaseModel):
+    """Per-day used / remaining capacity for the upcoming horizon.
+
+    Returned by ``GET /schedule/capacity-usage``. Distinct from
+    ``/schedule/capacity`` — that one returns the segment tree's
+    feasibility-oriented prefix sums from Redis; this one returns the
+    realized forward-fill view from the DB cache populated by
+    ``apply_schedule``.
+
+    The list always has exactly ``HORIZON_DAYS`` (30) entries starting at
+    ``base_date``. Dates without scheduled production come back as
+    ``used=0, remaining=daily_capacity`` so the frontend can render a
+    continuous timeline without filling gaps client-side.
+    """
+
+    base_date: date
+    daily_capacity: int = Field(gt=0)
+    entries: list[DailyCapacityUsageEntry]
 
 
 class ScheduleResultResponse(BaseModel):

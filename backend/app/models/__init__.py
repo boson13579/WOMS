@@ -13,6 +13,18 @@ from app.models.audit_log import AuditLog
 from app.models.base_class import Base
 from app.models.notification import Notification
 from app.models.order import Order, OrderStatus
+from app.models.order_daily_seq import order_daily_seq
+from app.models.schedule_daily_capacity import ScheduleDailyCapacity
 from app.models.user import User, UserRole
 
-__all__ = ["AuditLog", "Base", "Notification", "Order", "OrderStatus", "User", "UserRole"]
+__all__ = [
+    "AuditLog",
+    "Base",
+    "Notification",
+    "Order",
+    "OrderStatus",
+    "ScheduleDailyCapacity",
+    "User",
+    "UserRole",
+    "order_daily_seq",
+]

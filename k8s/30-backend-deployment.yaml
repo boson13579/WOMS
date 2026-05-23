@@ -1,0 +1,60 @@
+# FastAPI backend Deployment.
+#
+# 2 replicas spread across the 2 worker nodes via the default scheduler. No
+# affinity rules — for a 2-node demo cluster Kubernetes naturally spreads.
+#
+# envFrom: pulls every key in the ConfigMap / Secret as an env var. Match
+# the names with what `backend/app/core/config.py` expects.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: woms
+  labels:
+    app: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: ${ECR_URI}/woms-backend:${IMAGE_TAG}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: woms-config
+            - secretRef:
+                name: woms-secrets
+          # readinessProbe gates whether the Service routes traffic to this
+          # pod. livenessProbe restarts the pod if it hangs.
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

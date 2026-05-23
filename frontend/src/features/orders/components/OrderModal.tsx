@@ -6,7 +6,7 @@
  * optimistic-lock protection).
  */
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 
@@ -22,6 +22,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { useAssignableUsers } from '@/features/auth/api/users';
+import { ApiError } from '@/lib/apiFetch';
 
 import { useCreateOrder, useUpdateOrder } from '../api/orders';
 import type { Order } from '../types';
@@ -62,13 +63,32 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const users = useAssignableUsers();
   const assignedToDisabled = isEdit;
 
+  const dynamicSchema = useMemo(() => {
+    // Skip the assignee refinement in edit mode: the field is disabled there
+    // (see `assignedToDisabled` below) so the user can't fix a mismatch
+    // anyway. Without this guard, an order whose original assignee has since
+    // been deactivated would fail validation on a field the user can't edit,
+    // leaving the modal permanently unsubmittable.
+    if (isEdit) return formSchema;
+    return formSchema.refine(
+      (data) => {
+        if (!data.assigned_to_email) return true;
+        return users.some((u) => u.email === data.assigned_to_email);
+      },
+      {
+        message: '負責人必須是系統中現有的使用者',
+        path: ['assigned_to_email'],
+      },
+    );
+  }, [users, isEdit]);
+
   const {
     register,
     handleSubmit,
     reset,
     formState: { errors },
   } = useForm<FormValues>({
-    resolver: zodResolver(formSchema),
+    resolver: zodResolver(dynamicSchema),
     defaultValues: {
       customer_name: '',
       wafer_quantity: 100,
@@ -244,8 +264,27 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
             <Textarea id="notes" rows={3} {...register('notes')} />
           </div>
 
-          {/* Mutation error */}
-          {(createMutation.isError || updateMutation.isError) && (
+          {/* Version conflict — 409 */}
+          {updateMutation.isError &&
+            updateMutation.error instanceof ApiError &&
+            updateMutation.error.status === 409 && (
+              <div
+                role="alert"
+                className="rounded-md border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-800 dark:border-yellow-700 dark:bg-yellow-950 dark:text-yellow-300"
+              >
+                <p className="font-medium">資料版本已更新</p>
+                <p className="mt-0.5 text-xs">
+                  此訂單已被其他人修改，請關閉後重新開啟以取得最新版本。
+                </p>
+              </div>
+            )}
+
+          {/* Generic mutation error */}
+          {(createMutation.isError ||
+            (updateMutation.isError &&
+              !(
+                updateMutation.error instanceof ApiError && updateMutation.error.status === 409
+              ))) && (
             <p role="alert" className="text-xs text-destructive">
               {(createMutation.error ?? updateMutation.error)?.message ?? '操作失敗，請重試。'}
             </p>

@@ -1,0 +1,128 @@
+# Build → push to ECR → roll the K8s Deployment forward.
+#
+# Trigger:
+#   - push to main, OR
+#   - manual `workflow_dispatch` (Actions tab → Run workflow)
+#
+# What it does:
+#   1. Auth to AWS via OIDC — no access keys, the role itself is locked to
+#      this repo via the trust policy set up in infra/github-actions.tf.
+#   2. Build the backend and frontend images, tagged with the commit SHA so
+#      every deploy is traceable. Push both to ECR.
+#   3. Update the kubeconfig and run `kubectl set image` to roll the new
+#      tag onto the existing Deployment. `rollout status` blocks until the
+#      new pods are healthy.
+
+name: Deploy to EKS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Don't run two deploys concurrently — they'd race for the same Deployment.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      AWS_REGION:       ${{ secrets.AWS_REGION }}
+      EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+      IMAGE_TAG:        ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Resolve ECR registry
+        id: ecr
+        run: |
+          REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---- Build + push ----
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: runtime
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/woms-backend:${{ env.IMAGE_TAG }}
+            ${{ steps.ecr.outputs.registry }}/woms-backend:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          target: runtime
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/woms-frontend:${{ env.IMAGE_TAG }}
+            ${{ steps.ecr.outputs.registry }}/woms-frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      # ---- Roll forward ----
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+
+      - name: Run DB migrations (alembic upgrade head)
+        env:
+          ECR_URI: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # woms-migrate has a fixed name and Jobs are immutable on most
+          # fields, so delete the prior run before re-applying.
+          kubectl delete job woms-migrate -n woms --ignore-not-found
+          # Pin envsubst to ONLY these vars — without this it greedily
+          # expands $HOME / $PATH / $GITHUB_* etc. The arg is single-quoted
+          # so the shell doesn't expand it before envsubst sees it.
+          envsubst '${ECR_URI} ${IMAGE_TAG}' < k8s/20-migration-job.yaml | kubectl apply -f -
+          if ! kubectl wait --for=condition=complete --timeout=180s job/woms-migrate -n woms; then
+            echo "::error::Migration job failed or timed out"
+            kubectl logs -n woms job/woms-migrate --tail=200 || true
+            exit 1
+          fi
+
+      - name: Roll backend Deployment
+        run: |
+          kubectl set image deployment/backend \
+            backend=${{ steps.ecr.outputs.registry }}/woms-backend:${{ env.IMAGE_TAG }} \
+            -n woms
+          kubectl rollout status deployment/backend -n woms --timeout=180s
+
+      - name: Roll worker Deployment
+        run: |
+          kubectl set image deployment/worker \
+            worker=${{ steps.ecr.outputs.registry }}/woms-backend:${{ env.IMAGE_TAG }} \
+            -n woms
+          kubectl rollout status deployment/worker -n woms --timeout=180s
+
+      - name: Roll frontend Deployment
+        run: |
+          kubectl set image deployment/frontend \
+            frontend=${{ steps.ecr.outputs.registry }}/woms-frontend:${{ env.IMAGE_TAG }} \
+            -n woms
+          kubectl rollout status deployment/frontend -n woms --timeout=180s

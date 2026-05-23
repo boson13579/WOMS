@@ -2,7 +2,17 @@
 
 from fastapi import APIRouter
 
-from app.api.v1 import auth, health, notifications, orders, schedule, system, users, websocket
+from app.api.v1 import (
+    audit,
+    auth,
+    health,
+    notifications,
+    orders,
+    schedule,
+    system,
+    users,
+    websocket,
+)
 
 # Aggregate router — `app.main` includes only this single router with prefix
 # `/api/v1`, keeping `main.py` free of per-feature wiring.
@@ -17,5 +27,7 @@ api_router.include_router(schedule.router, prefix="/schedule", tags=["schedule"]
 # System-level read endpoints (dashboard's Service Health card).
 api_router.include_router(system.router, prefix="/system", tags=["system"])
 api_router.include_router(notifications.router, prefix="/notifications", tags=["notifications"])
+# Global audit-log feed (root-only, /audit/events) — backs the admin Audit page.
+api_router.include_router(audit.router, prefix="/audit", tags=["audit"])
 # WebSocket router has no prefix — endpoint is /api/v1/ws (single channel).
 api_router.include_router(websocket.router, tags=["websocket"])

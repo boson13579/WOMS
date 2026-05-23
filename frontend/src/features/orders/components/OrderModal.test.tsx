@@ -6,21 +6,38 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ApiError } from '@/lib/apiFetch';
+
 import type { Order } from '../types';
 
 import { OrderModal } from './OrderModal';
 
 // ---------------------------------------------------------------------------
-// Mock mutations
+// Mock mutations — state is mutable so individual tests can set isError/error
 // ---------------------------------------------------------------------------
 
 const mockCreateMutate = vi.fn();
 const mockUpdateMutate = vi.fn();
 
-vi.mock('../api/orders', () => ({
-  useCreateOrder: () => ({ mutate: mockCreateMutate, isPending: false, isError: false }),
-  useUpdateOrder: () => ({ mutate: mockUpdateMutate, isPending: false, isError: false }),
-}));
+interface MutationState {
+  mutate: ReturnType<typeof vi.fn>;
+  isPending: boolean;
+  isError: boolean;
+  error: Error | null;
+}
+
+let createState: MutationState;
+let updateState: MutationState;
+
+// Spread the real module so ApiError keeps its class identity for instanceof checks.
+vi.mock('../api/orders', async () => {
+  const actual = await vi.importActual<Record<string, unknown>>('../api/orders');
+  return {
+    ...actual,
+    useCreateOrder: () => createState,
+    useUpdateOrder: () => updateState,
+  };
+});
 
 vi.mock('@/features/auth/api/users', () => {
   // Must be a stable reference — if the hook returns a new array every render,
@@ -79,6 +96,8 @@ describe('OrderModal', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    createState = { mutate: mockCreateMutate, isPending: false, isError: false, error: null };
+    updateState = { mutate: mockUpdateMutate, isPending: false, isError: false, error: null };
   });
 
   // --- create mode ---
@@ -140,6 +159,69 @@ describe('OrderModal', () => {
     expect(assigneeInput).toHaveAttribute('list', 'users-datalist');
   });
 
+  it('create mode: fails validation if responsible email is not in the assignable users list', async () => {
+    const user = userEvent.setup();
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    await user.clear(screen.getByLabelText(/客戶名稱/));
+    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
+
+    await user.clear(screen.getByLabelText(/晶圓數量/));
+    await user.type(screen.getByLabelText(/晶圓數量/), '200');
+
+    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
+
+    await user.type(screen.getByLabelText(/負責人/), 'invalid-email@random.com');
+
+    await user.click(screen.getByRole('button', { name: '新增' }));
+
+    expect(screen.getByText('負責人必須是系統中現有的使用者')).toBeInTheDocument();
+    expect(mockCreateMutate).not.toHaveBeenCalled();
+  });
+
+  it('create mode: a valid email from the list maps to its user id on submit', async () => {
+    const user = userEvent.setup();
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    await user.clear(screen.getByLabelText(/客戶名稱/));
+    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
+
+    await user.clear(screen.getByLabelText(/晶圓數量/));
+    await user.type(screen.getByLabelText(/晶圓數量/), '200');
+
+    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
+    await user.type(screen.getByLabelText(/負責人/), 'bob@example.com');
+
+    await user.click(screen.getByRole('button', { name: '新增' }));
+
+    expect(mockCreateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customer_name: 'Samsung',
+        assigned_to: 'uid-002',
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('create mode: passes validation if responsible email is empty', async () => {
+    const user = userEvent.setup();
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    await user.clear(screen.getByLabelText(/客戶名稱/));
+    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
+
+    await user.clear(screen.getByLabelText(/晶圓數量/));
+    await user.type(screen.getByLabelText(/晶圓數量/), '200');
+
+    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
+
+    // responsible email is left empty
+
+    await user.click(screen.getByRole('button', { name: '新增' }));
+
+    expect(mockCreateMutate).toHaveBeenCalled();
+  });
+
   // --- edit mode ---
 
   it('edit mode: title shows "編輯訂單"', () => {
@@ -162,7 +244,6 @@ describe('OrderModal', () => {
 
   it('edit mode: passes version_id to updateMutation.mutate', async () => {
     const user = userEvent.setup();
-    // assigned_to must match a mock user so the pre-filled email passes validation
     const order = makeOrder({ id: 'edit-id', version_id: 3, assigned_to: 'uid-001' });
     render(<OrderModal open order={order} onClose={onClose} />);
 
@@ -178,6 +259,28 @@ describe('OrderModal', () => {
     );
   });
 
+  it('edit mode: submit is not blocked when the existing assignee is no longer in the assignable list', async () => {
+    // Simulates an assignee who has since been deactivated/removed: the
+    // assigned_to user id no longer maps to any entry in useAssignableUsers().
+    // The field is disabled in edit mode, so refine must NOT run — otherwise
+    // the modal would be permanently unsubmittable.
+    const user = userEvent.setup();
+    const order = makeOrder({
+      id: 'edit-orphan',
+      version_id: 7,
+      assigned_to: 'uid-DELETED',
+    });
+    render(<OrderModal open order={order} onClose={onClose} />);
+
+    await user.click(screen.getByRole('button', { name: '儲存' }));
+
+    expect(screen.queryByText('負責人必須是系統中現有的使用者')).not.toBeInTheDocument();
+    expect(mockUpdateMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'edit-orphan' }),
+      expect.anything(),
+    );
+  });
+
   // --- shared ---
 
   it('calls onClose() when the cancel button is clicked', async () => {
@@ -187,5 +290,48 @@ describe('OrderModal', () => {
     await user.click(screen.getByRole('button', { name: '取消' }));
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  // --- error states ---
+
+  describe('error states', () => {
+    it('edit mode: shows version-conflict warning on 409', () => {
+      updateState = {
+        mutate: mockUpdateMutate,
+        isPending: false,
+        isError: true,
+        error: new ApiError(409, 'Order was modified by another user.'),
+      };
+      render(<OrderModal open order={makeOrder()} onClose={onClose} />);
+
+      expect(screen.getByText('資料版本已更新')).toBeInTheDocument();
+      expect(screen.getByText(/此訂單已被其他人修改/)).toBeInTheDocument();
+      expect(screen.queryByText(/操作失敗/)).not.toBeInTheDocument();
+    });
+
+    it('edit mode: shows generic error text for non-409 errors', () => {
+      updateState = {
+        mutate: mockUpdateMutate,
+        isPending: false,
+        isError: true,
+        error: new Error('伺服器錯誤，請稍後再試'),
+      };
+      render(<OrderModal open order={makeOrder()} onClose={onClose} />);
+
+      expect(screen.getByText('伺服器錯誤，請稍後再試')).toBeInTheDocument();
+      expect(screen.queryByText('資料版本已更新')).not.toBeInTheDocument();
+    });
+
+    it('create mode: shows generic error text on failure', () => {
+      createState = {
+        mutate: mockCreateMutate,
+        isPending: false,
+        isError: true,
+        error: new Error('建立訂單失敗'),
+      };
+      render(<OrderModal open order={undefined} onClose={onClose} />);
+
+      expect(screen.getByText('建立訂單失敗')).toBeInTheDocument();
+    });
   });
 });
