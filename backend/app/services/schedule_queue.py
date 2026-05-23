@@ -26,6 +26,7 @@ otherwise arise (``workers.scheduling`` already imports
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from enum import StrEnum
 from functools import lru_cache
@@ -137,6 +138,10 @@ def enqueue_compound(compound: ScheduleCompoundRequest) -> None:
 
     payload = compound.model_dump(mode="json")
     payload["_seq"] = seq
+    # Stamp enqueue time so ``compound_finalize`` can compute end-to-end
+    # pipeline lag on commit. Internal key (``_`` prefix) like ``_seq``;
+    # consumed by ``app.services.schedule_lag``.
+    payload["_enqueued_at_ms"] = int(time.time() * 1000)
     member = json.dumps(payload)
 
     score = score_for_op(group=compound.group, seq=seq)

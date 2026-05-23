@@ -73,6 +73,7 @@ def _make_fake_redis(
     *,
     used_memory: int = 1_048_576,
     used_memory_peak: int = 2_097_152,
+    maxmemory: int = 0,
     connected_clients: int = 3,
     ops_per_sec: int = 12,
     evicted_keys: int = 0,
@@ -91,6 +92,7 @@ def _make_fake_redis(
             return {
                 "used_memory": used_memory,
                 "used_memory_peak": used_memory_peak,
+                "maxmemory": maxmemory,
             }
         if section == "clients":
             return {"connected_clients": connected_clients}
@@ -238,6 +240,7 @@ def test_resources_returns_redis_info(
     fake_redis = _make_fake_redis(
         used_memory=4_194_304,
         used_memory_peak=8_388_608,
+        maxmemory=16_777_216,
         connected_clients=7,
         ops_per_sec=42,
         evicted_keys=3,
@@ -252,6 +255,7 @@ def test_resources_returns_redis_info(
     assert redis_section == {
         "used_memory_bytes": 4_194_304,
         "used_memory_peak_bytes": 8_388_608,
+        "max_memory_bytes": 16_777_216,
         "connected_clients": 7,
         "ops_per_sec": 42,
         "evicted_keys": 3,

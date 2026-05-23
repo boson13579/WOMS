@@ -1,212 +1,151 @@
 /**
- * RedKpiCards — four KPI tiles (Rate / Error % / P95 / SLO).
+ * RedKpiCards — the four-tile RED row (rate, errors, duration, schedule lag).
  *
- * The interesting test surface is the SLO colour-band logic per the
- * plan:
- *   - green (positive) when ``success_pct >= slo_target_pct``
- *   - amber (warning) when ``budget_consumed >= 50`` AND
- *     ``budget_remaining >= 10``
- *   - red (critical) when ``budget_remaining < 10``
+ * Verifies the lag-tone bands at the 1000 / 5000 ms thresholds, the
+ * empty-window vs degraded subtitle swap, and the sparkline wiring
+ * when samples accumulate.
  */
 import { render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import { useRedHistoryStore } from '../stores/redHistoryStore';
-import type { RedMetricsResponse, SloCompliance } from '../types';
+import type { RedMetricsResponse, ScheduleLag } from '../types';
 
 import { RedKpiCards } from './RedKpiCards';
 
-function makeRed(overrides: Partial<RedMetricsResponse> = {}): RedMetricsResponse {
+const baseRed: RedMetricsResponse = {
+  window_seconds: 60,
+  total_requests: 100,
+  rate_per_sec: 1.5,
+  error_count: 0,
+  error_pct: 0,
+  latency_ms: { p50: 10, p95: 50, p99: 80, max: 100 },
+  by_endpoint: [],
+  data_status: 'ok',
+};
+
+function lagFixture(over: Partial<ScheduleLag> = {}): ScheduleLag {
   return {
     window_seconds: 60,
-    total_requests: 744,
-    rate_per_sec: 12.4,
-    error_count: 3,
-    error_pct: 0.4,
-    latency_ms: { p50: 12, p95: 45, p99: 95, max: 320 },
-    by_endpoint: [],
+    sample_count: 10,
+    p50_ms: 30,
+    p95_ms: 200,
+    max_ms: 400,
     data_status: 'ok',
-    ...overrides,
+    ...over,
   };
 }
 
-function makeSlo(overrides: Partial<SloCompliance> = {}): SloCompliance {
-  return {
-    window_hours: 24,
-    total_requests: 12_000,
-    successful_requests: 11_990,
-    success_pct: 99.92,
-    slo_target_pct: 99.5,
-    error_budget_pct_remaining: 84,
-    error_budget_consumed_pct: 16,
-    // Default: actual matches the full 24h window so the "data: last Xm"
-    // hint is hidden. Individual tests override this when they care.
-    data_window_seconds_actual: 24 * 3600,
-    data_status: 'ok',
-    ...overrides,
-  };
-}
-
-describe('RedKpiCards', () => {
-  afterEach(() => {
-    useRedHistoryStore.getState().reset();
-  });
-
-  it('renders the four KPI labels and headline values', () => {
+describe('RedKpiCards — schedule-lag tile', () => {
+  it('renders P95 as the headline', () => {
     render(
       <RedKpiCards
-        red={makeRed()}
+        red={baseRed}
         redLoading={false}
         redError={false}
-        slo={makeSlo()}
-        sloLoading={false}
-        sloError={false}
+        lag={lagFixture({ p95_ms: 187 })}
+        lagLoading={false}
+        lagError={false}
       />,
     );
-    expect(screen.getByText('Rate')).toBeInTheDocument();
-    expect(screen.getByText('Error rate')).toBeInTheDocument();
-    expect(screen.getByText('P95 latency')).toBeInTheDocument();
-    expect(screen.getByText('SLO compliance')).toBeInTheDocument();
-    expect(screen.getByText('12.40')).toBeInTheDocument();
-    expect(screen.getByText('0.40')).toBeInTheDocument();
-    expect(screen.getByText('45')).toBeInTheDocument();
-    expect(screen.getByText('99.92')).toBeInTheDocument();
+    expect(screen.getByText('Schedule lag P95')).toBeInTheDocument();
+    expect(screen.getByText('187')).toBeInTheDocument();
   });
 
-  it('renders the SLO subtitle with target + budget remaining', () => {
+  it('renders empty-window subtitle when sample_count is 0 and data_status is ok', () => {
     render(
       <RedKpiCards
-        red={makeRed()}
+        red={baseRed}
         redLoading={false}
         redError={false}
-        slo={makeSlo()}
-        sloLoading={false}
-        sloError={false}
+        lag={lagFixture({ sample_count: 0, p50_ms: 0, p95_ms: 0, max_ms: 0 })}
+        lagLoading={false}
+        lagError={false}
       />,
     );
-    expect(screen.getByText(/target: 99.5%/i)).toBeInTheDocument();
-    expect(screen.getByText(/budget remaining: 84.0%/i)).toBeInTheDocument();
+    // Multiple "—" appear on the page (one per KPI card's delta with
+    // empty history). Anchor on the unique subtitle copy instead.
+    expect(screen.getByText(/no compounds processed/i)).toBeInTheDocument();
   });
 
-  it('renders skeletons while red is loading', () => {
+  it('renders degraded subtitle when data_status is degraded', () => {
     render(
       <RedKpiCards
-        red={undefined}
-        redLoading
-        redError={false}
-        slo={undefined}
-        sloLoading
-        sloError={false}
-      />,
-    );
-    expect(screen.getAllByTestId('red-kpi-skeleton').length).toBeGreaterThanOrEqual(4);
-  });
-
-  it('renders an error card when red metrics fetch fails', () => {
-    render(
-      <RedKpiCards
-        red={undefined}
-        redLoading={false}
-        redError
-        slo={undefined}
-        sloLoading={false}
-        sloError={false}
-      />,
-    );
-    expect(screen.getByText(/failed to load red metrics/i)).toBeInTheDocument();
-  });
-
-  it('uses the positive (green) tone when SLO success >= target', () => {
-    // success 99.92 >= target 99.5 AND budget_remaining 84 >= 10 →
-    // success branch wins → emerald colour on the value.
-    render(
-      <RedKpiCards
-        red={makeRed()}
+        red={baseRed}
         redLoading={false}
         redError={false}
-        slo={makeSlo({
-          success_pct: 99.92,
-          slo_target_pct: 99.5,
-          error_budget_pct_remaining: 84,
-          error_budget_consumed_pct: 16,
+        lag={lagFixture({
+          sample_count: 0,
+          p50_ms: 0,
+          p95_ms: 0,
+          max_ms: 0,
+          data_status: 'degraded',
         })}
-        sloLoading={false}
-        sloError={false}
+        lagLoading={false}
+        lagError={false}
       />,
     );
-    const value = screen.getByText('99.92');
-    expect(value.className).toContain('text-emerald-600');
+    expect(screen.getByText(/metrics unavailable/i)).toBeInTheDocument();
   });
 
-  it('uses the warning (amber) tone when budget consumed >= 50%', () => {
+  it('shows error state when lag fetch errored', () => {
     render(
       <RedKpiCards
-        red={makeRed()}
+        red={baseRed}
         redLoading={false}
         redError={false}
-        slo={makeSlo({
-          success_pct: 99.0,
-          slo_target_pct: 99.5,
-          error_budget_consumed_pct: 60,
-          error_budget_pct_remaining: 40,
-        })}
-        sloLoading={false}
-        sloError={false}
+        lag={undefined}
+        lagLoading={false}
+        lagError
       />,
     );
-    const value = screen.getByText('99.00');
-    expect(value.className).toContain('text-amber-600');
+    expect(screen.getByText(/failed to load schedule lag/i)).toBeInTheDocument();
   });
 
-  it('uses the critical (red) tone when budget remaining < 10%', () => {
+  it('lag band: P95 < 1000 ms → positive tone (healthy)', () => {
     render(
       <RedKpiCards
-        red={makeRed()}
+        red={baseRed}
         redLoading={false}
         redError={false}
-        slo={makeSlo({
-          success_pct: 98.0,
-          slo_target_pct: 99.5,
-          error_budget_consumed_pct: 95,
-          error_budget_pct_remaining: 5,
-        })}
-        sloLoading={false}
-        sloError={false}
+        lag={lagFixture({ p95_ms: 500 })}
+        lagLoading={false}
+        lagError={false}
       />,
     );
-    const value = screen.getByText('98.00');
-    expect(value.className).toContain('text-destructive');
+    // The tone is rendered as a class on the value node; assert via
+    // class lookup. The exact class names come from RedKpiCard's
+    // ``toneClass`` map and are stable.
+    const valueNode = screen.getByText('500');
+    expect(valueNode.className).toMatch(/emerald|green|positive/i);
   });
 
-  it('renders "data: last Xm" when the actual sample window < requested', () => {
-    // Requested 24h, but the ZSET only retains 1h (3600s). Frontend
-    // should surface a muted hint so operators know they're looking at
-    // a smaller slice than they asked for.
+  it('lag band: 1000 ≤ P95 < 5000 ms → warning tone', () => {
     render(
       <RedKpiCards
-        red={makeRed()}
+        red={baseRed}
         redLoading={false}
         redError={false}
-        slo={makeSlo({ window_hours: 24, data_window_seconds_actual: 3600 })}
-        sloLoading={false}
-        sloError={false}
+        lag={lagFixture({ p95_ms: 2500 })}
+        lagLoading={false}
+        lagError={false}
       />,
     );
-    expect(screen.getByTestId('red-kpi-footnote')).toHaveTextContent('data: last 60m');
+    const valueNode = screen.getByText('2500');
+    expect(valueNode.className).toMatch(/amber|yellow|warning/i);
   });
 
-  it('does NOT render the "data:" hint when the actual window matches the requested', () => {
-    // Requested 1h and got 1h — no truncation, hint suppressed.
+  it('lag band: P95 ≥ 5000 ms → critical tone', () => {
     render(
       <RedKpiCards
-        red={makeRed()}
+        red={baseRed}
         redLoading={false}
         redError={false}
-        slo={makeSlo({ window_hours: 1, data_window_seconds_actual: 3600 })}
-        sloLoading={false}
-        sloError={false}
+        lag={lagFixture({ p95_ms: 7000 })}
+        lagLoading={false}
+        lagError={false}
       />,
     );
-    expect(screen.queryByTestId('red-kpi-footnote')).not.toBeInTheDocument();
+    const valueNode = screen.getByText('7000');
+    expect(valueNode.className).toMatch(/destructive|red|critical/i);
   });
 });

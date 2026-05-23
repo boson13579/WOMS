@@ -70,12 +70,25 @@ export type RedMetricsResponse = z.infer<typeof redMetricsResponseSchema>;
 // USE — utilization / saturation / errors (resources card)
 // ---------------------------------------------------------------------------
 
+export const dbPoolPerReplicaSchema = z.object({
+  pod_id: z.string(),
+  size: z.number().int().nonnegative(),
+  checked_out: z.number().int().nonnegative(),
+  overflow: z.number().int(),
+  max_overflow: z.number().int().nonnegative(),
+});
+
+export type DbPoolPerReplica = z.infer<typeof dbPoolPerReplicaSchema>;
+
 export const dbPoolStatsSchema = z.object({
   size: z.number().int().nonnegative(),
   checked_out: z.number().int().nonnegative(),
   overflow: z.number().int(),
   max_overflow: z.number().int().nonnegative(),
   utilization_pct: z.number().min(0).max(100),
+  // ``[]`` when no per-replica publishes exist (fresh deploy or Redis
+  // outage); ``[1]`` for single-pod deployments; ``[N]`` for k8s.
+  replicas: z.array(dbPoolPerReplicaSchema).default([]),
 });
 
 export type DbPoolStats = z.infer<typeof dbPoolStatsSchema>;
@@ -83,12 +96,29 @@ export type DbPoolStats = z.infer<typeof dbPoolStatsSchema>;
 export const redisStatsSchema = z.object({
   used_memory_bytes: z.number().int().nonnegative(),
   used_memory_peak_bytes: z.number().int().nonnegative(),
+  // ``0`` means "no maxmemory cap configured" (the local docker default).
+  // Frontend uses this to decide whether to draw the saturation bar.
+  max_memory_bytes: z.number().int().nonnegative().default(0),
   connected_clients: z.number().int().nonnegative(),
   ops_per_sec: z.number().int().nonnegative(),
   evicted_keys: z.number().int().nonnegative(),
 });
 
 export type RedisStats = z.infer<typeof redisStatsSchema>;
+
+export const wsConnectionsPerReplicaSchema = z.object({
+  pod_id: z.string(),
+  count: z.number().int().nonnegative(),
+});
+
+export type WsConnectionsPerReplica = z.infer<typeof wsConnectionsPerReplicaSchema>;
+
+export const wsConnectionStatsSchema = z.object({
+  total: z.number().int().nonnegative(),
+  replicas: z.array(wsConnectionsPerReplicaSchema).default([]),
+});
+
+export type WsConnectionStats = z.infer<typeof wsConnectionStatsSchema>;
 
 export const workerStatusSchema = z.enum(['active', 'idle']);
 
@@ -117,41 +147,31 @@ export type CeleryStats = z.infer<typeof celeryStatsSchema>;
 export const useResourcesSchema = z.object({
   db_pool: dbPoolStatsSchema.nullable(),
   redis: redisStatsSchema.nullable(),
+  // ``celery`` kept for wire compatibility with any external consumer
+  // (k8s probes, scripts). The dashboard no longer renders a Workers
+  // card; live WebSocket connections replace it.
   celery: celeryStatsSchema.nullable(),
+  ws_connections: wsConnectionStatsSchema.nullable().default(null),
 });
 
 export type UseResources = z.infer<typeof useResourcesSchema>;
 
 // ---------------------------------------------------------------------------
-// SLO compliance
+// Schedule lag (replaces the SLO KPI card)
 // ---------------------------------------------------------------------------
 
-export const sloComplianceSchema = z.object({
-  window_hours: z.number().int().positive(),
-  total_requests: z.number().int().nonnegative(),
-  successful_requests: z.number().int().nonnegative(),
-  success_pct: z.number().min(0).max(100),
-  slo_target_pct: z.number().min(0).max(100),
-  error_budget_pct_remaining: z.number().min(0).max(100),
-  error_budget_consumed_pct: z.number().min(0).max(100),
-  /**
-   * Actual amount of data (in seconds) backing this response. When the
-   * requested ``window_hours`` exceeds the underlying ZSET retention
-   * (1 hour at the time of writing), this caps at the available slice
-   * so the UI can surface "Showing Xm of data (requested Yh)" hints.
-   * 0 means no samples are present at all.
-   */
-  data_window_seconds_actual: z.number().int().nonnegative(),
-  /**
-   * Same semantics as ``RedMetricsResponse.data_status``: ``"degraded"``
-   * means the underlying Redis source was unreachable, so the headline
-   * "100% available" is actually "we don't know". Defaulted so older
-   * backend revisions remain wire-compatible.
-   */
+export const scheduleLagSchema = z.object({
+  window_seconds: z.number().int().positive(),
+  sample_count: z.number().int().nonnegative(),
+  p50_ms: z.number().int().nonnegative(),
+  p95_ms: z.number().int().nonnegative(),
+  max_ms: z.number().int().nonnegative(),
+  // ``"degraded"`` when the backend couldn't read Redis; envelope is
+  // zeros but operator should see "data unavailable", not "no traffic".
   data_status: dataStatusSchema,
 });
 
-export type SloCompliance = z.infer<typeof sloComplianceSchema>;
+export type ScheduleLag = z.infer<typeof scheduleLagSchema>;
 
 // ---------------------------------------------------------------------------
 // UI-only helpers
