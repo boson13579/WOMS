@@ -68,7 +68,14 @@
 - **pending_ops queue**：所有 compound（想排 / 想取消 / 想 pin 等的事件包成一組）先進這個 Redis sorted set，score 編碼 shrink-優先 + 組內 FIFO。worker 用 batch admission 一次處理 — `ZRANGE` 讀全部、二分搜尋找最大可行 prefix `[1..k]`、整 batch tree 一次更新後 `ZREM` 那 k 個 member。可行性 check 在 tree 變動前就做，所以不需要 snapshot rollback。詳見 §4.2。
 - **scheduler state**：序列化在 Redis 的線段樹 + pq + `pinned_orders` + `base_date`，跨次持久保存。
 - **schedule status**：`idle` / `running` / `failed`，由 worker 維護，API 跟 advance\_day 拿來判斷有沒有任務在跑。
-- **訂單生命週期 status**（DB 上的 `Order.status` 欄位，跟上面的 schedule status 是不同的東西）：`pending` → `scheduled` → `in_production` → `completed`。`pending` 是剛建立 / 剛 PATCH 的；scheduler 把它排進排程後變 `scheduled`；advance_day 在生產日當天 00:00 UTC 把它變 `in_production`、生產完那天 00:00 UTC 變 `completed`。`cancelled` 是 PATCH 軟刪除走的旁路。
+- **訂單生命週期 status**（DB 上的 `Order.status` 欄位，跟上面的 schedule status 是不同的東西）：`pending` → `scheduled` → `in_production` → `completed`。`pending` 是剛建立 / 剛 PATCH 的；scheduler 把它排進排程後變 `scheduled`；advance_day 在生產日當天 00:00 UTC 把它變 `in_production`、生產完那天 00:00 UTC 變 `completed`。`cancelled` 是「訂單沒能成功進入排程 / 被人工取消」的旁路（user 主動取消、user 刪除、worker reject 三種來源）。
+- **`cancelled` 跟 `is_deleted` 的區分**（兩個欄位獨立，組合決定可見性）：
+    - **使用者 `DELETE /orders/{id}`**（「刪除訂單」按鈕，僅適用 `scheduled` 訂單）：`status='cancelled'` + `is_deleted=True` + audit `order.deleted`。訂單從 list view 消失（`is_deleted=False` filter），但 audit log 還查得到（`/orders/{id}/audit` 不過 soft-delete filter）。
+    - **使用者 `POST /orders/{id}/cancel`**（「取消訂單」按鈕，僅適用 `scheduled` 訂單）：`status='cancelled'` + `is_deleted=False` + audit `order.cancelled`。訂單**保留在 list view**，跟「刪除」的差別只在 `is_deleted` 這一欄。compound shape 跟 delete 相同（`[remove]` / `[unpin, remove]`），只是 `db_action.kind="cancel"`。語意：「客戶反悔，把這張單從產線拉掉但保留紀錄」。
+    - **使用者 `DELETE /schedule/operations/{compound_id}`**（「取消訂單操作」按鈕，適用 pending list 中尚未被 worker 處理的 compound）：依被取消的 compound `kind` 走 reject 路徑 — `kind="create"` 走下面那條（cancelled + visible）、`kind="update"` / `"delete"` / `"cancel"` 只是 clear lock 還原 status。
+    - **Worker 拒絕一筆 create compound**（producer 已建 row、worker `add` 因 `capacity_exceeded` / `deadline_too_far` reject）**或上面那條 user 取消 create-kind compound**：`status='cancelled'` + `is_deleted=False` + audit `order.cancelled`。訂單**保留在 list view**，讓 user 知道「這張單沒有被成功收進排程，要不要改完再重送」。`compound_finalize._apply_db_action_reject(kind="create")` 是這條路徑的 single source of truth。
+    - 三條 user-facing path 都不會碰 DB 列的真實刪除 — `is_deleted` 是 soft delete flag。`GET /orders` 不變地用 `is_deleted.is_(False)` 篩；新邏輯下它會自然 surface 出 user-cancelled / worker-rejected / queue-cancelled 的 cancelled row。
+- **Audit action 字串**：`order.deleted`（DELETE 路徑） vs `order.cancelled`（其餘 cancel 路徑），兩種能在 audit trail 一眼分辨。
 
 WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：worker 用同步 `publish()`，FastAPI 進程在 lifespan 起 async subscriber，把訊息推到連線在 `/api/v1/ws` 的客戶端（§4.5 細講）。
 
@@ -708,14 +715,20 @@ WebSocket 整套已經實作完成，**你不用寫 backend code**。前端只�
 > **`db_action.old_*` 欄位在 delete compound 內被 worker 用於 audit**：`_build_delete_compound` 把 pre-delete 的 `wafer_quantity` / `requested_delivery_date` / `notes` / `assigned_to` 都塞進 `db_action`；worker accept 時把這四個欄位填進 `audit_logs.old_value`。Update compound 也帶 `old_pinned_production_date` / `old_is_pinned` 給 worker 寫 audit。
 >
 > **`_apply_db_action_reject` 防禦 `in_production` status**：reject path 預設「DB 沒被產品端寫過 → 清 lock + 用 `scheduled_production_date` 推導 status」。但若未來放寬 `MUTABLE_STATUSES` 讓 in_production row 也能 PATCH（例如改 notes），這條 reject 路徑會把 in_production 訂單默默 demote 回 `scheduled` — 跟 §4.4 P0-1 為 `set_schedule_dates` 加的防禦對稱。所以 reject path 顯式 `if status == in_production: return`，今天不可達、明天放寬時也不會踩雷。
+>
+> **Producer-side deadline fast-fail（B + worker C 雙層防禦）**：`create_order` / `update_order` 在 row-lock 後、build compound 前先過 `validate_deadline_in_horizon(deadline, today)`（`app/services/scheduling.py`）。落在 `[today + 1, today + 30]` 之外 → 同步 raise `HTTPException(422)`，前端立刻拿到錯誤訊息、worker 完全不被打擾。三種 reject reason：`in_past`（deadline ≤ 昨天）、`too_close`（deadline = 今天，違反「day 1 鎖定」業務規則）、`too_far`（deadline > today + HORIZON_DAYS）。`update_order` 只在 `req.requested_delivery_date` 真的有改 / `pin_day_set` 有設值時才檢查，純改 notes 不會無端 422。
+>
+> **為什麼還保留 worker 端 admission（option C，§4.2）**：producer fast-fail 是 happy-path 體驗（user 拿同步 422 比 fire-and-forget WS notify_failed 直覺得多）；worker 端的 `add_order` / `pin_order` 仍會回 `deadline_too_far`，作為「producer 沒檢查或繞過」的 defense-in-depth。Producer 檢查用「現在 wall clock」做基準，worker 檢查用 `state.base_date` — 兩者通常一致，但跨日換天時 producer 已經拒掉、worker 不用處理「user 在 23:59:59 送的 deadline=today+1 在 worker 跑到時變成 deadline=today」這種 race。
 
 訂單**送進 producer service** 後推 compound + 觸發排程。**沒有對外 raw 排程 API** — 從 `app/api/v1/orders.py` 進來的 Order CRUD endpoint 是唯一寫入路徑。**操作對應**：
 
 | Order 動作 | 推進 `pending_ops` 的 ops | `group` |
 |---|---|---|
 | `POST /orders` 新增 | 1 筆 `add` | `grow` |
-| `DELETE /orders/{id}` 軟刪除（非 pinned） | 1 筆 `remove`（用刪除前的 qty / deadline） | `shrink` |
-| `DELETE /orders/{id}` 軟刪除（pinned） | `unpin + remove` | `shrink` |
+| `DELETE /orders/{id}` 軟刪除（非 pinned） | 1 筆 `remove`（用刪除前的 qty / deadline）；`db_action.kind="delete"` | `shrink` |
+| `DELETE /orders/{id}` 軟刪除（pinned） | `unpin + remove`；`db_action.kind="delete"` | `shrink` |
+| `POST /orders/{id}/cancel` 取消（非 pinned） | 1 筆 `remove`；`db_action.kind="cancel"`，僅適用 `status=scheduled` | `shrink` |
+| `POST /orders/{id}/cancel` 取消（pinned） | `unpin + remove`；`db_action.kind="cancel"`，僅適用 `status=scheduled` | `shrink` |
 | `PATCH /orders/{id}` 延後 deadline 或縮減 qty | `remove`（舊）+ `add`（新），加上 pin 相關 ops | strict-AND ↓ |
 | `PATCH /orders/{id}` 提前 deadline 或增加 qty | `remove`（舊）+ `add`（新），加上 pin 相關 ops | `grow` |
 | `PATCH /orders/{id}` `pinned_production_date: "YYYY-MM-DD"` | `pin(target)`（若需要 qty/deadline 改，前面接 `unpin?, remove, add`） | strict-AND ↓ |
@@ -779,13 +792,38 @@ enqueue_compound(compound)   # ← 同 process Redis call；條件式 .delay() �
 - **Producer ↔ consumer 契約**：Redis key 常數（`STATE_KEY` / `STATUS_KEY` / `PENDING_OPS_KEY` / `PENDING_OPS_SEQ_KEY`）跟 `score_for_op` 編碼也住在這個檔，因為兩端（API 跟 worker）都要對得上，把契約放在共同上游避免 api → workers 反向依賴（RULES.md §3）。
 - 演算法詳細推導見 [`backend/CLAUDE.md`](../backend/CLAUDE.md) §業務規則
 
-**Admission control invariant — 不可能有「pinned 滿載 10000 + pq 有 dl=today 訂單」這種 state**
+**Tree 結構：day 1 = 明天**（不是「今天但被 lock」）
 
-`pin_order` 跟 `add_order` 的容量檢查都用 `capacity_tree.query(rel)` — 它回傳的是「day 1 到 day `rel` 的累計剩餘產能」。配合 backward-fill 的 reservation：
-- pin Y(qty=10000) 到 today 之後，day 1 prefix sum = 0，任何後續 `add_order` with dl=today 必 reject。
-- 反過來：先 add X(qty=2000, dl=today)，day 1 prefix sum = 8000；後續 pin Y(qty=10000, fake=today) 看到 8000 < 10000 → reject；只有 pin Y(qty=8000, fake=today) 剛好用滿才會通過，此時 X 跟 Y 加總正好 10000，仍可行。
+業務規則：今天的生產線在前一晚 00:00 UTC 就已經由 `advance_day_task::mark_in_production` 把當天訂單升級成 `in_production` 確認下來。當天 user 新增訂單 / PATCH / pin 一律不能落在今天，只能 day 2（明天）以後。
 
-所以「pinned 把今天吃滿但 pq 還有 dl=today 訂單」這個 state 在 admission 正確的前提下**不可達**。reviewer 提出的 P1-1 場景（advance_day 之後該 pq 訂單卡死）的前提條件因此排除掉。`tests/services/test_scheduling.py::test_p1_1_invariant_*` 三個測試把這個 invariant 鎖住 — 如果後續有人改 admission control 把這個保證打破，test 立刻紅燈。
+實作層面採用**結構性設計**：兩棵 segment tree 只覆蓋「可放」的天，今天根本不在 tree 裡。`abs_to_rel(today, base_date)` 直接回 `None`，跟「超出 horizon」走同一條 reject 分支。
+
+| 對應關係 | 公式 |
+|---|---|
+| `state.base_date` | 今天的絕對日期 |
+| tree day 1 | `base_date + 1`（明天） |
+| tree day 30 | `base_date + 30` |
+| `abs_to_rel(d, base)` | `(d - base).days`，落在 `[1, 30]` 才合法；否則 `None` |
+| `rel_to_abs(rel, base)` | `base + timedelta(days=rel)`（rel=1 → tomorrow） |
+
+四個函式都用**標準形**，沒有任何 day-1 hack：
+
+| 函式 | 行為 |
+|---|---|
+| `add_order` | `available = capacity_tree.query(rel) >= wafer_quantity`。`deadline == today` 在 `abs_to_rel` 就回 None → 走 `deadline_too_far` 分支，rejection message 區分 `today` / `past` / `outside_horizon` 三種子情境 |
+| `pin_order` | 同上，`fake_deadline == today` → `deadline_too_far`，message 提示「pick tomorrow or later」 |
+| `compute_schedule` phase 2 | `for d in range(1, deadline_rel + 1)`，沒有 day-1 skip。`deadline_rel is None` 的 pq order（legacy / overdue）走既有的 `continue` 分支，不另開 log 路徑 |
+| `is_batch_feasible` | 標準累計 `cumulative_demand <= cumulative_capacity` ∀i ∈ [1, HORIZON_DAYS]，沒有 day-1 = 0 的特殊處理 |
+
+**為什麼這條規則**：原本算法把 day 1 當「跟其他 30 天一樣的 bucket」，新訂單塞滿後直接擠到 day 1 production line — 但 day 1 = 今天，生產已經在跑，物理上沒辦法臨時插一張單。改成 day 1 鎖定之後：(1) 新 admission 只能往 day 2+ 塞，符合「今天線不能動」的真實限制；(2) 前端 calendar 看到 day 1 一律是 `status='in_production'` 的訂單（pinned-today 或前一天承諾的 day-2），跟 list 表的 status 一致，沒有「calendar 顯示生產中但 list 顯示已排程」的不一致。
+
+**為什麼結構性比補丁式好**：第一版實作用 `FIRST_FILLABLE_DAY = 2` 常數 + `query(rel) - query(1)` 減法在四個地方各自把 day 1 排除掉。這個設計能 work，但每個函式都有特殊 case 要維護，未來重構容易漏掉一處導致 day-1 復活。改成「tree 從 tomorrow 開始」之後 invariant 自然成立 — 連 `FIRST_FILLABLE_DAY` 常數都不需要存在，函式回到標準型，無人能誤寫。
+
+**Admission control invariant — 不可能有「pinned 滿載 10000 + pq 有 dl=today 訂單」這種 state**（歷史 invariant，新規則下仍成立）
+
+`pin_order` 跟 `add_order` 的容量檢查都用 `capacity_tree.query(...)` — 配合 backward-fill 的 reservation。新規則下 admission 階段 `abs_to_rel(today, base) is None` 就 reject 了，所以 pq 不可能有 dl=today 訂單。這個 invariant 變成「結構性 vacuous true」 — 不靠 runtime check，靠 type/domain 構造保證。
+
+`tests/services/test_scheduling.py::test_p1_1_invariant_*` 三個測試把這個 invariant 鎖住 — 如果後續有人改 admission control 把這個保證打破，test 立刻紅燈。
 
 **Invariant break 時的處理：`SegmentTreeInvariantError` per-leaf 隔離**
 
@@ -892,6 +930,17 @@ remove 的 forward give-back 走完還有 `remaining > 0`，代表線段樹的 o
    - 試 `[1..take]` → 用 `compute_batch_capacity_delta` 折成 per-day 表 → `is_batch_feasible(state, delta)` 比較 prefix sum 跟 `capacity_tree`。可行就接受。
    - 不可行 → 試 `[1..take//2]`，再 `[1..take//4]`...，到 `[1..1]` 仍不可行就 return `0`。
 4. **`k == 0`**（連第一筆 compound 都塞不下）：`_reject_first_compound` ZREM 那筆 + drop secondary index + `_perform_compound_db_action(rejected)` + WS `schedule.compound_failed`。`_update_reject_rate(rejected=1)` 把 p 往 1 推一個 EWMA 步。再 continue 外圈 while。
+
+   > `_perform_compound_db_action` 本體住在 **`app/services/compound_finalize.py`** 模組（worker 端 `from app.services.compound_finalize import perform_compound_db_action as _perform_compound_db_action`），跟 `app/services/schedule_queue.py::cancel_compound` 共用同一份 accept / reject 邏輯。Accept / reject 路徑依 `db_action.kind` 分四種：
+   >
+   > | kind | accept 行為 | reject 行為 |
+   > |---|---|---|
+   > | `create` | 清 lock；producer 已寫的 row 留下、由 materializer 接著 `status=scheduled` | `status=cancelled` + `is_deleted=False`（**保留在 list**）+ audit `order.cancelled` |
+   > | `update` | 寫 new\_\* 欄位 + audit `order.updated` | 清 lock，status 由 `scheduled_production_date` 推回 `scheduled` / `pending` |
+   > | `delete` | `is_deleted=True` + `status=cancelled` + audit `order.deleted` | 同 update reject |
+   > | `cancel` | `status=cancelled` + `is_deleted=False`（**保留在 list**）+ audit `order.cancelled` | 同 update reject |
+   >
+   > `delete` 跟 `cancel` 在 worker 端的 compound shape 完全一樣（`[remove]` / `[unpin, remove]`），accept 路徑只差「`is_deleted` 翻不翻」這一行 — 對應前端兩個按鈕（「刪除訂單」vs「取消訂單」）。一份程式碼涵蓋 worker 自動 reject 跟 user 手動 cancel-compound 兩條路徑，避免兩處 ownership 漂移。
 5. **`k > 0`**：`_commit_accepted_batch` 一口氣處理 `compounds[:k]`：
    - 用 batch delta 一次更新兩棵樹（`apply_batch_to_capacity` 用 carry-back distribution，`apply_batch_to_deadline` 直接 point_update）。**樹只動一次，不論 batch 裡有 k 個還是 1 個 compound**。
    - 逐 compound 逐 leaf 跑 `_apply_compound_leaf_structural`：`add` / `remove` 只動 pq（樹的部分剛剛 batch 寫完了）；`pin` / `unpin` 呼 既有的 `pin_order` / `unpin_order`（它們有自己的 tree swap，不在 batch delta 內）。

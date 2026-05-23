@@ -92,11 +92,18 @@ class CompoundDbAction(BaseModel):
       Worker on failure clears the lock; DB still holds the pre-PATCH
       values (which is the correct rollback outcome).
     - ``kind="delete"``: producer only writes the lock flag. Worker on
-      success sets ``is_deleted=True`` + ``status=cancelled`` + audit.
-      Worker on failure clears the lock; the order remains alive.
+      success sets ``is_deleted=True`` + ``status=cancelled`` + audit
+      (``order.deleted``). Worker on failure clears the lock; the
+      order remains alive.
+    - ``kind="cancel"``: same scheduler-side compound shape as delete
+      (``[remove]`` / ``[unpin, remove]``) but worker on success leaves
+      ``is_deleted=False`` so the row stays visible in ``GET /orders``
+      with ``status=cancelled`` + audit (``order.cancelled``). User
+      intent: "pull this scheduled order off the line but keep it on
+      record". Worker on failure mirrors delete-reject.
     """
 
-    kind: Literal["create", "update", "delete"]
+    kind: Literal["create", "update", "delete", "cancel"]
     actor_id: uuid.UUID
 
     # New values to write (None = field absent from the PATCH).

@@ -8,7 +8,7 @@ Run: pytest tests/api/test_notifications.py -v
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import patch
 
 import bcrypt
@@ -234,12 +234,14 @@ def test_order_lock_creates_notification(client: TestClient, db_session: Session
     token = _login(client, "notif_user6")
     order = _make_order(db_session, created_by=user.id)
 
-    # PATCH with scheduling change triggers is_processing_locked=True and notification hook
+    # PATCH with scheduling change triggers is_processing_locked=True and notification hook.
+    # Deadline must land in producer's [today+1, today+30] horizon, so compute relative.
+    new_deadline = (date.today() + timedelta(days=20)).isoformat()
     res = client.patch(
         f"/api/v1/orders/{order.id}",
         json={
             "wafer_quantity": 200,
-            "requested_delivery_date": "2026-10-01",
+            "requested_delivery_date": new_deadline,
             "version_id": order.version_id,
         },
         headers=_auth(token),
@@ -365,10 +367,12 @@ def test_order_cancelled_notification(db_session: Session) -> None:
         },
     }
 
-    # Redirect _perform_compound_db_action's SessionLocal to the test session so
-    # the worker can see records committed via savepoints, and prevent db.close()
-    # from tearing down the test session.
-    with patch("app.workers.scheduling.SessionLocal", return_value=db_session):
+    # Redirect ``perform_compound_db_action``'s SessionLocal to the test
+    # session. P1-2 extracted the function to ``app.services.compound_finalize``
+    # so the binding to patch is over there (the worker re-exports as
+    # ``_perform_compound_db_action`` for backward compat but the inner
+    # ``SessionLocal()`` call now lives in ``compound_finalize``).
+    with patch("app.services.compound_finalize.SessionLocal", return_value=db_session):
         with patch.object(db_session, "close"):
             with patch("app.services.notification.notify_user"):
                 _perform_compound_db_action(compound, accepted=True)
