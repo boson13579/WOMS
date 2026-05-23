@@ -176,10 +176,12 @@ def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
     **DB compensation**: when ZREM succeeds, the producer's pre-write
     (``is_processing_locked=True`` plus, for ``create``, the orphan row)
     is still in the DB and won't be touched by the worker (the compound
-    is gone from the queue). We replay the same ``db_action(accepted=
-    False)`` finalize the worker would have run on a rejection — soft-
-    deletes the create-orphan, restores status + clears lock for update/
-    delete. Without this, a cancelled create leaves the row stuck in
+    is gone from the queue). We replay the same rejection/cancellation
+    finalize path the worker would have run for ``db_action(accepted=
+    False)``: ``create`` compounds are marked cancelled but remain
+    visible (for example, ``status=cancelled`` and ``is_deleted=False``),
+    while ``update``/``delete`` restore status and clear the processing
+    lock. Without this, a cancelled create leaves the row stuck in
     ``is_processing_locked=True`` with no recovery path; cancelled
     update/delete leaves status pinned to ``pending`` even though the
     row was previously ``scheduled``.
