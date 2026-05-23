@@ -49,14 +49,38 @@ export function OrderFilters(): JSX.Element {
   }, [localSearch, setSearch]);
 
   // Local text for the assignee / creator inputs — only push to the store when
-  // the typed value resolves to a real user (or is cleared).
-  const initialAssignee = users.find((u) => u.id === assignedTo[0])?.username ?? '';
-  const initialCreator = users.find((u) => u.id === createdBy[0])?.username ?? '';
-  const [assigneeInput, setAssigneeInput] = useState(initialAssignee);
-  const [creatorInput, setCreatorInput] = useState(initialCreator);
+  // the typed value resolves to a real user (or is cleared). Initial value uses
+  // the cached user list if available; the hydration effect below covers the
+  // case where the list is still loading at mount but the store carries a
+  // pre-existing filter (e.g. after navigating away and returning).
+  const [assigneeInput, setAssigneeInput] = useState(
+    () => users.find((u) => u.id === assignedTo[0])?.username ?? '',
+  );
+  const [creatorInput, setCreatorInput] = useState(
+    () => users.find((u) => u.id === createdBy[0])?.username ?? '',
+  );
+  const [didHydrate, setDidHydrate] = useState(users.length > 0);
+
+  useEffect(() => {
+    if (didHydrate || users.length === 0) return;
+    setDidHydrate(true);
+    // Only fill inputs that haven't been touched, so we don't clobber a user
+    // mid-type if the user list resolves late.
+    setAssigneeInput(
+      (prev) => prev || users.find((u) => u.id === assignedTo[0])?.username || '',
+    );
+    setCreatorInput(
+      (prev) => prev || users.find((u) => u.id === createdBy[0])?.username || '',
+    );
+  }, [users, assignedTo, createdBy, didHydrate]);
 
   useEffect(() => {
     const id = setTimeout(() => {
+      // Don't touch the store until the user list has loaded — otherwise a
+      // slow `/users/assignable` response would race the debounce timer and
+      // we'd treat the still-empty input as "user cleared the filter",
+      // wiping a pre-existing assignedTo on mount.
+      if (users.length === 0) return;
       const userId = findUserIdByInput(users, assigneeInput);
       if (assigneeInput.trim() === '') {
         if (assignedTo.length > 0) setAssignedTo([]);
@@ -71,6 +95,7 @@ export function OrderFilters(): JSX.Element {
 
   useEffect(() => {
     const id = setTimeout(() => {
+      if (users.length === 0) return;
       const userId = findUserIdByInput(users, creatorInput);
       if (creatorInput.trim() === '') {
         if (createdBy.length > 0) setCreatedBy([]);
@@ -103,7 +128,7 @@ export function OrderFilters(): JSX.Element {
       />
 
       <Input
-        list="assignee-filter-datalist"
+        list="order-filter-users-datalist"
         placeholder="搜尋負責人姓名…"
         value={assigneeInput}
         onChange={(e) => {
@@ -113,16 +138,9 @@ export function OrderFilters(): JSX.Element {
         aria-label="搜尋負責人"
         autoComplete="off"
       />
-      <datalist id="assignee-filter-datalist">
-        {users.map((u) => (
-          <option key={u.id} value={u.username}>
-            {u.email ?? ''}
-          </option>
-        ))}
-      </datalist>
 
       <Input
-        list="creator-filter-datalist"
+        list="order-filter-users-datalist"
         placeholder="搜尋建立者姓名…"
         value={creatorInput}
         onChange={(e) => {
@@ -132,7 +150,9 @@ export function OrderFilters(): JSX.Element {
         aria-label="搜尋建立者"
         autoComplete="off"
       />
-      <datalist id="creator-filter-datalist">
+
+      {/* Shared datalist for both assignee and creator inputs. */}
+      <datalist id="order-filter-users-datalist">
         {users.map((u) => (
           <option key={u.id} value={u.username}>
             {u.email ?? ''}

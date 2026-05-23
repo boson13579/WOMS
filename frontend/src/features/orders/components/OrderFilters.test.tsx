@@ -31,6 +31,8 @@ vi.mock('@/features/auth/api/users', () => ({
 
 const mockSetStatus = vi.fn();
 const mockSetSearch = vi.fn();
+const mockSetAssignedTo = vi.fn();
+const mockSetCreatedBy = vi.fn();
 const mockReset = vi.fn();
 
 const mockStore = {
@@ -41,8 +43,8 @@ const mockStore = {
   page: 1,
   setStatus: mockSetStatus,
   setSearch: mockSetSearch,
-  setAssignedTo: vi.fn(),
-  setCreatedBy: vi.fn(),
+  setAssignedTo: mockSetAssignedTo,
+  setCreatedBy: mockSetCreatedBy,
   setPage: vi.fn(),
   reset: mockReset,
 };
@@ -60,6 +62,8 @@ describe('OrderFilters', () => {
     vi.clearAllMocks();
     mockStore.status = null;
     mockStore.search = '';
+    mockStore.assignedTo = [];
+    mockStore.createdBy = [];
   });
 
   it('renders the search input and status select', () => {
@@ -117,5 +121,84 @@ describe('OrderFilters', () => {
     );
     // debounce: called once with the final value, not once per character typed
     expect(mockSetSearch).toHaveBeenCalledOnce();
+  });
+
+  it('calls setAssignedTo with the matching user id when a username is typed', async () => {
+    const user = userEvent.setup();
+    render(<OrderFilters />);
+
+    await user.type(screen.getByRole('combobox', { name: /搜尋負責人/ }), 'alice');
+
+    await waitFor(
+      () => {
+        expect(mockSetAssignedTo).toHaveBeenCalledWith(['u-1']);
+      },
+      { timeout: 1000 },
+    );
+  });
+
+  it('calls setCreatedBy with the matching user id when a username is typed', async () => {
+    const user = userEvent.setup();
+    render(<OrderFilters />);
+
+    await user.type(screen.getByRole('combobox', { name: /搜尋建立者/ }), 'bob');
+
+    await waitFor(
+      () => {
+        expect(mockSetCreatedBy).toHaveBeenCalledWith(['u-2']);
+      },
+      { timeout: 1000 },
+    );
+  });
+
+  it('does not call setAssignedTo when the typed name matches no user', async () => {
+    const user = userEvent.setup();
+    render(<OrderFilters />);
+
+    await user.type(screen.getByRole('combobox', { name: /搜尋負責人/ }), 'nobody');
+
+    // Wait past the 300ms debounce so we can assert nothing fires.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(mockSetAssignedTo).not.toHaveBeenCalled();
+  });
+
+  it('clears the assignee filter when the input is emptied (store had a value)', async () => {
+    mockStore.assignedTo = ['u-1'];
+    const user = userEvent.setup();
+    render(<OrderFilters />);
+
+    // Initial value hydrated from the store.
+    const input = screen.getByRole('combobox', { name: /搜尋負責人/ });
+    await waitFor(() => {
+      expect(input).toHaveValue('alice');
+    });
+
+    await user.clear(input);
+
+    await waitFor(
+      () => {
+        expect(mockSetAssignedTo).toHaveBeenCalledWith([]);
+      },
+      { timeout: 1000 },
+    );
+  });
+
+  it('reset button clears local assignee/creator inputs', async () => {
+    const user = userEvent.setup();
+    render(<OrderFilters />);
+
+    const assigneeInput = screen.getByRole('combobox', { name: /搜尋負責人/ });
+    const creatorInput = screen.getByRole('combobox', { name: /搜尋建立者/ });
+
+    await user.type(assigneeInput, 'alice');
+    await user.type(creatorInput, 'bob');
+    expect(assigneeInput).toHaveValue('alice');
+    expect(creatorInput).toHaveValue('bob');
+
+    await user.click(screen.getByRole('button', { name: /重設/ }));
+
+    expect(assigneeInput).toHaveValue('');
+    expect(creatorInput).toHaveValue('');
+    expect(mockReset).toHaveBeenCalledOnce();
   });
 });
