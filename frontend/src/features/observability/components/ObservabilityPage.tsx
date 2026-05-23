@@ -66,7 +66,7 @@ export function ObservabilityPage(): JSX.Element {
   const systemHealth = useSystemHealth();
   const red = useRedMetrics(windowSeconds);
   const resources = useUseResources();
-  const lag = useScheduleLag(60);
+  const lag = useScheduleLag(windowSeconds);
 
   const isFetching =
     systemHealth.isFetching || red.isFetching || resources.isFetching || lag.isFetching;

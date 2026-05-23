@@ -158,10 +158,12 @@ def get_schedule_lag(
     window_seconds: int = Query(
         default=60,
         ge=1,
-        le=300,
+        le=3600,
         description=(
-            "Trailing window in seconds. Underlying sorted set has 5-minute "
-            "retention; values above 300 are clamped client-side."
+            "Trailing window in seconds. The underlying sorted set is "
+            "trimmed to 5 minutes of retention, so windows wider than "
+            "300s return only the samples physically present — same "
+            "best-effort semantics as ``/system/red``."
         ),
     ),
     current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),

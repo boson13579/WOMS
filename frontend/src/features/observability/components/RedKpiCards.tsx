@@ -167,7 +167,7 @@ function LagCardSlot({
   if (lag.sample_count === 0) {
     return (
       <RedKpiCard
-        label="Schedule lag"
+        label="Schedule lag P95"
         value="—"
         unit="ms"
         subtitle="No compounds processed in window"
@@ -177,10 +177,10 @@ function LagCardSlot({
   }
   return (
     <RedKpiCard
-      label="Schedule lag"
+      label="Schedule lag P95"
       value={`${lag.p95_ms}`}
       unit="ms"
-      subtitle={`P50 ${lag.p50_ms} • max ${lag.max_ms} (${lag.sample_count} samples)`}
+      subtitle={`P50 ${lag.p50_ms} ms • max ${lag.max_ms} ms (${lag.sample_count} samples)`}
       tone={lagTone(lag.p95_ms)}
       sparklineData={history}
       sparklineLabel="P95 schedule lag over time"
