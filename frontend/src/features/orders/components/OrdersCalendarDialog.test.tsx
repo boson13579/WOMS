@@ -182,9 +182,9 @@ describe('OrdersCalendarDialog', () => {
       base_date: '2026-05-09',
       daily_capacity: 2500,
       entries: [
-        { date: '2026-05-09', cumulative_remaining: 1500 },
-        { date: '2026-05-10', cumulative_remaining: 2500 },
-        { date: '2026-05-11', cumulative_remaining: 2500 },
+        { date: '2026-05-09', used: 1000, remaining: 1500 },
+        { date: '2026-05-10', used: 1500, remaining: 1000 },
+        { date: '2026-05-11', used: 2500, remaining: 0 },
       ],
     };
     mockScheduleCapacity.isPending = false;
@@ -232,14 +232,14 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText(/MediaTek/)).toBeInTheDocument();
   });
 
-  it('does not render date-based production states before server base_date is loaded', () => {
+  it('renders calendar rows while server base_date is loading', () => {
     mockScheduleCapacity.data = undefined;
     mockScheduleCapacity.isPending = true;
 
     renderDialog();
 
     expect(screen.getByText('載入日曆中...')).toBeInTheDocument();
-    expect(screen.queryByText('ORD-20260504-0001')).not.toBeInTheDocument();
+    expect(screen.getByText('ORD-20260504-0001')).toBeInTheDocument();
   });
 
   it('shows split production progress across production dates', async () => {

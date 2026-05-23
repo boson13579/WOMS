@@ -174,20 +174,6 @@ function groupByProductionDate(
   }, {});
 }
 
-function canDragScheduledOrder(
-  order: ProductionCalendarItem,
-  dragOrder: DraggableOrder | undefined,
-  canManageSchedule: boolean,
-): boolean {
-  return (
-    canManageSchedule &&
-    order.status === 'scheduled' &&
-    order.productionState !== 'in_progress' &&
-    dragOrder !== undefined &&
-    !dragOrder.is_processing_locked
-  );
-}
-
 function capacityTone(remaining: number, dailyCapacity: number): string {
   if (remaining <= 0) return 'text-red-600 dark:text-red-400';
   if (remaining <= dailyCapacity / 2) return 'text-amber-600 dark:text-amber-400';
