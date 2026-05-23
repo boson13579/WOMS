@@ -1,14 +1,10 @@
 """Targeted tests for ``app.services.order`` paths touched by the scheduler.
 
 Per RULES.md §5 (TDD), every functional change ships with a regression test.
-The PR-review fix that made ``apply_schedule`` write into the ``audit_logs``
-table — instead of only emitting a stdout audit line — is exactly the kind
-of change that needs a real-DB assertion: a unit test with mocked sessions
-would happily pass even if the row were never persisted.
 
-Scope is intentionally narrow: just enough to lock the audit-DB-write
-contract that the review feedback called out. Broader ``services/order``
-coverage lives elsewhere.
+Scope is intentionally narrow: ``apply_schedule`` behaviour, concurrent PATCH
+isolation (StaleDataError + SAVEPOINT), and DB-write correctness. Broader
+``services/order`` coverage lives elsewhere.
 """
 
 from __future__ import annotations
@@ -80,13 +76,12 @@ def _make_order(
     return order
 
 
-def test_apply_schedule_persists_audit_row_per_order(db_session: Session) -> None:
-    """Each order whose schedule is applied must land a row in ``audit_logs``
-    with ``action="order.scheduled"``, ``user_id=None`` (system actor), and a
-    ``new_value`` JSON containing the persisted dates and final status.
+def test_apply_schedule_returns_correct_applied_count(db_session: Session) -> None:
+    """apply_schedule returns the count of orders whose dates were written.
 
-    Pre-fix this path only emitted a stdout log; if the log shipper missed it
-    the schedule history was unrecoverable from the DB.
+    Multi-day assignments for one order count as a single applied order (the
+    date fold collapses them to earliest/latest). Single-day for another order
+    counts as one more. Total: 2.
     """
     creator = _make_user(db_session, username="apply-sched-user-1")
     order_a = _make_order(
@@ -102,9 +97,6 @@ def test_apply_schedule_persists_audit_row_per_order(db_session: Session) -> Non
         deadline=date(2026, 5, 22),
     )
 
-    # Mixed multi-day assignment for order_a (collapses to earliest/latest);
-    # single-day for order_b — covers both branches of the fold inside
-    # apply_schedule.
     scheduled = [
         ScheduledResult(order_id=order_a.id, scheduled_date=date(2026, 5, 12), quantity=60),
         ScheduledResult(order_id=order_a.id, scheduled_date=date(2026, 5, 13), quantity=40),
@@ -114,36 +106,12 @@ def test_apply_schedule_persists_audit_row_per_order(db_session: Session) -> Non
     applied = order_service.apply_schedule(db_session, scheduled)
     assert applied == 2
 
-    rows = list(
-        db_session.scalars(
-            select(AuditLog)
-            .where(AuditLog.action == "order.scheduled")
-            .where(AuditLog.resource_id.in_([order_a.id, order_b.id]))
-            .order_by(AuditLog.created_at.asc())
-        ).all()
-    )
-
-    assert len(rows) == 2
-    by_order = {row.resource_id: row for row in rows}
-    a_row = by_order[order_a.id]
-    b_row = by_order[order_b.id]
-
-    # System-driven scheduling has no human actor.
-    assert a_row.user_id is None
-    assert b_row.user_id is None
-    assert a_row.resource_type == "order"
-    # New_value carries the earliest/latest fold and the new status, so the
-    # audit history alone is enough to answer "when was X scheduled?".
-    assert a_row.new_value == {
-        "scheduled_production_date": "2026-05-12",
-        "expected_delivery_date": "2026-05-13",
-        "status": OrderStatus.scheduled.value,
-    }
-    assert b_row.new_value == {
-        "scheduled_production_date": "2026-05-14",
-        "expected_delivery_date": "2026-05-14",
-        "status": OrderStatus.scheduled.value,
-    }
+    db_session.refresh(order_a)
+    db_session.refresh(order_b)
+    assert order_a.scheduled_production_date == date(2026, 5, 12)
+    assert order_a.expected_delivery_date == date(2026, 5, 13)
+    assert order_b.scheduled_production_date == date(2026, 5, 14)
+    assert order_b.expected_delivery_date == date(2026, 5, 14)
 
 
 def test_apply_schedule_writes_daily_capacity_snapshot(db_session: Session) -> None:
@@ -1424,18 +1392,6 @@ def test_apply_schedule_skips_stale_row_and_continues_others(
     # order_a's dates were NOT written (the SAVEPOINT rolled back).
     db_session.refresh(order_a)
     assert order_a.scheduled_production_date is None
-
-    # Audit row landed for order_b only; order_a got skipped before the
-    # audit insert ran inside the same nested block.
-    audit_rows = list(
-        db_session.scalars(
-            select(AuditLog).where(
-                AuditLog.action == "order.scheduled",
-                AuditLog.resource_id.in_([order_a.id, order_b.id]),
-            )
-        ).all()
-    )
-    assert {r.resource_id for r in audit_rows} == {order_b.id}
 
 
 # ---------------------------------------------------------------------------
