@@ -44,6 +44,9 @@ from app.core.db import SessionLocal
 from app.repositories import order as order_repo
 from app.services import order as order_service
 from app.services import websocket
+from app.services.compound_finalize import (
+    perform_compound_db_action as _perform_compound_db_action,
+)
 from app.services.schedule_queue import enqueue_notify_user
 from app.services.scheduling import (
     MATERIALIZE_NOTIFY_PENDING_KEY,
@@ -915,14 +918,11 @@ def _drop_compound_index_entry(compound_id: str | None) -> None:
 # DB side via :func:`perform_compound_db_action`.
 #
 # The shared implementation lives in :mod:`app.services.compound_finalize`
-# so the worker and the cancel path use the SAME compensation rules.
-# Without that sharing, cancelling a queued compound left the producer's
-# pre-write stranded (``is_processing_locked=True`` forever) — see the
-# module docstring there for the full motivation.
-
-from app.services.compound_finalize import (  # noqa: E402 — late import: avoids circular dep through services/order
-    perform_compound_db_action as _perform_compound_db_action,
-)
+# (imported at the top of this file as
+# ``_perform_compound_db_action``). Without that sharing, cancelling a
+# queued compound left the producer's pre-write stranded
+# (``is_processing_locked=True`` forever) — see the module docstring
+# there for the full motivation.
 
 # ---------------------------------------------------------------------------
 # Tasks

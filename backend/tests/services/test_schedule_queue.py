@@ -430,7 +430,6 @@ def test_cancel_compound_raises_and_skips_ws_when_compensation_fails(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
     db_session,  # type: ignore[no-untyped-def]
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Compensation failure path (PR review #1): if
     ``perform_compound_db_action`` raises (DB outage / deadlock / constraint
@@ -445,9 +444,17 @@ def test_cancel_compound_raises_and_skips_ws_when_compensation_fails(
     Earlier the code logged + swallowed the exception + sent the WS
     notification anyway — exactly the bug the cancel compensation was
     meant to fix, just relocated to the error path.
-    """
-    import logging
 
+    We deliberately do NOT assert against ``caplog`` here. structlog's
+    ECS renderer puts the ``event`` key in a JSON-encoded part of the
+    record that pytest's stdlib ``caplog`` reads differently across
+    renderer configurations — an OR-ed "either getMessage contains X
+    OR record.__dict__['event'] equals X" check would pass today but
+    silently break if the renderer changes. The behavioral surface
+    (``pytest.raises`` + ``notify_mock.assert_not_called()``) is what
+    actually protects users; the log line is operational telemetry,
+    not part of the contract.
+    """
     from app.models.order import OrderStatus
 
     _, notify_mock = _patch_taskdispatch(monkeypatch)
@@ -475,20 +482,12 @@ def test_cancel_compound_raises_and_skips_ws_when_compensation_fails(
         _explode,
     )
 
-    with caplog.at_level(logging.ERROR, logger="app.services.schedule_queue"):
-        with pytest.raises(RuntimeError, match="simulated DB outage"):
-            cancel_compound(compound.compound_id)
+    with pytest.raises(RuntimeError, match="simulated DB outage"):
+        cancel_compound(compound.compound_id)
 
     # WS notification MUST NOT have been sent — frontend never sees
     # false success.
     notify_mock.assert_not_called()
-
-    # Log with the operational marker so ops can grep for stuck rows.
-    assert any(
-        "schedule.compound.cancel_db_action_failed" in record.getMessage()
-        or record.__dict__.get("event") == "schedule.compound.cancel_db_action_failed"
-        for record in caplog.records
-    )
 
 
 def test_cancel_compound_in_progress_race_skips_db_compensation(
