@@ -56,9 +56,7 @@ describe('UseResourceCards', () => {
         overflow: 0,
         max_overflow: 0,
         utilization_pct: 16.0,
-        replicas: [
-          { pod_id: 'solo-pod', size: 50, checked_out: 8, overflow: 0, max_overflow: 0 },
-        ],
+        replicas: [{ pod_id: 'solo-pod', size: 50, checked_out: 8, overflow: 0, max_overflow: 0 }],
       },
     });
     render(<UseResourceCards data={data} isLoading={false} isError={false} />);

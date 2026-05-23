@@ -95,7 +95,7 @@ describe('RedKpiCards — schedule-lag tile', () => {
         redError={false}
         lag={undefined}
         lagLoading={false}
-        lagError={true}
+        lagError
       />,
     );
     expect(screen.getByText(/failed to load schedule lag/i)).toBeInTheDocument();

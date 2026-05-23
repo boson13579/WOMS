@@ -25,7 +25,6 @@ from fastapi.testclient import TestClient
 from redis import Redis
 from sqlalchemy.orm import Session
 
-
 # ---------------------------------------------------------------------------
 # Fixtures + helpers
 # ---------------------------------------------------------------------------
@@ -152,9 +151,7 @@ def test_lag_window_validation_upper_bound(client: TestClient, db_session: Sessi
 # ---------------------------------------------------------------------------
 
 
-def test_lag_empty_window_returns_zero_envelope(
-    client: TestClient, db_session: Session
-) -> None:
+def test_lag_empty_window_returns_zero_envelope(client: TestClient, db_session: Session) -> None:
     """No samples in window → zeros + ``data_status='ok'`` (NOT degraded)."""
     _make_user(db_session, username="lag_empty", role=UserRole.scheduler)
     token = _login(client, "lag_empty")
