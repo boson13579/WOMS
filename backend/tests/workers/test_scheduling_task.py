@@ -2238,17 +2238,25 @@ def _patch_worker_sessionlocal_to_test_db(
     monkeypatch: pytest.MonkeyPatch,
     db_session: Any,
 ) -> None:
-    """Route ``app.workers.scheduling.SessionLocal()`` to the test session.
+    """Route ``SessionLocal()`` to the test session for both worker + compound finalize.
 
-    Without this, the worker would call its module-level ``SessionLocal``
-    which is bound to the application's default engine (the placeholder
-    URL from ``conftest`` module-level env defaults), not the
-    testcontainer's engine. The wrapper makes worker commits go through
-    the test's transaction so they're isolated per-test by the outer
-    rollback in ``db_session``.
+    Without this, the worker / compound_finalize would call their module-
+    level ``SessionLocal`` which is bound to the application's default
+    engine (the placeholder URL from ``conftest`` module-level env
+    defaults), not the testcontainer's engine. The wrappers make commits
+    go through the test's transaction so they're isolated per-test by the
+    outer rollback in ``db_session``.
+
+    Two paths to patch because P1-2 extracted ``perform_compound_db_action``
+    to ``app.services.compound_finalize`` — its ``SessionLocal`` import
+    is independent of the worker's, even though both bind the same global.
     """
     monkeypatch.setattr(
         "app.workers.scheduling.SessionLocal",
+        lambda: _NonClosingSession(db_session),
+    )
+    monkeypatch.setattr(
+        "app.services.compound_finalize.SessionLocal",
         lambda: _NonClosingSession(db_session),
     )
 

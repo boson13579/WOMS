@@ -365,10 +365,12 @@ def test_order_cancelled_notification(db_session: Session) -> None:
         },
     }
 
-    # Redirect _perform_compound_db_action's SessionLocal to the test session so
-    # the worker can see records committed via savepoints, and prevent db.close()
-    # from tearing down the test session.
-    with patch("app.workers.scheduling.SessionLocal", return_value=db_session):
+    # Redirect ``perform_compound_db_action``'s SessionLocal to the test
+    # session. P1-2 extracted the function to ``app.services.compound_finalize``
+    # so the binding to patch is over there (the worker re-exports as
+    # ``_perform_compound_db_action`` for backward compat but the inner
+    # ``SessionLocal()`` call now lives in ``compound_finalize``).
+    with patch("app.services.compound_finalize.SessionLocal", return_value=db_session):
         with patch.object(db_session, "close"):
             with patch("app.services.notification.notify_user"):
                 _perform_compound_db_action(compound, accepted=True)

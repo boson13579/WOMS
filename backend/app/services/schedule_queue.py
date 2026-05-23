@@ -173,10 +173,30 @@ def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
     the index entry (worker's best-effort cleanup may already have
     fired, but defensive cleanup is cheap).
 
+    **DB compensation**: when ZREM succeeds, the producer's pre-write
+    (``is_processing_locked=True`` plus, for ``create``, the orphan row)
+    is still in the DB and won't be touched by the worker (the compound
+    is gone from the queue). We replay the same ``db_action(accepted=
+    False)`` finalize the worker would have run on a rejection — soft-
+    deletes the create-orphan, restores status + clears lock for update/
+    delete. Without this, a cancelled create leaves the row stuck in
+    ``is_processing_locked=True`` with no recovery path; cancelled
+    update/delete leaves status pinned to ``pending`` even though the
+    row was previously ``scheduled``.
+
     On successful cancel, emits ``schedule.compound_cancelled`` to the
     compound's ``requested_by`` so the frontend can clear any optimistic
     UI state (e.g., re-enable a "Cancel" button or restore an indicator).
     """
+    # Lazy import to avoid a circular dependency: ``compound_finalize`` is
+    # in ``app.services`` and so is this module; importing at top would
+    # pull in ``app.services.notification`` → ``app.services.websocket``
+    # which fan in here. Function-level import is fine — cancel is a
+    # cold-ish path (user-initiated).
+    from app.services.compound_finalize import (  # noqa: PLC0415 — lazy by design
+        perform_compound_db_action,
+    )
+
     rds = _redis()
     compound_id_str = str(compound_id)
 
@@ -204,12 +224,34 @@ def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
         )
         return CancelResult.in_progress
 
-    # Successfully removed from queue. Notify the requester.
+    # Parse the compound payload — needed for both db_action compensation
+    # and for the requested_by recipient on the WS notification.
     try:
         payload = json.loads(member_raw)
-        requested_by_raw = payload.get("requested_by")
     except json.JSONDecodeError:
-        requested_by_raw = None
+        logger.warning(
+            "schedule.compound.cancel_unparseable_member",
+            compound_id=compound_id_str,
+        )
+        payload = {}
+
+    # Compensate the producer's pre-write. Idempotent + safe on
+    # already-clean rows (the helper is a no-op if no db_action / no
+    # matching order). Done BEFORE the WS notification so the frontend
+    # never sees "cancelled" while the row is still locked.
+    try:
+        perform_compound_db_action(payload, accepted=False)
+    except Exception:
+        # Best-effort: if compensation fails, the queue is already drained
+        # so the row stays in producer-locked state. Log + continue so the
+        # user at least gets the ``compound_cancelled`` WS notification.
+        logger.exception(
+            "schedule.compound.cancel_db_action_failed",
+            compound_id=compound_id_str,
+        )
+
+    # Successfully removed from queue. Notify the requester.
+    requested_by_raw = payload.get("requested_by")
     if requested_by_raw:
         websocket.notify_user(
             user_id=uuid.UUID(requested_by_raw),
