@@ -46,6 +46,7 @@ __all__ = [
     "SchedulerState",
     "SchedulingOrder",
     "SegmentTree",
+    "SegmentTreeInvariantError",
     "SkippedOrder",
     "abs_to_rel",
     "add_order",
@@ -83,6 +84,41 @@ __all__ = [
 _settings = get_settings()
 DAILY_CAPACITY: int = _settings.SCHEDULER_DAILY_CAPACITY
 HORIZON_DAYS: int = _settings.SCHEDULER_HORIZON_DAYS
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class SegmentTreeInvariantError(RuntimeError):
+    """Segment-tree state has diverged from the order's expected obligation.
+
+    Raised from ``_apply_remove_to_trees`` / ``_apply_add_to_trees`` when
+    the per-tree accounting can't be reconciled with the order being
+    removed / added — typically because the in-memory state's record of
+    that order's ``wafer_quantity`` doesn't match what the tree actually
+    has reserved.
+
+    Most common cause in practice: a producer-side race where two
+    concurrent PATCH transactions both read the order at ``version_id=N``
+    (both see the same old qty), each build a compound with that old qty
+    in its ``remove`` op, and enqueue to Redis BEFORE either has
+    committed. PostgreSQL OCC saves DB consistency (one transaction's
+    commit fails with StaleDataError) but the Redis queue already has
+    the stale compound; when the worker processes it, the ``remove(old_qty)``
+    no longer matches the tree's actual record for that order. The
+    correct producer-side fix is row-level locking on the PATCH path
+    (``SELECT ... FOR UPDATE``) so the second transaction sees
+    ``is_processing_locked=True`` and gets rejected with 409 before
+    enqueueing. This exception is the defensive net at the worker level
+    — even with the producer fix, any other invariant break (programming
+    bug, manual Redis surgery, advance_day edge case) would hit this
+    path. Worker catches it per-leaf in ``_commit_accepted_batch``, logs
+    + emits ``schedule.compound_failed`` to the requester, and continues
+    with the next leaf — so a single bad compound never poisons the
+    whole drain.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -661,21 +697,25 @@ def _apply_remove_to_trees(state: SchedulerState, order: SchedulingOrder) -> Non
         # diverged from the order's obligation. Pre-fix this only logged a
         # warning, but the algorithm continuing on a corrupted state would
         # silently propagate the divergence into compute_schedule and into
-        # DB writes. Raising here lets ``_process_compound``'s saga rollback
-        # restore the pre-compound snapshot, contains the corruption to the
-        # current compound, and surfaces ``schedule.compound_failed`` to the
-        # requester so ops can react. Recovery still goes through
-        # ``POST /schedule/rebuild`` if the residual indicates a deeper
-        # invariant break.
+        # DB writes. Raising ``SegmentTreeInvariantError`` lets the worker's
+        # per-leaf catch in ``_commit_accepted_batch`` contain the corruption
+        # to this one compound, fire ``schedule.compound_failed`` to the
+        # requester, and continue processing the rest of the batch instead
+        # of crashing the whole task. (Pre-batch-admission this used
+        # ``_process_compound`` saga rollback; that path is gone but the
+        # corruption-containment invariant is preserved by the worker-side
+        # try/except.) Recovery still goes through ``POST /schedule/rebuild``
+        # if the residual indicates a deeper state divergence affecting
+        # many orders.
         logger.error(
             "schedule.remove.unexpected_residual",
             order_id=str(order.order_id),
             residual=remaining,
         )
-        raise RuntimeError(
+        raise SegmentTreeInvariantError(
             f"remove_order: {remaining} wafers of order {order.order_id} could "
             "not be given back to capacity_tree — segment tree invariant broken; "
-            "rolling back compound."
+            "compound skipped."
         )
 
 

@@ -170,262 +170,15 @@ def test_trigger_without_token_returns_401(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
-# POST /operations
+# POST /operations — REMOVED
 # ---------------------------------------------------------------------------
-
-
-def test_operations_enqueues_compound(
-    client: TestClient,
-    db_session: Session,
-    _autouse_mock_enqueue_compound: MagicMock,
-) -> None:
-    """Endpoint accepts compound shape and forwards to schedule_queue.
-
-    The autouse fixture has replaced ``enqueue_compound`` with a MagicMock,
-    so we don't need a fake Redis here — just verify the endpoint reached
-    the helper with the right payload.
-    """
-    _make_user(db_session, username="sched_op_idle", role=UserRole.scheduler)
-    token = _login(client, "sched_op_idle")
-
-    res = client.post(
-        "/api/v1/schedule/operations",
-        headers=_auth(token),
-        json=_VALID_COMPOUND_PAYLOAD,
-    )
-
-    assert res.status_code == 202
-    body = res.json()
-    assert body["message"] == "Compound queued"
-    assert "compound_id" in body
-    # enqueue_compound was called exactly once with the parsed compound.
-    assert _autouse_mock_enqueue_compound.call_count == 1
-    enqueued = _autouse_mock_enqueue_compound.call_args.args[0]
-    assert enqueued.group == "grow"
-    assert len(enqueued.ops) == 1
-    assert enqueued.ops[0].op == "add"
-
-
-def test_operations_rejects_empty_ops(client: TestClient, db_session: Session) -> None:
-    """The compound schema requires at least 1 op (``min_length=1``). Sending
-    an empty ``ops`` list trips a standard pydantic validation error — the
-    422 unified-error contract is what tests should observe.
-    """
-    _make_user(db_session, username="sched_op_empty", role=UserRole.scheduler)
-    token = _login(client, "sched_op_empty")
-
-    payload = {
-        "group": "grow",
-        "op_count": 0,
-        "requested_by": str(uuid.uuid4()),
-        "ops": [],
-    }
-
-    res = client.post(
-        "/api/v1/schedule/operations",
-        headers=_auth(token),
-        json=payload,
-    )
-
-    assert res.status_code == 422
-    assert res.json()["error"]["code"] == 422
-
-
-def test_operations_rejects_op_count_mismatch(client: TestClient, db_session: Session) -> None:
-    """``op_count`` MUST equal ``len(ops)``. Sending a wrong count triggers
-    the schema-level tamper guard, before any Redis interaction.
-    """
-    _make_user(db_session, username="sched_op_count", role=UserRole.scheduler)
-    token = _login(client, "sched_op_count")
-
-    payload = {
-        "group": "grow",
-        "op_count": 5,  # lies — only 1 op below
-        "requested_by": str(uuid.uuid4()),
-        "ops": [
-            {
-                "op": "add",
-                "order_id": str(uuid.uuid4()),
-                "order_number": "ORD-COUNT",
-                "wafer_quantity": 100,
-                "deadline": "2026-08-01",
-            }
-        ],
-    }
-
-    res = client.post(
-        "/api/v1/schedule/operations",
-        headers=_auth(token),
-        json=payload,
-    )
-
-    assert res.status_code == 422
-    assert res.json()["error"]["code"] == 422
-
-
-def test_operations_by_viewer_returns_403(client: TestClient, db_session: Session) -> None:
-    _make_user(db_session, username="viewer_ops", role=UserRole.viewer)
-    token = _login(client, "viewer_ops")
-
-    res = client.post(
-        "/api/v1/schedule/operations",
-        headers=_auth(token),
-        json=_VALID_COMPOUND_PAYLOAD,
-    )
-
-    assert res.status_code == 403
-    assert res.json()["error"]["code"] == 403
-
-
-def test_operations_without_token_returns_401(client: TestClient) -> None:
-    res = client.post("/api/v1/schedule/operations", json=_VALID_COMPOUND_PAYLOAD)
-    assert res.status_code == 401
-    assert res.json()["error"]["code"] == 401
-
-
-# GREEN
-def test_operations_overrides_requested_by_with_caller(
-    client: TestClient,
-    db_session: Session,
-    _autouse_mock_enqueue_compound: MagicMock,
-) -> None:
-    """Body-supplied ``requested_by`` is silently overwritten with the
-    authenticated user's id at the route boundary.
-
-    A user with the ``scheduler`` role can otherwise submit a compound whose
-    ``requested_by`` points at any other user and the WS broadcast / audit
-    trail would misattribute the action. The fix is route-scoped: rewrite
-    the field on the parsed request before handing it to
-    ``enqueue_compound``.
-    """
-    user_a = _make_user(db_session, username="sched_op_override_rb", role=UserRole.scheduler)
-    token = _login(client, "sched_op_override_rb")
-
-    payload = {
-        "group": "grow",
-        "op_count": 1,
-        # Attacker-supplied identity — must be ignored.
-        "requested_by": str(uuid.uuid4()),
-        "ops": [
-            {
-                "op": "add",
-                "order_id": str(uuid.uuid4()),
-                "order_number": "ORD-OVERRIDE-RB",
-                "wafer_quantity": 100,
-                "deadline": "2026-08-01",
-            }
-        ],
-    }
-
-    res = client.post(
-        "/api/v1/schedule/operations",
-        headers=_auth(token),
-        json=payload,
-    )
-
-    assert res.status_code == 202
-    assert _autouse_mock_enqueue_compound.call_count == 1
-    enqueued = _autouse_mock_enqueue_compound.call_args.args[0]
-    # The override happens regardless of what the body said.
-    assert enqueued.requested_by == user_a.id
-
-
-# GREEN
-def test_operations_overrides_db_action_actor_id(
-    client: TestClient,
-    db_session: Session,
-    _autouse_mock_enqueue_compound: MagicMock,
-) -> None:
-    """``db_action.actor_id`` is also overridden with the authenticated user.
-
-    Without this guard a scheduler could forge audit-log entries attributed
-    to any other user (the worker writes ``audit_logs.user_id`` and the ECS
-    ``actor_id`` field straight from the compound payload).
-    """
-    user_a = _make_user(db_session, username="sched_op_override_actor", role=UserRole.scheduler)
-    token = _login(client, "sched_op_override_actor")
-
-    payload = {
-        "group": "grow",
-        "op_count": 1,
-        "requested_by": str(uuid.uuid4()),  # forged
-        "ops": [
-            {
-                "op": "add",
-                "order_id": str(uuid.uuid4()),
-                "order_number": "ORD-OVERRIDE-ACTOR",
-                "wafer_quantity": 100,
-                "deadline": "2026-08-01",
-            }
-        ],
-        "db_action": {
-            "kind": "update",
-            "actor_id": str(uuid.uuid4()),  # also forged
-            "new_wafer_quantity": 200,
-        },
-    }
-
-    res = client.post(
-        "/api/v1/schedule/operations",
-        headers=_auth(token),
-        json=payload,
-    )
-
-    assert res.status_code == 202
-    assert _autouse_mock_enqueue_compound.call_count == 1
-    enqueued = _autouse_mock_enqueue_compound.call_args.args[0]
-    # Both identity fields collapse onto current_user.id.
-    assert enqueued.requested_by == user_a.id
-    assert enqueued.db_action is not None
-    assert enqueued.db_action.actor_id == user_a.id
-
-
-# GREEN
-def test_operations_override_is_noop_when_body_matches_current_user(
-    client: TestClient,
-    db_session: Session,
-    _autouse_mock_enqueue_compound: MagicMock,
-) -> None:
-    """When the body already carries the authenticated user's id, the
-    override is a no-op — the same UUID round-trips into ``enqueue_compound``
-    unchanged. Belt-and-suspenders against a future refactor that would
-    accidentally drop the identity onto the floor.
-    """
-    user_a = _make_user(db_session, username="sched_op_noop", role=UserRole.scheduler)
-    token = _login(client, "sched_op_noop")
-
-    payload = {
-        "group": "grow",
-        "op_count": 1,
-        "requested_by": str(user_a.id),  # honest body
-        "ops": [
-            {
-                "op": "add",
-                "order_id": str(uuid.uuid4()),
-                "order_number": "ORD-OVERRIDE-NOOP",
-                "wafer_quantity": 100,
-                "deadline": "2026-08-01",
-            }
-        ],
-        "db_action": {
-            "kind": "update",
-            "actor_id": str(user_a.id),  # honest body
-            "new_wafer_quantity": 250,
-        },
-    }
-
-    res = client.post(
-        "/api/v1/schedule/operations",
-        headers=_auth(token),
-        json=payload,
-    )
-
-    assert res.status_code == 202
-    assert _autouse_mock_enqueue_compound.call_count == 1
-    enqueued = _autouse_mock_enqueue_compound.call_args.args[0]
-    assert enqueued.requested_by == user_a.id
-    assert enqueued.db_action is not None
-    assert enqueued.db_action.actor_id == user_a.id
+#
+# The raw POST /schedule/operations endpoint was removed in favor of
+# folding pin / unpin into PATCH /orders/{id} via the
+# pinned_production_date field. See app/api/v1/schedule.py for rationale.
+# Pin / unpin compound coverage now lives in tests/services/test_order.py
+# (the PATCH-with-pin transitions). DELETE /operations/{compound_id} is a
+# separate endpoint and is still tested below.
 
 
 def test_apply_schedule_audit_row_has_null_user_id_for_system_actor(
@@ -1050,6 +803,144 @@ def test_capacity_by_viewer_returns_403(
 
 def test_capacity_without_token_returns_401(client: TestClient) -> None:
     res = client.get("/api/v1/schedule/capacity")
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /capacity-usage
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_usage_returns_realized_per_day_view(
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
+) -> None:
+    """GET /capacity-usage reads the DB snapshot written by ``apply_schedule``
+    and aligns it against the SchedulerState's base_date. Two orders sharing
+    day 1 should aggregate; days the snapshot doesn't cover come back as
+    used=0, remaining=daily_capacity. This verifies the snapshot → endpoint
+    pipeline end-to-end with both populated and empty days.
+    """
+    from app.models.order import Order, OrderStatus
+    from app.services import order as order_service
+    from app.services.scheduling import (
+        DAILY_CAPACITY,
+        HORIZON_DAYS,
+        ScheduledResult,
+        SchedulerState,
+    )
+
+    _patch_delay(monkeypatch)
+    creator = _make_user(db_session, username="mgr_capuse_ok", role=UserRole.order_manager)
+    token = _login(client, "mgr_capuse_ok")
+
+    base = date(2026, 5, 21)
+    redis_client.set("schedule:state", SchedulerState.initial(base).to_json())
+
+    # Two orders share day 1 → 700 used; only A on day 2 → 200.
+    # ``Order.wafer_quantity`` has a [25, 2500] check constraint; per-day
+    # ``ScheduledResult.quantity`` (the aggregation source) is independent
+    # and just needs to be plausible.
+    order_a = Order(
+        order_number="ORD-CU-A",
+        customer_name="X",
+        wafer_quantity=600,
+        requested_delivery_date=date(2026, 5, 25),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+    )
+    order_b = Order(
+        order_number="ORD-CU-B",
+        customer_name="X",
+        wafer_quantity=300,
+        requested_delivery_date=date(2026, 5, 26),
+        created_by=creator.id,
+        status=OrderStatus.pending,
+    )
+    db_session.add_all([order_a, order_b])
+    db_session.commit()
+    db_session.refresh(order_a)
+    db_session.refresh(order_b)
+
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(order_id=order_a.id, scheduled_date=base, quantity=400),
+            ScheduledResult(
+                order_id=order_a.id, scheduled_date=base + timedelta(days=1), quantity=200
+            ),
+            ScheduledResult(order_id=order_b.id, scheduled_date=base, quantity=300),
+        ],
+    )
+
+    res = client.get("/api/v1/schedule/capacity-usage", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["base_date"] == base.isoformat()
+    assert body["daily_capacity"] == DAILY_CAPACITY
+    assert len(body["entries"]) == HORIZON_DAYS
+
+    # Day 1: a(400) + b(300) = 700 used.
+    assert body["entries"][0] == {
+        "date": base.isoformat(),
+        "used": 700,
+        "remaining": DAILY_CAPACITY - 700,
+    }
+    # Day 2: a(200) only.
+    assert body["entries"][1] == {
+        "date": (base + timedelta(days=1)).isoformat(),
+        "used": 200,
+        "remaining": DAILY_CAPACITY - 200,
+    }
+    # Day 3 onward: nothing scheduled → used=0.
+    assert body["entries"][2] == {
+        "date": (base + timedelta(days=2)).isoformat(),
+        "used": 0,
+        "remaining": DAILY_CAPACITY,
+    }
+
+
+def test_capacity_usage_without_redis_state_uses_today_as_base(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """When Redis ``schedule:state`` is missing (fresh deploy or flushed
+    cache), the endpoint falls back to today as base_date so the dashboard
+    still gets a usable 30-entry response instead of a 500.
+    """
+    from app.services.scheduling import DAILY_CAPACITY, HORIZON_DAYS
+
+    _patch_delay(monkeypatch)
+    _make_user(db_session, username="mgr_capuse_empty", role=UserRole.order_manager)
+    token = _login(client, "mgr_capuse_empty")
+
+    res = client.get("/api/v1/schedule/capacity-usage", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["daily_capacity"] == DAILY_CAPACITY
+    assert len(body["entries"]) == HORIZON_DAYS
+    # No snapshot rows seeded → every day is fully available.
+    for entry in body["entries"]:
+        assert entry["used"] == 0
+        assert entry["remaining"] == DAILY_CAPACITY
+
+
+def test_capacity_usage_by_viewer_returns_403(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    _patch_delay(monkeypatch)
+    _make_user(db_session, username="viewer_capuse", role=UserRole.viewer)
+    token = _login(client, "viewer_capuse")
+
+    res = client.get("/api/v1/schedule/capacity-usage", headers=_auth(token))
+
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == 403
+
+
+def test_capacity_usage_without_token_returns_401(client: TestClient) -> None:
+    res = client.get("/api/v1/schedule/capacity-usage")
     assert res.status_code == 401
     assert res.json()["error"]["code"] == 401
 

@@ -32,7 +32,8 @@ def _autouse_mock_enqueue_compound(monkeypatch: pytest.MonkeyPatch) -> MagicMock
     """
     mock = MagicMock()
     # Order CRUD service imports the symbol directly into its namespace.
+    # The raw POST /schedule/operations endpoint was removed (pin/unpin
+    # folded into PATCH /orders/{id}), so the only call-site that needs
+    # stubbing at the API layer is the order CRUD service.
     monkeypatch.setattr("app.services.order.enqueue_compound", mock)
-    # Schedule API router does likewise.
-    monkeypatch.setattr("app.api.v1.schedule.enqueue_compound", mock)
     return mock

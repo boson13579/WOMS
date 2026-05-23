@@ -44,6 +44,32 @@ def get_by_id(db: Session, order_id: uuid.UUID) -> Order | None:
     return db.scalars(stmt).first()
 
 
+def get_by_id_for_update(db: Session, order_id: uuid.UUID) -> Order | None:
+    """Like ``get_by_id`` but takes a PostgreSQL row-level exclusive lock.
+
+    Two concurrent transactions both calling this on the same ``order_id``
+    serialize: the second blocks until the first commits / rolls back.
+    After the first commits, the second's SELECT proceeds and sees the
+    updated row state (``version_id`` bumped, ``is_processing_locked``
+    likely set to True).
+
+    Used by ``update_order`` / ``delete_order`` to close the producer-side
+    race where two concurrent PATCH requests both read the row at the
+    same ``version_id``, each build a compound off the same old data, and
+    both enqueue to Redis before either has committed. Without the row
+    lock, PostgreSQL OCC catches the second commit (``StaleDataError``)
+    but the stale compound is already in the Redis queue — worker then
+    processes it with mismatched ``wafer_quantity`` and trips
+    ``SegmentTreeInvariantError``. With the lock, the second transaction
+    blocks before building its compound; when it unblocks it sees
+    ``is_processing_locked=True`` and gets rejected with 409 cleanly.
+
+    Returns ``None`` for absent / soft-deleted orders, matching ``get_by_id``.
+    """
+    stmt = select(Order).where(Order.id == order_id, Order.is_deleted.is_(False)).with_for_update()
+    return db.scalars(stmt).first()
+
+
 def get_by_id_including_deleted(db: Session, order_id: uuid.UUID) -> Order | None:
     """Return the order with *order_id* regardless of soft-delete status.
 
