@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { useAssignableUsers, type UserOption } from '@/features/auth/api/users';
+import { useCanWrite } from '@/lib/auth';
 
 import { useOrderStore } from '../stores/orderStore';
 import type { OrderStatus } from '../types';
@@ -36,6 +37,7 @@ export function OrderFilters(): JSX.Element {
   const { status, search, assignedTo, createdBy, setStatus, setSearch, setAssignedTo, setCreatedBy, reset } =
     useOrderStore();
   const users = useAssignableUsers();
+  const canUseUserFilters = useCanWrite();
 
   // Debounce the search input by 300 ms to avoid spamming the API.
   const [localSearch, setLocalSearch] = useState(search);
@@ -127,38 +129,42 @@ export function OrderFilters(): JSX.Element {
         aria-label="搜尋訂單"
       />
 
-      <Input
-        list="order-filter-users-datalist"
-        placeholder="搜尋負責人姓名…"
-        value={assigneeInput}
-        onChange={(e) => {
-          setAssigneeInput(e.target.value);
-        }}
-        className="w-52"
-        aria-label="搜尋負責人"
-        autoComplete="off"
-      />
+      {canUseUserFilters && (
+        <>
+          <Input
+            list="order-filter-users-datalist"
+            placeholder="搜尋負責人姓名…"
+            value={assigneeInput}
+            onChange={(e) => {
+              setAssigneeInput(e.target.value);
+            }}
+            className="w-52"
+            aria-label="搜尋負責人"
+            autoComplete="off"
+          />
 
-      <Input
-        list="order-filter-users-datalist"
-        placeholder="搜尋建立者姓名…"
-        value={creatorInput}
-        onChange={(e) => {
-          setCreatorInput(e.target.value);
-        }}
-        className="w-52"
-        aria-label="搜尋建立者"
-        autoComplete="off"
-      />
+          <Input
+            list="order-filter-users-datalist"
+            placeholder="搜尋建立者姓名…"
+            value={creatorInput}
+            onChange={(e) => {
+              setCreatorInput(e.target.value);
+            }}
+            className="w-52"
+            aria-label="搜尋建立者"
+            autoComplete="off"
+          />
 
-      {/* Shared datalist for both assignee and creator inputs. */}
-      <datalist id="order-filter-users-datalist">
-        {users.map((u) => (
-          <option key={u.id} value={u.username}>
-            {u.email ?? ''}
-          </option>
-        ))}
-      </datalist>
+          {/* Shared datalist for both assignee and creator inputs. */}
+          <datalist id="order-filter-users-datalist">
+            {users.map((u) => (
+              <option key={u.id} value={u.username}>
+                {u.email ?? ''}
+              </option>
+            ))}
+          </datalist>
+        </>
+      )}
 
       <div className="flex items-center gap-1.5">
         <Label htmlFor="status-filter" className="sr-only">

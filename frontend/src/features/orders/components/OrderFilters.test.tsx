@@ -12,8 +12,12 @@ import { OrderFilters } from './OrderFilters';
 // Mock @/lib/auth and users
 // ---------------------------------------------------------------------------
 
+const authMocks = vi.hoisted(() => ({
+  canWrite: true,
+}));
+
 vi.mock('@/lib/auth', () => ({
-  useCanWrite: () => false,
+  useCanWrite: () => authMocks.canWrite,
   useCurrentUserId: () => null,
 }));
 
@@ -64,6 +68,7 @@ describe('OrderFilters', () => {
     mockStore.search = '';
     mockStore.assignedTo = [];
     mockStore.createdBy = [];
+    authMocks.canWrite = true;
   });
 
   it('renders the search input and status select', () => {
@@ -200,5 +205,19 @@ describe('OrderFilters', () => {
     expect(assigneeInput).toHaveValue('');
     expect(creatorInput).toHaveValue('');
     expect(mockReset).toHaveBeenCalledOnce();
+  });
+
+  it('hides assignee/creator filter inputs for viewer role (cannot write)', () => {
+    // viewer 沒有 /users/assignable 權限，看到 input 卻搜不到人是壞 UX。
+    authMocks.canWrite = false;
+    render(<OrderFilters />);
+
+    // Order keyword search and status select still render.
+    expect(screen.getByRole('textbox', { name: /搜尋訂單/ })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: /篩選狀態/ })).toBeInTheDocument();
+
+    // But the user-pickers are hidden.
+    expect(screen.queryByRole('combobox', { name: /搜尋負責人/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: /搜尋建立者/ })).not.toBeInTheDocument();
   });
 });
