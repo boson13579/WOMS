@@ -27,15 +27,22 @@ const STATUS_OPTIONS: { label: string; value: OrderStatus | '' }[] = [
 function findUserIdByInput(users: UserOption[], input: string): string | null {
   const v = input.trim().toLowerCase();
   if (!v) return null;
-  const matched = users.find(
-    (u) => u.username.toLowerCase() === v || u.email?.toLowerCase() === v,
-  );
+  const matched = users.find((u) => u.username.toLowerCase() === v || u.email?.toLowerCase() === v);
   return matched?.id ?? null;
 }
 
 export function OrderFilters(): JSX.Element {
-  const { status, search, assignedTo, createdBy, setStatus, setSearch, setAssignedTo, setCreatedBy, reset } =
-    useOrderStore();
+  const {
+    status,
+    search,
+    assignedTo,
+    createdBy,
+    setStatus,
+    setSearch,
+    setAssignedTo,
+    setCreatedBy,
+    reset,
+  } = useOrderStore();
   const users = useAssignableUsers();
   const canUseUserFilters = useCanWrite();
 
@@ -68,12 +75,14 @@ export function OrderFilters(): JSX.Element {
     setDidHydrate(true);
     // Only fill inputs that haven't been touched, so we don't clobber a user
     // mid-type if the user list resolves late.
-    setAssigneeInput(
-      (prev) => prev || users.find((u) => u.id === assignedTo[0])?.username || '',
-    );
-    setCreatorInput(
-      (prev) => prev || users.find((u) => u.id === createdBy[0])?.username || '',
-    );
+    setAssigneeInput((prev) => {
+      if (prev !== '') return prev;
+      return users.find((u) => u.id === assignedTo[0])?.username ?? '';
+    });
+    setCreatorInput((prev) => {
+      if (prev !== '') return prev;
+      return users.find((u) => u.id === createdBy[0])?.username ?? '';
+    });
   }, [users, assignedTo, createdBy, didHydrate]);
 
   useEffect(() => {

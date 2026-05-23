@@ -163,7 +163,9 @@ describe('OrderFilters', () => {
     await user.type(screen.getByRole('combobox', { name: /搜尋負責人/ }), 'nobody');
 
     // Wait past the 300ms debounce so we can assert nothing fires.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 500);
+    });
     expect(mockSetAssignedTo).not.toHaveBeenCalled();
   });
 
