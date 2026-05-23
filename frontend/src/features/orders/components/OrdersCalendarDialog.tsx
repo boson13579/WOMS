@@ -6,6 +6,7 @@ import {
   ChevronRight,
   GripVertical,
   Loader2,
+  Lock,
   PackageOpen,
   Zap,
 } from 'lucide-react';
@@ -76,7 +77,23 @@ interface ProductionCalendarItem extends ScheduleResult {
   productionDate: string;
   productionQuantity: number;
   cumulativeQuantity: number;
-  productionState: 'in_progress' | 'complete';
+  productionState: ProductionState;
+}
+
+type ProductionState = 'in_progress' | 'complete' | 'scheduled';
+
+function getProductionStateLabel(state: ProductionState): string {
+  if (state === 'complete') return '已完成';
+  if (state === 'in_progress') return '生產中';
+  return '已排程';
+}
+
+function getProductionStateVariant(
+  state: ProductionState,
+): 'success' | 'warning' | 'info' | 'secondary' {
+  if (state === 'complete') return 'success';
+  if (state === 'in_progress') return 'warning';
+  return 'info';
 }
 
 function dateKey(date: Date): string {
@@ -116,16 +133,34 @@ function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): 
     .reduce((total, assignment) => total + assignment.quantity, 0);
 }
 
-function groupByProductionDate(items: ScheduleResult[]): Record<string, ProductionCalendarItem[]> {
+function groupByProductionDate(
+  items: ScheduleResult[],
+  baseDate: string,
+): Record<string, ProductionCalendarItem[]> {
   return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
+
+      let productionState: ProductionState;
+
+      // Only past rows of a fulfilled order earn the `complete` badge.
+      // Earlier daily slices of a multi-day split whose cumulative hasn't
+      // yet reached the wafer_quantity stay `in_progress`, otherwise the
+      // first day of a 3-day run would falsely advertise completion.
+      if (assignment.date > baseDate) {
+        productionState = 'scheduled';
+      } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
+        productionState = 'complete';
+      } else {
+        productionState = 'in_progress';
+      }
+
       const productionItem: ProductionCalendarItem = {
         ...item,
         productionDate: assignment.date,
         productionQuantity: assignment.quantity,
         cumulativeQuantity,
-        productionState: cumulativeQuantity >= item.wafer_quantity ? 'complete' : 'in_progress',
+        productionState,
       };
       acc[assignment.date] = [...(acc[assignment.date] ?? []), productionItem];
     });
@@ -141,6 +176,20 @@ function capacityTone(remaining: number, dailyCapacity: number): string {
 
 function isTargetAfterDeadline(order: DraggableOrder, targetDate: string): boolean {
   return targetDate > order.requested_delivery_date;
+}
+
+function canDragScheduledOrder(
+  order: ProductionCalendarItem,
+  dragOrder: DraggableOrder | undefined,
+  canManageSchedule: boolean,
+): dragOrder is DraggableOrder {
+  return (
+    canManageSchedule &&
+    order.status === 'scheduled' &&
+    order.productionState !== 'in_progress' &&
+    dragOrder !== undefined &&
+    !dragOrder.is_processing_locked
+  );
 }
 
 function dragOrdersFromEvent(event: DragEvent): DraggableOrder[] {
@@ -209,9 +258,15 @@ function OrderLine({
           )}
           {canDrag && dragOrder && <GripVertical className="h-3.5 w-3.5 shrink-0" />}
           <span className="truncate">{order.order_number}</span>
+          {(order.productionState === 'in_progress' || dragOrder?.is_processing_locked) && (
+            <Lock
+              aria-label="處理鎖定中"
+              className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0"
+            />
+          )}
         </span>
-        <Badge variant="secondary" className="shrink-0">
-          {order.productionState === 'complete' ? '已完成' : '生產中'}
+        <Badge variant={getProductionStateVariant(order.productionState)} className="shrink-0">
+          {getProductionStateLabel(order.productionState)}
         </Badge>
       </div>
       <div className="mt-1 truncate text-muted-foreground">
@@ -314,9 +369,10 @@ export function OrdersCalendarDialog({
   const canReadSchedule = role !== 'viewer';
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
+  const baseDate = scheduleCapacity.data?.base_date;
   const grouped = useMemo(
-    () => groupByProductionDate(scheduleResult.data ?? []),
-    [scheduleResult.data],
+    () => (baseDate ? groupByProductionDate(scheduleResult.data ?? [], baseDate) : {}),
+    [scheduleResult.data, baseDate],
   );
   const dailyCapacityByDate = useMemo(() => {
     if (!scheduleCapacity.data)
@@ -425,7 +481,22 @@ export function OrdersCalendarDialog({
       },
       {
         onSuccess: () => {
-          toast.success('已送出排程嘗試，等待排程器確認。');
+          toast.success('已送出排程嘗試，等待排程器確認。', {
+            description: (
+              <div className="mt-2 space-y-1.5">
+                {pendingMoves.map((move) => (
+                  <div key={move.order.id} className="flex flex-col gap-0.5">
+                    <span className="font-mono text-[11px] font-semibold text-foreground">
+                      {move.order.order_number}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      拖移至: {move.targetDate}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ),
+          });
           setPendingMoves([]);
           setSelectedOrderIds([]);
         },
@@ -573,12 +644,16 @@ export function OrdersCalendarDialog({
               </div>
             </div>
 
-            {scheduleResult.isPending ? (
+            {!canReadSchedule ? (
+              <div className="flex h-96 items-center justify-center rounded-md border text-sm text-destructive">
+                無法載入排程日曆，請確認帳號權限或稍後再試。
+              </div>
+            ) : scheduleResult.isPending || scheduleCapacity.isPending ? (
               <div className="flex h-96 items-center justify-center text-muted-foreground">
                 <Loader2 className="mr-2 h-5 w-5 animate-spin" />
                 載入日曆中...
               </div>
-            ) : scheduleResult.isError || !canReadSchedule ? (
+            ) : scheduleResult.isError || scheduleCapacity.isError ? (
               <div className="flex h-96 items-center justify-center rounded-md border text-sm text-destructive">
                 無法載入排程日曆，請確認帳號權限或稍後再試。
               </div>
@@ -645,11 +720,11 @@ export function OrdersCalendarDialog({
                         <div className="space-y-1">
                           {items.slice(0, MAX_ITEMS_PER_DAY).map((order) => {
                             const draggableOrder = scheduledOrderById.get(order.id);
-                            const isDraggable =
-                              canManageSchedule &&
-                              Boolean(draggableOrder) &&
-                              order.status === 'scheduled' &&
-                              !draggableOrder?.is_processing_locked;
+                            const isDraggable = canDragScheduledOrder(
+                              order,
+                              draggableOrder,
+                              canManageSchedule,
+                            );
                             return (
                               <div
                                 key={order.id}
@@ -684,12 +759,20 @@ export function OrdersCalendarDialog({
             {pendingMoves.length > 0 && (
               <div className="mb-5 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/30">
                 <div className="font-medium">待送出的排程變更</div>
-                <div className="mt-2 space-y-1 text-muted-foreground">
+                <div className="mt-2 space-y-2 text-muted-foreground">
                   {pendingMoves.map((move) => (
-                    <div key={move.order.id} className="flex items-center justify-between gap-2">
-                      <span className="truncate">
-                        {move.order.order_number} → {move.targetDate}
-                      </span>
+                    <div
+                      key={move.order.id}
+                      className="flex items-start justify-between gap-2 border-b border-sky-100 dark:border-sky-900/50 pb-2 last:border-0 last:pb-0"
+                    >
+                      <div className="flex flex-col gap-0.5 min-w-0">
+                        <span className="font-mono text-xs font-semibold text-foreground truncate">
+                          {move.order.order_number}
+                        </span>
+                        <span className="text-[11px] text-muted-foreground">
+                          拖移至: {move.targetDate}
+                        </span>
+                      </div>
                       <Button
                         type="button"
                         variant="ghost"
@@ -698,6 +781,7 @@ export function OrdersCalendarDialog({
                           removePendingMove(move.order.id);
                         }}
                         disabled={pinSchedule.isPending}
+                        className="h-5 px-1.5 text-[10px] text-destructive hover:bg-destructive/10 shrink-0"
                       >
                         移除
                       </Button>
@@ -733,14 +817,26 @@ export function OrdersCalendarDialog({
 
             {activeOperation && (
               <div className="mb-5 rounded-md border bg-background p-3 text-sm text-muted-foreground">
-                <div className="flex items-center gap-2">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>
-                    {activeOperation.targets
-                      .map((target) => `${target.orderNumber} → ${target.targetDate}`)
-                      .join(', ')}{' '}
-                    排程處理中
-                  </span>
+                <div className="flex items-start gap-2">
+                  <Loader2 className="mt-0.5 h-4 w-4 animate-spin shrink-0" />
+                  <div className="space-y-1.5 flex-1 min-w-0">
+                    <div className="font-medium text-foreground">排程處理中...</div>
+                    <div className="space-y-1.5">
+                      {activeOperation.targets.map((target) => (
+                        <div
+                          key={target.orderId}
+                          className="flex flex-col gap-0.5 border-b border-border/50 pb-1.5 last:border-0 last:pb-0"
+                        >
+                          <span className="font-mono text-xs font-semibold text-foreground truncate">
+                            {target.orderNumber}
+                          </span>
+                          <span className="text-[11px] text-muted-foreground">
+                            拖移至: {target.targetDate}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
@@ -772,16 +868,17 @@ export function OrdersCalendarDialog({
                   </span>
                 )}
               </div>
-              <div className="mt-3 space-y-2">
+              <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
                 {selectedItems.length > 0 ? (
                   selectedItems.map((order) => {
                     const dragOrder = scheduledOrderById.get(order.id);
+                    const canDrag = canDragScheduledOrder(order, dragOrder, canManageSchedule);
                     return (
                       <OrderLine
                         key={order.id}
                         order={order}
                         {...(dragOrder ? { dragOrder } : {})}
-                        canDrag={canManageSchedule && order.status === 'scheduled'}
+                        canDrag={canDrag}
                         onDragStart={handleDragStart}
                         selected={selectedOrderIds.includes(order.id)}
                         onSelectedChange={updateSelectedOrder}
