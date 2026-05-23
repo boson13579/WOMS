@@ -18,8 +18,8 @@ import { useCurrentUser } from '@/lib/auth';
 
 import { useResourcesSchema, type UseResources } from '../types';
 
-const REFETCH_INTERVAL_MS = 15_000;
-const STALE_TIME_MS = 10_000;
+const REFETCH_INTERVAL_MS = 3_000;
+const STALE_TIME_MS = 1_500;
 
 export const useResourcesQueryKey = ['system', 'resources'] as const;
 

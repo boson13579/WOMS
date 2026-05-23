@@ -35,7 +35,7 @@ const orderListResponseSchema = z.object({
 export const ordersSnapshotQueryKey = (status: OrdersSnapshotStatus) =>
   ['orders', 'snapshot', status] as const;
 
-const REFETCH_INTERVAL_MS = 30_000;
+const REFETCH_INTERVAL_MS = 5_000;
 
 async function fetchCount(status: OrdersSnapshotStatus): Promise<number> {
   const result = await apiFetch(
@@ -74,7 +74,7 @@ export function useOrdersSnapshot(): UseOrdersSnapshotResult {
       queryFn: () => fetchCount(status),
       enabled: allowed,
       refetchInterval: REFETCH_INTERVAL_MS,
-      staleTime: 15_000,
+      staleTime: 2_000,
     })),
   });
 

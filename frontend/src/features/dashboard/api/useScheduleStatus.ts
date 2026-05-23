@@ -26,7 +26,7 @@ const scheduleStatusResponseSchema = z.object({
 
 export const scheduleStatusQueryKey = ['schedule', 'status'] as const;
 
-const REFETCH_INTERVAL_MS = 10_000;
+const REFETCH_INTERVAL_MS = 2_000;
 
 export function useScheduleStatus(): UseQueryResult<ScheduleStatusResponse> {
   const user = useCurrentUser();
@@ -44,6 +44,6 @@ export function useScheduleStatus(): UseQueryResult<ScheduleStatusResponse> {
       ),
     enabled: allowed,
     refetchInterval: REFETCH_INTERVAL_MS,
-    staleTime: 5_000,
+    staleTime: 1_000,
   });
 }

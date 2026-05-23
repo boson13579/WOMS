@@ -37,7 +37,7 @@ const pendingOpsResponseSchema = z.array(pendingOpsEntrySchema);
 
 export const pendingOpsQueryKey = ['schedule', 'pending-ops'] as const;
 
-const REFETCH_INTERVAL_MS = 10_000;
+const REFETCH_INTERVAL_MS = 2_000;
 
 export function usePendingOps(): UseQueryResult<PendingOpsEntry[]> {
   const user = useCurrentUser();
@@ -52,6 +52,6 @@ export function usePendingOps(): UseQueryResult<PendingOpsEntry[]> {
       ),
     enabled: allowed,
     refetchInterval: REFETCH_INTERVAL_MS,
-    staleTime: 5_000,
+    staleTime: 1_000,
   });
 }

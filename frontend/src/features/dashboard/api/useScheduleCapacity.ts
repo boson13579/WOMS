@@ -29,7 +29,7 @@ const scheduleCapacityResponseSchema = z.object({
 
 export const scheduleCapacityQueryKey = ['schedule', 'capacity'] as const;
 
-const REFETCH_INTERVAL_MS = 30_000;
+const REFETCH_INTERVAL_MS = 5_000;
 
 export function useScheduleCapacity(): UseQueryResult<ScheduleCapacityResponse> {
   const user = useCurrentUser();
@@ -44,6 +44,6 @@ export function useScheduleCapacity(): UseQueryResult<ScheduleCapacityResponse> 
       ),
     enabled: allowed,
     refetchInterval: REFETCH_INTERVAL_MS,
-    staleTime: 15_000,
+    staleTime: 2_000,
   });
 }

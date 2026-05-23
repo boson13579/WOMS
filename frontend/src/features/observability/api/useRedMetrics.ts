@@ -21,8 +21,8 @@ import { useCurrentUser } from '@/lib/auth';
 import { useRedHistoryStore } from '../stores/redHistoryStore';
 import { redMetricsResponseSchema, type RedMetricsResponse } from '../types';
 
-const REFETCH_INTERVAL_MS = 10_000;
-const STALE_TIME_MS = 5_000;
+const REFETCH_INTERVAL_MS = 2_000;
+const STALE_TIME_MS = 1_000;
 
 export function redMetricsQueryKey(windowSeconds: number): readonly unknown[] {
   return ['system', 'red', windowSeconds] as const;

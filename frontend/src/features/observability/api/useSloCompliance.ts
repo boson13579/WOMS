@@ -14,8 +14,8 @@ import { useCurrentUser } from '@/lib/auth';
 
 import { sloComplianceSchema, type SloCompliance } from '../types';
 
-const REFETCH_INTERVAL_MS = 60_000;
-const STALE_TIME_MS = 30_000;
+const REFETCH_INTERVAL_MS = 30_000;
+const STALE_TIME_MS = 15_000;
 const DEFAULT_WINDOW_HOURS = 24;
 
 export function sloComplianceQueryKey(windowHours: number): readonly unknown[] {

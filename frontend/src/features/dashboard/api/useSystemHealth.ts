@@ -49,7 +49,7 @@ const systemHealthResponseSchema = z.object({
 
 export const systemHealthQueryKey = ['system', 'health'] as const;
 
-const REFETCH_INTERVAL_MS = 30_000;
+const REFETCH_INTERVAL_MS = 2_000;
 
 export function useSystemHealth(): UseQueryResult<SystemHealthResponse> {
   const user = useCurrentUser();
@@ -71,6 +71,6 @@ export function useSystemHealth(): UseQueryResult<SystemHealthResponse> {
       ),
     enabled: Boolean(user),
     refetchInterval: REFETCH_INTERVAL_MS,
-    staleTime: 10_000,
+    staleTime: 1_000,
   });
 }
