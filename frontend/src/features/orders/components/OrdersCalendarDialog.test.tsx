@@ -116,7 +116,7 @@ function setServerBaseDate(baseDate: string): void {
 // in-flight rows have a ``daily_breakdown`` entry on ``base_date``. The
 // calendar uses ``status`` (not date math) to pick the badge, so the
 // data shape below is the realistic post-rule snapshot.
-const scheduledOrder: ScheduleResult = {
+const inProductionOrder: ScheduleResult = {
   id: '11111111-1111-4111-8111-111111111111',
   order_number: 'ORD-20260504-0001',
   customer_name: 'TSMC',
@@ -155,15 +155,15 @@ const secondPendingOrder: Order = {
   customer_name: 'UMC',
 };
 
-const scheduledOrderDetail: Order = {
+const inProductionOrderDetail: Order = {
   ...pendingOrder,
-  id: scheduledOrder.id,
-  order_number: scheduledOrder.order_number,
-  customer_name: scheduledOrder.customer_name,
-  wafer_quantity: scheduledOrder.wafer_quantity,
-  requested_delivery_date: scheduledOrder.requested_delivery_date,
-  scheduled_production_date: scheduledOrder.scheduled_production_date,
-  expected_delivery_date: scheduledOrder.expected_delivery_date,
+  id: inProductionOrder.id,
+  order_number: inProductionOrder.order_number,
+  customer_name: inProductionOrder.customer_name,
+  wafer_quantity: inProductionOrder.wafer_quantity,
+  requested_delivery_date: inProductionOrder.requested_delivery_date,
+  scheduled_production_date: inProductionOrder.scheduled_production_date,
+  expected_delivery_date: inProductionOrder.expected_delivery_date,
   status: 'in_production',
 };
 
@@ -171,8 +171,8 @@ const scheduledOrderDetail: Order = {
 // branch pick "已完成" / "生產中" / "已排程" per day. With status=scheduled,
 // every row would render as "已排程" (correct under the new rule, but
 // doesn't exercise the multi-day visualization).
-const splitScheduledOrder: ScheduleResult = {
-  ...scheduledOrder,
+const splitInProductionOrder: ScheduleResult = {
+  ...inProductionOrder,
   id: '44444444-4444-4444-8444-444444444444',
   order_number: 'ORD-20260504-0004',
   customer_name: 'ASE',
@@ -202,13 +202,18 @@ describe('OrdersCalendarDialog', () => {
     };
     mockScheduleCapacity.isPending = false;
     mockScheduleCapacity.isError = false;
-    mockScheduleResult.data = [scheduledOrder];
+    mockScheduleResult.data = [inProductionOrder];
     mockScheduleResult.isPending = false;
     mockScheduleResult.isError = false;
     mockOrders.data = { items: [pendingOrder], total: 1, page: 1, page_size: 100 };
     mockOrders.isPending = false;
     mockOrders.isError = false;
-    mockScheduledOrders.data = { items: [scheduledOrderDetail], total: 1, page: 1, page_size: 100 };
+    mockScheduledOrders.data = {
+      items: [inProductionOrderDetail],
+      total: 1,
+      page: 1,
+      page_size: 100,
+    };
     mockScheduledOrders.isPending = false;
     mockScheduledOrders.isFetching = false;
     mockScheduledOrders.isSuccess = true;
@@ -257,7 +262,7 @@ describe('OrdersCalendarDialog', () => {
 
   it('shows split production progress across production dates', async () => {
     const user = userEvent.setup();
-    mockScheduleResult.data = [splitScheduledOrder];
+    mockScheduleResult.data = [splitInProductionOrder];
     setServerBaseDate('2026-05-10');
     renderDialog();
 
@@ -276,7 +281,7 @@ describe('OrdersCalendarDialog', () => {
 
   it('shows split production as completed when base_date is past the final production date', async () => {
     const user = userEvent.setup();
-    mockScheduleResult.data = [splitScheduledOrder];
+    mockScheduleResult.data = [splitInProductionOrder];
     setServerBaseDate('2026-05-12');
     renderDialog();
 
@@ -289,7 +294,7 @@ describe('OrdersCalendarDialog', () => {
     // the 2,500-wafer order has been produced by then. The row must NOT
     // show "已完成" — earlier slices of an in-flight split stay 生產中.
     const user = userEvent.setup();
-    mockScheduleResult.data = [splitScheduledOrder];
+    mockScheduleResult.data = [splitInProductionOrder];
     setServerBaseDate('2026-05-11');
     renderDialog();
 
@@ -303,7 +308,7 @@ describe('OrdersCalendarDialog', () => {
     const user = userEvent.setup();
     vi.setSystemTime(new Date('2026-05-12T00:00:00Z'));
     setServerBaseDate('2026-05-10');
-    mockScheduleResult.data = [splitScheduledOrder];
+    mockScheduleResult.data = [splitInProductionOrder];
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));

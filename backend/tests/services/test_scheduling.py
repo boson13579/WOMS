@@ -199,12 +199,13 @@ def test_remove_order_restores_capacity_after_single_add() -> None:
 
 
 def test_remove_order_leaves_other_orders_intact() -> None:
-    """Doc example abc on day 2 — remove the middle one and verify what's left.
+    """Doc example abc on tree day 1 — remove the middle one and verify what's left.
 
-    Originally written against day-1 fills; under the ``"tree day 1 = tomorrow" rule``
-    rule (today is locked from new admissions) day-1 is unreachable, so we
-    shift the deadline to ``base + 1`` (tomorrow = rel 2) and assert against
-    day-2 prefix sums. The remove-then-check invariant is unchanged.
+    Originally written against the old "tree day 1 = today" convention.
+    Under the current tree-day-1-is-tomorrow convention, ``abs_to_rel(base+1, base)``
+    returns ``1`` (the tree's first index = tomorrow), so deadline = ``base + 1``
+    means ``rel = 1``. The remove-then-check invariant the test is exercising
+    is unchanged; only the calendar interpretation of the indices shifted.
     """
     state = SchedulerState.initial(_BASE)
     dl = _BASE + timedelta(days=1)
@@ -791,25 +792,30 @@ def test_rebuild_state_separates_pinned_from_pq() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Admission control invariants — "day 1 (today) locked from new admissions"
+# Admission control invariants — today is structurally out of the tree
 # ---------------------------------------------------------------------------
 #
-# Under ``"tree day 1 = tomorrow" rule``, every new ``add_order`` / ``pin_order``
-# that would touch day 1 rejects at admission. The earlier P1-1 invariant
-# tests (pin full today + add today, etc.) tested "what if both end up
-# coexisting" — that scenario is no longer reachable via the public API,
-# so we replace those tests with checks of the admission rejection itself.
+# Under the "tree day 1 = tomorrow" convention every new ``add_order`` /
+# ``pin_order`` that targets today is rejected by ``abs_to_rel`` returning
+# ``None`` — there is no rel index for today at all. The earlier P1-1
+# invariant tests (pin full today + add today, etc.) tested "what if both
+# end up coexisting"; that scenario is no longer reachable via the public
+# API, so we replace those tests with checks of the admission rejection
+# itself.
 #
-# Mental model: ``capacity_tree.query(rel) - capacity_tree.query(1)`` is
-# the new feasibility metric — capacity available in [day 2 .. day rel].
-# ``rel == 1`` makes this 0 trivially, so any positive ``wafer_quantity``
-# rejects. The same subtraction applies in ``pin_order``.
+# Mental model: the feasibility metric is the standard
+# ``capacity_tree.query(rel) >= wafer_quantity`` — no day-1 subtraction
+# hack. ``rel`` is only ever in ``[1, HORIZON_DAYS]``; deadlines that
+# would map to today / past / past-horizon get filtered out by
+# ``abs_to_rel`` returning ``None`` before the capacity check runs, and
+# follow the ``deadline_too_far`` reject branch.
 
 
 def test_add_order_rejects_deadline_today() -> None:
-    """An order with deadline = today (``rel = 1``) has no usable days under
-    the new rule — the segment tree starts at ``base_date + 1`` (tomorrow),
-    so ``abs_to_rel(today, base_date)`` returns ``None`` → admission
+    """An order with deadline = today has no tree index at all — the
+    segment tree starts at ``base_date + 1`` (tomorrow), so
+    ``abs_to_rel(today, base_date)`` returns ``None`` (today is
+    out-of-tree, not ``rel=0`` or any other valid index). Admission
     rejects as ``deadline_too_far``. State must remain untouched.
     """
     state = SchedulerState.initial(_BASE)

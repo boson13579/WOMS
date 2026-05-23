@@ -757,10 +757,13 @@ def add_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
     capacity remains, otherwise ``success`` and mutates ``state`` in
     place.
 
-    Note: ``deadline == base_date`` (= today) reads as ``rel=0`` which
-    falls outside the tree, so it gets the ``deadline_too_far`` branch.
-    The rejection message distinguishes the "due today" subcase since
-    that's the most common user-input error under the day-1-locked rule.
+    Note: ``deadline == base_date`` (= today) yields ``delta_days == 0``,
+    which ``abs_to_rel`` treats as out-of-tree and returns ``None`` — so
+    it falls into the ``deadline_too_far`` branch alongside past and
+    past-horizon deadlines. There is no ``rel=0`` index; tree day 1 is
+    ``base_date + 1``. The rejection message distinguishes the "due
+    today" subcase from the generic out-of-horizon case since "I tried
+    to schedule for today" is the most common user-input error.
     """
     rel = abs_to_rel(order.deadline, state.base_date)
     if rel is None:
