@@ -9,7 +9,7 @@ Lock / soft-pin tests are skipped until feat/order-lock-mechanism merges.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import bcrypt
 from app.models.order import Order, OrderStatus
