@@ -4,9 +4,10 @@
  * Backed by ``GET /api/v1/system/red?window_seconds=…``. The endpoint
  * returns a point-in-time aggregate, so on every successful poll we
  * also push the headline metrics into ``useRedHistoryStore`` so the
- * sparklines have something to render. 10-second polling matches the
- * cadence the operator-grade card needs: fast enough to see a spike
- * unfold, slow enough to keep server cost negligible.
+ * sparklines have something to render. 2-second polling lets the
+ * sparkline feel live during demos / bombard runs without putting real
+ * load on the backend (each call is a Redis ZRANGEBYSCORE + aggregate,
+ * ~10-30ms server-side).
  *
  * The query key includes ``window_seconds`` so changing the time-range
  * pill triggers a new fetch (each window is cached independently by

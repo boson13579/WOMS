@@ -6,8 +6,11 @@
  * total" footer. The slicing is the caller's responsibility so the
  * unsliced data is still available if a future expanded-view UI lands.
  *
- * Polled every 10 s because the queue is highly dynamic (a single
- * batch PATCH can push dozens of compounds in seconds).
+ * Polled every 2 s because the queue is highly dynamic (a single
+ * batch PATCH can push dozens of compounds in seconds). `useDashboardWs`
+ * also invalidates this query on `schedule.compound_*` events for
+ * instant drain visibility — polling backs that up for any state the
+ * worker didn't broadcast.
  */
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 import { z } from 'zod';
@@ -52,6 +55,6 @@ export function usePendingOps(): UseQueryResult<PendingOpsEntry[]> {
       ),
     enabled: allowed,
     refetchInterval: REFETCH_INTERVAL_MS,
-    staleTime: 1_000,
+    staleTime: 5_000,
   });
 }

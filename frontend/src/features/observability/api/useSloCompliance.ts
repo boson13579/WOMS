@@ -1,11 +1,12 @@
 /**
  * useSloCompliance — fetches the SLO + error-budget snapshot.
  *
- * Backed by ``GET /api/v1/system/slo?window_hours=…``. Polled at 60s
+ * Backed by ``GET /api/v1/system/slo?window_hours=…``. Polled at 30s
  * because the underlying value moves slowly — a 24h SLO window only
- * shifts noticeably when sustained errors land. The page's RED-row
- * SLO card colour-bands on ``success_pct`` vs ``slo_target_pct`` and
- * ``error_budget_pct_remaining``.
+ * shifts noticeably when sustained errors land, so anything faster
+ * spends backend cycles aggregating the same answer. The page's
+ * RED-row SLO card colour-bands on ``success_pct`` vs ``slo_target_pct``
+ * and ``error_budget_pct_remaining``.
  */
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 

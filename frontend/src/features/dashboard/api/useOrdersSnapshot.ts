@@ -6,8 +6,11 @@
  * The fan-out is cheap on modern HTTP/2 connections (multiplexed over
  * one TCP socket) and lets each per-status query cache independently.
  *
- * Polled every 30 s. The status counts change only on order CRUD or
- * scheduler transitions — minute-grain is plenty for a dashboard card.
+ * Polled every 5 s (fans out 4 status counts per tick = 4 requests/5 s).
+ * The status counts change only on order CRUD or scheduler transitions;
+ * `useDashboardWs` invalidates this query on order / schedule events so
+ * the typical update path is instant. 5 s polling is the safety net for
+ * any transition that didn't emit an event.
  */
 import { useQueries } from '@tanstack/react-query';
 import { z } from 'zod';

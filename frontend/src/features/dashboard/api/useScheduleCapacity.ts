@@ -1,11 +1,13 @@
 /**
  * `useScheduleCapacity` — 30-day prefix-sum series for the dashboard chart.
  *
- * Polls `GET /api/v1/schedule/capacity` every 30 s. Capacity is an
+ * Polls `GET /api/v1/schedule/capacity` every 5 s. Capacity is an
  * algorithm-internal quantity that lives only in Redis, so the value
  * effectively changes only when `materialize_schedule_task` or
- * `advance_day_task` runs — 30 s is well below the upper bound on
- * change frequency.
+ * `advance_day_task` runs. `useDashboardWs` invalidates this query on
+ * `schedule.updated` / `schedule.materialized` events for instant
+ * updates after a compound lands — 5 s polling is the safety net for
+ * any state change that didn't emit an event.
  */
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 import { z } from 'zod';

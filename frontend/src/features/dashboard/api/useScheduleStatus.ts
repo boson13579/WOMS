@@ -1,9 +1,12 @@
 /**
  * `useScheduleStatus` — scheduler lifecycle snapshot for the dashboard badge.
  *
- * Polls `GET /api/v1/schedule/status` every 10 s so the badge surfaces
- * state flips (idle → running, running → failed) close to real time
- * while the WS bridge isn't wired up yet. Permission `order_manager+`
+ * Polls `GET /api/v1/schedule/status` every 2 s so the badge surfaces
+ * state flips (idle → running, running → failed) within a second of
+ * the worker writing them. `useDashboardWs` also invalidates this query
+ * on `schedule.compound_accepted` / `schedule.compound_failed` events
+ * for instant updates when those fire — polling is the safety net for
+ * states that don't emit an event. Permission `order_manager+`
  * (backend enforces; the dashboard hides the widget for viewer anyway).
  */
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';

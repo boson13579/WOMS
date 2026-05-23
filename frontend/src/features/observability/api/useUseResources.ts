@@ -7,9 +7,10 @@
  * other two still render. The frontend treats ``null`` as "we have no
  * signal, show a degraded card" rather than as a request-level error.
  *
- * 15-second polling — resource pressure shifts more slowly than RED
- * traffic, and CPU on the backend's USE probe (Celery ``inspect()``,
- * Redis ``INFO``) is non-trivial.
+ * 3-second polling — fast enough to catch a Redis / Celery degradation
+ * during demos but well above the per-probe cost (Celery ``inspect()``
+ * + Redis ``INFO`` add up to ~100ms server-side, dominant cost in this
+ * hook). RED uses 2s; this stays slower because USE probes are heavier.
  */
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 
