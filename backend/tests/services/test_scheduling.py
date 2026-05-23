@@ -52,6 +52,7 @@ def _seed_pq(state: SchedulerState, order: SchedulingOrder) -> None:
     _pq_add(state, order)
     _apply_add_to_trees(state, order)
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

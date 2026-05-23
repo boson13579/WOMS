@@ -772,9 +772,7 @@ def add_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
                 "Use a deadline of tomorrow or later."
             )
         elif delta < 0:
-            message = (
-                f"Deadline {order.deadline.isoformat()} is in the past."
-            )
+            message = f"Deadline {order.deadline.isoformat()} is in the past."
         else:
             message = "Deadline outside the 30-day scheduling horizon."
         logger.warning(
