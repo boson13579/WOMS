@@ -2,8 +2,8 @@
  * `useScheduleStatus` — scheduler lifecycle snapshot for the dashboard badge.
  *
  * Polls `GET /api/v1/schedule/status` every 2 s so the badge surfaces
- * state flips (idle → running, running → failed) within a second of
- * the worker writing them. `useDashboardWs` also invalidates this query
+ * state flips (idle → running, running → failed) within a couple
+ * seconds of the worker writing them. `useDashboardWs` also invalidates
  * on `schedule.compound_accepted` / `schedule.compound_failed` events
  * for instant updates when those fire — polling is the safety net for
  * states that don't emit an event. Permission `order_manager+`
@@ -46,7 +46,10 @@ export function useScheduleStatus(): UseQueryResult<ScheduleStatusResponse> {
         scheduleStatusResponseSchema.parse(d),
       ),
     enabled: allowed,
-    refetchInterval: REFETCH_INTERVAL_MS,
+    // Skip tick when a poll is still in-flight — apiFetch uses its own
+    // AbortController so overlapping requests can't be cancelled.
+    refetchInterval: (query) =>
+      query.state.fetchStatus === 'fetching' ? false : REFETCH_INTERVAL_MS,
     staleTime: 1_000,
   });
 }

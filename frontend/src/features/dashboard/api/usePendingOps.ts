@@ -6,11 +6,8 @@
  * total" footer. The slicing is the caller's responsibility so the
  * unsliced data is still available if a future expanded-view UI lands.
  *
- * Polled every 2 s because the queue is highly dynamic (a single
- * batch PATCH can push dozens of compounds in seconds). `useDashboardWs`
- * also invalidates this query on `schedule.compound_*` events for
- * instant drain visibility — polling backs that up for any state the
- * worker didn't broadcast.
+ * Polled every 10 s because the queue is highly dynamic (a single
+ * batch PATCH can push dozens of compounds in seconds).
  */
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 import { z } from 'zod';
@@ -40,7 +37,7 @@ const pendingOpsResponseSchema = z.array(pendingOpsEntrySchema);
 
 export const pendingOpsQueryKey = ['schedule', 'pending-ops'] as const;
 
-const REFETCH_INTERVAL_MS = 2_000;
+const REFETCH_INTERVAL_MS = 10_000;
 
 export function usePendingOps(): UseQueryResult<PendingOpsEntry[]> {
   const user = useCurrentUser();
@@ -54,7 +51,10 @@ export function usePendingOps(): UseQueryResult<PendingOpsEntry[]> {
         pendingOpsResponseSchema.parse(d),
       ),
     enabled: allowed,
-    refetchInterval: REFETCH_INTERVAL_MS,
+    // Skip tick when a poll is still in-flight — apiFetch uses its own
+    // AbortController so overlapping requests can't be cancelled.
+    refetchInterval: (query) =>
+      query.state.fetchStatus === 'fetching' ? false : REFETCH_INTERVAL_MS,
     staleTime: 5_000,
   });
 }

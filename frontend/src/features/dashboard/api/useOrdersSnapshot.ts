@@ -76,7 +76,14 @@ export function useOrdersSnapshot(): UseOrdersSnapshotResult {
       queryKey: ordersSnapshotQueryKey(status),
       queryFn: () => fetchCount(status),
       enabled: allowed,
-      refetchInterval: REFETCH_INTERVAL_MS,
+      // Skip tick when a poll is still in-flight. Especially important
+      // here because this hook fans out 4 parallel status queries per
+      // tick — without the guard a slow Postgres could pile up 4 × N
+      // concurrent requests. (Inline structural type because
+      // ``useQueries`` doesn't infer the ``query`` parameter the way
+      // ``useQuery<T>`` does.)
+      refetchInterval: (query: { state: { fetchStatus: string } }) =>
+        query.state.fetchStatus === 'fetching' ? false : REFETCH_INTERVAL_MS,
       staleTime: 2_000,
     })),
   });

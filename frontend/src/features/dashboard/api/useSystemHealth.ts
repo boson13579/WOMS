@@ -71,7 +71,13 @@ export function useSystemHealth(): UseQueryResult<SystemHealthResponse> {
         10_000,
       ),
     enabled: Boolean(user),
-    refetchInterval: REFETCH_INTERVAL_MS,
+    // Function form so a slow probe doesn't stack overlapping requests:
+    // skip the tick if a previous fetch is still in-flight. Matters because
+    // ``apiFetch`` runs its own AbortController and doesn't honour React
+    // Query's signal — without this guard, a 6s-stalled health probe would
+    // pile up three concurrent requests on the 2s cadence.
+    refetchInterval: (query) =>
+      query.state.fetchStatus === 'fetching' ? false : REFETCH_INTERVAL_MS,
     staleTime: 1_000,
   });
 }
