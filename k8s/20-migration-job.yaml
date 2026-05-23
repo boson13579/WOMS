@@ -23,7 +23,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: alembic
-          image: ${ECR_URI}/woms-backend:v0.1
+          image: ${ECR_URI}/woms-backend:${IMAGE_TAG}
           command: ["alembic", "upgrade", "head"]
           envFrom:
             - secretRef:
