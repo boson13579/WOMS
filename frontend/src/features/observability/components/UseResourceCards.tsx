@@ -44,6 +44,18 @@ function formatBytes(n: number): string {
   return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
 }
 
+/**
+ * Compact a pod id for caption rendering. Both docker (hex container id
+ * prefix, e.g. ``7e004a4e76de``) and k8s (pod name, e.g.
+ * ``backend-7d8c9b4f5-abc12``) get usefully distinguished by taking the
+ * trailing 6 chars — the random suffix in k8s, the hex tail in docker.
+ * Prefix-based slicing would collapse every k8s replica to ``backend-``
+ * which defeats the per-replica breakdown.
+ */
+function shortPodId(id: string): string {
+  return id.length <= 6 ? id : id.slice(-6);
+}
+
 export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsProps): JSX.Element {
   if (isLoading && !data) {
     return (
@@ -76,7 +88,7 @@ export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsP
   const dbReplicaHint =
     db && db.replicas.length > 1
       ? db.replicas
-          .map((r) => `${r.pod_id.slice(0, 8)}: ${r.checked_out}/${r.size + r.max_overflow}`)
+          .map((r) => `${shortPodId(r.pod_id)}: ${r.checked_out}/${r.size + r.max_overflow}`)
           .join(' · ')
       : null;
   const dbCaption = db
@@ -119,7 +131,7 @@ export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsP
   // demo scale. Skip the bar.
   const wsReplicaHint =
     ws && ws.replicas.length > 1
-      ? ws.replicas.map((r) => `${r.pod_id.slice(0, 8)}: ${r.count}`).join(' · ')
+      ? ws.replicas.map((r) => `${shortPodId(r.pod_id)}: ${r.count}`).join(' · ')
       : null;
   const wsCaption = ws
     ? `${ws.total === 1 ? 'session' : 'sessions'}${wsReplicaHint ? ` · ${wsReplicaHint}` : ''}`
