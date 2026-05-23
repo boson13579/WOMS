@@ -2,10 +2,11 @@
  * `useSystemHealth` — fetches the dashboard's Service Health card data.
  *
  * Backed by `GET /api/v1/system/health` (open to any logged-in user,
- * viewers included). The polling cadence is intentionally conservative —
- * service health changes slowly and dashboard re-renders cost CSS work
- * across the entire page. A 30-second cadence is well below MTTR for
- * the underlying services and well above the cost-of-render budget.
+ * viewers included). Polls every 2s so operators see service-state
+ * transitions (e.g. Redis going down, Celery worker pool shrinking)
+ * within seconds — needed for the demo / debug flow. Backend cost is
+ * negligible at single-digit viewer count: each probe is ~50ms server
+ * side, no DB writes.
  *
  * Future: when the WS-cookie-auth follow-up PR lands (see
  * `notes/ws-design-spec.md`), wire `schedule.updated` / `schedule.materialized`
@@ -49,7 +50,7 @@ const systemHealthResponseSchema = z.object({
 
 export const systemHealthQueryKey = ['system', 'health'] as const;
 
-const REFETCH_INTERVAL_MS = 30_000;
+const REFETCH_INTERVAL_MS = 2_000;
 
 export function useSystemHealth(): UseQueryResult<SystemHealthResponse> {
   const user = useCurrentUser();
@@ -70,7 +71,13 @@ export function useSystemHealth(): UseQueryResult<SystemHealthResponse> {
         10_000,
       ),
     enabled: Boolean(user),
-    refetchInterval: REFETCH_INTERVAL_MS,
-    staleTime: 10_000,
+    // Function form so a slow probe doesn't stack overlapping requests:
+    // skip the tick if a previous fetch is still in-flight. Matters because
+    // ``apiFetch`` runs its own AbortController and doesn't honour React
+    // Query's signal — without this guard, a 6s-stalled health probe would
+    // pile up three concurrent requests on the 2s cadence.
+    refetchInterval: (query) =>
+      query.state.fetchStatus === 'fetching' ? false : REFETCH_INTERVAL_MS,
+    staleTime: 1_000,
   });
 }

@@ -35,7 +35,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: seed
-          image: ${ECR_URI}/woms-backend:v0.1
+          image: ${ECR_URI}/woms-backend:${IMAGE_TAG}
           envFrom:
             - secretRef:
                 name: woms-secrets

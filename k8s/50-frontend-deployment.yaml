@@ -24,7 +24,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: ${ECR_URI}/woms-frontend:v0.1
+          image: ${ECR_URI}/woms-frontend:${IMAGE_TAG}
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

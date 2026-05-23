@@ -26,7 +26,7 @@ spec:
     spec:
       containers:
         - name: worker
-          image: ${ECR_URI}/woms-backend:v0.1
+          image: ${ECR_URI}/woms-backend:${IMAGE_TAG}
           imagePullPolicy: IfNotPresent
           command:
             - celery
