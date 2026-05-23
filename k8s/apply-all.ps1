@@ -60,5 +60,6 @@ Apply-Templated "k8s/50-frontend-deployment.yaml"
 Apply-Plain "k8s/60-ingress.yaml"
 
 Write-Host "`nAll manifests applied." -ForegroundColor Green
-Write-Host "Demo admin: username=admin, password=woms-demo-2026" -ForegroundColor Green
+Write-Host "Demo admin: username=admin" -ForegroundColor Green
+Write-Host "Password:   terraform -chdir=infra output -raw admin_password" -ForegroundColor Green
 Write-Host "Watch pods come up with: kubectl get pods -n woms -w"

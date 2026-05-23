@@ -96,7 +96,10 @@ jobs:
           # woms-migrate has a fixed name and Jobs are immutable on most
           # fields, so delete the prior run before re-applying.
           kubectl delete job woms-migrate -n woms --ignore-not-found
-          envsubst < k8s/20-migration-job.yaml | kubectl apply -f -
+          # Pin envsubst to ONLY these vars — without this it greedily
+          # expands $HOME / $PATH / $GITHUB_* etc. The arg is single-quoted
+          # so the shell doesn't expand it before envsubst sees it.
+          envsubst '${ECR_URI} ${IMAGE_TAG}' < k8s/20-migration-job.yaml | kubectl apply -f -
           if ! kubectl wait --for=condition=complete --timeout=180s job/woms-migrate -n woms; then
             echo "::error::Migration job failed or timed out"
             kubectl logs -n woms job/woms-migrate --tail=200 || true
