@@ -57,7 +57,8 @@ export function useScheduleWs(): void {
         void qc.invalidateQueries({ queryKey: scheduleResultKeys.all });
       }
       if (env.type === 'schedule.compound_failed') {
-        const description = env.message ?? env.reason ?? '排程器拒絕這次操作，請檢查訂單日期與產能。';
+        const description =
+          env.message ?? env.reason ?? '排程器拒絕這次操作，請檢查訂單日期與產能。';
         toast.error('排程失敗', { description });
       }
       if (env.type === 'schedule.materialized') {
