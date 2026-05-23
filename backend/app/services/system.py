@@ -472,16 +472,24 @@ def _get_db_pool_stats() -> DbPoolStats | None:
     if not snapshots:
         snapshots = [{"pod_id": get_pod_id(), **local}]
 
-    replicas = [
-        DbPoolPerReplica(
-            pod_id=str(s["pod_id"]),
-            size=int(s["size"]),
-            checked_out=int(s["checked_out"]),
-            overflow=int(s["overflow"]),
-            max_overflow=int(s["max_overflow"]),
-        )
-        for s in snapshots
-    ]
+    # Defensive parse: each snapshot is JSON deserialised from Redis,
+    # so a stale write from an older pod schema (missing field, wrong
+    # type) shouldn't break the whole endpoint. Skip the bad ones and
+    # keep going so one bad replica degrades to absence rather than 500.
+    replicas: list[DbPoolPerReplica] = []
+    for s in snapshots:
+        try:
+            replicas.append(
+                DbPoolPerReplica(
+                    pod_id=str(s["pod_id"]),
+                    size=int(s["size"]),
+                    checked_out=int(s["checked_out"]),
+                    overflow=int(s["overflow"]),
+                    max_overflow=int(s["max_overflow"]),
+                )
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("system.resources.db_pool.bad_snapshot", error=str(exc), snapshot=s)
     # Sort for stable rendering — pod_id is the only intrinsic ordering
     # we have without dragging cluster topology in.
     replicas.sort(key=lambda r: r.pod_id)
@@ -663,14 +671,21 @@ def _get_ws_connection_stats() -> WsConnectionStats | None:
     if not snapshots:
         snapshots = [{"pod_id": get_pod_id(), "count": local_count}]
 
-    replicas = [
-        WsConnectionsPerReplica(pod_id=str(s["pod_id"]), count=int(s["count"])) for s in snapshots
-    ]
-    replicas.sort(key=lambda r: r.pod_id)
+    # Defensive parse — same rationale as db_pool aggregation: skip
+    # any malformed published snapshot instead of 500-ing the endpoint.
+    ws_replicas: list[WsConnectionsPerReplica] = []
+    for s in snapshots:
+        try:
+            ws_replicas.append(
+                WsConnectionsPerReplica(pod_id=str(s["pod_id"]), count=int(s["count"]))
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("system.resources.ws.bad_snapshot", error=str(exc), snapshot=s)
+    ws_replicas.sort(key=lambda r: r.pod_id)
 
     return WsConnectionStats(
-        total=sum(r.count for r in replicas),
-        replicas=replicas,
+        total=sum(r.count for r in ws_replicas),
+        replicas=ws_replicas,
     )
 
 

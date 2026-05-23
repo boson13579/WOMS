@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
 from functools import lru_cache
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -36,11 +37,20 @@ logger = structlog.get_logger(__name__)
 # pod being slow; short enough that a dead replica doesn't linger.
 _TTL_SECONDS = 30
 
-# Fast-fail pre-flight timeout for the Redis port check. Matches the
-# pattern in ``app.services.system._redis_port_open``: when Redis is
-# down we want to bail out in ~200 ms instead of letting the redis
-# client eat its full 2 s connect timeout on every probe call.
+# Fast-fail pre-flight timeout for the Redis port check. 500 ms is the
+# longest we accept blocking ``/system/resources`` while waiting for the
+# OS to refuse the connection — tighter risks false negatives on
+# laggy laptops; looser starts being a real UX regression.
 _PORT_CHECK_TIMEOUT_SECONDS = 0.5
+
+# Cache the reachability result briefly so a single ``/system/resources``
+# request — which calls publish + aggregate for each category, currently
+# four pod_stats calls per request — only pays the port-check once.
+# A 2 s TTL is short enough that Redis recovery surfaces within ~2 s of
+# the dashboard's next poll, and long enough to deduplicate within one
+# poll cycle (3 s dashboard cadence).
+_PORT_CHECK_CACHE_TTL_SECONDS = 2.0
+_port_check_cache: dict[str, float] = {"checked_at": 0.0, "result": 0.0}
 
 
 def _redis_port_open() -> bool:
@@ -48,23 +58,32 @@ def _redis_port_open() -> bool:
 
     Without this, every ``publish_pod_stats`` / ``aggregate_pod_stats``
     call during a Redis outage adds the full client connect timeout
-    (~2s) to ``/system/resources``, making the observability page hang.
+    (~2 s) to ``/system/resources``. Cached for
+    ``_PORT_CHECK_CACHE_TTL_SECONDS`` so the four pod_stats calls per
+    resources request only run the TCP check once.
     """
+    now = time.monotonic()
+    if now - _port_check_cache["checked_at"] < _PORT_CHECK_CACHE_TTL_SECONDS:
+        return bool(_port_check_cache["result"])
+
     settings = get_settings()
     parsed = urlparse(str(settings.REDIS_URL))
     host = parsed.hostname or "localhost"
     port = parsed.port or 6379
+    ok = False
     try:
         addrs = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
-        if not addrs:
-            return False
-        family, socktype, proto, _, sockaddr = addrs[0]
-        with socket.socket(family, socktype, proto) as sock:
-            sock.settimeout(_PORT_CHECK_TIMEOUT_SECONDS)
-            sock.connect(sockaddr)
-            return True
+        if addrs:
+            family, socktype, proto, _, sockaddr = addrs[0]
+            with socket.socket(family, socktype, proto) as sock:
+                sock.settimeout(_PORT_CHECK_TIMEOUT_SECONDS)
+                sock.connect(sockaddr)
+                ok = True
     except OSError:
-        return False
+        ok = False
+    _port_check_cache["checked_at"] = now
+    _port_check_cache["result"] = 1.0 if ok else 0.0
+    return ok
 
 
 @lru_cache(maxsize=1)
