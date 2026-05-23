@@ -89,6 +89,20 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
 
+      - name: Run DB migrations (alembic upgrade head)
+        env:
+          ECR_URI: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # woms-migrate has a fixed name and Jobs are immutable on most
+          # fields, so delete the prior run before re-applying.
+          kubectl delete job woms-migrate -n woms --ignore-not-found
+          envsubst < k8s/20-migration-job.yaml | kubectl apply -f -
+          if ! kubectl wait --for=condition=complete --timeout=180s job/woms-migrate -n woms; then
+            echo "::error::Migration job failed or timed out"
+            kubectl logs -n woms job/woms-migrate --tail=200 || true
+            exit 1
+          fi
+
       - name: Roll backend Deployment
         run: |
           kubectl set image deployment/backend \
