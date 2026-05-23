@@ -104,8 +104,7 @@ def _validate_assigned_to_user(db: Session, assigned_to: uuid.UUID | None) -> No
 def _generate_order_number(db: Session) -> str:
     """Produce a unique ORD-YYYYMMDD-XXXX number for today."""
     today = datetime.now(tz=UTC).date()
-    count = order_repo.get_today_order_count(db, today)
-    seq = count + 1
+    seq = order_repo.allocate_order_seq(db, today)
     return f"ORD-{today.strftime('%Y%m%d')}-{seq:04d}"
 
 
