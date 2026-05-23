@@ -25,8 +25,11 @@ interface UseResourceCardProps {
   detail?: string | undefined;
   /** Utilization ratio in ``[0, 1]``; controls bar width + colour. */
   ratio?: number | null | undefined;
-  /** Suffix under the bar (e.g. ``"10 % used"``). */
-  caption?: string | undefined;
+  /**
+   * Suffix under the bar. ``string`` renders one line; ``string[]``
+   * renders each entry as its own line (e.g. one per replica pod).
+   */
+  caption?: string | string[] | undefined;
   /** Optional drilldown content rendered after the bar / caption. */
   expandable?: ReactNode | undefined;
   /**
@@ -107,9 +110,14 @@ export function UseResourceCard({
         {isUnreachable ? (
           <p className="text-xs text-muted-foreground">{unreachableMessage}</p>
         ) : null}
-        {!isUnreachable && caption ? (
-          <p className="text-xs text-muted-foreground">{caption}</p>
-        ) : null}
+        {!isUnreachable && caption
+          ? (Array.isArray(caption) ? caption : [caption]).map((line, idx) => (
+              // eslint-disable-next-line react/no-array-index-key
+              <p key={idx} className="text-xs text-muted-foreground">
+                {line}
+              </p>
+            ))
+          : null}
 
         {expandable ? <div className="pt-1">{expandable}</div> : null}
       </CardContent>

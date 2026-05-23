@@ -80,68 +80,61 @@ export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsP
   }
 
   // ---- DB pool ----------------------------------------------------------
+  // Layout:
+  //   "16 / 50"  [detail: "(32.0% used)"]
+  //   bar
+  //   backend-1: 9/25
+  //   backend-2: 7/25
   const db = data.db_pool;
   const dbValue = db ? `${db.checked_out} / ${db.size + db.max_overflow}` : null;
+  const dbDetail = db ? `(${db.utilization_pct.toFixed(1)}% used)` : undefined;
   const dbRatio = db ? db.utilization_pct / 100 : null;
-  // Show per-replica only when there's more than one — single-pod
-  // deployments would otherwise just repeat the headline number.
-  const dbReplicaHint =
+  const dbCaption: string | undefined =
     db && db.replicas.length > 1
       ? db.replicas
-          .map((r) => `${shortPodId(r.pod_id)}: ${r.checked_out}/${r.size + r.max_overflow}`)
+          .map((r) => `${shortPodId(r.pod_id)}: ${r.checked_out} / ${r.size + r.max_overflow}`)
           .join(' · ')
-      : null;
-  const dbCaption = db
-    ? `${db.utilization_pct.toFixed(1)} % used${dbReplicaHint ? ` · ${dbReplicaHint}` : ''}`
-    : undefined;
+      : undefined;
 
   // ---- Redis ------------------------------------------------------------
+  // Two layout modes depending on whether a maxmemory cap is configured:
+  // - Capped (AWS ElastiCache): one-line caption + saturation bar
+  // - Uncapped (docker default): caption split into two lines so the
+  //   "no cap" status is visually distinct from the client count
   const { redis } = data;
   const redisValue = redis ? formatBytes(redis.used_memory_bytes) : null;
-  // Only draw the saturation bar when ``maxmemory`` is configured.
-  // Docker / local Redis runs without a cap (max=0) so any denominator
-  // we pick is fake; surface absolute MB + eviction count and skip the
-  // bar entirely instead of pretending we have a budget.
   const redisRatio =
     redis && redis.max_memory_bytes > 0 ? redis.used_memory_bytes / redis.max_memory_bytes : null;
-  const redisCaption = redis
-    ? (() => {
-        const parts: string[] = [];
-        if (redis.max_memory_bytes > 0) {
-          parts.push(`cap ${formatBytes(redis.max_memory_bytes)}`);
-        } else {
-          parts.push('no cap');
-        }
-        parts.push(`${redis.connected_clients} client${redis.connected_clients === 1 ? '' : 's'}`);
-        // Evictions are the real "Redis is hurting" signal — surface
-        // them when non-zero so the operator sees them even on the
-        // single-line caption.
-        if (redis.evicted_keys > 0) {
-          parts.push(`${redis.evicted_keys} evicted`);
-        }
-        return parts.join(' · ');
-      })()
+  const clientsLine = redis
+    ? `${redis.connected_clients} client${redis.connected_clients === 1 ? '' : 's'}${
+        redis.evicted_keys > 0 ? ` · ${redis.evicted_keys} evicted` : ''
+      }`
     : undefined;
+  let redisCaption: string | string[] | undefined;
+  if (!redis) {
+    redisCaption = undefined;
+  } else if (redis.max_memory_bytes > 0) {
+    redisCaption = `cap ${formatBytes(redis.max_memory_bytes)} · ${clientsLine ?? ''}`;
+  } else {
+    redisCaption = ['no cap', clientsLine ?? ''];
+  }
 
   // ---- Live WebSocket connections (replaces Workers card) ----------------
+  // Layout: just the number + per-pod breakdown on separate lines, no
+  // "session"/"sessions" suffix (number on its own is unambiguous).
   const ws = data.ws_connections;
   const wsValue = ws ? `${ws.total}` : null;
-  // No natural saturation denominator for "how many dashboards are
-  // watching" — operationally there's no upper bound that matters at
-  // demo scale. Skip the bar.
-  const wsReplicaHint =
+  const wsCaption: string[] | undefined =
     ws && ws.replicas.length > 1
-      ? ws.replicas.map((r) => `${shortPodId(r.pod_id)}: ${r.count}`).join(' · ')
-      : null;
-  const wsCaption = ws
-    ? `${ws.total === 1 ? 'session' : 'sessions'}${wsReplicaHint ? ` · ${wsReplicaHint}` : ''}`
-    : undefined;
+      ? ws.replicas.map((r) => `${shortPodId(r.pod_id)}: ${r.count}`)
+      : undefined;
 
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
       <UseResourceCard
         label="DB connections"
         value={dbValue}
+        detail={dbDetail}
         ratio={dbRatio}
         caption={dbCaption}
         unreachableMessage="Pool stats unavailable."

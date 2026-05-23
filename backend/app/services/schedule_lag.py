@@ -45,8 +45,10 @@ _LAG_SET_KEY = "metrics:schedule_lag"
 _LAG_SEQ_KEY = "metrics:schedule_lag:seq"
 
 # Trim window — anything older than this gets dropped on each write.
-# 5 min matches RED's retention so both metrics degrade together.
-_RETENTION_SECONDS = 300
+# 1h covers the widest pill on the observability page (15m / 1h) so the
+# UI never has to silently fall back to "5 min of data when you asked
+# for 1h". Cost: ~2-3 MB of Redis at ~10 ops/sec sustained — fine.
+_RETENTION_SECONDS = 3600
 
 
 @lru_cache(maxsize=1)
