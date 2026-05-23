@@ -63,14 +63,32 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    ports:
-      - "8000:8000"
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-50}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-30}
+    expose:
+      - "8000"
+    deploy:
+      replicas: 2
     healthcheck:
       test: [ "CMD", "curl", "--fail", "http://localhost:8000/api/v1/health" ]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 15s
+
+  # Load balancer in front of backend replicas. Frontend / clients still
+  # hit localhost:8000 as before; nginx round-robins to backend instances
+  # via docker DNS (which returns all healthy replica IPs for the
+  # ``backend`` service name).
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      backend: { condition: service_healthy }
+    ports:
+      - "8000:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
 
   worker:
     build:

@@ -1002,7 +1002,7 @@ def list_for_scheduler(
     return orders, creators
 
 
-def apply_schedule(  # noqa: PLR0912 — orchestration: each branch is one well-named step
+def apply_schedule(
     db: Session,
     scheduled: list[ScheduledResult],
     pinned: dict[uuid.UUID, date] | None = None,
@@ -1142,28 +1142,6 @@ def apply_schedule(  # noqa: PLR0912 — orchestration: each branch is one well-
                                 earliest,
                             )
                         )
-                # Read status from the refreshed row, not a hard-coded constant —
-                # ``set_schedule_dates`` preserves ``in_production`` (see its
-                # docstring for why), so an in-production order being
-                # re-materialized for tomorrow's boundary portion will
-                # audit-log status=in_production, not status=scheduled.
-                new_value: dict[str, Any] = {
-                    "scheduled_production_date": str(earliest),
-                    "expected_delivery_date": str(latest),
-                    "status": order.status.value,
-                }
-                if is_pinned:
-                    new_value["pinned_production_date"] = str(pinned_map[order_id])
-                # Dual-write to audit_logs + stdout. user_id=None marks this as
-                # system-driven (the scheduler, not a human, applied the result).
-                record_audit(
-                    db,
-                    action="order.scheduled",
-                    actor_id=None,
-                    resource_type="order",
-                    resource_id=order_id,
-                    new_value=new_value,
-                )
         except StaleDataError:
             # Concurrent PATCH on this row landed between our SELECT and
             # our flush. The SAVEPOINT is already rolled back; outer
