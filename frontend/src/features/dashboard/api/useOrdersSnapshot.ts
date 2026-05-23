@@ -12,7 +12,7 @@
  * the typical update path is instant. 5 s polling is the safety net for
  * any transition that didn't emit an event.
  */
-import { useQueries } from '@tanstack/react-query';
+import { useQueries, type Query } from '@tanstack/react-query';
 import { z } from 'zod';
 
 import { useCurrentUser, useCurrentRole } from '@/lib/auth';
@@ -79,10 +79,12 @@ export function useOrdersSnapshot(): UseOrdersSnapshotResult {
       // Skip tick when a poll is still in-flight. Especially important
       // here because this hook fans out 4 parallel status queries per
       // tick — without the guard a slow Postgres could pile up 4 × N
-      // concurrent requests. (Inline structural type because
-      // ``useQueries`` doesn't infer the ``query`` parameter the way
-      // ``useQuery<T>`` does.)
-      refetchInterval: (query: { state: { fetchStatus: string } }) =>
+      // concurrent requests. Explicit ``Query`` type because
+      // ``useQueries`` doesn't infer the parameter the way
+      // ``useQuery<T>`` does, and we want the narrow ``fetchStatus``
+      // union (``'fetching' | 'paused' | 'idle'``) so a typo wouldn't
+      // silently typecheck.
+      refetchInterval: (query: Query<number>) =>
         query.state.fetchStatus === 'fetching' ? false : REFETCH_INTERVAL_MS,
       staleTime: 2_000,
     })),
