@@ -36,6 +36,7 @@ pre-write back to a sane resting state.
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import date
 from typing import Any
@@ -142,6 +143,19 @@ def perform_compound_db_action(
             _apply_db_action_reject(db, order, kind, actor_id)
 
         db.commit()
+
+        # Pipeline-lag sample: time from enqueue (stamped by
+        # ``schedule_queue.enqueue_compound``) to this commit. Only
+        # recorded on the success path so the metric reflects "worker
+        # kept up with the queue", not "worker failed and stopped".
+        # Best-effort; ``record_lag_sample`` swallows its own errors.
+        enqueued_at_ms = compound.get("_enqueued_at_ms")
+        if isinstance(enqueued_at_ms, (int, float)):
+            now_ms = int(time.time() * 1000)
+            lag_ms = max(0, now_ms - int(enqueued_at_ms))
+            from app.services.schedule_lag import record_lag_sample
+
+            record_lag_sample(lag_ms)
 
         # Send cancellation notification after commit (best-effort).
         # Triggers for: explicit user delete accepted, or orphan create

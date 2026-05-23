@@ -109,6 +109,19 @@ class ConnectionManager:
             targets = [s for sockets in self._connections.values() for s in sockets]
         return await self._send_all(targets, message)
 
+    def total_connections(self) -> int:
+        """Return the number of live WebSocket sessions on this pod.
+
+        Sync (no ``await``) because callers are sync FastAPI route
+        handlers / system probes — dict / set ``len`` is atomic in
+        CPython so we don't need the lock to read.
+
+        Multi-replica deployments aggregate this across pods via
+        ``app.services.pod_stats``; on its own this number is only
+        meaningful for the pod that served the request.
+        """
+        return sum(len(sockets) for sockets in self._connections.values())
+
     async def _send_all(self, sockets: list[WebSocket], message: dict[str, Any]) -> int:
         delivered = 0
         for ws in sockets:

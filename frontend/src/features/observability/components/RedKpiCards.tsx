@@ -1,14 +1,16 @@
 /**
- * RedKpiCards — the four-tile RED + SLO row.
+ * RedKpiCards — the four-tile RED row (rate, errors, duration, lag).
  *
  * Layout: ``grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4`` so the
  * four KPIs reflow to a 2×2 grid at md and a single 1×4 row at xl.
  *
- * SLO colour bands (per plan):
- *   - green when ``success_pct >= slo_target_pct``
- *   - amber when ``error_budget_consumed_pct >= 50`` AND
- *     ``error_budget_pct_remaining >= 10``
- *   - red when ``error_budget_pct_remaining < 10``
+ * The fourth slot was historically SLO compliance. SLO was teaching-
+ * level demo content (5-min retention, single target, no alerting) with
+ * limited operational signal — replaced with schedule pipeline lag,
+ * which directly answers "is the worker keeping up". Lag bands:
+ *   - green when P95 < 1000 ms (worker on top of the queue)
+ *   - amber when 1000 ≤ P95 < 5000 ms (queue starting to back up)
+ *   - red when P95 ≥ 5000 ms (operator should investigate)
  *
  * Deltas are derived from the ring buffer: ``current - previous`` of
  * each metric. We don't ask the backend for a delta because the buffer
@@ -21,7 +23,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 
 import { useRedHistoryStore } from '../stores/redHistoryStore';
-import type { RedMetricsResponse, SloCompliance } from '../types';
+import type { RedMetricsResponse, ScheduleLag } from '../types';
 
 import { RedKpiCard, type KpiTone } from './RedKpiCard';
 
@@ -29,9 +31,9 @@ interface RedKpiCardsProps {
   red: RedMetricsResponse | undefined;
   redLoading: boolean;
   redError: boolean;
-  slo: SloCompliance | undefined;
-  sloLoading: boolean;
-  sloError: boolean;
+  lag: ScheduleLag | undefined;
+  lagLoading: boolean;
+  lagError: boolean;
 }
 
 interface DeltaResult {
@@ -52,11 +54,10 @@ function formatDelta(current: number, previous: number | undefined, unit: string
   return { text: `${direction} ${Math.abs(diff).toFixed(2)}${unit}`, tone: 'neutral' };
 }
 
-function sloTone(s: SloCompliance): KpiTone {
-  if (s.error_budget_pct_remaining < 10) return 'critical';
-  if (s.error_budget_consumed_pct >= 50) return 'warning';
-  if (s.success_pct >= s.slo_target_pct) return 'positive';
-  return 'neutral';
+function lagTone(p95Ms: number): KpiTone {
+  if (p95Ms >= 5_000) return 'critical';
+  if (p95Ms >= 1_000) return 'warning';
+  return 'positive';
 }
 
 function ErrorState({ message }: { message: string }): JSX.Element {
@@ -85,13 +86,14 @@ export function RedKpiCards({
   red,
   redLoading,
   redError,
-  slo,
-  sloLoading,
-  sloError,
+  lag,
+  lagLoading,
+  lagError,
 }: RedKpiCardsProps): JSX.Element {
   const rateHistory = useRedHistoryStore((s) => s.series.rate);
   const errorPctHistory = useRedHistoryStore((s) => s.series.errorPct);
   const p95History = useRedHistoryStore((s) => s.series.p95);
+  const lagP95History = useRedHistoryStore((s) => s.series.lagP95);
 
   if (redLoading && !red) {
     return <LoadingGrid />;
@@ -136,55 +138,52 @@ export function RedKpiCards({
         sparklineData={p95History}
         sparklineLabel="P95 latency over time"
       />
-      <SloCardSlot slo={slo} loading={sloLoading} error={sloError} />
+      <LagCardSlot lag={lag} loading={lagLoading} error={lagError} history={lagP95History} />
     </div>
   );
 }
 
-/**
- * Format the "data: last Xm" hint surfaced below the SLO subtitle when the
- * actual data window is shorter than the requested ``window_hours`` (e.g.
- * the user asked for 24h but the ZSET only retains 1h).
- *
- * Returned in minutes (rounded) to match the operator's mental model;
- * sub-minute slivers round down to 0m which we still show so the empty-
- * data case is visible rather than silently hidden.
- */
-function formatDataWindowHint(actualSeconds: number): string {
-  const minutes = Math.max(0, Math.round(actualSeconds / 60));
-  return `data: last ${minutes}m`;
-}
-
-function SloCardSlot({
-  slo,
+function LagCardSlot({
+  lag,
   loading,
   error,
+  history,
 }: {
-  slo: SloCompliance | undefined;
+  lag: ScheduleLag | undefined;
   loading: boolean;
   error: boolean;
+  history: number[];
 }): JSX.Element {
-  if (loading && !slo) {
+  if (loading && !lag) {
     return <Skeleton data-testid="red-kpi-skeleton" className="h-32 w-full" />;
   }
-  if (error || !slo) {
-    return <ErrorState message="Failed to load SLO." />;
+  if (error || !lag) {
+    return <ErrorState message="Failed to load schedule lag." />;
   }
-  // Surface "data: last Xm" only when the actual sample window is shorter
-  // than requested — when they match (>= requested seconds) the card stays
-  // clean rather than restating the obvious. The +slo.window_hours hour
-  // → seconds conversion mirrors the backend's ``data_window_seconds_actual``
-  // definition so the comparison is exact.
-  const requestedSeconds = slo.window_hours * 3600;
-  const showDataHint = slo.data_window_seconds_actual < requestedSeconds;
+  // Empty window (no compounds processed yet) → render a "—" card
+  // instead of a "0 ms / healthy" green pill which would falsely
+  // suggest the pipeline is succeeding when it just hasn't seen any
+  // traffic. The sparkline stays empty too.
+  if (lag.sample_count === 0) {
+    return (
+      <RedKpiCard
+        label="Schedule lag"
+        value="—"
+        unit="ms"
+        subtitle="No compounds processed in window"
+        tone="neutral"
+      />
+    );
+  }
   return (
     <RedKpiCard
-      label="SLO compliance"
-      value={slo.success_pct.toFixed(2)}
-      unit="%"
-      subtitle={`Target: ${slo.slo_target_pct.toFixed(1)}% • Budget remaining: ${slo.error_budget_pct_remaining.toFixed(1)}%`}
-      tone={sloTone(slo)}
-      footnote={showDataHint ? formatDataWindowHint(slo.data_window_seconds_actual) : undefined}
+      label="Schedule lag"
+      value={`${lag.p95_ms}`}
+      unit="ms"
+      subtitle={`P50 ${lag.p50_ms} • max ${lag.max_ms} (${lag.sample_count} samples)`}
+      tone={lagTone(lag.p95_ms)}
+      sparklineData={history}
+      sparklineLabel="P95 schedule lag over time"
     />
   );
 }

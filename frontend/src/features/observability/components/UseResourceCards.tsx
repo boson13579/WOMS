@@ -3,8 +3,23 @@
  *
  * Each card reads its own slice of the ``/system/resources`` response
  * and degrades independently when its section is ``null`` (probe
- * failed). The Workers card threads a per-worker drilldown through
- * the generic ``UseResourceCard``'s ``expandable`` slot.
+ * failed).
+ *
+ * Card layout (post-Phase-2 observability revamp):
+ *   1. DB connections — aggregate across all backend replicas, with the
+ *      per-replica breakdown rendered in the caption so an uneven
+ *      nginx round-robin is visible at a glance.
+ *   2. Redis — saturation bar against ``max_memory_bytes`` (the
+ *      configured cap). When unset (=0, the docker default) we drop the
+ *      bar entirely and surface raw MB + ``evicted_keys`` instead;
+ *      ``used_memory_peak`` was the previous denominator but that's a
+ *      high-water mark, not a budget, so it made the bar permanently
+ *      red on a quiet system.
+ *   3. Live connections — total active WebSocket sessions across all
+ *      backend replicas (was: Workers / Celery). Workers were single-
+ *      replica and not a bottleneck; this card shows "how many
+ *      dashboards are currently watching" which is operationally
+ *      meaningful and visually responsive during a demo.
  */
 import { AlertTriangle } from 'lucide-react';
 
@@ -14,7 +29,6 @@ import { Skeleton } from '@/components/ui/skeleton';
 import type { UseResources } from '../types';
 
 import { UseResourceCard } from './UseResourceCard';
-import { WorkersDrilldown } from './WorkersDrilldown';
 
 interface UseResourceCardsProps {
   data: UseResources | undefined;
@@ -57,41 +71,59 @@ export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsP
   const db = data.db_pool;
   const dbValue = db ? `${db.checked_out} / ${db.size + db.max_overflow}` : null;
   const dbRatio = db ? db.utilization_pct / 100 : null;
-  const dbCaption = db ? `${db.utilization_pct.toFixed(1)} % used` : undefined;
+  // Show per-replica only when there's more than one — single-pod
+  // deployments would otherwise just repeat the headline number.
+  const dbReplicaHint =
+    db && db.replicas.length > 1
+      ? db.replicas
+          .map((r) => `${r.pod_id.slice(0, 8)}: ${r.checked_out}/${r.size + r.max_overflow}`)
+          .join(' · ')
+      : null;
+  const dbCaption = db
+    ? `${db.utilization_pct.toFixed(1)} % used${dbReplicaHint ? ` · ${dbReplicaHint}` : ''}`
+    : undefined;
 
   // ---- Redis ------------------------------------------------------------
   const { redis } = data;
   const redisValue = redis ? formatBytes(redis.used_memory_bytes) : null;
-  // We don't get max_memory from /resources; use peak as a soft denominator
-  // to give the bar a visual anchor when the peak is non-trivial.
+  // Only draw the saturation bar when ``maxmemory`` is configured.
+  // Docker / local Redis runs without a cap (max=0) so any denominator
+  // we pick is fake; surface absolute MB + eviction count and skip the
+  // bar entirely instead of pretending we have a budget.
   const redisRatio =
-    redis && redis.used_memory_peak_bytes > 0
-      ? redis.used_memory_bytes / redis.used_memory_peak_bytes
-      : null;
+    redis && redis.max_memory_bytes > 0 ? redis.used_memory_bytes / redis.max_memory_bytes : null;
   const redisCaption = redis
-    ? `peak ${formatBytes(redis.used_memory_peak_bytes)} · ${redis.connected_clients} client${redis.connected_clients === 1 ? '' : 's'}`
+    ? (() => {
+        const parts: string[] = [];
+        if (redis.max_memory_bytes > 0) {
+          parts.push(`cap ${formatBytes(redis.max_memory_bytes)}`);
+        } else {
+          parts.push('no cap');
+        }
+        parts.push(`${redis.connected_clients} client${redis.connected_clients === 1 ? '' : 's'}`);
+        // Evictions are the real "Redis is hurting" signal — surface
+        // them when non-zero so the operator sees them even on the
+        // single-line caption.
+        if (redis.evicted_keys > 0) {
+          parts.push(`${redis.evicted_keys} evicted`);
+        }
+        return parts.join(' · ');
+      })()
     : undefined;
 
-  // ---- Celery / workers -------------------------------------------------
-  const { celery } = data;
-  const celeryValue = celery
-    ? `${celery.registered_workers} up · ${celery.active_tasks} active`
-    : null;
-  const celeryDetail = celery ? `${celery.queue_depth} pending` : undefined;
-  // No natural denominator for "workers utilization"; saturation is
-  // queue_depth-vs-workers, capped at 1.0 for the bar visual.
-  const celeryRatio =
-    celery && celery.registered_workers > 0
-      ? Math.min(1, celery.queue_depth / (celery.registered_workers * 5))
+  // ---- Live WebSocket connections (replaces Workers card) ----------------
+  const ws = data.ws_connections;
+  const wsValue = ws ? `${ws.total}` : null;
+  // No natural saturation denominator for "how many dashboards are
+  // watching" — operationally there's no upper bound that matters at
+  // demo scale. Skip the bar.
+  const wsReplicaHint =
+    ws && ws.replicas.length > 1
+      ? ws.replicas.map((r) => `${r.pod_id.slice(0, 8)}: ${r.count}`).join(' · ')
       : null;
-  const celeryCaption = celery?.truncated
-    ? `showing 50 of ${celery.registered_workers} workers`
+  const wsCaption = ws
+    ? `${ws.total === 1 ? 'session' : 'sessions'}${wsReplicaHint ? ` · ${wsReplicaHint}` : ''}`
     : undefined;
-
-  // Per the plan: don't render the expand button when ``workers.length <= 1``
-  // — a single worker has nothing to drill into.
-  const workersExpandable =
-    celery && celery.workers.length > 1 ? <WorkersDrilldown workers={celery.workers} /> : undefined;
 
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -110,13 +142,10 @@ export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsP
         unreachableMessage="Redis unreachable."
       />
       <UseResourceCard
-        label="Workers"
-        value={celeryValue}
-        detail={celeryDetail}
-        ratio={celeryRatio}
-        caption={celeryCaption}
-        expandable={workersExpandable}
-        unreachableMessage="Celery unreachable."
+        label="Live connections"
+        value={wsValue}
+        caption={wsCaption}
+        unreachableMessage="WebSocket stats unavailable."
       />
     </div>
   );

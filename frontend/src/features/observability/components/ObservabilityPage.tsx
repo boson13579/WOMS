@@ -21,7 +21,7 @@ import { useSystemHealth } from '@/features/dashboard/api/useSystemHealth';
 import { ServiceHealthGrid } from '@/features/dashboard/components/ServiceHealthGrid';
 
 import { useRedMetrics } from '../api/useRedMetrics';
-import { useSloCompliance } from '../api/useSloCompliance';
+import { useScheduleLag } from '../api/useScheduleLag';
 import { useUseResources } from '../api/useUseResources';
 import { RED_WINDOW_OPTIONS, type RedWindowSeconds } from '../types';
 
@@ -35,7 +35,7 @@ const DEFAULT_WINDOW: RedWindowSeconds = RED_WINDOW_OPTIONS[0];
 const INVALIDATE_PREFIXES = [
   ['system', 'red'],
   ['system', 'resources'],
-  ['system', 'slo'],
+  ['system', 'schedule-lag'],
   ['system', 'health'],
 ];
 
@@ -66,14 +66,14 @@ export function ObservabilityPage(): JSX.Element {
   const systemHealth = useSystemHealth();
   const red = useRedMetrics(windowSeconds);
   const resources = useUseResources();
-  const slo = useSloCompliance();
+  const lag = useScheduleLag(60);
 
   const isFetching =
-    systemHealth.isFetching || red.isFetching || resources.isFetching || slo.isFetching;
+    systemHealth.isFetching || red.isFetching || resources.isFetching || lag.isFetching;
 
   // ``dataUpdatedAt`` is always a number in React Query v5 — 0 when the
   // query has never resolved, ms-epoch once it has.
-  const lastUpdatedMs = Math.max(red.dataUpdatedAt, resources.dataUpdatedAt, slo.dataUpdatedAt);
+  const lastUpdatedMs = Math.max(red.dataUpdatedAt, resources.dataUpdatedAt, lag.dataUpdatedAt);
   const lastUpdatedLabel = formatLastUpdated(lastUpdatedMs);
 
   const onRefresh = (): void => {
@@ -113,17 +113,18 @@ export function ObservabilityPage(): JSX.Element {
               </div>
             </div>
             {/*
-             * Degraded-data banner. Both RED and SLO read the same Redis
-             * ZSET — if the source is unreachable, the backend returns the
-             * zero envelope with ``data_status === 'degraded'``. Without
-             * this banner, the dashboard would silently render an all-
-             * green "0 req/s · 100% SLO" state during a metrics outage and
+             * Degraded-data banner. RED reads the request-sample ZSET in
+             * Redis — if the source is unreachable, the backend returns
+             * the zero envelope with ``data_status === 'degraded'``.
+             * Without this banner, the dashboard would silently render
+             * an all-green "0 req/s" state during a metrics outage and
              * the operator would mistake the outage for healthy quiet.
-             * Placed above the KPI cards so it dominates the eye before
-             * the numbers do; one banner per page since RED and SLO
-             * degrade together.
+             * Schedule lag reads a separate ZSET; if RED degrades, lag
+             * has almost certainly also degraded but we don't surface a
+             * separate banner for it — the existing one already covers
+             * "metrics data is unavailable" generically.
              */}
-            {(red.data?.data_status === 'degraded' || slo.data?.data_status === 'degraded') && (
+            {red.data?.data_status === 'degraded' && (
               <div
                 role="status"
                 data-testid="metrics-degraded-banner"
@@ -137,9 +138,9 @@ export function ObservabilityPage(): JSX.Element {
               red={red.data}
               redLoading={red.isLoading}
               redError={red.isError}
-              slo={slo.data}
-              sloLoading={slo.isLoading}
-              sloError={slo.isError}
+              lag={lag.data}
+              lagLoading={lag.isLoading}
+              lagError={lag.isError}
             />
           </section>
 

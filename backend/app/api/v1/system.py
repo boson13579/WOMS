@@ -26,12 +26,14 @@ from app.core.security import get_current_user, require_roles
 from app.models.user import User, UserRole
 from app.schemas.system import (
     RedMetricsResponse,
+    ScheduleLagStats,
     SloComplianceResponse,
     SystemHealthResponse,
     SystemResourcesResponse,
     UsernamesLookupResponse,
 )
 from app.services import red_metrics as red_metrics_service
+from app.services import schedule_lag as schedule_lag_service
 from app.services.system import gather_resources, gather_system_health, lookup_usernames
 
 router = APIRouter()
@@ -145,6 +147,33 @@ def get_slo_compliance(
     """
     del current_user
     return red_metrics_service.compute_slo(window_hours)
+
+
+@router.get(
+    "/schedule-lag",
+    response_model=ScheduleLagStats,
+    summary="P50 / P95 / max compound enqueue → commit latency over a window.",
+)
+def get_schedule_lag(
+    window_seconds: int = Query(
+        default=60,
+        ge=1,
+        le=300,
+        description=(
+            "Trailing window in seconds. Underlying sorted set has 5-minute "
+            "retention; values above 300 are clamped client-side."
+        ),
+    ),
+    current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),
+) -> ScheduleLagStats:
+    """Return aggregated schedule-pipeline lag (enqueue → worker commit).
+
+    Permission: scheduler + root only — matches the other observability
+    endpoints. Empty windows return a zero envelope so the frontend can
+    render "no samples yet" instead of erroring.
+    """
+    del current_user
+    return schedule_lag_service.compute_window(window_seconds)
 
 
 @router.get(
