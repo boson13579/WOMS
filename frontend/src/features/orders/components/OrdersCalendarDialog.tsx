@@ -141,18 +141,39 @@ function groupByProductionDate(
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
 
+      // ``productionState`` is driven by the order's DB ``status`` first,
+      // with a date-based refinement only for the multi-day in-flight case.
+      // The earlier version computed state purely from ``assignment.date``
+      // vs ``baseDate`` — which gave the wrong answer in the window between
+      // an order being scheduled and ``advance_day_task`` actually flipping
+      // its status to ``in_production`` at midnight: the calendar showed
+      // "生產中" while the table view still showed "已排程" and the order
+      // was still editable. Sourcing the status from the same field both
+      // views read keeps them in lockstep.
+      //
+      // Date refinement for ``in_production`` multi-day orders only:
+      // - future days of an in-flight order: still "scheduled" visually
+      //   (those days haven't started)
+      // - past days where the order completed: "complete"
+      // - the current production day and any unfinished past day: "in_progress"
       let productionState: ProductionState;
-
-      // Only past rows of a fulfilled order earn the `complete` badge.
-      // Earlier daily slices of a multi-day split whose cumulative hasn't
-      // yet reached the wafer_quantity stay `in_progress`, otherwise the
-      // first day of a 3-day run would falsely advertise completion.
-      if (assignment.date > baseDate) {
-        productionState = 'scheduled';
-      } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
+      if (item.status === 'completed') {
         productionState = 'complete';
+      } else if (item.status === 'in_production') {
+        if (assignment.date > baseDate) {
+          productionState = 'scheduled';
+        } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
+          productionState = 'complete';
+        } else {
+          productionState = 'in_progress';
+        }
       } else {
-        productionState = 'in_progress';
+        // ``scheduled`` / ``pending`` — never show in_progress until the
+        // backend flips status. Under the "no scheduling for today" rule,
+        // ``status='scheduled'`` orders should not have any
+        // daily_breakdown rows on ``baseDate`` (today) at all, so this
+        // branch only ever produces "scheduled" badges in steady state.
+        productionState = 'scheduled';
       }
 
       const productionItem: ProductionCalendarItem = {

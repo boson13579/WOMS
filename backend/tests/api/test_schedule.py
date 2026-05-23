@@ -707,12 +707,16 @@ def test_capacity_with_state_returns_prefix_sums(
     client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
 ) -> None:
     """GET /capacity reads the live SchedulerState and exposes the
-    capacity_tree as a per-day prefix-sum series. Building a known state
-    with one 4,000-wafer order on day 1 must produce:
-        day 1 → 6,000 (10,000 - 4,000)
-        day 2 → 16,000 (day1 + full day2)
-        day n → 6,000 + (n - 1) * 10,000
-    so any off-by-one in the prefix-sum walk surfaces immediately.
+    capacity_tree as a per-day prefix-sum series. Tree day 1 = ``base +
+    1`` (tomorrow), so ``entries[0].date`` is tomorrow, not today. A
+    4,000-wafer order with deadline = tomorrow sits on tree day 1 →
+    that day's residual capacity = 6,000.
+
+    Expected prefix sums:
+        entries[0] (tomorrow) → 6,000 (10,000 - 4,000)
+        entries[1] (tomorrow + 1) → 16,000
+        entries[i] → (i + 1) * 10,000 - 4,000
+        entries[-1] (base + 30) → 30 * 10,000 - 4,000 = 296,000
     """
     from app.services.scheduling import (
         DAILY_CAPACITY,
@@ -734,7 +738,7 @@ def test_capacity_with_state_returns_prefix_sums(
             order_id=uuid.uuid4(),
             order_number="ORD-CAP-1",
             wafer_quantity=4_000,
-            deadline=base,
+            deadline=base + timedelta(days=1),  # rel = 1 (= tree day 1 = tomorrow)
         ),
     )
     redis_client.set("schedule:state", state.to_json())
@@ -746,22 +750,20 @@ def test_capacity_with_state_returns_prefix_sums(
     assert body["base_date"] == base.isoformat()
     assert body["daily_capacity"] == DAILY_CAPACITY
     assert len(body["entries"]) == HORIZON_DAYS
-    # Day 1 lost 4,000 wafers; every subsequent day adds DAILY_CAPACITY.
+    # entries[0] = tomorrow with 4,000 consumed.
     assert body["entries"][0] == {
-        "date": base.isoformat(),
+        "date": (base + timedelta(days=1)).isoformat(),
         "cumulative_remaining": DAILY_CAPACITY - 4_000,
     }
+    # entries[1] = day after tomorrow, cumulative adds full day's capacity.
     assert body["entries"][1] == {
-        "date": (base + timedelta(days=1)).isoformat(),
-        "cumulative_remaining": (DAILY_CAPACITY - 4_000) + DAILY_CAPACITY,
+        "date": (base + timedelta(days=2)).isoformat(),
+        "cumulative_remaining": 2 * DAILY_CAPACITY - 4_000,
     }
-    # Last entry — sanity check the closing of the prefix sum.
+    # Last entry = base + HORIZON_DAYS, full horizon prefix sum minus the 4000.
     last = body["entries"][-1]
-    assert last["date"] == (base + timedelta(days=HORIZON_DAYS - 1)).isoformat()
-    assert (
-        last["cumulative_remaining"]
-        == (DAILY_CAPACITY - 4_000) + (HORIZON_DAYS - 1) * DAILY_CAPACITY
-    )
+    assert last["date"] == (base + timedelta(days=HORIZON_DAYS)).isoformat()
+    assert last["cumulative_remaining"] == HORIZON_DAYS * DAILY_CAPACITY - 4_000
 
 
 def test_capacity_without_redis_state_returns_full_horizon(

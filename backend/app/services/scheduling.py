@@ -85,6 +85,16 @@ _settings = get_settings()
 DAILY_CAPACITY: int = _settings.SCHEDULER_DAILY_CAPACITY
 HORIZON_DAYS: int = _settings.SCHEDULER_HORIZON_DAYS
 
+# **Tree convention**: ``capacity_tree`` and ``deadline_tree`` index day 1
+# at ``base_date + 1`` (tomorrow), day 30 at ``base_date + 30``. ``base_date``
+# itself (= today) is **not** in the tree — today's production line was
+# locked at the previous midnight (``advance_day_task::mark_in_production``
+# flipped yesterday's day-1 set into ``status='in_production'``), so it
+# can't accept new admissions and shouldn't show up in any
+# ``compute_schedule`` output. ``abs_to_rel(today, base_date)`` returns
+# ``None`` so admission / batch / forward-fill all reject "deadline =
+# today" through the same path as "deadline outside horizon".
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -209,18 +219,32 @@ def score_for_op(*, group: str, seq: int) -> float:
 def abs_to_rel(absolute_date: date, base_date: date) -> int | None:
     """Convert an absolute date to a 1-based segment-tree index.
 
-    Returns ``None`` when the date falls outside ``[base_date, base_date+29]``;
-    callers treat that as "cannot be scheduled".
+    **Tree day 1 = ``base_date + 1`` (tomorrow)**, not ``base_date`` itself.
+    The segment tree only covers days that are still plannable; today's
+    production is locked at the previous midnight and lives in DB
+    (``status='in_production'``), not in the tree. This shifts every
+    relative index by 1 from the original (now-removed) "tree day 1 =
+    today" convention — the tree's job is "can this fit?" and today
+    can't, so today shouldn't have an index.
+
+    Returns ``None`` when the date falls outside ``[base_date + 1,
+    base_date + 30]``; callers treat that as "cannot be scheduled". In
+    particular, ``absolute_date == base_date`` (= today) returns ``None``
+    — admission cannot land an order on today.
     """
-    delta = (absolute_date - base_date).days
-    if delta < 0 or delta >= HORIZON_DAYS:
+    delta = (absolute_date - base_date).days  # tomorrow → 1, day 30 → 30
+    if delta < 1 or delta > HORIZON_DAYS:
         return None
-    return delta + 1
+    return delta
 
 
 def rel_to_abs(rel_index: int, base_date: date) -> date:
-    """Convert a 1-based segment-tree index back to an absolute date."""
-    return base_date + timedelta(days=rel_index - 1)
+    """Convert a 1-based segment-tree index back to an absolute date.
+
+    ``rel=1`` → ``base_date + 1`` (tomorrow); ``rel=30`` → ``base_date + 30``.
+    Inverse of :func:`abs_to_rel`.
+    """
+    return base_date + timedelta(days=rel_index)
 
 
 # ---------------------------------------------------------------------------
@@ -727,22 +751,42 @@ def _apply_remove_to_trees(state: SchedulerState, order: SchedulingOrder) -> Non
 def add_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
     """Insert an order into the schedule.
 
-    Returns ``deadline_too_far`` if the deadline lies outside the 30-day
-    horizon, ``capacity_exceeded`` if no capacity remains in
-    ``[base_date, deadline]``, otherwise ``success`` and mutates ``state``
-    in place.
+    Returns ``deadline_too_far`` if the deadline lies outside the
+    plannable window ``[base_date + 1, base_date + 30]`` (i.e., today or
+    earlier, or more than 30 days out), ``capacity_exceeded`` if no
+    capacity remains, otherwise ``success`` and mutates ``state`` in
+    place.
+
+    Note: ``deadline == base_date`` (= today) reads as ``rel=0`` which
+    falls outside the tree, so it gets the ``deadline_too_far`` branch.
+    The rejection message distinguishes the "due today" subcase since
+    that's the most common user-input error under the day-1-locked rule.
     """
     rel = abs_to_rel(order.deadline, state.base_date)
     if rel is None:
+        delta = (order.deadline - state.base_date).days
+        if delta == 0:
+            message = (
+                f"Order is due today ({order.deadline.isoformat()}); new "
+                "orders cannot be scheduled for the current production day. "
+                "Use a deadline of tomorrow or later."
+            )
+        elif delta < 0:
+            message = (
+                f"Deadline {order.deadline.isoformat()} is in the past."
+            )
+        else:
+            message = "Deadline outside the 30-day scheduling horizon."
         logger.warning(
             "schedule.add.deadline_too_far",
             order_id=str(order.order_id),
             deadline=order.deadline.isoformat(),
+            delta_days=delta,
         )
         return ScheduleResult(
             status="deadline_too_far",
             order_id=order.order_id,
-            message="Deadline outside the 30-day scheduling horizon.",
+            message=message,
         )
 
     # Membership guard: refuse to add an order that's already in pq OR in
@@ -773,6 +817,12 @@ def add_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
             message="Order is already pinned; unpin it before re-adding.",
         )
 
+    # Day-1 lock is structural: the segment tree starts at ``base_date + 1``
+    # (tomorrow), so today's production never has an index. ``abs_to_rel``
+    # already returned ``None`` for ``deadline == today``, which gets
+    # caught by the ``rel is None`` branch above as ``deadline_too_far``.
+    # By the time we reach this check, ``rel`` is in [1, 30] and the
+    # standard capacity check is sufficient.
     available = state.capacity_tree.query(rel)
     if available < order.wafer_quantity:
         logger.warning(
@@ -780,13 +830,14 @@ def add_order(state: SchedulerState, order: SchedulingOrder) -> ScheduleResult:
             order_id=str(order.order_id),
             requested=order.wafer_quantity,
             available=available,
+            rel=rel,
         )
         return ScheduleResult(
             status="capacity_exceeded",
             order_id=order.order_id,
             message=(
                 f"Need {order.wafer_quantity} wafers, only {available} "
-                "available before the deadline."
+                "available between tomorrow and the deadline."
             ),
         )
 
@@ -889,15 +940,26 @@ def pin_order(
     """
     fake_rel = abs_to_rel(fake_deadline, state.base_date)
     if fake_rel is None:
+        delta = (fake_deadline - state.base_date).days
+        if delta == 0:
+            message = (
+                f"Cannot pin to today ({fake_deadline.isoformat()}); today's "
+                "production is already locked. Pick tomorrow or later."
+            )
+        elif delta < 0:
+            message = f"Pin date {fake_deadline.isoformat()} is in the past."
+        else:
+            message = "Pin date outside the 30-day scheduling horizon."
         logger.warning(
             "schedule.pin.deadline_too_far",
             order_id=str(order.order_id),
             fake_deadline=fake_deadline.isoformat(),
+            delta_days=delta,
         )
         return ScheduleResult(
             status="deadline_too_far",
             order_id=order.order_id,
-            message="Pin date outside the 30-day scheduling horizon.",
+            message=message,
         )
 
     # Order MUST be in pq currently — otherwise we have nothing to remove
@@ -918,6 +980,10 @@ def pin_order(
     _apply_remove_to_trees(state, order)
 
     # Step 2: capacity check at fake_deadline (same query as add_order).
+    # Day-1 lock is structural via ``abs_to_rel``: pin to today returns
+    # ``fake_rel = None`` which the ``deadline_too_far`` branch above
+    # already caught. By here ``fake_rel`` is in [1, 30] and the standard
+    # ``capacity_tree.query`` is sufficient.
     available = state.capacity_tree.query(fake_rel)
     if available < order.wafer_quantity:
         # Undo: re-add at the real deadline so state is bit-for-bit unchanged.
@@ -1113,18 +1179,20 @@ def is_batch_feasible(state: SchedulerState, delta: list[int]) -> bool:
     """Whether the batch's per-day demand fits in current remaining capacity.
 
     The batch is feasible iff the demand prefix sum never exceeds the
-    capacity prefix sum at any horizon day::
+    capacity prefix sum at any tree day::
 
-        ∀ i ∈ [1, HORIZON_DAYS]:  Σ_{j ≤ i} delta[j-1]  ≤  capacity_tree.query(i)
+        forall i in [1, HORIZON_DAYS]:
+            sum_{j <= i} delta[j-1]  <=  capacity_tree.query(i)
 
-    A negative cumulative demand (the batch nets to a removal at day ``i``)
-    trivially satisfies the inequality at that day because
-    ``capacity_tree.query(i) ≥ 0`` always holds. The check is symmetric in
-    sign and does not need a separate path for removal-heavy batches.
+    Tree day 1 = ``base_date + 1`` (tomorrow), so demand index 0 of
+    ``delta`` corresponds to tomorrow's plannable load — there's no
+    "today" entry to special-case. A negative cumulative demand (batch
+    nets to a removal at day ``i``) trivially satisfies the inequality
+    because ``capacity_tree.query(i) >= 0`` always holds. Symmetric in
+    sign — no separate path for removal-heavy batches.
 
-    Complexity: O(HORIZON_DAYS). Pre-opt this did one ``tree.query(i)`` per
-    day (O(D log D) total); now we materialize the raw per-day capacity
-    once via ``to_array()`` and run a cumulative-sum compare in one pass.
+    Complexity: O(HORIZON_DAYS). One ``to_array()`` materialization plus
+    a single-pass running compare.
     """
     if len(delta) != HORIZON_DAYS:
         raise ValueError(
@@ -1289,6 +1357,10 @@ def compute_schedule(state: SchedulerState) -> list[ScheduledResult]:
     # within-bucket sort (by qty desc, order_number asc) at iteration time
     # — cheaper than maintaining a SortedKeyList at every mutation,
     # because compute_schedule is the only ordered-iteration consumer.
+    #
+    # Tree day 1 = ``base_date + 1`` (tomorrow), so forward-fill starts at
+    # rel=1 unconditionally — there's no "today" in the tree to skip.
+    # Today's in-production orders are tracked in DB (status), not in pq.
     for order in _iter_pq_edf_sorted(state):
         deadline_rel = abs_to_rel(order.deadline, state.base_date)
         if deadline_rel is None:

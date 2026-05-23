@@ -110,6 +110,12 @@ function setServerBaseDate(baseDate: string): void {
   mockScheduleCapacity.data = { ...mockScheduleCapacity.data, base_date: baseDate };
 }
 
+// Order whose production day == base_date. Under the "day 1 (today) is
+// locked" rule, any order actually being produced today has already been
+// flipped to ``status='in_production'`` by ``advance_day_task`` — only
+// in-flight rows have a ``daily_breakdown`` entry on ``base_date``. The
+// calendar uses ``status`` (not date math) to pick the badge, so the
+// data shape below is the realistic post-rule snapshot.
 const scheduledOrder: ScheduleResult = {
   id: '11111111-1111-4111-8111-111111111111',
   order_number: 'ORD-20260504-0001',
@@ -118,7 +124,7 @@ const scheduledOrder: ScheduleResult = {
   requested_delivery_date: '2026-06-01',
   scheduled_production_date: '2026-05-09',
   expected_delivery_date: '2026-05-10',
-  status: 'scheduled',
+  status: 'in_production',
   daily_breakdown: [{ date: '2026-05-09', quantity: 500 }],
 };
 
@@ -158,15 +164,20 @@ const scheduledOrderDetail: Order = {
   requested_delivery_date: scheduledOrder.requested_delivery_date,
   scheduled_production_date: scheduledOrder.scheduled_production_date,
   expected_delivery_date: scheduledOrder.expected_delivery_date,
-  status: 'scheduled',
+  status: 'in_production',
 };
 
+// Multi-day in-flight order: status=in_production lets the date-refinement
+// branch pick "已完成" / "生產中" / "已排程" per day. With status=scheduled,
+// every row would render as "已排程" (correct under the new rule, but
+// doesn't exercise the multi-day visualization).
 const splitScheduledOrder: ScheduleResult = {
   ...scheduledOrder,
   id: '44444444-4444-4444-8444-444444444444',
   order_number: 'ORD-20260504-0004',
   customer_name: 'ASE',
   wafer_quantity: 2500,
+  status: 'in_production',
   daily_breakdown: [
     { date: '2026-05-10', quantity: 1000 },
     { date: '2026-05-11', quantity: 1500 },
