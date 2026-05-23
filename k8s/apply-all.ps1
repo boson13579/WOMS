@@ -13,7 +13,13 @@ $AWS_REGION = "ap-northeast-1"
 $ACCOUNT_ID = (aws sts get-caller-identity --query Account --output text)
 $ECR_URI    = "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
 
+# Image tag for templated manifests. deploy.yml pushes both :<sha> and
+# :latest, so the default picks up the most recent build. Override with
+# $env:IMAGE_TAG="<sha>" to pin a specific build.
+$IMAGE_TAG  = if ($env:IMAGE_TAG) { $env:IMAGE_TAG } else { "latest" }
+
 Write-Host "ECR registry: $ECR_URI" -ForegroundColor Cyan
+Write-Host "Image tag:    $IMAGE_TAG" -ForegroundColor Cyan
 
 function Apply-Plain($file) {
   Write-Host "Applying $file..." -ForegroundColor Yellow
@@ -22,7 +28,10 @@ function Apply-Plain($file) {
 
 function Apply-Templated($file) {
   Write-Host "Applying $file (templated)..." -ForegroundColor Yellow
-  (Get-Content $file -Raw) -replace '\$\{ECR_URI\}', $ECR_URI | kubectl apply -f -
+  $content = Get-Content $file -Raw
+  $content = $content -replace '\$\{ECR_URI\}', $ECR_URI
+  $content = $content -replace '\$\{IMAGE_TAG\}', $IMAGE_TAG
+  $content | kubectl apply -f -
 }
 
 # 1. Namespace + non-secret config + services (no image refs).
