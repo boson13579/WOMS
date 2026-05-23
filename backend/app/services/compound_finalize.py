@@ -72,8 +72,9 @@ def perform_compound_db_action(
     ``kind="create"``:
       - accepted: clear the in-flight lock (producer pre-created the
         row; materializer will fill scheduling cols).
-      - rejected: orphan cleanup — set ``is_deleted=True`` and
-        ``status=cancelled`` so the row exits user-visible queries.
+      - rejected: clear lock; set ``status=cancelled``; keep
+        ``is_deleted`` unchanged/``False`` so the row remains visible
+        in user-facing queries; emit ``order.cancelled`` audit record.
 
     ``kind="update"``:
       - accepted: write the new ``wafer_quantity`` /
