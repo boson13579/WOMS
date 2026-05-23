@@ -1,7 +1,7 @@
 /**
- * Filter bar for the order list: keyword search + status select.
- * Filter state lives in Zustand (useOrderStore) — React Query re-fetches
- * automatically when the query key changes.
+ * Filter bar for the order list: keyword search + status select +
+ * assignee/creator pickers. Filter state lives in Zustand (useOrderStore) —
+ * React Query re-fetches automatically when the query key changes.
  */
 import { useEffect, useState } from 'react';
 
@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
+import { useAssignableUsers, type UserOption } from '@/features/auth/api/users';
 
 import { useOrderStore } from '../stores/orderStore';
 import type { OrderStatus } from '../types';
@@ -22,8 +23,19 @@ const STATUS_OPTIONS: { label: string; value: OrderStatus | '' }[] = [
   { label: '已取消', value: 'cancelled' },
 ];
 
+function findUserIdByInput(users: UserOption[], input: string): string | null {
+  const v = input.trim().toLowerCase();
+  if (!v) return null;
+  const matched = users.find(
+    (u) => u.username.toLowerCase() === v || u.email?.toLowerCase() === v,
+  );
+  return matched?.id ?? null;
+}
+
 export function OrderFilters(): JSX.Element {
-  const { status, search, setStatus, setSearch, reset } = useOrderStore();
+  const { status, search, assignedTo, createdBy, setStatus, setSearch, setAssignedTo, setCreatedBy, reset } =
+    useOrderStore();
+  const users = useAssignableUsers();
 
   // Debounce the search input by 300 ms to avoid spamming the API.
   const [localSearch, setLocalSearch] = useState(search);
@@ -36,6 +48,48 @@ export function OrderFilters(): JSX.Element {
     };
   }, [localSearch, setSearch]);
 
+  // Local text for the assignee / creator inputs — only push to the store when
+  // the typed value resolves to a real user (or is cleared).
+  const initialAssignee = users.find((u) => u.id === assignedTo[0])?.username ?? '';
+  const initialCreator = users.find((u) => u.id === createdBy[0])?.username ?? '';
+  const [assigneeInput, setAssigneeInput] = useState(initialAssignee);
+  const [creatorInput, setCreatorInput] = useState(initialCreator);
+
+  useEffect(() => {
+    const id = setTimeout(() => {
+      const userId = findUserIdByInput(users, assigneeInput);
+      if (assigneeInput.trim() === '') {
+        if (assignedTo.length > 0) setAssignedTo([]);
+      } else if (userId && assignedTo[0] !== userId) {
+        setAssignedTo([userId]);
+      }
+    }, 300);
+    return () => {
+      clearTimeout(id);
+    };
+  }, [assigneeInput, users, assignedTo, setAssignedTo]);
+
+  useEffect(() => {
+    const id = setTimeout(() => {
+      const userId = findUserIdByInput(users, creatorInput);
+      if (creatorInput.trim() === '') {
+        if (createdBy.length > 0) setCreatedBy([]);
+      } else if (userId && createdBy[0] !== userId) {
+        setCreatedBy([userId]);
+      }
+    }, 300);
+    return () => {
+      clearTimeout(id);
+    };
+  }, [creatorInput, users, createdBy, setCreatedBy]);
+
+  const handleReset = (): void => {
+    setLocalSearch('');
+    setAssigneeInput('');
+    setCreatorInput('');
+    reset();
+  };
+
   return (
     <div className="flex flex-wrap items-center gap-3">
       <Input
@@ -47,6 +101,44 @@ export function OrderFilters(): JSX.Element {
         className="w-60"
         aria-label="搜尋訂單"
       />
+
+      <Input
+        list="assignee-filter-datalist"
+        placeholder="搜尋負責人姓名…"
+        value={assigneeInput}
+        onChange={(e) => {
+          setAssigneeInput(e.target.value);
+        }}
+        className="w-52"
+        aria-label="搜尋負責人"
+        autoComplete="off"
+      />
+      <datalist id="assignee-filter-datalist">
+        {users.map((u) => (
+          <option key={u.id} value={u.username}>
+            {u.email ?? ''}
+          </option>
+        ))}
+      </datalist>
+
+      <Input
+        list="creator-filter-datalist"
+        placeholder="搜尋建立者姓名…"
+        value={creatorInput}
+        onChange={(e) => {
+          setCreatorInput(e.target.value);
+        }}
+        className="w-52"
+        aria-label="搜尋建立者"
+        autoComplete="off"
+      />
+      <datalist id="creator-filter-datalist">
+        {users.map((u) => (
+          <option key={u.id} value={u.username}>
+            {u.email ?? ''}
+          </option>
+        ))}
+      </datalist>
 
       <div className="flex items-center gap-1.5">
         <Label htmlFor="status-filter" className="sr-only">
@@ -68,7 +160,7 @@ export function OrderFilters(): JSX.Element {
         </Select>
       </div>
 
-      <Button variant="outline" size="sm" onClick={reset}>
+      <Button variant="outline" size="sm" onClick={handleReset}>
         重設
       </Button>
     </div>

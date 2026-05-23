@@ -19,6 +19,10 @@ vi.mock('@/lib/auth', () => ({
 
 vi.mock('@/features/auth/api/users', () => ({
   useUsers: () => [],
+  useAssignableUsers: () => [
+    { id: 'u-1', username: 'alice', email: 'alice@example.com' },
+    { id: 'u-2', username: 'bob', email: 'bob@example.com' },
+  ],
 }));
 
 // ---------------------------------------------------------------------------
