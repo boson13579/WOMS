@@ -1,6 +1,6 @@
 """add order_daily_seq table
 
-Revision ID: 4c74403fix01
+Revision ID: a4c74403f001
 Revises: 0e1b18254a51
 Create Date: 2026-05-23 00:00:00.000000+00:00
 
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "4c74403fix01"
+revision: str = "a4c74403f001"
 down_revision: str | None = "0e1b18254a51"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -34,6 +34,7 @@ def upgrade() -> None:
             server_default="0",
             nullable=False,
         ),
+        if_not_exists=True,
     )
 
 
