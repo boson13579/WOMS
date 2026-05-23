@@ -4,9 +4,10 @@
  * Backed by ``GET /api/v1/system/red?window_seconds=…``. The endpoint
  * returns a point-in-time aggregate, so on every successful poll we
  * also push the headline metrics into ``useRedHistoryStore`` so the
- * sparklines have something to render. 10-second polling matches the
- * cadence the operator-grade card needs: fast enough to see a spike
- * unfold, slow enough to keep server cost negligible.
+ * sparklines have something to render. 2-second polling lets the
+ * sparkline feel live during demos / bombard runs without putting real
+ * load on the backend (each call is a Redis ZRANGEBYSCORE + aggregate,
+ * ~10-30ms server-side).
  *
  * The query key includes ``window_seconds`` so changing the time-range
  * pill triggers a new fetch (each window is cached independently by
@@ -21,8 +22,8 @@ import { useCurrentUser } from '@/lib/auth';
 import { useRedHistoryStore } from '../stores/redHistoryStore';
 import { redMetricsResponseSchema, type RedMetricsResponse } from '../types';
 
-const REFETCH_INTERVAL_MS = 10_000;
-const STALE_TIME_MS = 5_000;
+const REFETCH_INTERVAL_MS = 2_000;
+const STALE_TIME_MS = 1_000;
 
 export function redMetricsQueryKey(windowSeconds: number): readonly unknown[] {
   return ['system', 'red', windowSeconds] as const;
@@ -42,7 +43,9 @@ export function useRedMetrics(windowSeconds: number): UseQueryResult<RedMetricsR
         10_000,
       ),
     enabled: Boolean(user),
-    refetchInterval: REFETCH_INTERVAL_MS,
+    // Skip tick when a poll is still in-flight — apiFetch uses its own
+    // AbortController so overlapping requests can't be cancelled.
+    refetchInterval: (q) => (q.state.fetchStatus === 'fetching' ? false : REFETCH_INTERVAL_MS),
     staleTime: STALE_TIME_MS,
   });
 

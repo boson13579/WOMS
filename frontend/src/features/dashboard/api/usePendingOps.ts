@@ -51,7 +51,10 @@ export function usePendingOps(): UseQueryResult<PendingOpsEntry[]> {
         pendingOpsResponseSchema.parse(d),
       ),
     enabled: allowed,
-    refetchInterval: REFETCH_INTERVAL_MS,
+    // Skip tick when a poll is still in-flight — apiFetch uses its own
+    // AbortController so overlapping requests can't be cancelled.
+    refetchInterval: (query) =>
+      query.state.fetchStatus === 'fetching' ? false : REFETCH_INTERVAL_MS,
     staleTime: 5_000,
   });
 }
