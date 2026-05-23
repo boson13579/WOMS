@@ -48,11 +48,7 @@ def get_pod_id() -> str:
 
     Cached at process lifetime — pod id never changes after startup.
     """
-    return (
-        os.environ.get("POD_ID")
-        or os.environ.get("HOSTNAME")
-        or socket.gethostname()
-    )
+    return os.environ.get("POD_ID") or os.environ.get("HOSTNAME") or socket.gethostname()
 
 
 @lru_cache(maxsize=1)

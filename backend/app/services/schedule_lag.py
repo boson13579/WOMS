@@ -129,7 +129,7 @@ def compute_window(window_seconds: int) -> ScheduleLagStats:
 
     def percentile(p: float) -> int:
         # Nearest-rank percentile (same convention as RED's percentiles).
-        idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+        idx = max(0, min(n - 1, round(p * (n - 1))))
         return lags[idx]
 
     return ScheduleLagStats(

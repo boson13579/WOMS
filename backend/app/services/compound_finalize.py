@@ -49,6 +49,7 @@ from app.core.audit import record_audit
 from app.core.db import SessionLocal
 from app.models.order import Order, OrderStatus
 from app.services import notification as notification_service
+from app.services.schedule_lag import record_lag_sample
 
 logger = structlog.get_logger(__name__)
 
@@ -153,8 +154,6 @@ def perform_compound_db_action(
         if isinstance(enqueued_at_ms, (int, float)):
             now_ms = int(time.time() * 1000)
             lag_ms = max(0, now_ms - int(enqueued_at_ms))
-            from app.services.schedule_lag import record_lag_sample
-
             record_lag_sample(lag_ms)
 
         # Send cancellation notification after commit (best-effort).

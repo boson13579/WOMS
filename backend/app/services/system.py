@@ -645,10 +645,14 @@ def _get_ws_connection_stats() -> WsConnectionStats | None:
     only happens during certain test configurations) — production
     always returns a populated envelope.
     """
-    # Local import to avoid a circular import at module-load time
-    # (websocket.py imports from this package indirectly via DB deps).
+    # Local import: ``ConnectionManager`` lives in ``app.api.v1.websocket``
+    # (the WS endpoint module), so a top-level ``from app.api.v1...``
+    # would invert the api→services layering. Importing at call-time
+    # keeps the layer dependency contained to this one function. Move
+    # the manager into ``app.services.websocket`` if you want this
+    # cleaner; for now noqa with rationale.
     try:
-        from app.api.v1.websocket import get_connection_manager
+        from app.api.v1.websocket import get_connection_manager  # noqa: PLC0415
     except Exception as exc:  # pragma: no cover — defensive
         logger.warning("system.resources.ws.import_failed", error=str(exc))
         return None
@@ -660,8 +664,7 @@ def _get_ws_connection_stats() -> WsConnectionStats | None:
         snapshots = [{"pod_id": get_pod_id(), "count": local_count}]
 
     replicas = [
-        WsConnectionsPerReplica(pod_id=str(s["pod_id"]), count=int(s["count"]))
-        for s in snapshots
+        WsConnectionsPerReplica(pod_id=str(s["pod_id"]), count=int(s["count"])) for s in snapshots
     ]
     replicas.sort(key=lambda r: r.pod_id)
 
