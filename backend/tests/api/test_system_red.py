@@ -269,17 +269,19 @@ def test_red_aggregates_recent_requests(
 def test_red_error_pct_calculation(
     client: TestClient, db_session: Session, redis_client: Redis
 ) -> None:
-    """Error rule: 5xx + 4xx that are NOT 401/403/404.
+    """Error rule: 5xx only.
 
     Seeds 100 samples with the following status mix:
 
       * 80 x 200  -> not an error
-      * 5  x 401  -> excluded (auth flow, not a service error)
-      * 5  x 404  -> excluded (caller mis-typed path, not a service error)
-      * 5  x 422  -> ERROR (validation failure counts)
-      * 5  x 500  -> ERROR (all 5xx count)
+      * 5  x 401  -> not an error (caller-side: auth flow)
+      * 5  x 404  -> not an error (caller-side: bad path)
+      * 5  x 422  -> not an error (caller-side: validation failure)
+      * 5  x 500  -> ERROR (server-side failure)
 
-    Total errors = 10. error_pct = 10 / 100 * 100 = 10.0.
+    Total errors = 5. error_pct = 5 / 100 * 100 = 5.0. Matches the SLO
+    success criterion (status < 500) — 4xx are caller-side problems and
+    don't represent service unhealthiness.
     """
     _make_user(db_session, username="red_err", role=UserRole.scheduler)
     token = _login(client, "red_err")
@@ -300,9 +302,9 @@ def test_red_error_pct_calculation(
     res = client.get("/api/v1/system/red?window_seconds=60", headers=_auth(token))
     body = res.json()
     assert body["total_requests"] == 100
-    # 422 + 500 → 10 errors. 401 / 404 do NOT count.
-    assert body["error_count"] == 10
-    assert body["error_pct"] == 10.0
+    # Only 5xx counts. 401 / 404 / 422 are caller-side.
+    assert body["error_count"] == 5
+    assert body["error_pct"] == 5.0
 
 
 def test_red_by_endpoint_top_10(
