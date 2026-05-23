@@ -55,31 +55,20 @@ _BY_ENDPOINT_TOP_N = 10
 
 # HTTP status-code thresholds. Named so the comparison sites read like
 # specification rather than magic numbers; also keeps ruff PLR2004 happy.
-_HTTP_CLIENT_ERROR_MIN = 400
 _HTTP_SERVER_ERROR_MIN = 500
 _PERCENT_MAX = 100
-
-# Error-classification rules per Plan A1:
-#   * All 5xx are errors (server problem).
-#   * 4xx is an error IF it's not 401 / 403 / 404 — those represent caller
-#     bugs / auth flow, not service errors. Counting them would pollute
-#     the error rate every time an unauthenticated client polls.
-_EXCLUDED_4XX = frozenset((401, 403, 404))
 
 
 def _is_error(status_code: int) -> bool:
     """Return True when *status_code* counts as an error for RED purposes.
 
-    See :data:`_EXCLUDED_4XX` for the rationale on which 4xx codes do NOT
-    count: 401 / 403 / 404 are normal traffic patterns (auth failures,
-    not-found polling) rather than service errors.
+    Errors = 5xx only (server-side failures). 4xx are caller-side problems
+    (auth, validation, conflict, not-found) and don't represent the service
+    being unhealthy — counting them would pollute the error rate every time
+    a client makes a bad request. This matches the SLO definition below
+    (``compute_slo``) and the RED method as documented by Google SRE.
     """
-    if status_code >= _HTTP_SERVER_ERROR_MIN:
-        return True
-    return (
-        _HTTP_CLIENT_ERROR_MIN <= status_code < _HTTP_SERVER_ERROR_MIN
-        and status_code not in _EXCLUDED_4XX
-    )
+    return status_code >= _HTTP_SERVER_ERROR_MIN
 
 
 def _percentile(sorted_values: list[float], pct: float) -> float:
