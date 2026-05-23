@@ -111,9 +111,12 @@ export function UseResourceCard({
           <p className="text-xs text-muted-foreground">{unreachableMessage}</p>
         ) : null}
         {!isUnreachable && caption
-          ? (Array.isArray(caption) ? caption : [caption]).map((line, idx) => (
-              // eslint-disable-next-line react/no-array-index-key
-              <p key={idx} className="text-xs text-muted-foreground">
+          ? (Array.isArray(caption) ? caption : [caption]).map((line) => (
+              // Caption lines are derived from stable sources that
+              // already embed the per-replica pod_id slice, so each
+              // line string is unique within a render and works as a
+              // stable React key.
+              <p key={line} className="text-xs text-muted-foreground">
                 {line}
               </p>
             ))

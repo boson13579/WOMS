@@ -197,9 +197,16 @@ class ScheduleLagStats(BaseModel):
     """P50 / P95 / max of compound enqueue → worker commit latency.
 
     Replaces the SLO KPI card. Sample timestamps live in Redis sorted
-    set ``metrics:schedule_lag`` with 5-min retention; computation is
+    set ``metrics:schedule_lag`` with 1-hour retention; computation is
     done at read time. Empty windows return zeros — frontend renders a
     "no samples yet" state rather than a 404.
+
+    ``data_status`` mirrors ``RedMetricsResponse.data_status``:
+    ``"ok"`` means the (possibly empty) envelope is backed by a healthy
+    Redis read, ``"degraded"`` means we couldn't reach Redis and the
+    zeros are "we don't know", not "no traffic". The frontend uses this
+    to avoid rendering a misleading "no compounds processed" caption
+    during a metrics-availability outage.
     """
 
     window_seconds: int
@@ -207,6 +214,7 @@ class ScheduleLagStats(BaseModel):
     p50_ms: int
     p95_ms: int
     max_ms: int
+    data_status: Literal["ok", "degraded"] = "ok"
 
 
 class WorkerBreakdown(BaseModel):

@@ -124,7 +124,7 @@ export function ObservabilityPage(): JSX.Element {
              * separate banner for it — the existing one already covers
              * "metrics data is unavailable" generically.
              */}
-            {red.data?.data_status === 'degraded' && (
+            {(red.data?.data_status === 'degraded' || lag.data?.data_status === 'degraded') && (
               <div
                 role="status"
                 data-testid="metrics-degraded-banner"

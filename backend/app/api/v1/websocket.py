@@ -113,14 +113,21 @@ class ConnectionManager:
         """Return the number of live WebSocket sessions on this pod.
 
         Sync (no ``await``) because callers are sync FastAPI route
-        handlers / system probes — dict / set ``len`` is atomic in
-        CPython so we don't need the lock to read.
+        handlers / system probes. We can't acquire ``_lock`` (it's an
+        ``asyncio.Lock``) from a sync caller, so we snapshot the
+        dict via ``list(...)`` before iterating — that's atomic in
+        CPython and gives us a stable view across the loop even if
+        ``connect`` / ``disconnect`` is mutating the dict on the event
+        loop in parallel. ``len(set)`` on a captured reference is also
+        atomic, so the per-user count is consistent.
 
         Multi-replica deployments aggregate this across pods via
         ``app.services.pod_stats``; on its own this number is only
         meaningful for the pod that served the request.
         """
-        return sum(len(sockets) for sockets in self._connections.values())
+        # ``list(self._connections.values())`` is what guards against
+        # ``RuntimeError: dictionary changed size during iteration``.
+        return sum(len(sockets) for sockets in list(self._connections.values()))
 
     async def _send_all(self, sockets: list[WebSocket], message: dict[str, Any]) -> int:
         delivered = 0

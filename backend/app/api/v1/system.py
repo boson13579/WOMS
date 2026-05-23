@@ -161,9 +161,8 @@ def get_schedule_lag(
         le=3600,
         description=(
             "Trailing window in seconds. The underlying sorted set is "
-            "trimmed to 5 minutes of retention, so windows wider than "
-            "300s return only the samples physically present — same "
-            "best-effort semantics as ``/system/red``."
+            "trimmed to 1 hour of retention — same upper bound as the "
+            "widest pill (15m / 1h) on the observability page."
         ),
     ),
     current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),

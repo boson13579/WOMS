@@ -22,6 +22,7 @@ import os
 import socket
 from functools import lru_cache
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import structlog
 from redis import Redis
@@ -34,6 +35,36 @@ logger = structlog.get_logger(__name__)
 # ~30s. Long enough to survive the 3s dashboard poll cadence even with one
 # pod being slow; short enough that a dead replica doesn't linger.
 _TTL_SECONDS = 30
+
+# Fast-fail pre-flight timeout for the Redis port check. Matches the
+# pattern in ``app.services.system._redis_port_open``: when Redis is
+# down we want to bail out in ~200 ms instead of letting the redis
+# client eat its full 2 s connect timeout on every probe call.
+_PORT_CHECK_TIMEOUT_SECONDS = 0.5
+
+
+def _redis_port_open() -> bool:
+    """Cheap reachability check before any Redis op.
+
+    Without this, every ``publish_pod_stats`` / ``aggregate_pod_stats``
+    call during a Redis outage adds the full client connect timeout
+    (~2s) to ``/system/resources``, making the observability page hang.
+    """
+    settings = get_settings()
+    parsed = urlparse(str(settings.REDIS_URL))
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 6379
+    try:
+        addrs = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if not addrs:
+            return False
+        family, socktype, proto, _, sockaddr = addrs[0]
+        with socket.socket(family, socktype, proto) as sock:
+            sock.settimeout(_PORT_CHECK_TIMEOUT_SECONDS)
+            sock.connect(sockaddr)
+            return True
+    except OSError:
+        return False
 
 
 @lru_cache(maxsize=1)
@@ -74,6 +105,8 @@ def publish_pod_stats(category: str, data: dict[str, Any]) -> None:
     Best-effort: failures are logged at WARN and swallowed. The aggregator
     will fall back to the local snapshot if Redis is dead.
     """
+    if not _redis_port_open():
+        return  # Redis down — caller falls back to local snapshot
     try:
         rds = _redis()
         rds.set(
@@ -92,6 +125,8 @@ def aggregate_pod_stats(category: str) -> list[dict[str, Any]]:
     Returns empty list on Redis failure — callers should treat that as
     "fall back to local-only snapshot".
     """
+    if not _redis_port_open():
+        return []
     try:
         rds = _redis()
         prefix = f"pod_stats:{category}:"

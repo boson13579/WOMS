@@ -166,6 +166,9 @@ export const scheduleLagSchema = z.object({
   p50_ms: z.number().int().nonnegative(),
   p95_ms: z.number().int().nonnegative(),
   max_ms: z.number().int().nonnegative(),
+  // ``"degraded"`` when the backend couldn't read Redis; envelope is
+  // zeros but operator should see "data unavailable", not "no traffic".
+  data_status: dataStatusSchema,
 });
 
 export type ScheduleLag = z.infer<typeof scheduleLagSchema>;

@@ -160,17 +160,20 @@ function LagCardSlot({
   if (error || !lag) {
     return <ErrorState message="Failed to load schedule lag." />;
   }
-  // Empty window (no compounds processed yet) → render a "—" card
-  // instead of a "0 ms / healthy" green pill which would falsely
-  // suggest the pipeline is succeeding when it just hasn't seen any
-  // traffic. The sparkline stays empty too.
+  // Empty window — distinguish "no traffic" from "Redis unreachable"
+  // via the ``data_status`` flag so the operator doesn't read a
+  // metrics-availability outage as a healthy quiet system.
   if (lag.sample_count === 0) {
     return (
       <RedKpiCard
         label="Schedule lag P95"
         value="—"
         unit="ms"
-        subtitle="No compounds processed in window"
+        subtitle={
+          lag.data_status === 'degraded'
+            ? 'Metrics unavailable (Redis unreachable)'
+            : 'No compounds processed in window'
+        }
         tone="neutral"
       />
     );
