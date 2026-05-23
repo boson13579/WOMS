@@ -44,7 +44,7 @@ def _seed_pq(state: SchedulerState, order: SchedulingOrder) -> None:
 
     Used by tests whose scenarios require day-1 occupancy (e.g.,
     ``advance_day`` processing today's orders). Production code can't put
-    orders there anymore under ``FIRST_FILLABLE_DAY=2``, but the
+    orders there anymore under ``"tree day 1 = tomorrow" rule``, but the
     algorithm still has to handle pre-existing day-1 state correctly
     (legacy rows from before the rule shipped, or rebuild-state output
     on Redis snapshots that pre-date the rule).
@@ -201,7 +201,7 @@ def test_remove_order_restores_capacity_after_single_add() -> None:
 def test_remove_order_leaves_other_orders_intact() -> None:
     """Doc example abc on day 2 — remove the middle one and verify what's left.
 
-    Originally written against day-1 fills; under the ``FIRST_FILLABLE_DAY = 2``
+    Originally written against day-1 fills; under the ``"tree day 1 = tomorrow" rule``
     rule (today is locked from new admissions) day-1 is unreachable, so we
     shift the deadline to ``base + 1`` (tomorrow = rel 2) and assert against
     day-2 prefix sums. The remove-then-check invariant is unchanged.
@@ -287,7 +287,7 @@ def test_remove_order_restores_when_later_add_overlaps_earlier_one() -> None:
 
 def test_compute_schedule_splits_orders_across_days() -> None:
     """Doc example abc, shifted forward one day under the
-    ``FIRST_FILLABLE_DAY = 2`` rule (today is locked; forward-fill starts
+    ``"tree day 1 = tomorrow" rule`` rule (today is locked; forward-fill starts
     at tomorrow). a's 15,000 wafers cross the day-2 / day-3 boundary
     instead of the original day-1 / day-2 boundary; b spills into day 4;
     c gets the day-4 tail. Same EDF + tie-break logic, just one calendar
@@ -568,7 +568,7 @@ def test_remove_order_on_pinned_order_gives_pinned_hint() -> None:
 
 
 def test_pin_order_rejected_when_capacity_insufficient_at_pin_day() -> None:
-    """Spec example 1, shifted +1 day under the ``FIRST_FILLABLE_DAY = 2``
+    """Spec example 1, shifted +1 day under the ``"tree day 1 = tomorrow" rule``
     rule: existing (a 9000 dl=2) + (b 2000 dl=3). Pin b to day 2 must fail
     because day 2 only has ``10000-9000=1000`` free, b needs 2000.
 
@@ -598,7 +598,7 @@ def test_pin_order_rejected_when_capacity_insufficient_at_pin_day() -> None:
 
 
 def test_pin_order_success_matches_spec_example_2() -> None:
-    """Spec example 2, shifted +1 day under the ``FIRST_FILLABLE_DAY = 2``
+    """Spec example 2, shifted +1 day under the ``"tree day 1 = tomorrow" rule``
     rule: (a 9000 dl=4), (b 1000 dl=4), (c 1000 dl=4), pin b to day 2 then
     c to day 2. Day 1 is locked from new admissions and from pin (pin to
     today = a "modification" of today's commitment, which is exactly what
@@ -694,7 +694,7 @@ def test_unpin_order_unknown_id_returns_error_without_mutating_state() -> None:
 def test_compute_schedule_places_pinned_first_then_fills_pq() -> None:
     """Two-phase fill: pinned consumes its fake_deadline day first, then EDF
     fills post-pin remaining. Pin target shifted to day 2 (= base+1) under
-    ``FIRST_FILLABLE_DAY = 2``; b+c pinned to day 2, a (9000) spreads from
+    ``"tree day 1 = tomorrow" rule``; b+c pinned to day 2, a (9000) spreads from
     day 2 onward.
 
     Expected:
@@ -794,7 +794,7 @@ def test_rebuild_state_separates_pinned_from_pq() -> None:
 # Admission control invariants — "day 1 (today) locked from new admissions"
 # ---------------------------------------------------------------------------
 #
-# Under ``FIRST_FILLABLE_DAY = 2``, every new ``add_order`` / ``pin_order``
+# Under ``"tree day 1 = tomorrow" rule``, every new ``add_order`` / ``pin_order``
 # that would touch day 1 rejects at admission. The earlier P1-1 invariant
 # tests (pin full today + add today, etc.) tested "what if both end up
 # coexisting" — that scenario is no longer reachable via the public API,
@@ -1159,7 +1159,7 @@ def test_rebuild_state_falls_back_to_pq_when_pin_capacity_exceeded() -> None:
     a safe fallback (better to schedule it within its real deadline
     than drop it) and is surfaced via ``skipped`` so ops can react."""
     # Pin both orders to ``base_date + 1`` (rel=2, the earliest pinnable
-    # day under ``FIRST_FILLABLE_DAY = 2``). For the new admission
+    # day under ``"tree day 1 = tomorrow" rule``). For the new admission
     # arithmetic ``query(fake_rel) - query(1)``, fake_rel=2 means only
     # day-2's own capacity counts. The first pin exhausts it; the second
     # pin then has 0 available and rejects.
@@ -1493,7 +1493,7 @@ def test_is_batch_feasible_empty_delta_is_feasible() -> None:
 def test_is_batch_feasible_demand_under_capacity_passes() -> None:
     """Demand prefix strictly less than capacity prefix on every day ⇒
     feasible. Day 1 is locked (capacity contribution = 0 under
-    ``FIRST_FILLABLE_DAY = 2``), so the day-1 demand entry must be 0;
+    ``"tree day 1 = tomorrow" rule``), so the day-1 demand entry must be 0;
     days 2+ each take well under ``DAILY_CAPACITY``.
     """
     state = SchedulerState.initial(_BASE)
@@ -1593,7 +1593,7 @@ def test_apply_batch_to_capacity_single_add_distributes_via_carry_back() -> None
 def test_apply_batch_to_capacity_overflow_spills_to_earlier_days() -> None:
     """If a day's demand exceeds its remaining capacity, the carry-back
     formula moves the overflow to earlier days. Shifted +1 day under
-    ``FIRST_FILLABLE_DAY = 2``: demand on day 3 (1.5x cap) spills into
+    ``"tree day 1 = tomorrow" rule``: demand on day 3 (1.5x cap) spills into
     day 2; ``is_batch_feasible`` accepts because cumulative capacity at
     day 3 = 0 (day 1 locked) + 10000 (day 2) + 10000 (day 3) = 20000 >=
     15000. Day 1 stays locked at full capacity.

@@ -426,6 +426,71 @@ def test_cancel_compound_delete_kind_clears_lock_and_keeps_row_alive(
     assert refreshed.status == OrderStatus.scheduled
 
 
+def test_cancel_compound_raises_and_skips_ws_when_compensation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+    db_session,  # type: ignore[no-untyped-def]
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Compensation failure path (PR review #1): if
+    ``perform_compound_db_action`` raises (DB outage / deadlock / constraint
+    violation), ``cancel_compound`` MUST:
+
+    - re-raise so the endpoint can map to 500
+    - NOT send the ``schedule.compound_cancelled`` WS notification (which
+      would falsely tell the frontend cancellation succeeded)
+    - log with the ``row_state=locked_orphaned_in_db`` marker so ops can
+      find these post-mortem
+
+    Earlier the code logged + swallowed the exception + sent the WS
+    notification anyway — exactly the bug the cancel compensation was
+    meant to fix, just relocated to the error path.
+    """
+    import logging
+
+    from app.models.order import OrderStatus
+
+    _, notify_mock = _patch_taskdispatch(monkeypatch)
+
+    actor, order = _seed_user_and_order(
+        db_session,
+        is_processing_locked=True,
+        status=OrderStatus.pending,
+    )
+    compound = _build_compound_with_db_action(
+        kind="create",
+        order_id=order.id,
+        actor_id=actor.id,
+        op="add",
+    )
+    enqueue_compound(compound)
+
+    # Force the compensation to raise. We monkeypatch the binding inside
+    # ``schedule_queue`` (where cancel_compound did the lazy import).
+    def _explode(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated DB outage during compensation")
+
+    monkeypatch.setattr(
+        "app.services.compound_finalize.perform_compound_db_action",
+        _explode,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="app.services.schedule_queue"):
+        with pytest.raises(RuntimeError, match="simulated DB outage"):
+            cancel_compound(compound.compound_id)
+
+    # WS notification MUST NOT have been sent — frontend never sees
+    # false success.
+    notify_mock.assert_not_called()
+
+    # Log with the operational marker so ops can grep for stuck rows.
+    assert any(
+        "schedule.compound.cancel_db_action_failed" in record.getMessage()
+        or record.__dict__.get("event") == "schedule.compound.cancel_db_action_failed"
+        for record in caplog.records
+    )
+
+
 def test_cancel_compound_in_progress_race_skips_db_compensation(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,

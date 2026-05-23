@@ -779,25 +779,36 @@ enqueue_compound(compound)   # ← 同 process Redis call；條件式 .delay() �
 - **Producer ↔ consumer 契約**：Redis key 常數（`STATE_KEY` / `STATUS_KEY` / `PENDING_OPS_KEY` / `PENDING_OPS_SEQ_KEY`）跟 `score_for_op` 編碼也住在這個檔，因為兩端（API 跟 worker）都要對得上，把契約放在共同上游避免 api → workers 反向依賴（RULES.md §3）。
 - 演算法詳細推導見 [`backend/CLAUDE.md`](../backend/CLAUDE.md) §業務規則
 
-**Day 1 (今天) 對新 admission 鎖定 — `FIRST_FILLABLE_DAY = 2`**
+**Tree 結構：day 1 = 明天**（不是「今天但被 lock」）
 
-業務規則：今天的生產線在前一晚 00:00 UTC 就已經由 `advance_day_task::mark_in_production` 把當天訂單升級成 `in_production` 確認下來。當天 user 新增訂單 / PATCH / pin 一律不能落在今天，只能 day 2（明天）以後。實作四個地方共用 `FIRST_FILLABLE_DAY = 2` 常數：
+業務規則：今天的生產線在前一晚 00:00 UTC 就已經由 `advance_day_task::mark_in_production` 把當天訂單升級成 `in_production` 確認下來。當天 user 新增訂單 / PATCH / pin 一律不能落在今天，只能 day 2（明天）以後。
 
-| 函式 | 改動 |
+實作層面採用**結構性設計**：兩棵 segment tree 只覆蓋「可放」的天，今天根本不在 tree 裡。`abs_to_rel(today, base_date)` 直接回 `None`，跟「超出 horizon」走同一條 reject 分支。
+
+| 對應關係 | 公式 |
 |---|---|
-| `add_order` | capacity check 改 `capacity_tree.query(rel) - capacity_tree.query(1)` — day 1 prefix sum 不計入。`rel == 1`（deadline = today）→ available = 0 → reject，rejection message 區分 `due_today` vs `insufficient_future_capacity` 兩種 reason |
-| `pin_order` | 同樣減去 day 1 prefix sum。`fake_rel == 1`（pin to today）→ reject，message 區分 `pin_today` vs `insufficient_future_capacity` |
-| `compute_schedule` phase 2 (pq forward-fill) | `for d in range(FIRST_FILLABLE_DAY, deadline_rel + 1)`。`deadline_rel < FIRST_FILLABLE_DAY` 的 pq order（legacy / orphan：deadline 被 base_date 追上）log + skip，避免生出 day-1 的 daily_breakdown row 污染日曆。Phase 1（pinned）不受影響 — pinned-to-today 是上一天就已經承諾的 commitment |
-| `is_batch_feasible` | 累積 cumulative_capacity 時 day 1 contribute 0，跟 single-order admission 對齊 |
+| `state.base_date` | 今天的絕對日期 |
+| tree day 1 | `base_date + 1`（明天） |
+| tree day 30 | `base_date + 30` |
+| `abs_to_rel(d, base)` | `(d - base).days`，落在 `[1, 30]` 才合法；否則 `None` |
+| `rel_to_abs(rel, base)` | `base + timedelta(days=rel)`（rel=1 → tomorrow） |
 
-**為什麼要這條規則**：原本算法把 day 1 當「跟其他 30 天一樣的 bucket」，新訂單塞滿後直接擠到 day 1 production line — 但 day 1 = 今天，生產已經在跑，物理上沒辦法臨時插一張單。改成 day 1 鎖定之後：(1) 新 admission 只能往 day 2+ 塞，符合「今天線不能動」的真實限制；(2) 前端 calendar 看到 day 1 一律是 `status='in_production'` 的訂單（pinned-today 或前一天承諾的 day-2），跟 list 表的 status 一致，沒有「calendar 顯示生產中但 list 顯示已排程」的不一致。
+四個函式都用**標準形**，沒有任何 day-1 hack：
+
+| 函式 | 行為 |
+|---|---|
+| `add_order` | `available = capacity_tree.query(rel) >= wafer_quantity`。`deadline == today` 在 `abs_to_rel` 就回 None → 走 `deadline_too_far` 分支，rejection message 區分 `today` / `past` / `outside_horizon` 三種子情境 |
+| `pin_order` | 同上，`fake_deadline == today` → `deadline_too_far`，message 提示「pick tomorrow or later」 |
+| `compute_schedule` phase 2 | `for d in range(1, deadline_rel + 1)`，沒有 day-1 skip。`deadline_rel is None` 的 pq order（legacy / overdue）走既有的 `continue` 分支，不另開 log 路徑 |
+| `is_batch_feasible` | 標準累計 `cumulative_demand <= cumulative_capacity` ∀i ∈ [1, HORIZON_DAYS]，沒有 day-1 = 0 的特殊處理 |
+
+**為什麼這條規則**：原本算法把 day 1 當「跟其他 30 天一樣的 bucket」，新訂單塞滿後直接擠到 day 1 production line — 但 day 1 = 今天，生產已經在跑，物理上沒辦法臨時插一張單。改成 day 1 鎖定之後：(1) 新 admission 只能往 day 2+ 塞，符合「今天線不能動」的真實限制；(2) 前端 calendar 看到 day 1 一律是 `status='in_production'` 的訂單（pinned-today 或前一天承諾的 day-2），跟 list 表的 status 一致，沒有「calendar 顯示生產中但 list 顯示已排程」的不一致。
+
+**為什麼結構性比補丁式好**：第一版實作用 `FIRST_FILLABLE_DAY = 2` 常數 + `query(rel) - query(1)` 減法在四個地方各自把 day 1 排除掉。這個設計能 work，但每個函式都有特殊 case 要維護，未來重構容易漏掉一處導致 day-1 復活。改成「tree 從 tomorrow 開始」之後 invariant 自然成立 — 連 `FIRST_FILLABLE_DAY` 常數都不需要存在，函式回到標準型，無人能誤寫。
 
 **Admission control invariant — 不可能有「pinned 滿載 10000 + pq 有 dl=today 訂單」這種 state**（歷史 invariant，新規則下仍成立）
 
-`pin_order` 跟 `add_order` 的容量檢查都用 `capacity_tree.query(...)` — 配合 backward-fill 的 reservation：
-- pin Y(qty=10000) 到 today 之後，day 1 prefix sum = 0，任何後續 `add_order` with dl=today 必 reject。
-- 反過來：先 add X(qty=2000, dl=today)，day 1 prefix sum = 8000；後續 pin Y(qty=10000, fake=today) 看到 8000 < 10000 → reject；只有 pin Y(qty=8000, fake=today) 剛好用滿才會通過。
-- 新規則下：add_order with dl=today 已經被 `query(rel) - query(1) = 0` 在第一關擋掉，所以這個 invariant 變成「廢話成立」 — pq 不可能有 dl=today 訂單，因為 admission 不接受。
+`pin_order` 跟 `add_order` 的容量檢查都用 `capacity_tree.query(...)` — 配合 backward-fill 的 reservation。新規則下 admission 階段 `abs_to_rel(today, base) is None` 就 reject 了，所以 pq 不可能有 dl=today 訂單。這個 invariant 變成「結構性 vacuous true」 — 不靠 runtime check，靠 type/domain 構造保證。
 
 `tests/services/test_scheduling.py::test_p1_1_invariant_*` 三個測試把這個 invariant 鎖住 — 如果後續有人改 admission control 把這個保證打破，test 立刻紅燈。
 

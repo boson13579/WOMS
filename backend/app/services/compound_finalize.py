@@ -126,7 +126,7 @@ def perform_compound_db_action(
         if accepted:
             _apply_db_action_accept(db, order, kind, db_action_raw, actor_id)
         else:
-            _apply_db_action_reject(order, kind)
+            _apply_db_action_reject(db, order, kind, actor_id)
 
         db.commit()
 
@@ -266,7 +266,12 @@ def _apply_db_action_accept(
         return
 
 
-def _apply_db_action_reject(order: Order, kind: str) -> None:
+def _apply_db_action_reject(
+    db: Session,
+    order: Order,
+    kind: str,
+    actor_id: uuid.UUID | None,
+) -> None:
     """Compensate for a rejected compound: clear lock; for create, orphan-cleanup.
 
     For update/delete the DB columns the user wanted to change were
@@ -274,6 +279,13 @@ def _apply_db_action_reject(order: Order, kind: str) -> None:
     the lock and snapping ``status`` back to whatever the row's actual
     schedule presence implies (scheduled vs pending). For create the
     producer DID write a stub row, so we soft-delete it.
+
+    Audit (PR review feedback): create-reject also writes an
+    ``order.cancelled`` audit row so that user-initiated cancel-of-create
+    leaves a trail — without it, the history shows ``order.created``
+    followed by the row vanishing with no closing event, which is bad
+    for compliance review and operational forensics. The cancel-endpoint
+    failure path needs the same audit symmetry as the worker reject path.
 
     N-4 round-2 guard: never demote ``in_production`` here. Today the
     producer-side ``MUTABLE_STATUSES`` check already blocks PATCH /
@@ -286,9 +298,26 @@ def _apply_db_action_reject(order: Order, kind: str) -> None:
     here than to forget when MUTABLE_STATUSES is relaxed.
     """
     if kind == "create":
+        # Capture the row's pre-cancel snapshot for the audit BEFORE
+        # mutating — even though "create" reject is sparse on data
+        # (producer wrote minimal columns), the audit row should at
+        # least carry the order_number + customer for forensic queries.
+        old_value: dict[str, Any] = {
+            "status": order.status.value,
+            "is_deleted": False,
+            "wafer_quantity": order.wafer_quantity,
+            "requested_delivery_date": str(order.requested_delivery_date),
+        }
         order.is_deleted = True
         order.status = OrderStatus.cancelled
         order.is_processing_locked = False
+        _worker_audit(
+            db,
+            action="order.cancelled",
+            actor_id=actor_id,
+            order_id=order.id,
+            old_value=old_value,
+        )
         return
 
     # update / delete: just unlock and restore status.

@@ -180,8 +180,9 @@ def cancel_compound_endpoint(
 
     Looks up the compound by id in the
     ``schedule:pending_ops:by_compound_id`` secondary index, ``ZREM``s it
-    from the sorted set, and fires ``schedule.compound_cancelled`` to the
-    compound's ``requested_by``.
+    from the sorted set, runs the producer-pre-write compensation
+    (``perform_compound_db_action(accepted=False)``), and fires
+    ``schedule.compound_cancelled`` to the compound's ``requested_by``.
 
     Returns:
         ``200`` — compound was in queue and got removed.
@@ -191,10 +192,32 @@ def cancel_compound_endpoint(
                  ``schedule.updated`` / ``schedule.compound_failed`` outcome.
         ``404`` — compound id is unknown (never enqueued, or processed
                  long enough ago that the index entry was cleaned).
+        ``500`` — ZREM succeeded but the DB compensation step failed
+                 (deadlock / constraint violation / DB outage). The row
+                 is stuck in producer-locked state; ops needs to inspect.
+                 ``cancel_compound`` re-raises in this case rather than
+                 lying to the user that cancellation worked.
 
     Permission: scheduler+.
     """
-    result = cancel_compound(compound_id)
+    try:
+        result = cancel_compound(compound_id)
+    except Exception as exc:
+        # Compensation-failure path. ``cancel_compound`` logged with
+        # ``row_state=locked_orphaned_in_db`` already; we surface a 500
+        # so the frontend keeps the "processing" UI and the user knows
+        # something went wrong. NOT a 409 — that semantically means
+        # "racing worker won", which would falsely tell the user "retry
+        # later". This is "we ate half your action; investigate."
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Cancellation partially completed: compound removed from queue "
+                "but database compensation failed. Order may remain in "
+                "processing state; please contact an administrator."
+            ),
+        ) from exc
+
     if result is CancelResult.cancelled:
         return ScheduleCompoundResponse(
             compound_id=compound_id,

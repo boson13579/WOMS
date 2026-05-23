@@ -239,16 +239,30 @@ def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
     # already-clean rows (the helper is a no-op if no db_action / no
     # matching order). Done BEFORE the WS notification so the frontend
     # never sees "cancelled" while the row is still locked.
+    #
+    # **Failure mode: raise, do NOT send WS.** Earlier the code logged
+    # + continued, which sent the user a "cancelled" notification while
+    # the row stayed ``is_processing_locked=True`` — exactly the bug
+    # that compensation was added to fix, re-introduced on the error
+    # path. If compensation fails we propagate the exception:
+    #
+    # * The endpoint returns 500, the frontend keeps the "processing"
+    #   state, the user knows something went wrong.
+    # * No ``schedule.compound_cancelled`` WS event fires — frontend
+    #   never sees a false success.
+    # * The Redis queue is already drained at this point (the ZREM
+    #   above succeeded), so a retry will 404 on the missing index
+    #   entry — that's fine; the row is stuck and ops needs to clean it.
+    #   We log loudly to make sure this surfaces in monitoring.
     try:
         perform_compound_db_action(payload, accepted=False)
     except Exception:
-        # Best-effort: if compensation fails, the queue is already drained
-        # so the row stays in producer-locked state. Log + continue so the
-        # user at least gets the ``compound_cancelled`` WS notification.
         logger.exception(
             "schedule.compound.cancel_db_action_failed",
             compound_id=compound_id_str,
+            row_state="locked_orphaned_in_db",
         )
+        raise
 
     # Successfully removed from queue. Notify the requester.
     requested_by_raw = payload.get("requested_by")

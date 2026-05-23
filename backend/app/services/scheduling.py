@@ -1410,12 +1410,23 @@ def capacity_prefix_sums(state: SchedulerState) -> list[tuple[date, int]]:
 def advance_day(state: SchedulerState) -> SchedulerState:
     """Roll the horizon forward one day.
 
+    **Timing note**: this function operates on the **pre-increment** state.
+    ``state.base_date`` is still today's calendar date and tree day 1 (= rel
+    == 1) is therefore ``base_date + 1`` = tomorrow from the caller's
+    perspective. But this function is called at the 00:00 UTC boundary
+    when "tomorrow" is about to become "today" — so the orders we
+    process on rel == 1 are the orders that, after Step 5 below, will
+    be **the new today**. The "pinned-today" / "fully done today"
+    terminology in the steps below refers to that post-increment view
+    (= what calling code calls "today" by the time advance_day returns).
+
     Steps:
       0. **Pinned-today consumption.** Pinned orders whose ``fake_deadline``
-         equals today (``rel == 1``) are produced in full today; remove them
-         from ``pinned_orders`` and from the trees. Their wafers count
-         against the day's 10,000-wafer ceiling, so the pq accumulator
-         starts from ``sum(pinned_today)`` rather than 0.
+         maps to rel == 1 (= the day that becomes today after Step 5)
+         are produced in full today; remove them from ``pinned_orders``
+         and from the trees. Their wafers count against the day's
+         10,000-wafer ceiling, so the pq accumulator starts from
+         ``sum(pinned_today)`` rather than 0.
       1. Walk the priority queue, accumulating ``wafer_quantity`` until the
          daily ceiling (10,000) is reached (counting pinned-today first).
          Orders ahead of the boundary are fully completed; the (optional)
