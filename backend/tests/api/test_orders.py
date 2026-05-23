@@ -8,7 +8,7 @@ Run `pytest tests/api/test_orders.py -v` to execute.
 from __future__ import annotations
 
 import uuid
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import bcrypt
 from app.models.audit_log import AuditLog
@@ -26,11 +26,12 @@ from sqlalchemy.orm import Session
 # (e.g., "2026-08-01"), but the producer-side ``validate_deadline_in_horizon``
 # now rejects deadlines >30 days from the system's "today", so a fixed
 # date in a long-lived test file would silently start failing once the
-# wall clock crossed (deadline - 30) days. Using ``date.today() + 15``
+# wall clock crossed (deadline - 30) days. Using
+# ``datetime.now(tz=UTC).date() + 15``
 # keeps every POST body inside the horizon regardless of when the suite
 # runs. Module-level evaluation means each test run gets a single frozen
 # date so assertions on the resulting Order rows remain stable.
-_DELIVERY = (date.today() + timedelta(days=15)).isoformat()
+_DELIVERY = (datetime.now(tz=UTC).date() + timedelta(days=15)).isoformat()
 
 
 def _make_user(
