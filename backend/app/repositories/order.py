@@ -9,12 +9,13 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from app.models.order import Order, OrderStatus
 
 __all__ = [
+    "allocate_order_seq",
     "clear_scheduled_dates",
     "create",
     "get_by_id",
@@ -22,7 +23,6 @@ __all__ = [
     "get_many",
     "get_scheduled",
     "get_scheduled_for_rebuild",
-    "get_today_order_count",
     "mark_completed_outside_set",
     "mark_in_production",
     "set_schedule_dates",
@@ -124,16 +124,22 @@ def get_many(
     return list(rows), total
 
 
-def get_today_order_count(db: Session, today: date) -> int:
-    """Return the number of orders whose order_number starts with today's prefix.
+def allocate_order_seq(db: Session, today: date) -> int:
+    """Atomically allocate the next sequence number for today's orders.
 
-    Used to derive the daily sequence number for new order_numbers.
+    Uses an upsert on order_daily_seq so that concurrent callers always
+    receive distinct values — no TOCTOU race is possible.
     """
-    prefix = f"ORD-{today.strftime('%Y%m%d')}-"
-    stmt = select(func.count()).where(
-        Order.order_number.like(f"{prefix}%"),
+    result = db.execute(
+        text(
+            "INSERT INTO order_daily_seq(date, last_seq) VALUES (:today, 1) "
+            "ON CONFLICT (date) DO UPDATE "
+            "SET last_seq = order_daily_seq.last_seq + 1 "
+            "RETURNING last_seq"
+        ),
+        {"today": today},
     )
-    return db.scalars(stmt).one()
+    return int(result.scalar_one())
 
 
 def create(
