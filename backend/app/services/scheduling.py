@@ -40,6 +40,7 @@ __all__ = [
     "STATE_KEY",
     "STATUS_KEY",
     "BatchOp",
+    "DeadlineOutOfRangeError",
     "PinnedOrder",
     "ScheduleResult",
     "ScheduledResult",
@@ -65,6 +66,7 @@ __all__ = [
     "remove_order",
     "score_for_op",
     "unpin_order",
+    "validate_deadline_in_horizon",
 ]
 
 
@@ -245,6 +247,85 @@ def rel_to_abs(rel_index: int, base_date: date) -> date:
     Inverse of :func:`abs_to_rel`.
     """
     return base_date + timedelta(days=rel_index)
+
+
+class DeadlineOutOfRangeError(ValueError):
+    """Producer-side fast-fail signal for a deadline / pin date out of range.
+
+    Raised when a producer-supplied deadline (or pin date) would be
+    rejected by the scheduler's ``abs_to_rel`` check.
+
+    The producer layer (``services/order``) catches this and turns it
+    into an HTTP 422 so the user gets synchronous feedback instead of
+    the "POST 200 then WS compound_failed" two-step. Worker's
+    ``abs_to_rel``-based rejection inside ``add_order`` / ``pin_order``
+    remains as defense in depth — if a producer accepts a deadline but
+    the scheduler's ``base_date`` has just advanced (00:00 UTC race),
+    the worker still rejects safely.
+
+    Attributes mirror what an HTTP response would need:
+
+    * ``reason``: short machine-readable tag (``too_close`` / ``in_past`` /
+      ``too_far``). Useful for frontend logic that wants to translate
+      to localized copy.
+    * ``message``: user-facing rejection text.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        """Initialize with a machine-readable reason tag and user-facing message."""
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+
+
+def validate_deadline_in_horizon(deadline: date, base_date: date) -> None:
+    """Raise :class:`DeadlineOutOfRangeError` if deadline is out of range.
+
+    Range is the plannable window ``[base_date + 1, base_date + HORIZON_DAYS]``.
+
+    Mirrors the rejection branches in ``add_order`` / ``pin_order``'s
+    ``abs_to_rel`` check. Called by producer functions (``create_order``,
+    ``update_order``) BEFORE committing the producer-side pre-write +
+    enqueuing a compound, so an obviously-bad deadline gets a 422 right
+    away instead of a "compound queued → compound rejected → row marked
+    cancelled" round-trip.
+
+    Single source of truth: this helper + ``abs_to_rel`` share the same
+    rule. ``abs_to_rel`` is the algorithmic authority (the segment tree
+    indices it returns drive the rest of the worker), this is the
+    producer-side mirror with friendlier error messages.
+
+    Examples::
+
+        validate_deadline_in_horizon(today, today)            # raises too_close
+        validate_deadline_in_horizon(today - 1, today)        # raises in_past
+        validate_deadline_in_horizon(today + 31, today)       # raises too_far
+        validate_deadline_in_horizon(today + 1, today)        # ok
+        validate_deadline_in_horizon(today + 30, today)       # ok (last valid day)
+    """
+    delta = (deadline - base_date).days
+    if delta == 0:
+        raise DeadlineOutOfRangeError(
+            reason="too_close",
+            message=(
+                f"Deadline cannot be today ({deadline.isoformat()}); today's "
+                "production is already locked. Use a deadline of tomorrow or later."
+            ),
+        )
+    if delta < 0:
+        raise DeadlineOutOfRangeError(
+            reason="in_past",
+            message=f"Deadline {deadline.isoformat()} is in the past.",
+        )
+    if delta > HORIZON_DAYS:
+        raise DeadlineOutOfRangeError(
+            reason="too_far",
+            message=(
+                f"Deadline cannot be more than {HORIZON_DAYS} days from today "
+                f"(got {deadline.isoformat()}, horizon ends "
+                f"{(base_date + timedelta(days=HORIZON_DAYS)).isoformat()})."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

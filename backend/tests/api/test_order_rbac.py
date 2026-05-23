@@ -9,7 +9,7 @@ Lock / soft-pin tests are skipped until feat/order-lock-mechanism merges.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
 import bcrypt
 from app.models.order import Order, OrderStatus
@@ -17,7 +17,9 @@ from app.models.user import User, UserRole
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-_DELIVERY = "2026-08-01"
+# Relative deadline keeps POST bodies inside the producer-side
+# [today+1, today+30] horizon enforced by ``validate_deadline_in_horizon``.
+_DELIVERY = (date.today() + timedelta(days=15)).isoformat()
 
 
 # ---------------------------------------------------------------------------

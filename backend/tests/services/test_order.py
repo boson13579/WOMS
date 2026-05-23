@@ -14,7 +14,7 @@ coverage lives elsewhere.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock
 
 import bcrypt
@@ -925,11 +925,16 @@ def test_update_order_qty_smaller_with_deadline_earlier_is_grow_group(
     tightening as grow, regardless of qty direction.
     """
     creator = _make_user(db_session, username="sru-smaller-earlier")
+    # Relative dates so both old and new deadlines fall inside the
+    # producer's [today+1, today+30] horizon. New deadline is pulled
+    # earlier than old to trigger the grow-group classification.
+    original_deadline = date.today() + timedelta(days=25)
+    earlier_deadline = date.today() + timedelta(days=20)
     order = Order(
         order_number="ORD-SMALLER-EARLIER",
         customer_name="ACME",
         wafer_quantity=500,
-        requested_delivery_date=date(2026, 5, 25),
+        requested_delivery_date=original_deadline,
         created_by=creator.id,
         status=OrderStatus.pending,
     )
@@ -939,7 +944,7 @@ def test_update_order_qty_smaller_with_deadline_earlier_is_grow_group(
 
     req = UpdateOrderRequest(
         wafer_quantity=100,  # smaller
-        requested_delivery_date=date(2026, 5, 20),  # earlier
+        requested_delivery_date=earlier_deadline,  # earlier
         version_id=order.version_id,
     )
     order_service.update_order(db_session, order.id, req, creator)
@@ -1021,17 +1026,23 @@ def test_update_order_pinned_with_deadline_before_pin_day_silent_drops_pin(
     production day for this order, so silent-drop pin.
     """
     creator = _make_user(db_session, username="sru-4")
+    # Relative dates so all three (old deadline, pin day, new deadline)
+    # land in the producer's [today+1, today+30] horizon. New deadline
+    # must be strictly before pin_day to trigger silent-drop.
+    old_deadline = date.today() + timedelta(days=20)
+    pin_day = date.today() + timedelta(days=15)
+    new_deadline_before_pin = date.today() + timedelta(days=10)
     order = _make_pinned_order(
         db_session,
         creator_id=creator.id,
         order_number="ORD-PIN-DL",
-        deadline=date(2026, 5, 20),
-        pin_day=date(2026, 5, 15),
+        deadline=old_deadline,
+        pin_day=pin_day,
         quantity=100,
     )
 
     req = UpdateOrderRequest(
-        requested_delivery_date=date(2026, 5, 10),  # BEFORE pin day
+        requested_delivery_date=new_deadline_before_pin,  # BEFORE pin day
         version_id=order.version_id,
     )
     order_service.update_order(db_session, order.id, req, creator)
@@ -1079,10 +1090,12 @@ def test_create_order_pushes_add_compound(db_session: Session, mock_enqueue: Mag
     edits while the worker handles the add.
     """
     creator = _make_user(db_session, username="sru-6")
+    # Relative deadline keeps the request inside the producer's
+    # [today+1, today+30] horizon regardless of when the suite runs.
     req = CreateOrderRequest(
         customer_name="ACME",
         wafer_quantity=100,
-        requested_delivery_date=date(2026, 5, 20),
+        requested_delivery_date=date.today() + timedelta(days=15),
     )
     order_service.create_order(db_session, req, creator)
 
@@ -1138,6 +1151,100 @@ def test_delete_order_pinned_pushes_unpin_then_remove_compound(
 
     compound = mock_enqueue.call_args.args[0]
     assert [op.op for op in compound.ops] == ["unpin", "remove"]
+
+
+def test_cancel_order_scheduled_pushes_remove_compound_with_cancel_kind(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """cancel_order pushes the same shape as delete_order ([remove] / [unpin,
+    remove], group=shrink) but with ``db_action.kind="cancel"`` so the
+    worker on accept leaves ``is_deleted=False``.
+    """
+    creator = _make_user(db_session, username="sru-cancel-1")
+    order = Order(
+        order_number="ORD-CANCEL-NP",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.scheduled,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    order_service.cancel_order(db_session, order.id, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert compound.group == "shrink"
+    assert [op.op for op in compound.ops] == ["remove"]
+    assert compound.db_action.kind == "cancel"
+
+
+def test_cancel_order_pinned_pushes_unpin_then_remove_with_cancel_kind(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """cancel_order on a pinned + scheduled order pushes ``[unpin, remove]``
+    with kind="cancel". Mirrors delete_order's pinned path.
+    """
+    creator = _make_user(db_session, username="sru-cancel-2")
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-CANCEL-P",
+        deadline=date(2026, 5, 20),
+        pin_day=date(2026, 5, 15),
+    )
+    # _make_pinned_order leaves status=pending; flip to scheduled so the
+    # cancel guard passes (cancel only allows status=scheduled).
+    order.status = OrderStatus.scheduled
+    db_session.commit()
+    db_session.refresh(order)
+
+    order_service.cancel_order(db_session, order.id, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert [op.op for op in compound.ops] == ["unpin", "remove"]
+    assert compound.db_action.kind == "cancel"
+
+
+def test_cancel_order_rejects_non_scheduled_status(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """cancel_order only accepts ``status=scheduled``. ``pending`` /
+    ``in_production`` / ``completed`` / ``cancelled`` all 409. The
+    409 for pending is the load-bearing one — it forces the frontend to
+    route those through ``DELETE /schedule/operations/{compound_id}``
+    instead of stacking another compound on a row whose create compound
+    is still in the queue.
+    """
+    from fastapi import HTTPException
+
+    creator = _make_user(db_session, username="sru-cancel-guard")
+    for blocked_status in (
+        OrderStatus.pending,
+        OrderStatus.in_production,
+        OrderStatus.completed,
+        OrderStatus.cancelled,
+    ):
+        order = Order(
+            order_number=f"ORD-CANCEL-{blocked_status.value}",
+            customer_name="ACME",
+            wafer_quantity=100,
+            requested_delivery_date=date(2026, 5, 20),
+            created_by=creator.id,
+            status=blocked_status,
+        )
+        db_session.add(order)
+        db_session.commit()
+        db_session.refresh(order)
+
+        with pytest.raises(HTTPException) as exc_info:
+            order_service.cancel_order(db_session, order.id, creator)
+        assert exc_info.value.status_code == 409
+
+    # None of the blocked attempts should have enqueued a compound.
+    assert mock_enqueue.call_count == 0
 
 
 # ---------------------------------------------------------------------------

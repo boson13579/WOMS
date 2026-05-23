@@ -41,7 +41,12 @@ from app.schemas.schedule import (
 )
 from app.services import notification as notification_service
 from app.services.schedule_queue import enqueue_compound
-from app.services.scheduling import ScheduledResult, SchedulingOrder
+from app.services.scheduling import (
+    DeadlineOutOfRangeError,
+    ScheduledResult,
+    SchedulingOrder,
+    validate_deadline_in_horizon,
+)
 
 if TYPE_CHECKING:
     # Lazy import at runtime (inside ``get_capacity_usage``) keeps the
@@ -54,6 +59,7 @@ logger = structlog.get_logger(__name__)
 __all__ = [
     "apply_schedule",
     "batch_update_orders",
+    "cancel_order",
     "create_order",
     "delete_order",
     "get_audit_log",
@@ -99,6 +105,35 @@ def _validate_assigned_to_user(db: Session, assigned_to: uuid.UUID | None) -> No
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Assigned user not found.",
         )
+
+
+def _validate_deadline_or_422(deadline: date) -> None:
+    """Producer-side mirror of ``add_order`` / ``pin_order``'s deadline check.
+
+    Fails fast with HTTP 422 (with a user-readable message) when the
+    deadline is today, in the past, or beyond the horizon. The worker
+    would catch the same case via ``abs_to_rel`` returning ``None`` and
+    soft-cancel the order asynchronously, but doing it here gives the
+    frontend synchronous feedback instead of a "POST 200 → WS
+    compound_failed" two-step UX wart.
+
+    "Today" is sourced from ``datetime.now(UTC).date()`` to match the
+    typical scheduler ``base_date``. There's a tiny race window at 00:00
+    UTC where the producer's "today" and the scheduler's ``base_date``
+    can disagree by one day; the worker's check (defense in depth)
+    catches that case and the user sees the same async cancel they would
+    have seen before this validator existed. Acceptable trade-off — that
+    race fires at most once per day per user and exactly when an
+    order's deadline straddles the midnight boundary.
+    """
+    today = datetime.now(tz=UTC).date()
+    try:
+        validate_deadline_in_horizon(deadline, today)
+    except DeadlineOutOfRangeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.message,
+        ) from exc
 
 
 def _generate_order_number(db: Session) -> str:
@@ -193,6 +228,52 @@ def _build_delete_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoun
             actor_id=actor_id,
             # Old values captured so the worker can audit-log the prior
             # state alongside ``is_deleted: False -> True``.
+            old_wafer_quantity=order.wafer_quantity,
+            old_requested_delivery_date=order.requested_delivery_date,
+            old_notes=order.notes,
+            old_assigned_to=order.assigned_to,
+        ),
+    )
+
+
+def _build_cancel_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoundRequest:
+    """Compound for a user-initiated cancel: same shape as delete, kind="cancel".
+
+    The scheduler-side effect is identical to delete (``unpin`` if pinned,
+    then ``remove`` — group=shrink). The only divergence is the worker's
+    DB write on accept: ``status=cancelled`` but ``is_deleted`` stays
+    ``False`` so the row remains in ``GET /orders``. See
+    ``compound_finalize._apply_db_action_accept`` for the kind="cancel"
+    branch.
+    """
+    ops: list[ScheduleOpInCompound] = []
+    if order.is_pinned:
+        ops.append(
+            ScheduleOpInCompound(
+                op="unpin",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=order.wafer_quantity,
+                deadline=order.requested_delivery_date,
+            )
+        )
+    ops.append(
+        ScheduleOpInCompound(
+            op="remove",
+            order_id=order.id,
+            order_number=order.order_number,
+            wafer_quantity=order.wafer_quantity,
+            deadline=order.requested_delivery_date,
+        )
+    )
+    return ScheduleCompoundRequest(
+        group="shrink",
+        op_count=len(ops),
+        ops=ops,
+        requested_by=actor_id,
+        db_action=CompoundDbAction(
+            kind="cancel",
+            actor_id=actor_id,
             old_wafer_quantity=order.wafer_quantity,
             old_requested_delivery_date=order.requested_delivery_date,
             old_notes=order.notes,
@@ -419,6 +500,7 @@ def create_order(db: Session, req: CreateOrderRequest, actor: User) -> OrderResp
     via ``set_schedule_dates``).
     """
     _validate_assigned_to_user(db, req.assigned_to)
+    _validate_deadline_or_422(req.requested_delivery_date)
     order_number = _generate_order_number(db)
     order = order_repo.create(
         db,
@@ -578,6 +660,18 @@ def update_order(  # noqa: PLR0912, PLR0915
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Pin date cannot be after the order's delivery deadline.",
         )
+
+    # Producer-side range check (B + C of the deadline-validation design):
+    # mirrors ``add_order`` / ``pin_order``'s ``abs_to_rel`` rejection so
+    # the user gets a synchronous 422 instead of "PATCH 200 → WS
+    # compound_failed → order auto-cancelled". Only fire when the user
+    # actually touched the deadline (otherwise an unchanged deadline
+    # that's now overtaken by ``base_date`` advancing would falsely
+    # reject a notes-only PATCH).
+    if req.requested_delivery_date is not None:
+        _validate_deadline_or_422(new_deadline)
+    if pin_day_set and new_pin_day is not None:
+        _validate_deadline_or_422(new_pin_day)
 
     pin_changed_explicitly = pin_day_set and (
         (new_pin_day is None) != (not order.is_pinned)
@@ -747,6 +841,82 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
         )
 
     logger.info("order.cancel_requested", order_id=str(order_id), actor_id=str(actor.id))
+    return OrderResponse.model_validate(order)
+
+
+def cancel_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse:
+    """User-initiated cancel of a ``scheduled`` order.
+
+    Producer side: same row-lock + enqueue dance as ``delete_order``,
+    but the compound carries ``db_action.kind="cancel"``. On worker
+    accept the order ends up at ``status=cancelled`` with
+    ``is_deleted=False`` — the row stays in ``GET /orders`` so the user
+    sees their cancelled order in the list (audit + recovery trail),
+    distinguishing it from ``delete_order`` which sets
+    ``is_deleted=True`` and removes the row from the list view.
+
+    Status guard is strict: **only ``scheduled``** is cancellable.
+    ``pending`` orders should be retracted via
+    ``DELETE /schedule/operations/{compound_id}`` (the queued compound
+    hasn't been processed yet); ``in_production`` / ``completed`` /
+    ``cancelled`` are immutable here (the floor has already started or
+    finished work on the wafer batch). 409 for any other status.
+    """
+    order = order_repo.get_by_id_for_update(db, order_id)
+    if order is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
+
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only modify orders you created.",
+        )
+
+    if order.status != OrderStatus.scheduled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Order in status '{order.status.value}' cannot be cancelled. "
+                "Only 'scheduled' orders are cancellable; use DELETE "
+                "/schedule/operations/{compound_id} to retract a pending order."
+            ),
+        )
+
+    if order.is_processing_locked:
+        raise _LOCKED_ORDER_ERROR
+
+    compound = _build_cancel_compound(order, actor.id)
+
+    order.is_processing_locked = True
+
+    try:
+        db.commit()
+    except StaleDataError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Order was modified by another user. Refresh and try again.",
+        ) from exc
+    db.refresh(order)
+
+    enqueue_compound(compound)
+    try:
+        notification_service.create_notification(
+            db,
+            user_id=order.created_by,
+            order_id=order.id,
+            type="order_locked",
+            message=f"訂單 {order.order_number} 已被鎖定處理中",
+        )
+    except Exception:
+        logger.warning(
+            "notification.create_failed",
+            order_id=str(order.id),
+            user_id=str(order.created_by),
+            exc_info=True,
+        )
+
+    logger.info("order.user_cancel_requested", order_id=str(order_id), actor_id=str(actor.id))
     return OrderResponse.model_validate(order)
 
 

@@ -88,9 +88,21 @@ def perform_compound_db_action(
 
     ``kind="delete"``:
       - accepted: soft-delete (``is_deleted=True``,
-        ``status=cancelled``); clear lock; emit ``order.cancelled``
+        ``status=cancelled``); clear lock; emit ``order.deleted``
         audit record.
       - rejected: clear lock; status restoration mirrors update.
+
+    ``kind="cancel"`` (user clicks the "取消訂單" button on a scheduled
+    order — the row stays visible but stops occupying capacity):
+      - accepted: ``status=cancelled`` but ``is_deleted`` stays
+        ``False`` so the row remains in ``GET /orders``; clear lock;
+        emit ``order.cancelled`` audit record.
+      - rejected: clear lock; status restoration mirrors update.
+
+    Same scheduler-side compound shape as ``delete``
+    (``[remove]`` / ``[unpin, remove]``); the only difference between
+    the two accept-paths is whether ``is_deleted`` flips, and the
+    audit label (``order.deleted`` vs ``order.cancelled``).
     """
     db_action_raw = compound.get("db_action")
     if not db_action_raw:
@@ -134,7 +146,11 @@ def perform_compound_db_action(
         # Triggers for: explicit user delete accepted, or orphan create
         # rejected (which includes "user cancelled a queued create compound"
         # — same DB end-state as "create compound was rejected by worker").
-        _is_cancel = (kind == "delete" and accepted) or (kind == "create" and not accepted)
+        _is_cancel = (
+            (kind == "delete" and accepted)
+            or (kind == "cancel" and accepted)
+            or (kind == "create" and not accepted)
+        )
         if _is_cancel:
             try:
                 notification_service.create_notification(
@@ -258,6 +274,42 @@ def _apply_db_action_accept(
         order.is_processing_locked = False
         _worker_audit(
             db,
+            action="order.deleted",
+            actor_id=actor_id,
+            order_id=order.id,
+            old_value=old_value,
+        )
+        return
+
+    if kind == "cancel":
+        # User-initiated cancel of a ``scheduled`` order. Same scheduler-side
+        # compound shape as ``delete`` ([remove] / [unpin, remove]) but the
+        # DB outcome differs in one column: ``is_deleted`` stays ``False``
+        # so the row remains visible in ``GET /orders``. Compared to the
+        # three existing cancel-shaped paths:
+        #
+        # - ``delete`` accept: ``is_deleted=True``, removed from list.
+        # - ``create`` reject (worker auto / user retract): ``is_deleted=False``,
+        #   row was never scheduled to begin with.
+        # - ``cancel`` accept (this branch): ``is_deleted=False``,
+        #   row WAS scheduled and the user is intentionally pulling it back.
+        #
+        # Audit action ``order.cancelled`` (matches the create-reject path);
+        # ``delete`` was retitled to ``order.deleted`` so the two
+        # are distinguishable in the audit trail.
+        old_value = {
+            "status": order.status.value,
+            "is_deleted": False,
+            "wafer_quantity": db_action.get("old_wafer_quantity"),
+            "requested_delivery_date": db_action.get("old_requested_delivery_date"),
+            "notes": db_action.get("old_notes"),
+            "assigned_to": db_action.get("old_assigned_to"),
+        }
+        order.status = OrderStatus.cancelled
+        order.is_processing_locked = False
+        # Intentionally NOT setting is_deleted=True — that's the delete path.
+        _worker_audit(
+            db,
             action="order.cancelled",
             actor_id=actor_id,
             order_id=order.id,
@@ -298,19 +350,32 @@ def _apply_db_action_reject(
     here than to forget when MUTABLE_STATUSES is relaxed.
     """
     if kind == "create":
-        # Capture the row's pre-cancel snapshot for the audit BEFORE
-        # mutating — even though "create" reject is sparse on data
-        # (producer wrote minimal columns), the audit row should at
-        # least carry the order_number + customer for forensic queries.
+        # Business rule: a create compound that the scheduler rejects (or
+        # that a user retracts via cancel-of-create) leaves the row
+        # **visible** to the user. ``status='cancelled'`` documents the
+        # outcome but ``is_deleted`` stays False so:
+        #
+        # - The order still appears in ``GET /orders``, letting the user
+        #   review what happened (e.g., "ORD-X was rejected:
+        #   deadline_too_far") alongside the notification-center entry.
+        # - Only the explicit ``DELETE /orders/{id}`` path sets
+        #   ``is_deleted=True`` (that's an active user intent to remove
+        #   the row from their workspace).
+        #
+        # Before this change every create-reject permanently soft-deleted
+        # the row, hiding the failure from the user — they got the
+        # "compound_failed" WS event but couldn't see the offending order
+        # anymore. Two-axis split (status + is_deleted) makes the
+        # distinction explicit.
         old_value: dict[str, Any] = {
             "status": order.status.value,
             "is_deleted": False,
             "wafer_quantity": order.wafer_quantity,
             "requested_delivery_date": str(order.requested_delivery_date),
         }
-        order.is_deleted = True
         order.status = OrderStatus.cancelled
         order.is_processing_locked = False
+        # Intentionally NOT setting is_deleted=True — see comment above.
         _worker_audit(
             db,
             action="order.cancelled",
@@ -320,7 +385,11 @@ def _apply_db_action_reject(
         )
         return
 
-    # update / delete: just unlock and restore status.
+    # update / delete / cancel: just unlock and restore status. The
+    # cancel reject path mirrors delete reject — both compounds were
+    # ``[remove]`` / ``[unpin, remove]`` and neither touched any
+    # user-facing column at producer time, so rollback is the same
+    # "clear lock + recompute status from scheduled_production_date".
     order.is_processing_locked = False
     if order.status == OrderStatus.in_production:
         # Defensive — see docstring.

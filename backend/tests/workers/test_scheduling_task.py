@@ -2391,8 +2391,11 @@ def test_perform_db_action_accept_delete_soft_deletes_and_audits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Accepted delete compound: ``is_deleted=True`` + ``status=cancelled``
-    + ``order.cancelled`` audit. Producer wrote *only* the lock; the
+    + ``order.deleted`` audit. Producer wrote *only* the lock; the
     visible deletion lands here.
+
+    The ``order.deleted`` label distinguishes this path from the user-cancel
+    path (``order.cancelled`` + ``is_deleted=False``) in the audit trail.
     """
     from app.models.audit_log import AuditLog
     from app.models.order import Order, OrderStatus
@@ -2443,21 +2446,25 @@ def test_perform_db_action_accept_delete_soft_deletes_and_audits(
 
     audit = db_session.scalars(_sa_select(AuditLog).where(AuditLog.resource_id == order.id)).all()
     actions = [row.action for row in audit]
-    assert "order.cancelled" in actions
+    assert "order.deleted" in actions
 
 
-def test_perform_db_action_reject_create_soft_deletes_orphan_row(
+def test_perform_db_action_reject_create_marks_cancelled_but_visible(
     db_session: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rejected create compound: producer pre-created a row (status=pending,
     is_processing_locked=True) before the worker knew if the schedule
     could accept the new order. When the schedule rejects (capacity
-    exceeded, deadline too far), the row would otherwise live forever as
-    a locked, pending orphan — UI shows it but can't apply any further
-    action because nothing's listening. Worker's compensation is to
-    soft-delete the orphan so it disappears from user views.
+    exceeded, deadline too far), the row stays **visible** to the user
+    so they can see what they tried — ``status=cancelled`` documents the
+    outcome but ``is_deleted=False`` keeps the row in ``GET /orders``.
+
+    Only the explicit ``DELETE /orders/{id}`` path sets ``is_deleted=True``;
+    scheduler-side rejection stops at "cancelled but visible". The audit
+    log also has an ``order.cancelled`` row so the history is queryable.
     """
+    from app.models.audit_log import AuditLog
     from app.models.order import Order, OrderStatus
     from app.models.user import User, UserRole
     from app.workers.scheduling import _perform_compound_db_action
@@ -2465,6 +2472,7 @@ def test_perform_db_action_reject_create_soft_deletes_orphan_row(
     _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
 
     import bcrypt
+    from sqlalchemy import select as _sa_select
 
     actor = User(
         username="worker-dbaction-rej-create",
@@ -2500,9 +2508,135 @@ def test_perform_db_action_reject_create_soft_deletes_orphan_row(
 
     db_session.expire_all()
     db_session.refresh(order)
-    assert order.is_deleted is True
+    assert order.is_deleted is False, "rejected create stays visible (status=cancelled)"
     assert order.status == OrderStatus.cancelled
     assert order.is_processing_locked is False
+    # Audit row still emitted so the history records the cancellation.
+    audit_actions = db_session.scalars(
+        _sa_select(AuditLog.action).where(AuditLog.resource_id == order.id)
+    ).all()
+    assert "order.cancelled" in audit_actions
+
+
+def test_perform_db_action_accept_cancel_keeps_visible_and_audits(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted cancel compound: ``status=cancelled`` + ``is_deleted=False``
+    (the cancel-specific divergence from delete) + ``order.cancelled`` audit.
+
+    This is the user-initiated "取消訂單" path. The row stays visible in
+    ``GET /orders`` so the user keeps a record of what they pulled off
+    the production line — contrast with delete (``is_deleted=True``,
+    hidden from list).
+    """
+    from app.models.audit_log import AuditLog
+    from app.models.order import Order, OrderStatus
+    from app.models.user import User, UserRole
+    from app.workers.scheduling import _perform_compound_db_action
+
+    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
+
+    import bcrypt
+    from sqlalchemy import select as _sa_select
+
+    actor = User(
+        username="worker-dbaction-cancel",
+        email="worker-dbaction-cancel@test.internal",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+
+    order = Order(
+        order_number="ORD-DBACTION-CANCEL",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+        created_by=actor.id,
+        status=OrderStatus.scheduled,
+        is_processing_locked=True,
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    compound = _stub_compound_with_db_action(
+        kind="cancel",
+        order_id=order.id,
+        actor_id=actor.id,
+    )
+
+    _perform_compound_db_action(compound, accepted=True)
+
+    db_session.expire_all()
+    db_session.refresh(order)
+    assert order.is_deleted is False, "cancel must keep the row visible"
+    assert order.status == OrderStatus.cancelled
+    assert order.is_processing_locked is False
+
+    actions = db_session.scalars(
+        _sa_select(AuditLog.action).where(AuditLog.resource_id == order.id)
+    ).all()
+    assert "order.cancelled" in actions
+
+
+def test_perform_db_action_reject_cancel_clears_lock_and_restores_scheduled(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected cancel compound: clear lock, restore status from
+    ``scheduled_production_date``. Mirrors the delete-reject path —
+    producer only wrote the lock, so rollback is just lock-clear +
+    status recompute.
+    """
+    from app.models.order import Order, OrderStatus
+    from app.models.user import User, UserRole
+    from app.workers.scheduling import _perform_compound_db_action
+
+    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
+
+    import bcrypt
+
+    actor = User(
+        username="worker-dbaction-rej-cancel",
+        email="worker-dbaction-rej-cancel@test.internal",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+
+    order = Order(
+        order_number="ORD-DBACTION-REJ-CANCEL",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+        scheduled_production_date=date(2026, 7, 30),
+        created_by=actor.id,
+        status=OrderStatus.pending,  # producer flipped to pending when locking
+        is_processing_locked=True,
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    compound = _stub_compound_with_db_action(
+        kind="cancel",
+        order_id=order.id,
+        actor_id=actor.id,
+    )
+
+    _perform_compound_db_action(compound, accepted=False)
+
+    db_session.expire_all()
+    db_session.refresh(order)
+    # Row stays alive — no soft-delete, no status=cancelled.
+    assert order.is_deleted is False
+    assert order.is_processing_locked is False
+    # Has scheduled_production_date → restore to scheduled (not pending).
+    assert order.status == OrderStatus.scheduled
 
 
 # ---------------------------------------------------------------------------

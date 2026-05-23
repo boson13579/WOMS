@@ -166,6 +166,32 @@ def delete_order(
     order_service.delete_order(db, order_id, current_user)
 
 
+@router.post("/{order_id}/cancel", response_model=OrderResponse)
+def cancel_order(
+    order_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_WRITE_ROLES),
+) -> OrderResponse:
+    """Cancel a scheduled order: sets status=cancelled but is_deleted stays False.
+
+    Unlike ``DELETE /orders/{id}`` (which hides the row from the list
+    view), the cancelled order remains visible in ``GET /orders`` so
+    the user keeps a record of what was pulled off the production line.
+
+    Only ``status='scheduled'`` orders are cancellable here. To retract
+    a still-pending order whose compound hasn't been processed, use
+    ``DELETE /schedule/operations/{compound_id}`` instead.
+
+    Permission: scheduler+.
+
+    Errors:
+        404: order not found.
+        409: order is not in ``scheduled`` status, or is currently locked
+            by another in-flight compound.
+    """
+    return order_service.cancel_order(db, order_id, current_user)
+
+
 @router.get("/{order_id}/audit-log", response_model=list[AuditLogResponse])
 def get_audit_log(
     order_id: uuid.UUID,

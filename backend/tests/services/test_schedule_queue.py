@@ -300,15 +300,20 @@ def _patch_compound_finalize_sessionlocal(
     )
 
 
-def test_cancel_compound_create_kind_soft_deletes_orphan_row(
+def test_cancel_compound_create_kind_marks_cancelled_but_visible(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
     db_session,  # type: ignore[no-untyped-def]
 ) -> None:
-    """Cancelling a ``create`` compound must clean up the orphan row that
-    the producer pre-INSERTed. Without this, ``create_order`` →
-    ``cancel`` leaves the row visible (is_deleted=False) and stuck at
-    ``is_processing_locked=True``, with no recovery path.
+    """Cancelling a ``create`` compound MUST mark the row ``status=cancelled``
+    but **keep ``is_deleted=False``** so the user still sees the failed
+    order in ``GET /orders`` — the rejection reason lives in the
+    accompanying ``schedule.compound_failed`` WS event / notification
+    center entry, but the order itself must remain visible for the user
+    to review what they tried to schedule.
+
+    Only the explicit ``DELETE /orders/{id}`` path sets ``is_deleted=True``;
+    scheduler-side rejection / user-retraction-of-create stops at "cancelled".
     """
     from app.models.order import Order, OrderStatus
 
@@ -334,7 +339,7 @@ def test_cancel_compound_create_kind_soft_deletes_orphan_row(
     db_session.expire_all()
     refreshed = db_session.get(Order, order.id)
     assert refreshed is not None
-    assert refreshed.is_deleted is True, "orphan row should be soft-deleted"
+    assert refreshed.is_deleted is False, "cancel must NOT soft-delete; user keeps visibility"
     assert refreshed.status == OrderStatus.cancelled
     assert refreshed.is_processing_locked is False
 

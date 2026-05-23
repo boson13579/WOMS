@@ -8,7 +8,7 @@ Run `pytest tests/api/test_orders.py -v` to execute.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
 import bcrypt
 from app.models.audit_log import AuditLog
@@ -22,7 +22,15 @@ from sqlalchemy.orm import Session
 # Helpers
 # ---------------------------------------------------------------------------
 
-_DELIVERY = "2026-08-01"
+# Relative deadline 15 days from today. Earlier this was a frozen literal
+# (e.g., "2026-08-01"), but the producer-side ``validate_deadline_in_horizon``
+# now rejects deadlines >30 days from the system's "today", so a fixed
+# date in a long-lived test file would silently start failing once the
+# wall clock crossed (deadline - 30) days. Using ``date.today() + 15``
+# keeps every POST body inside the horizon regardless of when the suite
+# runs. Module-level evaluation means each test run gets a single frozen
+# date so assertions on the resulting Order rows remain stable.
+_DELIVERY = (date.today() + timedelta(days=15)).isoformat()
 
 
 def _make_user(
@@ -506,26 +514,35 @@ def test_update_order_partial_fields(client: TestClient, db_session: Session) ->
 def test_update_order_only_delivery_date(client: TestClient, db_session: Session) -> None:
     """As above — deadline change is deferred until the worker accepts the
     compound. PATCH 200 returns the locked-but-pre-PATCH state.
+
+    Dates here are relative to ``date.today()`` because the producer-side
+    ``validate_deadline_in_horizon`` rejects deadlines outside
+    ``[today + 1, today + 30]``. Original/new must both be in-range.
     """
     user = _make_user(db_session, username="sched_delivery", role=UserRole.scheduler)
     token = _login(client, "sched_delivery")
+    original = date.today() + timedelta(days=10)  # in-range, pre-PATCH value
+    new_deadline = date.today() + timedelta(days=20)  # in-range, post-PATCH target
     order = _make_order(
         db_session,
         created_by=user.id,
         wafer_quantity=100,
-        requested_delivery_date=date(2026, 8, 1),
+        requested_delivery_date=original,
     )
 
     res = client.patch(
         f"/api/v1/orders/{order.id}",
-        json={"requested_delivery_date": "2026-09-30", "version_id": order.version_id},
+        json={
+            "requested_delivery_date": new_deadline.isoformat(),
+            "version_id": order.version_id,
+        },
         headers=_auth(token),
     )
 
     assert res.status_code == 200
     body = res.json()
     # Pre-PATCH date still in the response — worker hasn't applied yet.
-    assert body["requested_delivery_date"] == "2026-08-01"
+    assert body["requested_delivery_date"] == original.isoformat()
     assert body["wafer_quantity"] == 100
     assert body["notes"] is None
     assert body["status"] == "pending"
@@ -577,6 +594,85 @@ def test_delete_nonexistent_order_returns_404(client: TestClient, db_session: Se
 
     assert res.status_code == 404
     assert res.json()["error"]["code"] == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /orders/{id}/cancel — user-initiated cancel
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_order_success_locks_row_pending_worker(
+    client: TestClient, db_session: Session
+) -> None:
+    """POST /orders/{id}/cancel returns 200 with the row only locked; the
+    actual ``status=cancelled`` write is deferred to the worker. Mirrors
+    the delete endpoint's locked-pending-worker behavior, but the row
+    must be ``status=scheduled`` to be cancellable.
+    """
+    user = _make_user(db_session, username="sched_cancel_ok", role=UserRole.scheduler)
+    token = _login(client, "sched_cancel_ok")
+    order = _make_order(db_session, created_by=user.id, status=OrderStatus.scheduled)
+
+    res = client.post(f"/api/v1/orders/{order.id}/cancel", headers=_auth(token))
+
+    assert res.status_code == 200
+    body = res.json()
+    # Pre-cancel state in body; worker hasn't applied yet.
+    assert body["status"] == "scheduled"
+    assert body["is_processing_locked"] is True
+
+    db_session.refresh(order)
+    assert order.is_processing_locked is True
+    assert order.is_deleted is False
+    assert order.status == OrderStatus.scheduled
+
+
+def test_cancel_order_pending_status_returns_409(client: TestClient, db_session: Session) -> None:
+    """Pending orders can't be cancelled via this endpoint — the user
+    must retract the queued compound through
+    ``DELETE /schedule/operations/{compound_id}`` instead.
+    """
+    user = _make_user(db_session, username="sched_cancel_pending", role=UserRole.scheduler)
+    token = _login(client, "sched_cancel_pending")
+    order = _make_order(db_session, created_by=user.id, status=OrderStatus.pending)
+
+    res = client.post(f"/api/v1/orders/{order.id}/cancel", headers=_auth(token))
+
+    assert res.status_code == 409
+    assert res.json()["error"]["code"] == 409
+
+
+def test_cancel_order_in_production_returns_409(client: TestClient, db_session: Session) -> None:
+    """``in_production`` orders aren't cancellable — the wafer batch is
+    already on the floor."""
+    user = _make_user(db_session, username="sched_cancel_ip", role=UserRole.scheduler)
+    token = _login(client, "sched_cancel_ip")
+    order = _make_order(db_session, created_by=user.id, status=OrderStatus.in_production)
+
+    res = client.post(f"/api/v1/orders/{order.id}/cancel", headers=_auth(token))
+
+    assert res.status_code == 409
+
+
+def test_cancel_nonexistent_order_returns_404(client: TestClient, db_session: Session) -> None:
+    _make_user(db_session, username="sched_cancel_404", role=UserRole.scheduler)
+    token = _login(client, "sched_cancel_404")
+
+    res = client.post(f"/api/v1/orders/{uuid.uuid4()}/cancel", headers=_auth(token))
+
+    assert res.status_code == 404
+
+
+def test_cancel_order_viewer_returns_403(client: TestClient, db_session: Session) -> None:
+    """Viewer role can't cancel orders (write permission required)."""
+    _make_user(db_session, username="viewer_cancel", role=UserRole.viewer)
+    token = _login(client, "viewer_cancel")
+    creator = _make_user(db_session, username="sched_cancel_owner", role=UserRole.scheduler)
+    order = _make_order(db_session, created_by=creator.id, status=OrderStatus.scheduled)
+
+    res = client.post(f"/api/v1/orders/{order.id}/cancel", headers=_auth(token))
+
+    assert res.status_code == 403
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +793,7 @@ def test_audit_log_for_update_deferred_to_worker(client: TestClient, db_session:
 
 
 def test_audit_log_for_cancel_deferred_to_worker(client: TestClient, db_session: Session) -> None:
-    """Same as the update test, but for DELETE: the ``order.cancelled``
+    """Same as the update test, but for DELETE: the ``order.deleted``
     audit row is written by the worker on accept, not by the producer.
     """
     user = _make_user(db_session, username="sched_audit_cancel", role=UserRole.scheduler)
@@ -707,9 +803,7 @@ def test_audit_log_for_cancel_deferred_to_worker(client: TestClient, db_session:
     client.delete(f"/api/v1/orders/{order.id}", headers=_auth(token))
 
     logs = db_session.scalars(
-        select(AuditLog).where(
-            AuditLog.resource_id == order.id, AuditLog.action == "order.cancelled"
-        )
+        select(AuditLog).where(AuditLog.resource_id == order.id, AuditLog.action == "order.deleted")
     ).all()
     assert len(logs) == 0
 
