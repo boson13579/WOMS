@@ -16,9 +16,13 @@ data:
   # frontend Service's address so a port-forwarded frontend can call backend.
   CORS_ORIGINS: "http://localhost,http://localhost:5173,http://localhost:8080"
   # DB connection pool sizing. RDS db.t3.micro defaults to ~85 max_connections.
-  # With 2 backend pods × 30 (pool 20 + overflow 10) + 1 worker × 15 (default)
-  # + ~5 for admin / healthcheck / migration jobs = ~80 → leaves headroom
-  # below the 85 ceiling. Raising further requires upgrading the RDS class
+  # Worst-case burst: 2 backend pods × 25 (pool 20 + overflow 5) + 1 worker ×
+  # 15 (default) + ~5 admin / healthcheck / migration = ~70 → leaves ~15
+  # headroom below the 85 ceiling for transient spikes. (Earlier draft used
+  # overflow=10 → worst-case ~80, which Copilot flagged as too tight: two
+  # replicas saturating overflow simultaneously plus worker burst could
+  # exceed 85 and the user-visible failure is ``FATAL: too many connections``
+  # from RDS.) Raising further requires upgrading the RDS class
   # (db.t3.small → ~170 max_connections) or adding PgBouncer in front.
   DB_POOL_SIZE: "20"
-  DB_MAX_OVERFLOW: "10"
+  DB_MAX_OVERFLOW: "5"
