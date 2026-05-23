@@ -60,6 +60,7 @@ export function useNotifications(
         notificationListSchema.parse(d),
       ),
     enabled: Boolean(userId),
+    staleTime: 30_000,
   });
 }
 

@@ -12,9 +12,6 @@ const RECONNECT_INITIAL_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 const WS_CLOSE_NORMAL = 1000;
 const WS_CLOSE_AUTH_FAILED = 4401;
-// Window used to coalesce toasts when a scheduler run bursts several
-// notification.created events together — one "N 則新通知" toast reads
-// better than N stacked ones.
 const TOAST_COALESCE_MS = 500;
 
 const wsEnvelopeSchema = z
@@ -50,22 +47,36 @@ export function useNotificationsWs(): void {
     let backoffMs = RECONNECT_INITIAL_MS;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let pendingMessages: string[] = [];
-    let toastTimer: ReturnType<typeof setTimeout> | null = null;
+    let notificationToastTimer: ReturnType<typeof setTimeout> | null = null;
+    let notificationToastCount = 0;
+    let latestNotificationMessage = '';
 
-    function flushPendingToasts(): void {
-      const msgs = pendingMessages;
-      pendingMessages = [];
-      toastTimer = null;
-      if (msgs.length === 0) return;
-      if (msgs.length === 1) {
-        toast.info('新通知', { description: msgs[0], duration: 5000 });
-        return;
+    function flushNotificationToast(): void {
+      if (notificationToastCount === 0) return;
+
+      if (notificationToastCount === 1) {
+        toast.info('新通知', {
+          description: latestNotificationMessage,
+          duration: 5000,
+        });
+      } else {
+        toast.info(`${notificationToastCount} 則新通知`, {
+          description: '通知中心已更新',
+          duration: 5000,
+        });
       }
-      toast.info(`${msgs.length} 則新通知`, {
-        description: msgs[0],
-        duration: 5000,
-      });
+
+      notificationToastCount = 0;
+      latestNotificationMessage = '';
+      notificationToastTimer = null;
+    }
+
+    function queueNotificationToast(message: string): void {
+      notificationToastCount += 1;
+      latestNotificationMessage = message;
+      if (notificationToastTimer !== null) return;
+
+      notificationToastTimer = setTimeout(flushNotificationToast, TOAST_COALESCE_MS);
     }
 
     function handleMessage(evt: MessageEvent<string>): void {
@@ -77,14 +88,8 @@ export function useNotificationsWs(): void {
       }
 
       if (env.type === 'notification.created' && env.data) {
-        // Invalidate all notifications queries to update badge count and list instantly
         void qc.invalidateQueries({ queryKey: notificationKeys.all });
-
-        // Coalesce bursts (e.g. a scheduler run touching several orders) into
-        // a single toast — see TOAST_COALESCE_MS.
-        pendingMessages.push(env.data.message);
-        if (toastTimer !== null) clearTimeout(toastTimer);
-        toastTimer = setTimeout(flushPendingToasts, TOAST_COALESCE_MS);
+        queueNotificationToast(env.data.message);
       }
     }
 
@@ -124,9 +129,9 @@ export function useNotificationsWs(): void {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
-      if (toastTimer !== null) {
-        clearTimeout(toastTimer);
-        toastTimer = null;
+      if (notificationToastTimer !== null) {
+        clearTimeout(notificationToastTimer);
+        notificationToastTimer = null;
       }
       ws?.close();
     };

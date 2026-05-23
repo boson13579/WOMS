@@ -86,7 +86,11 @@ function NavRow({ item, onNavigate }: { item: NavItem; onNavigate: () => void })
       />
       <span className="flex-1">{label}</span>
       {badgeCount !== undefined && badgeCount > 0 && (
-        <span className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white transition-all duration-300 group-hover:scale-110">
+        <span
+          aria-label={`${badgeCount} unread notifications`}
+          aria-live="polite"
+          className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white transition-all duration-300 group-hover:scale-110"
+        >
           {badgeCount}
         </span>
       )}

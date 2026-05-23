@@ -167,7 +167,7 @@ describe('useNotificationsWs', () => {
     expect(toast.info).toHaveBeenCalledTimes(1);
     expect(toast.info).toHaveBeenCalledWith(
       '3 則新通知',
-      expect.objectContaining({ description: 'msg 0' }),
+      expect.objectContaining({ description: '通知中心已更新' }),
     );
   });
 

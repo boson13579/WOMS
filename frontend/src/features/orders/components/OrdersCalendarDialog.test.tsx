@@ -19,9 +19,9 @@ const mockScheduleCapacity = {
     base_date: '2026-05-09',
     daily_capacity: 2500,
     entries: [
-      { date: '2026-05-09', cumulative_remaining: 1500 },
-      { date: '2026-05-10', cumulative_remaining: 2500 },
-      { date: '2026-05-11', cumulative_remaining: 2500 },
+      { date: '2026-05-09', used: 1000, remaining: 1500 },
+      { date: '2026-05-10', used: 1500, remaining: 1000 },
+      { date: '2026-05-11', used: 2500, remaining: 0 },
     ],
   },
 };
@@ -64,16 +64,14 @@ vi.mock('../api/scheduleResult', () => ({
 vi.mock('../api/scheduleCapacity', () => ({
   toDailyCapacity: (capacity: {
     daily_capacity: number;
-    entries: { date: string; cumulative_remaining: number }[];
+    entries: { date: string; used: number; remaining: number }[];
   }) =>
-    capacity.entries.map((entry, index) => {
-      const previous = index === 0 ? 0 : capacity.entries[index - 1].cumulative_remaining;
-      return {
-        date: entry.date,
-        remaining: entry.cumulative_remaining - previous,
-        dailyCapacity: capacity.daily_capacity,
-      };
-    }),
+    capacity.entries.map((entry) => ({
+      date: entry.date,
+      used: entry.used,
+      remaining: entry.remaining,
+      dailyCapacity: capacity.daily_capacity,
+    })),
   useScheduleCapacity: () => mockScheduleCapacity,
 }));
 

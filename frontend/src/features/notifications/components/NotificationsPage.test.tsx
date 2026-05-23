@@ -143,6 +143,26 @@ describe('NotificationsPage', () => {
     expect(screen.getByText('2')).toBeInTheDocument(); // Badge count
   });
 
+  it('shows a fallback label for invalid timestamps', async () => {
+    setupFetchMock({
+      items: [
+        {
+          ...mockUnreadNotifications.items[0],
+          message: 'Broken time notification',
+          created_at: 'not-a-date',
+        },
+      ],
+      total: 1,
+    });
+
+    render(<NotificationsPage />, { wrapper: makeWrapper() });
+
+    await waitFor(() => {
+      expect(screen.getByText('Broken time notification')).toBeInTheDocument();
+    });
+    expect(screen.getByText('未知時間')).toBeInTheDocument();
+  });
+
   it('switches between Unread and All tabs and displays correct counts', async () => {
     const user = userEvent.setup();
     render(<NotificationsPage />, { wrapper: makeWrapper() });
