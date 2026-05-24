@@ -4,20 +4,22 @@ import { z } from 'zod';
 import { apiFetch } from '@/lib/apiFetch';
 import { useCurrentRole, useCurrentUser } from '@/lib/auth';
 
-const capacityEntrySchema = z.object({
+const capacityUsageEntrySchema = z.object({
   date: z.string(),
-  cumulative_remaining: z.number().int().nonnegative(),
+  used: z.number().int().nonnegative(),
+  remaining: z.number().int().nonnegative(),
 });
 
-const scheduleCapacitySchema = z.object({
+const scheduleCapacityUsageSchema = z.object({
   base_date: z.string(),
   daily_capacity: z.number().int().positive(),
-  entries: z.array(capacityEntrySchema),
+  entries: z.array(capacityUsageEntrySchema),
 });
 
 export interface ScheduleCapacityEntry {
   date: string;
-  cumulative_remaining: number;
+  used: number;
+  remaining: number;
 }
 
 export interface ScheduleCapacity {
@@ -28,23 +30,22 @@ export interface ScheduleCapacity {
 
 export interface DailyCapacity {
   date: string;
+  used: number;
   remaining: number;
   dailyCapacity: number;
 }
 
 export const scheduleCapacityKeys = {
-  all: ['schedule', 'capacity'] as const,
+  all: ['schedule', 'capacity-usage'] as const,
 };
 
 export function toDailyCapacity(capacity: ScheduleCapacity): DailyCapacity[] {
-  return capacity.entries.map((entry, index) => {
-    const previous = index === 0 ? 0 : capacity.entries[index - 1].cumulative_remaining;
-    return {
-      date: entry.date,
-      remaining: entry.cumulative_remaining - previous,
-      dailyCapacity: capacity.daily_capacity,
-    };
-  });
+  return capacity.entries.map((entry) => ({
+    date: entry.date,
+    used: entry.used,
+    remaining: entry.remaining,
+    dailyCapacity: capacity.daily_capacity,
+  }));
 }
 
 export function useScheduleCapacity(): UseQueryResult<ScheduleCapacity> {
@@ -55,8 +56,8 @@ export function useScheduleCapacity(): UseQueryResult<ScheduleCapacity> {
   return useQuery<ScheduleCapacity>({
     queryKey: scheduleCapacityKeys.all,
     queryFn: () =>
-      apiFetch('/api/v1/schedule/capacity', { credentials: 'include' }, (d) =>
-        scheduleCapacitySchema.parse(d),
+      apiFetch('/api/v1/schedule/capacity-usage', { credentials: 'include' }, (d) =>
+        scheduleCapacityUsageSchema.parse(d),
       ),
     enabled: allowed,
     staleTime: 5_000,

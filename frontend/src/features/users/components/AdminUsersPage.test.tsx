@@ -16,6 +16,11 @@ const { mockCurrentRole, mockCurrentUserId } = vi.hoisted(() => ({
 }));
 
 vi.mock('@/lib/auth', () => ({
+  useCurrentUser: () => ({
+    id: mockCurrentUserId() ?? '00000000-0000-0000-0000-000000000001',
+    username: 'root_admin',
+    role: mockCurrentRole(),
+  }),
   useCurrentRole: mockCurrentRole,
   useCurrentUserId: mockCurrentUserId,
 }));

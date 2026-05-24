@@ -8,6 +8,8 @@ import {
   Loader2,
   Lock,
   PackageOpen,
+  Search,
+  X,
   Zap,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -133,26 +135,53 @@ function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): 
     .reduce((total, assignment) => total + assignment.quantity, 0);
 }
 
+// `baseDate` is the server's production "today" anchor. When it is undefined
+// (capacity query still loading / errored), every row collapses to `scheduled`
+// so the UI never quietly falls back to the client clock — that fallback
+// would re-introduce the timezone bug this view was rewritten to avoid.
 function groupByProductionDate(
   items: ScheduleResult[],
-  baseDate: string,
+  baseDate: string | undefined,
 ): Record<string, ProductionCalendarItem[]> {
   return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
 
+      // ``productionState`` is driven by the order's DB ``status`` first,
+      // with a date-based refinement only for the multi-day in-flight case.
+      // The earlier version computed state purely from ``assignment.date``
+      // vs ``baseDate`` — which gave the wrong answer in the window between
+      // an order being scheduled and ``advance_day_task`` actually flipping
+      // its status to ``in_production`` at midnight: the calendar showed
+      // "生產中" while the table view still showed "已排程" and the order
+      // was still editable. Sourcing the status from the same field both
+      // views read keeps them in lockstep.
+      //
+      // Date refinement for ``in_production`` multi-day orders only:
+      // - future days of an in-flight order: still "scheduled" visually
+      //   (those days haven't started)
+      // - past days where the order completed: "complete"
+      // - the current production day and any unfinished past day: "in_progress"
       let productionState: ProductionState;
-
-      // Only past rows of a fulfilled order earn the `complete` badge.
-      // Earlier daily slices of a multi-day split whose cumulative hasn't
-      // yet reached the wafer_quantity stay `in_progress`, otherwise the
-      // first day of a 3-day run would falsely advertise completion.
-      if (assignment.date > baseDate) {
+      if (baseDate === undefined) {
         productionState = 'scheduled';
-      } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
+      } else if (item.status === 'completed') {
         productionState = 'complete';
+      } else if (item.status === 'in_production') {
+        if (assignment.date > baseDate) {
+          productionState = 'scheduled';
+        } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
+          productionState = 'complete';
+        } else {
+          productionState = 'in_progress';
+        }
       } else {
-        productionState = 'in_progress';
+        // ``scheduled`` / ``pending`` — never show in_progress until the
+        // backend flips status. Under the "no scheduling for today" rule,
+        // ``status='scheduled'`` orders should not have any
+        // daily_breakdown rows on ``baseDate`` (today) at all, so this
+        // branch only ever produces "scheduled" badges in steady state.
+        productionState = 'scheduled';
       }
 
       const productionItem: ProductionCalendarItem = {
@@ -344,6 +373,8 @@ export function OrdersCalendarDialog({
   const [activeOperation, setActiveOperation] = useState<ActiveOperation | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [selectedOrderIds, setSelectedOrderIds] = useState<string[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const role = useCurrentRole();
 
   const scheduleResult = useScheduleResult();
@@ -371,9 +402,26 @@ export function OrdersCalendarDialog({
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
   const baseDate = scheduleCapacity.data?.base_date;
   const grouped = useMemo(
-    () => (baseDate ? groupByProductionDate(scheduleResult.data ?? [], baseDate) : {}),
+    () => groupByProductionDate(scheduleResult.data ?? [], baseDate),
     [scheduleResult.data, baseDate],
   );
+  const filteredGrouped = useMemo(() => {
+    if (!searchQuery) return grouped;
+    const query = searchQuery.toLowerCase();
+    return Object.keys(grouped).reduce<Record<string, ProductionCalendarItem[]>>((acc, date) => {
+      const items = grouped[date];
+      const matched = items.filter(
+        (item) =>
+          item.order_number.toLowerCase().includes(query) ||
+          item.customer_name.toLowerCase().includes(query),
+      );
+      if (matched.length > 0) {
+        acc[date] = matched;
+      }
+      return acc;
+    }, {});
+  }, [grouped, searchQuery]);
+
   const dailyCapacityByDate = useMemo(() => {
     if (!scheduleCapacity.data)
       return new Map<string, { remaining: number; dailyCapacity: number }>();
@@ -384,7 +432,7 @@ export function OrdersCalendarDialog({
     () => new Map((scheduledOrders.data?.items ?? []).map((order) => [order.id, order])),
     [scheduledOrders.data],
   );
-  const selectedItems = grouped[selectedDate] ?? [];
+  const selectedItems = filteredGrouped[selectedDate] ?? [];
   const unscheduled = useMemo(
     () =>
       (pendingOrders.data?.items ?? []).filter(
@@ -392,6 +440,15 @@ export function OrdersCalendarDialog({
       ),
     [pendingOrders.data],
   );
+  const filteredUnscheduled = useMemo(() => {
+    if (!searchQuery) return unscheduled;
+    const query = searchQuery.toLowerCase();
+    return unscheduled.filter(
+      (order) =>
+        order.order_number.toLowerCase().includes(query) ||
+        order.customer_name.toLowerCase().includes(query),
+    );
+  }, [unscheduled, searchQuery]);
   const selectableOrders = useMemo(
     () => [...(scheduledOrders.data?.items ?? []), ...unscheduled],
     [scheduledOrders.data, unscheduled],
@@ -570,7 +627,33 @@ export function OrdersCalendarDialog({
           order.is_pinned && order.pinned_production_date === targetByOrderId.get(order.id),
       )
     ) {
-      toast.success('排程日期已套用。');
+      // One coalesced toast instead of N — bulk operations were spraying a
+      // toast per affected order and competing with the on-screen pending /
+      // active-operation cards that already enumerate each target.
+      const { targets } = activeOperation;
+      toast.success(
+        targets.length === 1
+          ? `訂單 ${targets[0].orderNumber} 已更改日期至 ${targets[0].targetDate}`
+          : `${targets.length} 筆訂單已套用排程`,
+        targets.length > 1
+          ? {
+              description: (
+                <div className="mt-2 space-y-1.5">
+                  {targets.map((target) => (
+                    <div key={target.orderId} className="flex flex-col gap-0.5">
+                      <span className="font-mono text-[11px] font-semibold text-foreground">
+                        {target.orderNumber}
+                      </span>
+                      <span className="text-[10px] text-muted-foreground">
+                        套用至: {target.targetDate}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ),
+            }
+          : undefined,
+      );
       setActiveOperation(null);
       setOperationError(null);
       return;
@@ -669,7 +752,7 @@ export function OrdersCalendarDialog({
                 <div className="grid grid-cols-7 border-l">
                   {days.map((day) => {
                     const key = dateKey(day);
-                    const items = grouped[key] ?? [];
+                    const items = filteredGrouped[key] ?? [];
                     const capacity = dailyCapacityByDate.get(key);
                     const isCurrentMonth = day.getMonth() === visibleMonth.getMonth();
                     const isSelected = key === selectedDate;
@@ -851,21 +934,55 @@ export function OrdersCalendarDialog({
             )}
 
             <div className="mb-5">
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="text-sm font-semibold">{selectedDate} 生產訂單</h3>
-                {dailyCapacityByDate.get(selectedDate) && (
-                  <span
-                    className={cn(
-                      'inline-flex items-center gap-1 text-xs font-medium',
-                      capacityTone(
-                        dailyCapacityByDate.get(selectedDate)?.remaining ?? 0,
-                        dailyCapacityByDate.get(selectedDate)?.dailyCapacity ?? 1,
-                      ),
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold">{selectedDate} 生產訂單</h3>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="搜尋訂單"
+                      onClick={() => {
+                        setIsSearching((prev) => !prev);
+                        if (isSearching) {
+                          setSearchQuery('');
+                        }
+                      }}
+                      className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                    >
+                      {isSearching ? <X className="h-4 w-4" /> : <Search className="h-4 w-4" />}
+                    </Button>
+                    {dailyCapacityByDate.get(selectedDate) && (
+                      <span
+                        className={cn(
+                          'inline-flex items-center gap-1 text-xs font-medium',
+                          capacityTone(
+                            dailyCapacityByDate.get(selectedDate)?.remaining ?? 0,
+                            dailyCapacityByDate.get(selectedDate)?.dailyCapacity ?? 1,
+                          ),
+                        )}
+                      >
+                        <Zap className="h-3.5 w-3.5" />
+                        剩餘 {dailyCapacityByDate.get(selectedDate)?.remaining.toLocaleString()}
+                      </span>
                     )}
-                  >
-                    <Zap className="h-3.5 w-3.5" />
-                    剩餘 {dailyCapacityByDate.get(selectedDate)?.remaining.toLocaleString()}
-                  </span>
+                  </div>
+                </div>
+
+                {isSearching && (
+                  <div className="relative">
+                    <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
+                    <input
+                      type="text"
+                      placeholder="輸入單號或客戶名稱..."
+                      value={searchQuery}
+                      onChange={(e) => {
+                        setSearchQuery(e.target.value);
+                      }}
+                      className="w-full rounded-md border border-input bg-background pl-8 pr-3 py-1.5 text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                    />
+                  </div>
                 )}
               </div>
               <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
@@ -909,8 +1026,8 @@ export function OrdersCalendarDialog({
                 </div>
               ) : (
                 <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
-                  {unscheduled.length > 0 ? (
-                    unscheduled.map((order) => (
+                  {filteredUnscheduled.length > 0 ? (
+                    filteredUnscheduled.map((order) => (
                       <UnscheduledOrderLine
                         key={order.id}
                         order={order}

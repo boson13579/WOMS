@@ -13,11 +13,13 @@ from pydantic import BaseModel, Field
 
 __all__ = [
     "CeleryStats",
+    "DbPoolPerReplica",
     "DbPoolStats",
     "EndpointStat",
     "LatencyPercentiles",
     "RedMetricsResponse",
     "RedisStats",
+    "ScheduleLagStats",
     "ServiceHealthDetail",
     "ServiceHealthEntry",
     "SloComplianceResponse",
@@ -26,6 +28,8 @@ __all__ = [
     "UsernamesLookupResponse",
     "WorkerBreakdown",
     "WorkerStatus",
+    "WsConnectionStats",
+    "WsConnectionsPerReplica",
 ]
 
 # Per-worker liveness vocabulary surfaced by ``GET /system/resources``.
@@ -105,13 +109,33 @@ class UsernamesLookupResponse(BaseModel):
 # ``celery: None`` rather than 5xx-ing the whole observability page.
 
 
-class DbPoolStats(BaseModel):
-    """SQLAlchemy ``QueuePool`` snapshot.
+class DbPoolPerReplica(BaseModel):
+    """Single-replica DB pool snapshot inside a multi-pod ``DbPoolStats``.
 
-    ``utilization_pct`` is the high-signal field for the dashboard — it's the
-    only one that lets a human spot pool exhaustion at a glance. Computed as
-    ``checked_out / (size + max_overflow) * 100`` so 100% means every
-    connection (steady-state + burst capacity) is in flight.
+    Each backend pod publishes its own pool counts to Redis (see
+    ``app.services.pod_stats``); the aggregator gathers them into the
+    parent ``DbPoolStats.replicas`` list so the dashboard can show both
+    the cluster-wide total and a per-pod breakdown.
+    """
+
+    pod_id: str
+    size: int
+    checked_out: int
+    overflow: int
+    max_overflow: int
+
+
+class DbPoolStats(BaseModel):
+    """Aggregated SQLAlchemy ``QueuePool`` snapshot across all backend pods.
+
+    ``size`` / ``checked_out`` / ``overflow`` / ``max_overflow`` are
+    cluster-wide sums; ``utilization_pct`` is computed against the summed
+    capacity. ``replicas`` carries the per-pod breakdown so the frontend
+    can render "9 + 7 / 50" and surface uneven nginx LB distribution.
+
+    When per-pod publishes are unavailable (Redis down or fresh deploy),
+    the aggregate falls back to this pod's local snapshot and ``replicas``
+    contains a single entry.
     """
 
     size: int
@@ -119,6 +143,7 @@ class DbPoolStats(BaseModel):
     overflow: int
     max_overflow: int
     utilization_pct: float
+    replicas: list[DbPoolPerReplica] = Field(default_factory=list)
 
 
 class RedisStats(BaseModel):
@@ -127,13 +152,69 @@ class RedisStats(BaseModel):
     All values come from ``redis.info()`` so types are coerced to ``int``
     at the service layer to insulate the DTO from server-version variance
     (some keys come back as bytes / strings depending on driver version).
+
+    ``max_memory_bytes`` is the configured Redis ``maxmemory`` limit; 0
+    means unlimited (the default on docker / local). The frontend uses
+    this as the saturation denominator — historically the dashboard used
+    ``used_memory_peak_bytes`` which made the bar approach 100% as soon
+    as any peak was set (Redis doesn't release memory back to the OS),
+    so the card was permanently red even on a quiet system.
     """
 
     used_memory_bytes: int
     used_memory_peak_bytes: int
+    max_memory_bytes: int = 0
     connected_clients: int
     ops_per_sec: int
     evicted_keys: int
+
+
+class WsConnectionsPerReplica(BaseModel):
+    """Per-pod WebSocket session count.
+
+    Each backend pod owns its WS clients in-memory; the cross-pod total
+    comes from each pod publishing its local count to Redis via
+    ``app.services.pod_stats`` and the aggregator summing the replicas.
+    """
+
+    pod_id: str
+    count: int
+
+
+class WsConnectionStats(BaseModel):
+    """Aggregate live-WebSocket-connection count across backend replicas.
+
+    Replaces the old Celery / Workers card on the observability page —
+    Workers metric was binary (alive/dead) and not actionable; live
+    connections directly visualises "how many dashboards are watching".
+    """
+
+    total: int
+    replicas: list[WsConnectionsPerReplica] = Field(default_factory=list)
+
+
+class ScheduleLagStats(BaseModel):
+    """P50 / P95 / max of compound enqueue → worker commit latency.
+
+    Replaces the SLO KPI card. Sample timestamps live in Redis sorted
+    set ``metrics:schedule_lag`` with 1-hour retention; computation is
+    done at read time. Empty windows return zeros — frontend renders a
+    "no samples yet" state rather than a 404.
+
+    ``data_status`` mirrors ``RedMetricsResponse.data_status``:
+    ``"ok"`` means the (possibly empty) envelope is backed by a healthy
+    Redis read, ``"degraded"`` means we couldn't reach Redis and the
+    zeros are "we don't know", not "no traffic". The frontend uses this
+    to avoid rendering a misleading "no compounds processed" caption
+    during a metrics-availability outage.
+    """
+
+    window_seconds: int
+    sample_count: int
+    p50_ms: int
+    p95_ms: int
+    max_ms: int
+    data_status: Literal["ok", "degraded"] = "ok"
 
 
 class WorkerBreakdown(BaseModel):
@@ -177,11 +258,16 @@ class SystemResourcesResponse(BaseModel):
     degrades that section only — the endpoint stays 200 and the other
     sections still populate. The frontend treats ``None`` here as "we have
     no signal, hide this card" rather than as an error.
+
+    ``celery`` is preserved for backward compatibility with any external
+    consumer (k8s probes, scripts) — the dashboard itself no longer
+    renders a Workers card and reads ``ws_connections`` instead.
     """
 
     db_pool: DbPoolStats | None
     redis: RedisStats | None
     celery: CeleryStats | None
+    ws_connections: WsConnectionStats | None = None
 
 
 # ---------------------------------------------------------------------------

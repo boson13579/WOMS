@@ -27,6 +27,10 @@ vi.mock('@/lib/auth', () => ({
   useCurrentUserId: () => 'u',
 }));
 
+vi.mock('@/features/notifications/api/notifications', () => ({
+  useNotifications: () => ({ data: { items: [], total: 0 } }),
+}));
+
 function renderWithRouter(initial = '/'): void {
   render(
     <MemoryRouter initialEntries={[initial]}>

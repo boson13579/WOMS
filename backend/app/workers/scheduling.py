@@ -37,17 +37,16 @@ import structlog
 from celery import Task
 from redis import Redis
 from redis.exceptions import RedisError, ResponseError
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.audit import record_audit
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.models.order import Order, OrderStatus
 from app.repositories import order as order_repo
-from app.services import notification as notification_service
 from app.services import order as order_service
 from app.services import websocket
+from app.services.compound_finalize import (
+    perform_compound_db_action as _perform_compound_db_action,
+)
 from app.services.schedule_queue import enqueue_notify_user
 from app.services.scheduling import (
     MATERIALIZE_NOTIFY_PENDING_KEY,
@@ -913,292 +912,17 @@ def _drop_compound_index_entry(compound_id: str | None) -> None:
 #
 # P1-2 (PR-14 review): producers (``create_order`` / ``update_order`` /
 # ``delete_order`` / ``batch_update_orders``) no longer commit the actual
-# user-facing column writes (new ``wafer_quantity`` /
-# ``requested_delivery_date`` / ``notes`` / ``is_deleted`` / etc.). They
-# only write the ``is_processing_locked=True`` flag and embed a
-# ``CompoundDbAction`` in the compound. The worker — which is the single
-# authority on whether the in-memory ``SchedulerState`` accepted the
-# change — executes the matching DB write here.
+# user-facing column writes. They write only ``is_processing_locked=True``
+# + a ``CompoundDbAction`` payload; the worker (or the cancel endpoint —
+# see ``app/services/schedule_queue.py::cancel_compound``) finalizes the
+# DB side via :func:`perform_compound_db_action`.
 #
-# Why: pre-P1-2 a rejected compound (capacity_exceeded / deadline_too_far)
-# would leave DB with new values while state had rolled back to the old —
-# permanently divergent until manual rebuild. With this handler the DB
-# write only happens when state has actually accepted; on reject the
-# producer's lock is cleared and DB columns remain at their pre-PATCH
-# values.
-
-
-def _perform_compound_db_action(
-    compound: dict[str, Any],
-    *,
-    accepted: bool,
-) -> None:
-    """Execute the compound's ``db_action`` after state has settled.
-
-    Idempotent at the row level: if the order disappeared between
-    enqueue and execution (e.g. a follow-up DELETE landed first), this
-    function logs a warning and returns without raising.
-
-    Branch matrix:
-
-    ``kind="create"``:
-      - accepted: no-op (producer pre-created the row; materializer
-        will fill scheduling cols).
-      - rejected: orphan cleanup — set ``is_deleted=True`` and
-        ``status=cancelled`` so the row exits user-visible queries.
-
-    ``kind="update"``:
-      - accepted: write the new ``wafer_quantity`` /
-        ``requested_delivery_date`` / ``notes`` / ``assigned_to`` from
-        ``db_action.new_*``; clear lock; emit ``order.updated`` audit
-        record with the diff.
-      - rejected: clear lock; restore ``status`` to ``scheduled`` if
-        the row has a ``scheduled_production_date`` (which means it
-        was already accepted into the schedule before this PATCH), or
-        ``pending`` otherwise. DB columns themselves stay at pre-PATCH
-        values because the producer never wrote them.
-
-    ``kind="delete"``:
-      - accepted: soft-delete (``is_deleted=True``,
-        ``status=cancelled``); clear lock; emit ``order.cancelled``
-        audit record.
-      - rejected: clear lock; status restoration mirrors update.
-    """
-    db_action_raw = compound.get("db_action")
-    if not db_action_raw:
-        return  # legacy / internally-generated compound
-
-    kind = db_action_raw["kind"]
-    actor_id_raw = db_action_raw["actor_id"]
-    actor_id = uuid.UUID(actor_id_raw) if actor_id_raw else None
-
-    ops = compound.get("ops") or []
-    if not ops:
-        logger.warning("schedule.db_action.no_ops", compound_id=compound.get("compound_id"))
-        return
-    # All ops in a producer-generated compound target the same order_id.
-    order_id = uuid.UUID(ops[0]["order_id"])
-
-    db: Session = SessionLocal()
-    try:
-        order = db.scalars(select(Order).where(Order.id == order_id)).first()
-        if order is None:
-            logger.warning(
-                "schedule.db_action.missing_order",
-                order_id=str(order_id),
-                kind=kind,
-            )
-            return
-
-        # Capture before commit — attributes expire after Session.commit().
-        _order_number = order.order_number
-        _created_by = order.created_by
-        _oid = order.id
-
-        if accepted:
-            _apply_db_action_accept(db, order, kind, db_action_raw, actor_id)
-        else:
-            _apply_db_action_reject(order, kind)
-
-        db.commit()
-
-        # Send cancellation notification after commit (best-effort).
-        # Triggers for: explicit user delete accepted, or orphan create rejected.
-        _is_cancel = (kind == "delete" and accepted) or (kind == "create" and not accepted)
-        if _is_cancel:
-            try:
-                notification_service.create_notification(
-                    db,
-                    user_id=_created_by,
-                    order_id=_oid,
-                    type="order_cancelled",
-                    message=f"訂單 {_order_number} 已被取消",
-                )
-            except Exception:
-                logger.warning(
-                    "notification.create_failed",
-                    order_id=str(_oid),
-                    user_id=str(_created_by),
-                    exc_info=True,
-                )
-    finally:
-        db.close()
-
-
-def _apply_db_action_accept(
-    db: Session,
-    order: Order,
-    kind: str,
-    db_action: dict[str, Any],
-    actor_id: uuid.UUID | None,
-) -> None:
-    """Write the success-path DB changes for an accepted compound.
-
-    Audit logs are emitted here (not at producer time) so the audit
-    timestamp reflects when the change was actually committed.
-    """
-    if kind == "create":
-        # Producer already inserted the row + wrote the ``order.created``
-        # audit. Worker only clears the in-flight lock so the row becomes
-        # editable again; the materializer's apply_schedule will set
-        # ``status=scheduled`` and fill the scheduling columns.
-        order.is_processing_locked = False
-        return
-
-    if kind == "update":
-        old_value: dict[str, Any] = {
-            "wafer_quantity": order.wafer_quantity,
-            "requested_delivery_date": str(order.requested_delivery_date),
-            "notes": order.notes,
-            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
-            "is_pinned": order.is_pinned,
-            "pinned_production_date": (
-                str(order.pinned_production_date)
-                if order.pinned_production_date is not None
-                else None
-            ),
-        }
-        new_qty = db_action.get("new_wafer_quantity")
-        if new_qty is not None:
-            order.wafer_quantity = int(new_qty)
-        new_dl = db_action.get("new_requested_delivery_date")
-        if new_dl is not None:
-            order.requested_delivery_date = date.fromisoformat(str(new_dl))
-        if db_action.get("new_notes_set"):
-            order.notes = db_action.get("new_notes")
-        if db_action.get("new_assigned_to_set"):
-            raw_assignee = db_action.get("new_assigned_to")
-            order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
-        # Pin columns: only touch when producer asked us to. ``_set=False``
-        # means "client didn't change pin status" — leave is_pinned /
-        # pinned_production_date alone so the auto-re-pin / silent-drop
-        # logic in the algorithm's pin_order / unpin_order calls stays
-        # authoritative on the in-memory side (DB matches whatever
-        # apply_schedule writes next).
-        if db_action.get("new_pinned_production_date_set"):
-            raw_pin_day = db_action.get("new_pinned_production_date")
-            if raw_pin_day is None:
-                order.is_pinned = False
-                order.pinned_production_date = None
-            else:
-                order.is_pinned = True
-                order.pinned_production_date = date.fromisoformat(str(raw_pin_day))
-        order.is_processing_locked = False
-        new_value: dict[str, Any] = {
-            "wafer_quantity": order.wafer_quantity,
-            "requested_delivery_date": str(order.requested_delivery_date),
-            "notes": order.notes,
-            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
-            "is_pinned": order.is_pinned,
-            "pinned_production_date": (
-                str(order.pinned_production_date)
-                if order.pinned_production_date is not None
-                else None
-            ),
-        }
-        _worker_audit(
-            db,
-            action="order.updated",
-            actor_id=actor_id,
-            order_id=order.id,
-            old_value=old_value,
-            new_value=new_value,
-        )
-        return
-
-    if kind == "delete":
-        # N-5: capture the full pre-delete view in the audit row.
-        # ``_build_delete_compound`` already snapshotted these into
-        # ``db_action.old_*`` at producer time; before round-2 the worker
-        # didn't read them and just logged ``status`` + ``is_deleted``,
-        # making it impossible to answer "what was the qty / deadline /
-        # notes when this order got cancelled?" without consulting the
-        # full row history. Pulling the snapshot into the audit row makes
-        # the history self-contained.
-        old_value = {
-            "status": order.status.value,
-            "is_deleted": False,
-            "wafer_quantity": db_action.get("old_wafer_quantity"),
-            "requested_delivery_date": db_action.get("old_requested_delivery_date"),
-            "notes": db_action.get("old_notes"),
-            "assigned_to": db_action.get("old_assigned_to"),
-        }
-        order.is_deleted = True
-        order.status = OrderStatus.cancelled
-        order.is_processing_locked = False
-        _worker_audit(
-            db,
-            action="order.cancelled",
-            actor_id=actor_id,
-            order_id=order.id,
-            old_value=old_value,
-        )
-        return
-
-
-def _apply_db_action_reject(order: Order, kind: str) -> None:
-    """Compensate for a rejected compound: clear lock; for create, orphan-cleanup.
-
-    For update/delete the DB columns the user wanted to change were
-    never written by the producer, so "rollback" reduces to clearing
-    the lock and snapping ``status`` back to whatever the row's actual
-    schedule presence implies (scheduled vs pending). For create the
-    producer DID write a stub row, so we soft-delete it.
-
-    N-4 round-2 guard: never demote ``in_production`` here. Today the
-    producer-side ``MUTABLE_STATUSES`` check already blocks PATCH /
-    DELETE on an in-production row, so this branch is unreachable in
-    practice. But if a future change opens up partial mutation (e.g.
-    "you can change notes on a row that's mid-production"), the
-    unconditional ``order.status = scheduled`` write below would
-    silently demote the row mid-shift and break the same downstream
-    invariant ``set_schedule_dates`` defends against (§4.4). Cheaper
-    to defend here than to forget when MUTABLE_STATUSES is relaxed.
-    """
-    if kind == "create":
-        order.is_deleted = True
-        order.status = OrderStatus.cancelled
-        order.is_processing_locked = False
-        return
-
-    # update / delete: just unlock and restore status.
-    order.is_processing_locked = False
-    if order.status == OrderStatus.in_production:
-        # Defensive — see docstring.
-        return
-    if order.scheduled_production_date is not None:
-        order.status = OrderStatus.scheduled
-    else:
-        order.status = OrderStatus.pending
-
-
-def _worker_audit(
-    db: Session,
-    *,
-    action: str,
-    actor_id: uuid.UUID | None,
-    order_id: uuid.UUID,
-    old_value: dict[str, Any] | None = None,
-    new_value: dict[str, Any] | None = None,
-) -> None:
-    """Write an audit row + ECS stdout record from inside the worker.
-
-    Thin wrapper around :func:`app.core.audit.record_audit` that keeps the
-    ``actor_id`` / ``order_id`` signature contract — the worker doesn't
-    load the ``User`` row, the id rides in the compound's ``db_action``
-    payload, so we take a raw UUID instead of the ``actor: User`` shape
-    used by ``services/order._write_audit``.
-    """
-    record_audit(
-        db,
-        action=action,
-        actor_id=actor_id,
-        resource_type="order",
-        resource_id=order_id,
-        old_value=old_value,
-        new_value=new_value,
-    )
-
+# The shared implementation lives in :mod:`app.services.compound_finalize`
+# (imported at the top of this file as
+# ``_perform_compound_db_action``). Without that sharing, cancelling a
+# queued compound left the producer's pre-write stranded
+# (``is_processing_locked=True`` forever) — see the module docstring
+# there for the full motivation.
 
 # ---------------------------------------------------------------------------
 # Tasks

@@ -25,8 +25,11 @@ interface UseResourceCardProps {
   detail?: string | undefined;
   /** Utilization ratio in ``[0, 1]``; controls bar width + colour. */
   ratio?: number | null | undefined;
-  /** Suffix under the bar (e.g. ``"10 % used"``). */
-  caption?: string | undefined;
+  /**
+   * Suffix under the bar. ``string`` renders one line; ``string[]``
+   * renders each entry as its own line (e.g. one per replica pod).
+   */
+  caption?: string | string[] | undefined;
   /** Optional drilldown content rendered after the bar / caption. */
   expandable?: ReactNode | undefined;
   /**
@@ -34,6 +37,14 @@ interface UseResourceCardProps {
    * a sensible "Probe unreachable" line.
    */
   unreachableMessage?: string | undefined;
+  /**
+   * When ``true``, the utilization bar slot is omitted entirely (no
+   * dashed placeholder either). Use for cards that have no natural
+   * saturation denominator — e.g. Live Connections (no upper bound on
+   * "how many dashboards are watching"), or Redis on a local docker
+   * setup where ``maxmemory=0`` (no cap configured).
+   */
+  hideBar?: boolean;
 }
 
 const UNREACHABLE_DEFAULT = 'Probe unreachable.';
@@ -46,6 +57,7 @@ export function UseResourceCard({
   caption,
   expandable,
   unreachableMessage = UNREACHABLE_DEFAULT,
+  hideBar = false,
 }: UseResourceCardProps): JSX.Element {
   const isUnreachable = value === null;
   // Clamp ratio so a borked backend value can't paint a 200%-wide bar.
@@ -71,34 +83,44 @@ export function UseResourceCard({
           {detail ? <span className="text-xs text-muted-foreground">{detail}</span> : null}
         </div>
 
-        <div
-          className="h-2 w-full overflow-hidden rounded-full bg-secondary"
-          role="progressbar"
-          aria-valuenow={isUnreachable ? undefined : widthPct}
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-label={`${label} utilization`}
-        >
-          {clampedRatio === null ? (
-            <div
-              data-testid="util-bar-dashed"
-              className="h-full w-full bg-muted-foreground/20 [background-image:repeating-linear-gradient(45deg,transparent,transparent_4px,hsl(var(--border))_4px,hsl(var(--border))_8px)]"
-            />
-          ) : (
-            <div
-              data-testid="util-bar-fill"
-              className={cn('h-full transition-all', isHot ? 'bg-destructive' : 'bg-primary')}
-              style={{ width: `${widthPct}%` }}
-            />
-          )}
-        </div>
+        {hideBar ? null : (
+          <div
+            className="h-2 w-full overflow-hidden rounded-full bg-secondary"
+            role="progressbar"
+            aria-valuenow={isUnreachable ? undefined : widthPct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label={`${label} utilization`}
+          >
+            {clampedRatio === null ? (
+              <div
+                data-testid="util-bar-dashed"
+                className="h-full w-full bg-muted-foreground/20 [background-image:repeating-linear-gradient(45deg,transparent,transparent_4px,hsl(var(--border))_4px,hsl(var(--border))_8px)]"
+              />
+            ) : (
+              <div
+                data-testid="util-bar-fill"
+                className={cn('h-full transition-all', isHot ? 'bg-destructive' : 'bg-primary')}
+                style={{ width: `${widthPct}%` }}
+              />
+            )}
+          </div>
+        )}
 
         {isUnreachable ? (
           <p className="text-xs text-muted-foreground">{unreachableMessage}</p>
         ) : null}
-        {!isUnreachable && caption ? (
-          <p className="text-xs text-muted-foreground">{caption}</p>
-        ) : null}
+        {!isUnreachable && caption
+          ? (Array.isArray(caption) ? caption : [caption]).map((line) => (
+              // Caption lines are derived from stable sources that
+              // already embed the per-replica pod_id slice, so each
+              // line string is unique within a render and works as a
+              // stable React key.
+              <p key={line} className="text-xs text-muted-foreground">
+                {line}
+              </p>
+            ))
+          : null}
 
         {expandable ? <div className="pt-1">{expandable}</div> : null}
       </CardContent>

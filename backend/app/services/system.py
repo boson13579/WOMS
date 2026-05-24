@@ -43,6 +43,7 @@ from app.core.db import get_pool_stats
 from app.models.user import User
 from app.schemas.system import (
     CeleryStats,
+    DbPoolPerReplica,
     DbPoolStats,
     RedisStats,
     ServiceHealthDetail,
@@ -52,6 +53,13 @@ from app.schemas.system import (
     UsernamesLookupResponse,
     WorkerBreakdown,
     WorkerStatus,
+    WsConnectionsPerReplica,
+    WsConnectionStats,
+)
+from app.services.pod_stats import (
+    aggregate_pod_stats,
+    get_pod_id,
+    publish_pod_stats,
 )
 from app.workers.celery_app import celery_app
 
@@ -445,12 +453,61 @@ def _get_db_pool_stats() -> DbPoolStats | None:
         return None
     if raw is None:
         return None
+
+    # Publish this pod's snapshot, then aggregate every published replica
+    # from Redis. The current pod's snapshot is included via the publish
+    # we just did, so single-replica deployments still see consistent
+    # numbers; multi-replica deployments now see the cluster-wide sum.
+    local = {
+        "size": int(raw["size"]),
+        "checked_out": int(raw["checked_out"]),
+        "overflow": int(raw["overflow"]),
+        "max_overflow": int(raw["max_overflow"]),
+    }
+    publish_pod_stats("db_pool", local)
+    snapshots = aggregate_pod_stats("db_pool")
+
+    # Fall back to local-only when Redis publish/aggregate failed —
+    # better to show this pod's slice than nothing at all.
+    if not snapshots:
+        snapshots = [{"pod_id": get_pod_id(), **local}]
+
+    # Defensive parse: each snapshot is JSON deserialised from Redis,
+    # so a stale write from an older pod schema (missing field, wrong
+    # type) shouldn't break the whole endpoint. Skip the bad ones and
+    # keep going so one bad replica degrades to absence rather than 500.
+    replicas: list[DbPoolPerReplica] = []
+    for s in snapshots:
+        try:
+            replicas.append(
+                DbPoolPerReplica(
+                    pod_id=str(s["pod_id"]),
+                    size=int(s["size"]),
+                    checked_out=int(s["checked_out"]),
+                    overflow=int(s["overflow"]),
+                    max_overflow=int(s["max_overflow"]),
+                )
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("system.resources.db_pool.bad_snapshot", error=str(exc), snapshot=s)
+    # Sort for stable rendering — pod_id is the only intrinsic ordering
+    # we have without dragging cluster topology in.
+    replicas.sort(key=lambda r: r.pod_id)
+
+    total_size = sum(r.size for r in replicas)
+    total_checked_out = sum(r.checked_out for r in replicas)
+    total_overflow = sum(r.overflow for r in replicas)
+    total_max_overflow = sum(r.max_overflow for r in replicas)
+    capacity = max(total_size + total_max_overflow, 1)
+    utilization_pct = round(total_checked_out / capacity * 100, 1)
+
     return DbPoolStats(
-        size=int(raw["size"]),
-        checked_out=int(raw["checked_out"]),
-        overflow=int(raw["overflow"]),
-        max_overflow=int(raw["max_overflow"]),
-        utilization_pct=float(raw["utilization_pct"]),
+        size=total_size,
+        checked_out=total_checked_out,
+        overflow=total_overflow,
+        max_overflow=total_max_overflow,
+        utilization_pct=utilization_pct,
+        replicas=replicas,
     )
 
 
@@ -481,6 +538,11 @@ def _get_redis_stats() -> RedisStats | None:
         return RedisStats(
             used_memory_bytes=int(info_mem.get("used_memory", 0)),
             used_memory_peak_bytes=int(info_mem.get("used_memory_peak", 0)),
+            # ``maxmemory == 0`` is the Redis convention for "no cap"
+            # (the docker / local default). Frontend uses this to decide
+            # whether to render a saturation bar at all — without a cap
+            # there is no meaningful denominator.
+            max_memory_bytes=int(info_mem.get("maxmemory", 0)),
             connected_clients=int(info_clients.get("connected_clients", 0)),
             ops_per_sec=int(info_stats.get("instantaneous_ops_per_sec", 0)),
             evicted_keys=int(info_stats.get("evicted_keys", 0)),
@@ -578,6 +640,55 @@ def _get_celery_stats() -> CeleryStats | None:
     )
 
 
+def _get_ws_connection_stats() -> WsConnectionStats | None:
+    """Aggregate WebSocket session count across backend replicas.
+
+    Each backend pod owns its WS clients in-memory (see
+    ``app/api/v1/websocket.py::ConnectionManager``); the local count is
+    published to Redis here as a side-effect, then we sum across every
+    published replica. Single-pod or Redis-down deployments still see
+    a meaningful number via the local-only fallback.
+
+    Returns ``None`` only when we couldn't import the manager (which
+    only happens during certain test configurations) — production
+    always returns a populated envelope.
+    """
+    # Local import: ``ConnectionManager`` lives in ``app.api.v1.websocket``
+    # (the WS endpoint module), so a top-level ``from app.api.v1...``
+    # would invert the api→services layering. Importing at call-time
+    # keeps the layer dependency contained to this one function. Move
+    # the manager into ``app.services.websocket`` if you want this
+    # cleaner; for now noqa with rationale.
+    try:
+        from app.api.v1.websocket import get_connection_manager  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("system.resources.ws.import_failed", error=str(exc))
+        return None
+
+    local_count = get_connection_manager().total_connections()
+    publish_pod_stats("ws", {"count": local_count})
+    snapshots = aggregate_pod_stats("ws")
+    if not snapshots:
+        snapshots = [{"pod_id": get_pod_id(), "count": local_count}]
+
+    # Defensive parse — same rationale as db_pool aggregation: skip
+    # any malformed published snapshot instead of 500-ing the endpoint.
+    ws_replicas: list[WsConnectionsPerReplica] = []
+    for s in snapshots:
+        try:
+            ws_replicas.append(
+                WsConnectionsPerReplica(pod_id=str(s["pod_id"]), count=int(s["count"]))
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("system.resources.ws.bad_snapshot", error=str(exc), snapshot=s)
+    ws_replicas.sort(key=lambda r: r.pod_id)
+
+    return WsConnectionStats(
+        total=sum(r.count for r in ws_replicas),
+        replicas=ws_replicas,
+    )
+
+
 def gather_resources() -> SystemResourcesResponse:
     """Compose the USE resources response from each per-section probe.
 
@@ -590,6 +701,7 @@ def gather_resources() -> SystemResourcesResponse:
         db_pool=_get_db_pool_stats(),
         redis=_get_redis_stats(),
         celery=_get_celery_stats(),
+        ws_connections=_get_ws_connection_stats(),
     )
 
 

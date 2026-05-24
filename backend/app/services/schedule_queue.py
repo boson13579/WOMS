@@ -26,6 +26,7 @@ otherwise arise (``workers.scheduling`` already imports
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from enum import StrEnum
 from functools import lru_cache
@@ -137,6 +138,10 @@ def enqueue_compound(compound: ScheduleCompoundRequest) -> None:
 
     payload = compound.model_dump(mode="json")
     payload["_seq"] = seq
+    # Stamp enqueue time so ``compound_finalize`` can compute end-to-end
+    # pipeline lag on commit. Internal key (``_`` prefix) like ``_seq``;
+    # consumed by ``app.services.schedule_lag``.
+    payload["_enqueued_at_ms"] = int(time.time() * 1000)
     member = json.dumps(payload)
 
     score = score_for_op(group=compound.group, seq=seq)
@@ -173,10 +178,32 @@ def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
     the index entry (worker's best-effort cleanup may already have
     fired, but defensive cleanup is cheap).
 
+    **DB compensation**: when ZREM succeeds, the producer's pre-write
+    (``is_processing_locked=True`` plus, for ``create``, the orphan row)
+    is still in the DB and won't be touched by the worker (the compound
+    is gone from the queue). We replay the same rejection/cancellation
+    finalize path the worker would have run for ``db_action(accepted=
+    False)``: ``create`` compounds are marked cancelled but remain
+    visible (for example, ``status=cancelled`` and ``is_deleted=False``),
+    while ``update``/``delete`` restore status and clear the processing
+    lock. Without this, a cancelled create leaves the row stuck in
+    ``is_processing_locked=True`` with no recovery path; cancelled
+    update/delete leaves status pinned to ``pending`` even though the
+    row was previously ``scheduled``.
+
     On successful cancel, emits ``schedule.compound_cancelled`` to the
     compound's ``requested_by`` so the frontend can clear any optimistic
     UI state (e.g., re-enable a "Cancel" button or restore an indicator).
     """
+    # Lazy import to avoid a circular dependency: ``compound_finalize`` is
+    # in ``app.services`` and so is this module; importing at top would
+    # pull in ``app.services.notification`` → ``app.services.websocket``
+    # which fan in here. Function-level import is fine — cancel is a
+    # cold-ish path (user-initiated).
+    from app.services.compound_finalize import (  # noqa: PLC0415 — lazy by design
+        perform_compound_db_action,
+    )
+
     rds = _redis()
     compound_id_str = str(compound_id)
 
@@ -204,12 +231,48 @@ def cancel_compound(compound_id: uuid.UUID) -> CancelResult:
         )
         return CancelResult.in_progress
 
-    # Successfully removed from queue. Notify the requester.
+    # Parse the compound payload — needed for both db_action compensation
+    # and for the requested_by recipient on the WS notification.
     try:
         payload = json.loads(member_raw)
-        requested_by_raw = payload.get("requested_by")
     except json.JSONDecodeError:
-        requested_by_raw = None
+        logger.warning(
+            "schedule.compound.cancel_unparseable_member",
+            compound_id=compound_id_str,
+        )
+        payload = {}
+
+    # Compensate the producer's pre-write. Idempotent + safe on
+    # already-clean rows (the helper is a no-op if no db_action / no
+    # matching order). Done BEFORE the WS notification so the frontend
+    # never sees "cancelled" while the row is still locked.
+    #
+    # **Failure mode: raise, do NOT send WS.** Earlier the code logged
+    # + continued, which sent the user a "cancelled" notification while
+    # the row stayed ``is_processing_locked=True`` — exactly the bug
+    # that compensation was added to fix, re-introduced on the error
+    # path. If compensation fails we propagate the exception:
+    #
+    # * The endpoint returns 500, the frontend keeps the "processing"
+    #   state, the user knows something went wrong.
+    # * No ``schedule.compound_cancelled`` WS event fires — frontend
+    #   never sees a false success.
+    # * The Redis queue is already drained at this point (the ZREM
+    #   above succeeded), so a retry will 404 on the missing index
+    #   entry — that's fine; the row is stuck and ops needs to clean it.
+    #   We log loudly to make sure this surfaces in monitoring.
+    try:
+        perform_compound_db_action(payload, accepted=False)
+    except Exception:
+        logger.exception(
+            "schedule.compound.cancel_db_action_failed",
+            compound_id=compound_id_str,
+            row_state="locked_orphaned_in_db",
+        )
+        raise
+
+    # Successfully removed from queue. Notify the requester.
+    requested_by_raw = payload.get("requested_by")
     if requested_by_raw:
         websocket.notify_user(
             user_id=uuid.UUID(requested_by_raw),

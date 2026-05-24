@@ -20,9 +20,9 @@ const mockScheduleCapacity = {
     base_date: '2026-05-09',
     daily_capacity: 2500,
     entries: [
-      { date: '2026-05-09', cumulative_remaining: 1500 },
-      { date: '2026-05-10', cumulative_remaining: 2500 },
-      { date: '2026-05-11', cumulative_remaining: 2500 },
+      { date: '2026-05-09', used: 1000, remaining: 1500 },
+      { date: '2026-05-10', used: 1500, remaining: 1000 },
+      { date: '2026-05-11', used: 2500, remaining: 0 },
     ],
   } as ScheduleCapacity | undefined,
   isPending: false,
@@ -67,16 +67,14 @@ vi.mock('../api/scheduleResult', () => ({
 vi.mock('../api/scheduleCapacity', () => ({
   toDailyCapacity: (capacity: {
     daily_capacity: number;
-    entries: { date: string; cumulative_remaining: number }[];
+    entries: { date: string; used: number; remaining: number }[];
   }) =>
-    capacity.entries.map((entry, index) => {
-      const previous = index === 0 ? 0 : capacity.entries[index - 1].cumulative_remaining;
-      return {
-        date: entry.date,
-        remaining: entry.cumulative_remaining - previous,
-        dailyCapacity: capacity.daily_capacity,
-      };
-    }),
+    capacity.entries.map((entry) => ({
+      date: entry.date,
+      used: entry.used,
+      remaining: entry.remaining,
+      dailyCapacity: capacity.daily_capacity,
+    })),
   useScheduleCapacity: () => mockScheduleCapacity,
 }));
 
@@ -110,7 +108,13 @@ function setServerBaseDate(baseDate: string): void {
   mockScheduleCapacity.data = { ...mockScheduleCapacity.data, base_date: baseDate };
 }
 
-const scheduledOrder: ScheduleResult = {
+// Order whose production day == base_date. Under the "day 1 (today) is
+// locked" rule, any order actually being produced today has already been
+// flipped to ``status='in_production'`` by ``advance_day_task`` — only
+// in-flight rows have a ``daily_breakdown`` entry on ``base_date``. The
+// calendar uses ``status`` (not date math) to pick the badge, so the
+// data shape below is the realistic post-rule snapshot.
+const inProductionOrder: ScheduleResult = {
   id: '11111111-1111-4111-8111-111111111111',
   order_number: 'ORD-20260504-0001',
   customer_name: 'TSMC',
@@ -118,7 +122,7 @@ const scheduledOrder: ScheduleResult = {
   requested_delivery_date: '2026-06-01',
   scheduled_production_date: '2026-05-09',
   expected_delivery_date: '2026-05-10',
-  status: 'scheduled',
+  status: 'in_production',
   daily_breakdown: [{ date: '2026-05-09', quantity: 500 }],
 };
 
@@ -149,24 +153,29 @@ const secondPendingOrder: Order = {
   customer_name: 'UMC',
 };
 
-const scheduledOrderDetail: Order = {
+const inProductionOrderDetail: Order = {
   ...pendingOrder,
-  id: scheduledOrder.id,
-  order_number: scheduledOrder.order_number,
-  customer_name: scheduledOrder.customer_name,
-  wafer_quantity: scheduledOrder.wafer_quantity,
-  requested_delivery_date: scheduledOrder.requested_delivery_date,
-  scheduled_production_date: scheduledOrder.scheduled_production_date,
-  expected_delivery_date: scheduledOrder.expected_delivery_date,
-  status: 'scheduled',
+  id: inProductionOrder.id,
+  order_number: inProductionOrder.order_number,
+  customer_name: inProductionOrder.customer_name,
+  wafer_quantity: inProductionOrder.wafer_quantity,
+  requested_delivery_date: inProductionOrder.requested_delivery_date,
+  scheduled_production_date: inProductionOrder.scheduled_production_date,
+  expected_delivery_date: inProductionOrder.expected_delivery_date,
+  status: 'in_production',
 };
 
-const splitScheduledOrder: ScheduleResult = {
-  ...scheduledOrder,
+// Multi-day in-flight order: status=in_production lets the date-refinement
+// branch pick "已完成" / "生產中" / "已排程" per day. With status=scheduled,
+// every row would render as "已排程" (correct under the new rule, but
+// doesn't exercise the multi-day visualization).
+const splitInProductionOrder: ScheduleResult = {
+  ...inProductionOrder,
   id: '44444444-4444-4444-8444-444444444444',
   order_number: 'ORD-20260504-0004',
   customer_name: 'ASE',
   wafer_quantity: 2500,
+  status: 'in_production',
   daily_breakdown: [
     { date: '2026-05-10', quantity: 1000 },
     { date: '2026-05-11', quantity: 1500 },
@@ -184,20 +193,25 @@ describe('OrdersCalendarDialog', () => {
       base_date: '2026-05-09',
       daily_capacity: 2500,
       entries: [
-        { date: '2026-05-09', cumulative_remaining: 1500 },
-        { date: '2026-05-10', cumulative_remaining: 2500 },
-        { date: '2026-05-11', cumulative_remaining: 2500 },
+        { date: '2026-05-09', used: 1000, remaining: 1500 },
+        { date: '2026-05-10', used: 1500, remaining: 1000 },
+        { date: '2026-05-11', used: 2500, remaining: 0 },
       ],
     };
     mockScheduleCapacity.isPending = false;
     mockScheduleCapacity.isError = false;
-    mockScheduleResult.data = [scheduledOrder];
+    mockScheduleResult.data = [inProductionOrder];
     mockScheduleResult.isPending = false;
     mockScheduleResult.isError = false;
     mockOrders.data = { items: [pendingOrder], total: 1, page: 1, page_size: 100 };
     mockOrders.isPending = false;
     mockOrders.isError = false;
-    mockScheduledOrders.data = { items: [scheduledOrderDetail], total: 1, page: 1, page_size: 100 };
+    mockScheduledOrders.data = {
+      items: [inProductionOrderDetail],
+      total: 1,
+      page: 1,
+      page_size: 100,
+    };
     mockScheduledOrders.isPending = false;
     mockScheduledOrders.isFetching = false;
     mockScheduledOrders.isSuccess = true;
@@ -234,19 +248,19 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText(/MediaTek/)).toBeInTheDocument();
   });
 
-  it('does not render date-based production states before server base_date is loaded', () => {
+  it('renders calendar rows while server base_date is loading', () => {
     mockScheduleCapacity.data = undefined;
     mockScheduleCapacity.isPending = true;
 
     renderDialog();
 
     expect(screen.getByText('載入日曆中...')).toBeInTheDocument();
-    expect(screen.queryByText('ORD-20260504-0001')).not.toBeInTheDocument();
+    expect(screen.getByText('ORD-20260504-0001')).toBeInTheDocument();
   });
 
   it('shows split production progress across production dates', async () => {
     const user = userEvent.setup();
-    mockScheduleResult.data = [splitScheduledOrder];
+    mockScheduleResult.data = [splitInProductionOrder];
     setServerBaseDate('2026-05-10');
     renderDialog();
 
@@ -265,7 +279,7 @@ describe('OrdersCalendarDialog', () => {
 
   it('shows split production as completed when base_date is past the final production date', async () => {
     const user = userEvent.setup();
-    mockScheduleResult.data = [splitScheduledOrder];
+    mockScheduleResult.data = [splitInProductionOrder];
     setServerBaseDate('2026-05-12');
     renderDialog();
 
@@ -278,7 +292,7 @@ describe('OrdersCalendarDialog', () => {
     // the 2,500-wafer order has been produced by then. The row must NOT
     // show "已完成" — earlier slices of an in-flight split stay 生產中.
     const user = userEvent.setup();
-    mockScheduleResult.data = [splitScheduledOrder];
+    mockScheduleResult.data = [splitInProductionOrder];
     setServerBaseDate('2026-05-11');
     renderDialog();
 
@@ -292,7 +306,7 @@ describe('OrdersCalendarDialog', () => {
     const user = userEvent.setup();
     vi.setSystemTime(new Date('2026-05-12T00:00:00Z'));
     setServerBaseDate('2026-05-10');
-    mockScheduleResult.data = [splitScheduledOrder];
+    mockScheduleResult.data = [splitInProductionOrder];
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));

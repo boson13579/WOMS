@@ -90,7 +90,7 @@ describe('usePinScheduleOperation (PATCH /orders/{id} flow)', () => {
     });
 
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['orders'] });
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['schedule', 'capacity'] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['schedule', 'capacity-usage'] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['schedule', 'result'] });
   });
 
