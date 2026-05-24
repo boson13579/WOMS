@@ -222,4 +222,19 @@ describe('OrderFilters', () => {
     expect(screen.queryByRole('combobox', { name: /搜尋負責人/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('combobox', { name: /搜尋建立者/ })).not.toBeInTheDocument();
   });
+
+  it('clears stale assignedTo/createdBy from the store when role cannot use user filters', () => {
+    // Reproduces the post-PR-review concern: a writable role sets an
+    // assignee filter, then the session downgrades to viewer. The viewer
+    // sees no input to clear the filter, but the table is still being
+    // filtered. Mounting OrderFilters in viewer mode must wipe the store.
+    mockStore.assignedTo = ['u-1'];
+    mockStore.createdBy = ['u-2'];
+    authMocks.canWrite = false;
+
+    render(<OrderFilters />);
+
+    expect(mockSetAssignedTo).toHaveBeenCalledWith([]);
+    expect(mockSetCreatedBy).toHaveBeenCalledWith([]);
+  });
 });

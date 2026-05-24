@@ -46,6 +46,16 @@ export function OrderFilters(): JSX.Element {
   const users = useAssignableUsers();
   const canUseUserFilters = useCanWrite();
 
+  // If the current role can no longer use the user-pickers (e.g. session
+  // role downgrades from order_manager → viewer mid-session), clear any
+  // assignee/creator filter the store still carries. Otherwise the table
+  // stays filtered but the viewer has no UI to clear it.
+  useEffect(() => {
+    if (canUseUserFilters) return;
+    if (assignedTo.length > 0) setAssignedTo([]);
+    if (createdBy.length > 0) setCreatedBy([]);
+  }, [canUseUserFilters, assignedTo, createdBy, setAssignedTo, setCreatedBy]);
+
   // Debounce the search input by 300 ms to avoid spamming the API.
   const [localSearch, setLocalSearch] = useState(search);
   useEffect(() => {
