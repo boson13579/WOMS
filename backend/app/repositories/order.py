@@ -273,10 +273,7 @@ def set_schedule_dates(
     """Mark an order as scheduled with full materialized per-day info.
 
     Writes the summary dates, the JSONB ``daily_breakdown`` (per-day
-    quantity split) and the pin columns. ``is_processing_locked`` is
-    always cleared — landing in ``apply_schedule`` means the worker has
-    finished its op for this order and the frontend may unlock the row
-    for editing again.
+    quantity split) and the pin columns.
 
     ``daily_breakdown`` is expected to be a chronologically-sorted list of
     ``{"date": "YYYY-MM-DD", "quantity": int}`` dicts. Pass ``None`` (or
@@ -285,18 +282,39 @@ def set_schedule_dates(
     materializer always passes a non-empty list since the order is by
     definition currently scheduled.
 
-    **Status preservation for in_production**: this function flips
-    ``status`` to ``scheduled`` only when the current status is NOT
-    ``in_production``. Once ``advance_day_task::mark_in_production``
-    promotes an order's status to ``in_production``, the materializer
-    can still freely re-write its scheduling columns (the boundary case
-    where today's portion finished and the remainder is rolled into
-    tomorrow) but MUST NOT demote it back to ``scheduled``. Demoting
-    would (1) silently flip the frontend's "currently producing" flag
-    to "queued" mid-shift and (2) cause
-    ``mark_completed_outside_set`` (which only collects rows with
-    ``status='in_production'``) to skip the order on completion,
-    leaving it stuck in ``scheduled`` forever.
+    **Status preservation for terminal / in_production statuses**: this
+    function flips ``status`` to ``scheduled`` only when the current
+    status is NOT in ``(in_production, cancelled)``.
+
+    - ``in_production``: once ``advance_day_task::mark_in_production``
+      promotes a row to ``in_production``, the materializer can still
+      freely re-write its scheduling columns (the boundary case where
+      today's portion finished and the remainder is rolled into
+      tomorrow) but MUST NOT demote it back to ``scheduled``. Demoting
+      would (1) silently flip the frontend's "currently producing"
+      flag to "queued" mid-shift and (2) cause
+      ``mark_completed_outside_set`` (which only collects rows with
+      ``status='in_production'``) to skip the order on completion,
+      leaving it stuck in ``scheduled`` forever.
+    - ``cancelled``: a row that's been cancelled (either by user-cancel
+      or worker auto-reject of a create compound) must not be silently
+      un-cancelled. Pre-fix the materializer rewrote ``status=scheduled``
+      on cancelled rows whenever its in-memory state still had the row
+      in pq (race window between cancel-compound enqueue and the next
+      materializer run), and the materializer's UPDATE could land
+      AFTER the worker's cancel-write but before another user op fired
+      — wiping out the cancel.
+
+    **``is_processing_locked`` no longer touched here**: pre-fix this
+    function unconditionally cleared the lock under the assumption that
+    "landing in apply_schedule means the worker has finished". That
+    assumption broke once materializer became an independent Celery
+    task with its own single-flight slot — a materializer started
+    before a compound was enqueued could race with the still-pending
+    compound's worker-accept, clear the lock prematurely, and let a
+    second user op slip in on the same row. The producer↔worker
+    pipeline now exclusively owns the lock lifecycle (producer sets,
+    ``compound_finalize.perform_compound_db_action`` clears).
 
     Returns the refreshed entity, or `None` if the order is missing or
     soft-deleted (caller decides how to react).
@@ -308,11 +326,10 @@ def set_schedule_dates(
     order.scheduled_production_date = scheduled_production_date
     order.expected_delivery_date = expected_delivery_date
     order.daily_breakdown = daily_breakdown
-    if order.status != OrderStatus.in_production:
+    if order.status not in (OrderStatus.in_production, OrderStatus.cancelled):
         order.status = OrderStatus.scheduled
     order.is_pinned = is_pinned
     order.pinned_production_date = pinned_production_date if is_pinned else None
-    order.is_processing_locked = False
     db.flush()
     db.refresh(order)
     return order

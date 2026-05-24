@@ -706,6 +706,100 @@ def test_apply_schedule_preserves_in_production_status(db_session: Session) -> N
     assert boundary.status == OrderStatus.in_production
 
 
+def test_apply_schedule_preserves_cancelled_status(db_session: Session) -> None:
+    """A row whose ``status='cancelled'`` MUST NOT be demoted back to
+    ``scheduled`` when ``apply_schedule`` runs on a (possibly stale)
+    schedule that still references this order.
+
+    Race this protects against (observed in production via
+    consistency_check.py): a previous materializer reads
+    ``schedule:state`` snapshot where order X is still in pq, then the
+    worker's next batch accepts a cancel compound for X (pq_remove +
+    DB ``status=cancelled``). The previous materializer's
+    ``apply_schedule`` loop then reaches X with the stale snapshot's
+    schedule entry — pre-fix, ``set_schedule_dates`` would
+    unconditionally write ``status=scheduled``, silently un-cancelling
+    the row. Same shape as the ``in_production`` regression above —
+    materializer must respect terminal statuses set by other writers.
+    """
+    creator = _make_user(db_session, username="apply-sched-preserve-cancelled")
+    cancelled = Order(
+        order_number="ORD-CANCELLED-RACE",
+        customer_name="ACME",
+        wafer_quantity=200,
+        requested_delivery_date=date(2026, 5, 14),
+        created_by=creator.id,
+        status=OrderStatus.cancelled,
+        scheduled_production_date=date(2026, 5, 12),
+        expected_delivery_date=date(2026, 5, 12),
+        daily_breakdown=[{"date": "2026-05-12", "quantity": 200}],
+    )
+    db_session.add(cancelled)
+    db_session.commit()
+
+    # Materializer's stale view still has this order in its schedule output.
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(
+                order_id=cancelled.id,
+                scheduled_date=date(2026, 5, 13),
+                quantity=200,
+            ),
+        ],
+    )
+
+    db_session.refresh(cancelled)
+    # Status preserved — load-bearing assertion of the cancel-race regression.
+    assert cancelled.status == OrderStatus.cancelled
+
+
+def test_apply_schedule_does_not_clear_processing_lock(db_session: Session) -> None:
+    """``set_schedule_dates`` MUST NOT touch ``is_processing_locked``. The
+    lock's lifecycle belongs to the producer↔worker(``compound_finalize``)
+    pipeline exclusively. Pre-fix, materializer unconditionally cleared
+    the lock as a side effect of writing schedule columns — which let a
+    second user op slip in on a row whose compound was still queued (the
+    producer set lock=True, materializer ran before the worker accepted
+    the compound, lock cleared prematurely, second producer saw lock=False
+    and built a stale compound on top).
+
+    Verifies by seeding a row with lock=True, running ``apply_schedule``,
+    and asserting the lock stays.
+    """
+    creator = _make_user(db_session, username="apply-sched-no-clear-lock")
+    locked = Order(
+        order_number="ORD-NO-CLEAR-LOCK",
+        customer_name="ACME",
+        wafer_quantity=300,
+        requested_delivery_date=date(2026, 5, 14),
+        created_by=creator.id,
+        status=OrderStatus.pending,  # producer flipped to pending while lock held
+        is_processing_locked=True,
+    )
+    db_session.add(locked)
+    db_session.commit()
+
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(
+                order_id=locked.id,
+                scheduled_date=date(2026, 5, 13),
+                quantity=300,
+            ),
+        ],
+    )
+
+    db_session.refresh(locked)
+    # Schedule columns get written.
+    assert locked.scheduled_production_date == date(2026, 5, 13)
+    # Lock untouched — load-bearing.
+    assert locked.is_processing_locked is True
+    # Status moved from pending→scheduled (pending is not in the terminal-status guard).
+    assert locked.status == OrderStatus.scheduled
+
+
 def test_list_for_scheduler_excludes_in_production_orders(db_session: Session) -> None:
     """Rebuild reconstructs the algorithm state from DB truth, but cannot
     represent the "partial production progress" of an in-production order —
@@ -1213,6 +1307,51 @@ def test_cancel_order_rejects_non_scheduled_status(
 
     # None of the blocked attempts should have enqueued a compound.
     assert mock_enqueue.call_count == 0
+
+
+def test_delete_after_cancel_uses_fast_path_no_compound(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """delete_order on an already-cancelled (but visible) row must take the
+    DB-only fast path: set ``is_deleted=True``, write the
+    ``order.deleted`` audit, and **NOT** enqueue a ``[remove]`` compound.
+
+    Enqueueing a second ``[remove]`` would silently double-subtract from
+    the segment trees (``pq_remove`` no-ops at the leaf level, but
+    ``apply_batch_to_capacity`` / ``apply_batch_to_deadline`` still
+    apply the delta) — phantom capacity / phantom released-deadline that
+    corrupts later admission decisions. The fast path is the producer-
+    side defense; ``_extract_batch_ops`` synthetic-pq skip is the
+    worker-side bottom liner. This test pins the producer half.
+    """
+    creator = _make_user(db_session, username="sru-del-after-cancel")
+    order = Order(
+        order_number="ORD-DEL-AFTER-CANCEL",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.cancelled,
+        is_deleted=False,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    order_service.delete_order(db_session, order.id, creator)
+
+    db_session.refresh(order)
+    assert order.is_deleted is True, "fast path must soft-delete the row"
+    assert order.status == OrderStatus.cancelled, "status stays cancelled"
+    assert mock_enqueue.call_count == 0, (
+        "fast path must skip the [remove] compound to avoid tree double-subtract"
+    )
+
+    # Audit row should exist for the soft-delete.
+    actions = db_session.scalars(
+        select(AuditLog.action).where(AuditLog.resource_id == order.id)
+    ).all()
+    assert "order.deleted" in actions
 
 
 # ---------------------------------------------------------------------------

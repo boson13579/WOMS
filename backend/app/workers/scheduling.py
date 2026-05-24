@@ -558,7 +558,10 @@ def _op_to_scheduling_order(op: dict[str, Any]) -> SchedulingOrder:
 # admission bug (defensive warning log), not as a compound failure.
 
 
-def _extract_batch_ops(compounds: list[dict[str, Any]]) -> list[BatchOp]:
+def _extract_batch_ops(
+    compounds: list[dict[str, Any]],
+    state: SchedulerState,
+) -> list[BatchOp]:
     """Project add/remove leaf ops across a batch of compounds into ``BatchOp``s.
 
     Pin/unpin leaf ops are intentionally skipped — by design they do not
@@ -567,12 +570,43 @@ def _extract_batch_ops(compounds: list[dict[str, Any]]) -> list[BatchOp]:
     capacity-tree swap (real→fake or fake→real) is applied per-compound
     inside ``_apply_compound_leaf_structural`` via the existing
     ``pin_order`` / ``unpin_order`` helpers, which are self-contained.
+
+    Defense-in-depth filter: ``remove`` ops whose ``order_id`` isn't
+    currently scheduled (neither in ``pq_index`` nor in
+    ``pinned_orders``, accounting for prior ops in this same batch) are
+    silently skipped. Rationale: ``pq_remove`` at the leaf level is a
+    no-op for missing orders, but ``apply_batch_to_capacity`` /
+    ``apply_batch_to_deadline`` will still apply the delta — producing
+    phantom capacity (capacity tree drifts above ``DAILY_CAPACITY``)
+    and phantom released-deadline obligation on the deadline tree. The
+    bug is reachable when a producer enqueues a duplicate remove (e.g.,
+    pre-fix: ``delete_order`` on an already-cancelled row would build
+    ``[remove]`` even though the prior cancel's compound already
+    released the capacity). The producer-side fast-path in
+    ``delete_order`` is the primary fix; this filter is the safety net.
+
+    The ``synthetic_pq`` set tracks membership as we walk the batch IN
+    ORDER (compounds in queue order, ops within a compound in their
+    declared order). An ``add`` puts the order_id in; a kept ``remove``
+    takes it out; ``pin`` / ``unpin`` don't change membership (they
+    just move between pq and pinned_orders sub-buckets). This lets a
+    within-batch ``[add(X), remove(X)]`` net to zero correctly — the
+    add inserts X, the subsequent remove finds it and is kept.
     """
+    synthetic_pq: set[uuid.UUID] = set(state.pq_index.keys()) | set(state.pinned_orders.keys())
     ops: list[BatchOp] = []
     for compound in compounds:
         for leaf in compound.get("ops", []):
             kind = leaf.get("op")
             if kind not in ("add", "remove"):
+                continue
+            order_id = uuid.UUID(leaf["order_id"])
+            if kind == "remove" and order_id not in synthetic_pq:
+                logger.warning(
+                    "schedule.batch.remove_skipped_not_in_pq",
+                    order_id=str(order_id),
+                    compound_id=compound.get("compound_id"),
+                )
                 continue
             ops.append(
                 BatchOp(
@@ -581,6 +615,10 @@ def _extract_batch_ops(compounds: list[dict[str, Any]]) -> list[BatchOp]:
                     deadline=date.fromisoformat(leaf["deadline"]),
                 )
             )
+            if kind == "add":
+                synthetic_pq.add(order_id)
+            else:
+                synthetic_pq.discard(order_id)
     return ops
 
 
@@ -629,7 +667,7 @@ def _largest_halving_feasible_prefix(
     attempts_tried = 0
     while attempt > 0:
         prefix = compounds[:attempt]
-        batch_ops = _extract_batch_ops(prefix)
+        batch_ops = _extract_batch_ops(prefix, state)
         delta = compute_batch_capacity_delta(batch_ops, base_date)
         attempts_tried += 1
         if is_batch_feasible(state, delta):
@@ -807,7 +845,7 @@ def _commit_accepted_batch(
     """
     rds = _get_redis()
 
-    batch_ops = _extract_batch_ops([compound for _, compound in accepted])
+    batch_ops = _extract_batch_ops([compound for _, compound in accepted], state)
     delta = compute_batch_capacity_delta(batch_ops, state.base_date)
     apply_batch_to_capacity(state, delta)
     apply_batch_to_deadline(state, delta)

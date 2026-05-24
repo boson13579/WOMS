@@ -327,3 +327,199 @@ def test_recovery_releases_flag_after_dispatch(
     run_startup_recovery()
 
     assert redis_client.get(_RECOVERY_FLAG_KEY) is None
+
+
+# ---------------------------------------------------------------------------
+# Orphan-lock cleanup
+# ---------------------------------------------------------------------------
+#
+# ``is_processing_locked=True`` is set by the producer right before
+# enqueueing a compound and cleared by the worker
+# (``compound_finalize.perform_compound_db_action``) after accept/reject.
+# If the worker crashes in between, the lock survives and silently
+# blocks every future PATCH / DELETE / cancel on that row until manual
+# DB surgery. ``_clear_orphan_locks`` is the startup sweep that closes
+# this gap.
+
+
+class _NonClosingSession:
+    """Wraps a Session so ``.close()`` is a no-op; lets startup_recovery
+    open + close its own session while still landing writes inside the
+    per-test SAVEPOINT that the outer ``db_session`` fixture rolls back.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _patch_recovery_sessionlocal(monkeypatch, db_session) -> None:
+    """Route ``startup_recovery.SessionLocal()`` to the per-test session."""
+    monkeypatch.setattr(
+        "app.services.startup_recovery.SessionLocal",
+        lambda: _NonClosingSession(db_session),
+    )
+
+
+def _seed_user(db, *, username: str):
+    """Lightweight user seed for the lock-cleanup tests."""
+    import bcrypt
+    from app.models.user import User, UserRole
+
+    user = User(
+        username=username,
+        email=f"{username}@test.internal",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _refetch_order(db, order_id):
+    """Re-SELECT the order through a fresh expire — the recovery code commits
+    via a wrapped Session, which can detach the pytest fixture's ORM-bound
+    instance. Querying by id is the cleanest way to read post-commit state.
+    """
+    from app.models.order import Order
+    from sqlalchemy import select
+
+    db.expire_all()
+    return db.scalar(select(Order).where(Order.id == order_id))
+
+
+def _seed_order(db, *, created_by, order_number: str, is_locked: bool, is_deleted: bool = False):
+    from datetime import date as _date
+
+    from app.models.order import Order, OrderStatus
+
+    order = Order(
+        order_number=order_number,
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=_date(2026, 6, 15),
+        created_by=created_by,
+        status=OrderStatus.pending,
+        is_processing_locked=is_locked,
+        is_deleted=is_deleted,
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def test_recovery_clears_orphan_lock_when_compound_not_in_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+    db_session,
+) -> None:
+    """Producer committed ``is_processing_locked=True`` and crashed before /
+    during ``enqueue_compound``. Compound isn't in pending_ops. The lock
+    must be cleared on the next startup or the row is hosed forever.
+    """
+    _patch_tasks(monkeypatch)
+    _patch_recovery_sessionlocal(monkeypatch, db_session)
+    redis_client.set(STATE_KEY, SchedulerState.initial(_today()).to_json())
+    # Empty pending_ops queue — no compound covers any order.
+    redis_client.delete(PENDING_OPS_KEY)
+
+    user = _seed_user(db_session, username="recover-orphan-1")
+    orphan = _seed_order(
+        db_session,
+        created_by=user.id,
+        order_number="ORD-ORPHAN-LOCK",
+        is_locked=True,
+    )
+
+    orphan_id = orphan.id
+    run_startup_recovery()
+
+    fetched = _refetch_order(db_session, orphan_id)
+    assert fetched.is_processing_locked is False, "orphan lock must be cleared by startup recovery"
+
+
+def test_recovery_preserves_lock_when_compound_still_in_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+    db_session,
+) -> None:
+    """A row whose compound is genuinely in pending_ops must NOT have its
+    lock cleared — the worker will handle it on the next drain. Clearing
+    here would race with the worker (second user op slips in before the
+    worker's accept commits its own state writes).
+    """
+    _patch_tasks(monkeypatch)
+    _patch_recovery_sessionlocal(monkeypatch, db_session)
+    redis_client.set(STATE_KEY, SchedulerState.initial(_today()).to_json())
+
+    user = _seed_user(db_session, username="recover-orphan-2")
+    in_flight = _seed_order(
+        db_session,
+        created_by=user.id,
+        order_number="ORD-INFLIGHT-LOCK",
+        is_locked=True,
+    )
+
+    # Put a compound in the queue that references this order.
+    compound = {
+        "compound_id": "11111111-1111-1111-1111-111111111111",
+        "group": "grow",
+        "op_count": 1,
+        "requested_by": str(user.id),
+        "ops": [
+            {
+                "op": "add",
+                "order_id": str(in_flight.id),
+                "order_number": in_flight.order_number,
+                "wafer_quantity": 100,
+                "deadline": "2026-06-15",
+            }
+        ],
+    }
+    redis_client.zadd(PENDING_OPS_KEY, {json.dumps(compound): 0.0})
+
+    in_flight_id = in_flight.id
+    run_startup_recovery()
+
+    fetched = _refetch_order(db_session, in_flight_id)
+    assert fetched.is_processing_locked is True, (
+        "in-flight lock must NOT be cleared while its compound is still queued"
+    )
+
+
+def test_recovery_skips_soft_deleted_locked_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_client: Redis,
+    db_session,
+) -> None:
+    """Soft-deleted rows are filtered out of the orphan-lock scan — they
+    can't be opened by a user op anyway (``get_by_id_for_update`` filters
+    ``is_deleted=False``), so clearing their lock is pointless work. This
+    isn't a correctness test, more a sanity-check on the scan WHERE clause.
+    """
+    _patch_tasks(monkeypatch)
+    _patch_recovery_sessionlocal(monkeypatch, db_session)
+    redis_client.set(STATE_KEY, SchedulerState.initial(_today()).to_json())
+    redis_client.delete(PENDING_OPS_KEY)
+
+    user = _seed_user(db_session, username="recover-orphan-3")
+    deleted = _seed_order(
+        db_session,
+        created_by=user.id,
+        order_number="ORD-SOFTDEL-LOCK",
+        is_locked=True,
+        is_deleted=True,
+    )
+
+    deleted_id = deleted.id
+    run_startup_recovery()
+
+    fetched = _refetch_order(db_session, deleted_id)
+    # Lock state is irrelevant for soft-deleted rows; we just assert no error.
+    assert fetched.is_deleted is True
