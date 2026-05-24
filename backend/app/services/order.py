@@ -805,6 +805,84 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     if order.is_processing_locked:
         raise _LOCKED_ORDER_ERROR
 
+    # Fast path: the row is already cancelled (user previously hit "取消
+    # 訂單", or worker auto-cancelled a rejected create). The order is
+    # NOT in pq or pinned_orders anymore — the cancel compound already
+    # released the capacity. Enqueueing another ``[remove]`` here would
+    # silently double-subtract from the segment trees: ``pq_remove`` no-
+    # ops at the leaf level, but ``apply_batch_to_capacity`` / ``apply_
+    # batch_to_deadline`` already applied the per-day delta, producing
+    # phantom capacity / phantom released-deadline that throws off every
+    # subsequent admission check on that day.
+    #
+    # The desired DB effect of "delete after cancel" is just
+    # ``is_deleted=True`` (hide from list); ``status=cancelled`` is
+    # already true. Do that synchronously, audit it, return. No
+    # compound, no lock dance.
+    if order.status == OrderStatus.cancelled:
+        # Snapshot BEFORE mutation so ``old_value`` reflects the
+        # pre-change state — and so the audit insert lands in the SAME
+        # transaction as the row UPDATE. Pre-fix this was mutate →
+        # commit → refresh → record_audit → commit, which broke the
+        # "audit row + row UPDATE share one transaction" invariant —
+        # a process crash between the two commits would leave the row
+        # soft-deleted with no audit trail.
+        old_value = {
+            "status": order.status.value,
+            "is_deleted": False,
+            "wafer_quantity": order.wafer_quantity,
+            "requested_delivery_date": str(order.requested_delivery_date),
+            "notes": order.notes,
+            "assigned_to": (str(order.assigned_to) if order.assigned_to is not None else None),
+        }
+        order.is_deleted = True
+        record_audit(
+            db,
+            action="order.deleted",
+            actor_id=actor.id,
+            resource_type="order",
+            resource_id=order.id,
+            old_value=old_value,
+        )
+        try:
+            db.commit()
+        except StaleDataError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Order was modified by another user. Refresh and try again.",
+            ) from exc
+        db.refresh(order)
+
+        # WebSocket cancellation notification — symmetric with the
+        # ``_is_cancel`` branch in ``compound_finalize`` (worker accept of
+        # a non-fast-path delete fires the same event). Without this,
+        # the frontend never sees the row leave the list and stays
+        # stale until next manual refetch. Best-effort: failures don't
+        # roll back the soft-delete that just committed.
+        try:
+            notification_service.create_notification(
+                db,
+                user_id=order.created_by,
+                order_id=order.id,
+                type="order_cancelled",
+                message=f"訂單 {order.order_number} 已被取消",
+            )
+        except Exception:
+            logger.warning(
+                "notification.create_failed",
+                order_id=str(order.id),
+                user_id=str(order.created_by),
+                exc_info=True,
+            )
+
+        logger.info(
+            "order.delete_fast_path_cancelled",
+            order_id=str(order_id),
+            actor_id=str(actor.id),
+        )
+        return OrderResponse.model_validate(order)
+
     # Build the compound from the *current* row state (the values the
     # worker will use to soft-delete + audit on accept).
     compound = _build_delete_compound(order, actor.id)

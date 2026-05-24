@@ -2582,6 +2582,186 @@ def test_perform_db_action_accept_cancel_keeps_visible_and_audits(
     assert "order.cancelled" in actions
 
 
+def test_extract_batch_ops_skips_remove_of_order_not_in_pq(
+    db_session: Any,  # unused, but keeps signature aligned with surrounding tests
+) -> None:
+    """``_extract_batch_ops`` must drop ``remove`` ops whose order_id is in
+    neither pq nor pinned_orders. Without this filter, a duplicate
+    ``[remove]`` (e.g., enqueued by a pre-fix ``delete_order`` after
+    ``cancel_order`` already released the capacity) would still feed
+    ``-qty`` into the batch delta — phantom capacity on the deadline
+    day. The leaf-level ``pq_remove`` is already no-op-safe; the batch
+    delta wasn't.
+    """
+    from app.services.scheduling import SchedulerState
+    from app.workers.scheduling import _extract_batch_ops
+
+    state = SchedulerState.initial(base_date=date(2026, 5, 1))
+    # State is intentionally empty: pq_index = {}, pinned_orders = {}.
+
+    orphan_id = uuid.uuid4()
+    compound = _make_compound(
+        ops=[
+            _make_leaf_op(
+                op="remove",
+                order_id=orphan_id,
+                wafer_quantity=500,
+                deadline="2026-05-10",
+            )
+        ]
+    )
+
+    ops = _extract_batch_ops([compound], state)
+
+    assert ops == [], "remove op for an order not in pq/pinned must be dropped from the batch"
+
+
+def test_extract_batch_ops_keeps_within_batch_add_then_remove(
+    db_session: Any,
+) -> None:
+    """Within a single batch, ``[add(X), remove(X)]`` must net to zero —
+    NOT have its remove silently dropped by the synthetic-pq filter.
+    The filter walks ops in order and adds X to ``synthetic_pq`` on the
+    add, so the subsequent remove finds it and is kept. Both ops end up
+    in the BatchOp list; the delta sums to 0; the tree update is a
+    no-op net. If the filter incorrectly looked only at ``state``
+    (which has X absent), the remove would be wrongly dropped and the
+    delta would carry a phantom +qty on the deadline day.
+    """
+    from app.services.scheduling import SchedulerState
+    from app.workers.scheduling import _extract_batch_ops
+
+    state = SchedulerState.initial(base_date=date(2026, 5, 1))
+
+    target_id = uuid.uuid4()
+    compound = _make_compound(
+        ops=[
+            _make_leaf_op(
+                op="add",
+                order_id=target_id,
+                wafer_quantity=500,
+                deadline="2026-05-10",
+            ),
+            _make_leaf_op(
+                op="remove",
+                order_id=target_id,
+                wafer_quantity=500,
+                deadline="2026-05-10",
+            ),
+        ]
+    )
+
+    ops = _extract_batch_ops([compound], state)
+
+    assert [op.kind for op in ops] == ["add", "remove"]
+    # Net delta must be zero on the deadline day.
+    from app.services.scheduling import compute_batch_capacity_delta
+
+    delta = compute_batch_capacity_delta(ops, state.base_date)
+    assert sum(delta) == 0
+
+
+def test_extract_batch_ops_keeps_remove_of_pinned_order(
+    db_session: Any,
+) -> None:
+    """A ``remove`` against an order that lives in ``pinned_orders`` (not
+    pq) must still be kept — that case is the legitimate ``[unpin,
+    remove]`` shape producers send for deleting a pinned order.
+
+    The filter checks BOTH pq and pinned_orders, so a pinned order_id
+    counts as present. If the filter only checked pq, this would drop
+    the remove and corrupt the tree on every pinned-delete.
+    """
+    from app.services.scheduling import PinnedOrder, SchedulerState
+    from app.workers.scheduling import _extract_batch_ops
+
+    state = SchedulerState.initial(base_date=date(2026, 5, 1))
+    pinned_id = uuid.uuid4()
+    state.pinned_orders[pinned_id] = PinnedOrder(
+        order_id=pinned_id,
+        order_number="ORD-PINNED",
+        wafer_quantity=500,
+        deadline=date(2026, 5, 10),
+        fake_deadline=date(2026, 5, 5),
+    )
+
+    compound = _make_compound(
+        ops=[
+            _make_leaf_op(
+                op="remove",
+                order_id=pinned_id,
+                wafer_quantity=500,
+                deadline="2026-05-10",
+            )
+        ]
+    )
+
+    ops = _extract_batch_ops([compound], state)
+    assert [op.kind for op in ops] == ["remove"]
+
+
+def test_apply_db_action_reject_does_not_overwrite_cancelled_status(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reject path's "restore status from scheduled_production_date"
+    branch must NOT fire for a row that's already terminal
+    (``status=cancelled`` or ``is_deleted=True``). Without this guard,
+    a reject of a delete/cancel compound against an already-cancelled
+    row would silently un-cancel it by writing ``status=scheduled``.
+
+    Reachable scenario (pre-fix): user-cancel accepted → cancel/delete
+    compound enqueued against the now-cancelled row → worker rejects
+    that compound for any reason → reject path "restores" status →
+    cancelled status is wiped out.
+    """
+    from app.models.order import Order, OrderStatus
+    from app.models.user import User, UserRole
+    from app.workers.scheduling import _perform_compound_db_action
+
+    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
+
+    import bcrypt
+
+    actor = User(
+        username="worker-reject-terminal-guard",
+        email="worker-reject-terminal-guard@test.internal",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+
+    order = Order(
+        order_number="ORD-REJECT-TERMINAL",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+        scheduled_production_date=date(2026, 7, 30),  # would push to scheduled
+        created_by=actor.id,
+        status=OrderStatus.cancelled,  # already terminal
+        is_processing_locked=True,
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    compound = _stub_compound_with_db_action(
+        kind="delete",
+        order_id=order.id,
+        actor_id=actor.id,
+    )
+
+    _perform_compound_db_action(compound, accepted=False)
+
+    db_session.expire_all()
+    db_session.refresh(order)
+    assert order.status == OrderStatus.cancelled, (
+        "reject must NOT overwrite cancelled status with scheduled"
+    )
+    assert order.is_processing_locked is False, "reject still clears lock"
+
+
 def test_perform_db_action_reject_cancel_clears_lock_and_restores_scheduled(
     db_session: Any,
     monkeypatch: pytest.MonkeyPatch,

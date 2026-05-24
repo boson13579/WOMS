@@ -124,7 +124,17 @@ def perform_compound_db_action(
 
     db: Session = SessionLocal()
     try:
-        order = db.scalars(select(Order).where(Order.id == order_id)).first()
+        # Row lock for the duration of the worker's DB write. Without it,
+        # ``materialize_schedule_task.apply_schedule`` (an independent
+        # Celery task) could SELECT the same row at the same version_id,
+        # mutate it, and win the OCC race on flush — silently losing the
+        # worker's pending ``is_deleted=True`` / ``status=cancelled``
+        # write to a StaleDataError that ``record_audit`` swallows. With
+        # the row lock the materializer's SELECT blocks until this
+        # transaction commits; when it resumes it sees the worker-written
+        # status (and the new cancelled-guard in ``set_schedule_dates``
+        # keeps it from being overwritten back to scheduled).
+        order = db.scalars(select(Order).where(Order.id == order_id).with_for_update()).first()
         if order is None:
             logger.warning(
                 "schedule.db_action.missing_order",
@@ -407,6 +417,18 @@ def _apply_db_action_reject(
     order.is_processing_locked = False
     if order.status == OrderStatus.in_production:
         # Defensive — see docstring.
+        return
+    # Terminal-state guard: a row that's already ``cancelled`` or
+    # soft-deleted must NOT have its status rewritten back to scheduled
+    # / pending. This is reachable when a producer enqueues a compound
+    # against a row whose state has since terminalized (e.g., a
+    # ``kind="delete"`` compound built against a row that was, by the
+    # time the worker rejected the compound, already cancelled by an
+    # earlier-accepted cancel). Without this guard, the reject's
+    # "recompute status from ``scheduled_production_date``" branch
+    # would silently un-cancel the row — a worse outcome than the
+    # compound that failed.
+    if order.status == OrderStatus.cancelled or order.is_deleted:
         return
     if order.scheduled_production_date is not None:
         order.status = OrderStatus.scheduled
