@@ -97,6 +97,10 @@ export function OrderFilters(): JSX.Element {
 
   useEffect(() => {
     const id = setTimeout(() => {
+      // Roles that can't use the user-pickers must never push to the store,
+      // otherwise we'd race the cleanup effect above and revert it 300ms
+      // after a role downgrade.
+      if (!canUseUserFilters) return;
       // Don't touch the store until the user list has loaded — otherwise a
       // slow `/users/assignable` response would race the debounce timer and
       // we'd treat the still-empty input as "user cleared the filter",
@@ -112,10 +116,11 @@ export function OrderFilters(): JSX.Element {
     return () => {
       clearTimeout(id);
     };
-  }, [assigneeInput, users, assignedTo, setAssignedTo]);
+  }, [assigneeInput, users, assignedTo, setAssignedTo, canUseUserFilters]);
 
   useEffect(() => {
     const id = setTimeout(() => {
+      if (!canUseUserFilters) return;
       if (users.length === 0) return;
       const userId = findUserIdByInput(users, creatorInput);
       if (creatorInput.trim() === '') {
@@ -127,7 +132,7 @@ export function OrderFilters(): JSX.Element {
     return () => {
       clearTimeout(id);
     };
-  }, [creatorInput, users, createdBy, setCreatedBy]);
+  }, [creatorInput, users, createdBy, setCreatedBy, canUseUserFilters]);
 
   const handleReset = (): void => {
     setLocalSearch('');
