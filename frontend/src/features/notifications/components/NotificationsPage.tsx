@@ -22,7 +22,6 @@ import {
   useMarkNotificationRead,
   useNotifications,
 } from '../api/notifications';
-import { useNotificationsWs } from '../hooks/useNotificationsWs';
 import type { NotificationResponse } from '../types';
 
 function getNotificationLabel(type: string): string {
@@ -64,9 +63,6 @@ function formatRelativeTime(dateStr: string): string {
 
 export function NotificationsPage(): JSX.Element {
   const [activeTab, setActiveTab] = useState<'unread' | 'all'>('unread');
-
-  // Activate WebSocket listener: any notification.created event automatically invalidates cache
-  useNotificationsWs();
 
   // Queries
   const { data: notificationsData, isPending } = useNotifications({
