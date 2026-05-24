@@ -4,6 +4,7 @@
  */
 import { ArrowDown, ArrowUp, ArrowUpDown, Loader2, Lock, Pencil, Trash2 } from 'lucide-react';
 import { useMemo, type ReactNode } from 'react';
+import { toast } from 'sonner';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -18,6 +19,7 @@ import {
 } from '@/components/ui/table';
 import { useUsernames } from '@/features/users/api/useUsernames';
 import { useCanWrite, useCurrentRole, useCurrentUserId } from '@/lib/auth';
+import { toastApiError } from '@/lib/toastApiError';
 import { cn } from '@/lib/utils';
 
 import { useDeleteOrder, useOrders } from '../api/orders';
@@ -56,6 +58,7 @@ interface SortableHeadProps {
   sortOrder: 'asc' | 'desc';
   onSort: (f: SortField) => void;
   className?: string;
+  testId?: string;
   children: ReactNode;
 }
 
@@ -65,6 +68,7 @@ function SortableHead({
   sortOrder,
   onSort,
   className,
+  testId,
   children,
 }: SortableHeadProps): JSX.Element {
   const active = sortBy === field;
@@ -73,6 +77,7 @@ function SortableHead({
   return (
     <TableHead
       className={cn('cursor-pointer select-none', className)}
+      data-testid={testId}
       onClick={() => {
         onSort(field);
       }}
@@ -141,9 +146,13 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
     // eslint-disable-next-line no-alert
     if (!window.confirm(`確定要刪除訂單 ${order.order_number}？`)) return;
     deleteMutation.mutate(order.id, {
+      onSuccess: () => {
+        toast.success('訂單已刪除', {
+          description: `訂單 ${order.order_number} 已移除，排程資料會同步更新。`,
+        });
+      },
       onError: (err) => {
-        // eslint-disable-next-line no-alert
-        window.alert(err.message);
+        toastApiError('刪除訂單失敗', err);
       },
     });
   }
@@ -186,6 +195,7 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
                   sortBy={sortBy}
                   sortOrder={sortOrder}
                   onSort={setSort}
+                  testId="orders-sort-customer-name"
                 >
                   客戶
                 </SortableHead>
@@ -217,7 +227,11 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
             <TableBody>
               {data.items.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-12 text-center text-muted-foreground">
+                  <TableCell
+                    colSpan={9}
+                    className="py-12 text-center text-muted-foreground"
+                    data-testid="orders-empty-state"
+                  >
                     沒有符合條件的訂單。
                   </TableCell>
                 </TableRow>
@@ -266,6 +280,7 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
                             }}
                             title={order.is_processing_locked ? '排程處理中，請稍候' : '編輯'}
                             disabled={order.is_processing_locked}
+                            data-testid="orders-edit-button"
                           >
                             <Pencil className="h-4 w-4" />
                           </Button>
@@ -280,6 +295,7 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
                             title={order.is_processing_locked ? '排程處理中，請稍候' : '刪除'}
                             disabled={deleteMutation.isPending || order.is_processing_locked}
                             className="text-destructive hover:text-destructive"
+                            data-testid="orders-delete-button"
                           >
                             <Trash2 className="h-4 w-4" />
                           </Button>

@@ -8,6 +8,7 @@
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useEffect, useMemo } from 'react';
 import { useForm } from 'react-hook-form';
+import { toast } from 'sonner';
 import { z } from 'zod';
 
 import { Button } from '@/components/ui/button';
@@ -23,6 +24,7 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { useAssignableUsers } from '@/features/auth/api/users';
 import { ApiError } from '@/lib/apiFetch';
+import { toastApiError } from '@/lib/toastApiError';
 
 import { useCreateOrder, useUpdateOrder } from '../api/orders';
 import type { Order } from '../types';
@@ -135,7 +137,17 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
             version_id: order.version_id,
           },
         },
-        { onSuccess: onClose },
+        {
+          onSuccess: () => {
+            toast.success('訂單已修改', {
+              description: '系統已送出排程更新，排程結果會在完成後同步。',
+            });
+            onClose();
+          },
+          onError: (err) => {
+            toastApiError('修改訂單失敗', err);
+          },
+        },
       );
     } else {
       createMutation.mutate(
@@ -146,7 +158,17 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
           notes,
           assigned_to: assignedTo,
         },
-        { onSuccess: onClose },
+        {
+          onSuccess: (createdOrder) => {
+            toast.success('訂單已新增', {
+              description: `訂單 ${createdOrder.order_number} 已建立，等待排程器處理。`,
+            });
+            onClose();
+          },
+          onError: (err) => {
+            toastApiError('新增訂單失敗', err);
+          },
+        },
       );
     }
   });
@@ -160,7 +182,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
         if (!v) onClose();
       }}
     >
-      <DialogContent>
+      <DialogContent data-testid="order-modal">
         <DialogHeader>
           <DialogTitle>{isEdit ? '編輯訂單' : '新增訂單'}</DialogTitle>
         </DialogHeader>
@@ -181,6 +203,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
               disabled={isEdit}
               aria-invalid={!!errors.customer_name}
               aria-describedby={errors.customer_name ? 'customer_name-error' : undefined}
+              data-testid="order-customer-name-input"
               {...register('customer_name')}
             />
             {errors.customer_name && (
@@ -200,6 +223,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
               max={2500}
               aria-invalid={!!errors.wafer_quantity}
               aria-describedby={errors.wafer_quantity ? 'wafer_quantity-error' : undefined}
+              data-testid="order-wafer-quantity-input"
               {...register('wafer_quantity', { valueAsNumber: true })}
             />
             {errors.wafer_quantity && (
@@ -219,6 +243,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
               aria-describedby={
                 errors.requested_delivery_date ? 'requested_delivery_date-error' : undefined
               }
+              data-testid="order-requested-delivery-date-input"
               {...register('requested_delivery_date')}
             />
             {errors.requested_delivery_date && (
@@ -261,7 +286,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
           {/* Notes */}
           <div className="space-y-2">
             <Label htmlFor="notes">備註</Label>
-            <Textarea id="notes" rows={3} {...register('notes')} />
+            <Textarea id="notes" rows={3} data-testid="order-notes-input" {...register('notes')} />
           </div>
 
           {/* Version conflict — 409 */}
@@ -295,7 +320,12 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
           <Button variant="outline" type="button" onClick={onClose} disabled={isPending}>
             取消
           </Button>
-          <Button type="submit" form="order-form" disabled={isPending}>
+          <Button
+            type="submit"
+            form="order-form"
+            disabled={isPending}
+            data-testid="order-modal-submit-button"
+          >
             {isPending ? '儲存中…' : submitLabel}
           </Button>
         </DialogFooter>

@@ -12,6 +12,7 @@ import { useMobileNavStore } from '@/components/layout/mobileNavStore';
 import { ThemeToggle } from '@/components/layout/ThemeToggle';
 import { Button } from '@/components/ui/button';
 import { useAuthStore } from '@/features/auth/stores/authStore';
+import { useNotifications } from '@/features/notifications/api/notifications';
 
 interface HeaderProps {
   title: string;
@@ -35,6 +36,13 @@ export function Header({
   const logout = useAuthStore((state) => state.logout);
   const openMobileNav = useMobileNavStore((state) => state.setOpen);
 
+  // Backend contract: when called with `all=false`, the `/api/v1/notifications`
+  // endpoint returns only unread items and `total` is the unread count. The
+  // sidebar relies on the same field; if that contract ever changes, both
+  // callers need to switch to counting `items` (and re-evaluate pagination).
+  const { data: unreadData } = useNotifications({ all: false });
+  const unreadCount = unreadData?.total ?? 0;
+
   const handleLogout = () => {
     // Clear server-state cache BEFORE the logout HTTP call so a slow
     // /auth/logout (or a network error during it) never leaves stale
@@ -56,9 +64,16 @@ export function Header({
           openMobileNav(true);
         }}
         aria-label="Open navigation"
-        className="md:hidden"
+        className="relative md:hidden"
       >
         <Menu className="h-5 w-5" />
+        {unreadCount > 0 && (
+          <span
+            aria-label={`${unreadCount} unread notifications`}
+            aria-live="polite"
+            className="absolute right-1.5 top-1.5 flex h-2 w-2 rounded-full bg-rose-500 ring-2 ring-background animate-pulse"
+          />
+        )}
       </Button>
       <div className="min-w-0 flex-1">
         <h1 className="truncate text-lg font-semibold tracking-tight">{title}</h1>

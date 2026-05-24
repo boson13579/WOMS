@@ -10,10 +10,13 @@
  * `schedule.updated` carry no correlation id, so treating them as a
  * single-task signal would mistakenly conflate other users' compounds with
  * the current session. Toasts for the user's own actions live with the
- * mutation that started them, not in here.
+ * mutation that started them, not in here. The exception is a failed compound:
+ * without a global fallback, rejected scheduler operations can be silent when
+ * the calendar dialog is not the active page.
  */
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
+import { toast } from 'sonner';
 import { z } from 'zod';
 
 import { useCurrentUser } from '@/lib/auth';
@@ -25,6 +28,8 @@ import { scheduleResultKeys } from '../api/scheduleResult';
 const wsEnvelopeSchema = z
   .object({
     type: z.string(),
+    reason: z.string().optional(),
+    detail: z.string().optional(),
   })
   .passthrough();
 
@@ -41,7 +46,7 @@ export function useScheduleWs(): void {
     const ws = new WebSocket(url);
 
     ws.onmessage = (evt: MessageEvent<string>) => {
-      let env: { type: string };
+      let env: z.infer<typeof wsEnvelopeSchema>;
       try {
         env = wsEnvelopeSchema.parse(JSON.parse(evt.data));
       } catch {
@@ -51,6 +56,12 @@ export function useScheduleWs(): void {
         void qc.invalidateQueries({ queryKey: orderKeys.all });
         void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
         void qc.invalidateQueries({ queryKey: scheduleResultKeys.all });
+      }
+
+      if (env.type === 'schedule.compound_failed') {
+        const reason = env.reason ?? '排程器拒絕此操作';
+        const description = env.detail ? `${reason}: ${env.detail}` : reason;
+        toast.error('排程失敗', { description });
       }
     };
 
