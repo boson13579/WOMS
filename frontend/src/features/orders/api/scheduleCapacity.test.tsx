@@ -30,8 +30,8 @@ describe('useScheduleCapacity', () => {
           base_date: '2026-05-19',
           daily_capacity: 2500,
           entries: [
-            { date: '2026-05-19', cumulative_remaining: 2500 },
-            { date: '2026-05-20', cumulative_remaining: 3500 },
+            { date: '2026-05-19', used: 500, remaining: 2000 },
+            { date: '2026-05-20', used: 1500, remaining: 1000 },
           ],
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } },
@@ -45,7 +45,7 @@ describe('useScheduleCapacity', () => {
     vi.clearAllMocks();
   });
 
-  it('fetches scheduler capacity', async () => {
+  it('fetches scheduler capacity usage', async () => {
     const { result } = renderHook(() => useScheduleCapacity(), { wrapper: makeWrapper() });
 
     await waitFor(() => {
@@ -53,27 +53,27 @@ describe('useScheduleCapacity', () => {
     });
 
     expect(global.fetch).toHaveBeenCalledWith(
-      '/api/v1/schedule/capacity',
+      '/api/v1/schedule/capacity-usage',
       expect.objectContaining({ credentials: 'include' }),
     );
     expect(result.current.data?.daily_capacity).toBe(2500);
   });
 
-  it('derives daily capacity from cumulative capacity', () => {
+  it('maps daily capacity usage without recalculating remaining capacity', () => {
     expect(
       toDailyCapacity({
         base_date: '2026-05-19',
         daily_capacity: 2500,
         entries: [
-          { date: '2026-05-19', cumulative_remaining: 2500 },
-          { date: '2026-05-20', cumulative_remaining: 3500 },
-          { date: '2026-05-21', cumulative_remaining: 3500 },
+          { date: '2026-05-19', used: 500, remaining: 2000 },
+          { date: '2026-05-20', used: 1500, remaining: 1000 },
+          { date: '2026-05-21', used: 2500, remaining: 0 },
         ],
       }),
     ).toEqual([
-      { date: '2026-05-19', remaining: 2500, dailyCapacity: 2500 },
-      { date: '2026-05-20', remaining: 1000, dailyCapacity: 2500 },
-      { date: '2026-05-21', remaining: 0, dailyCapacity: 2500 },
+      { date: '2026-05-19', used: 500, remaining: 2000, dailyCapacity: 2500 },
+      { date: '2026-05-20', used: 1500, remaining: 1000, dailyCapacity: 2500 },
+      { date: '2026-05-21', used: 2500, remaining: 0, dailyCapacity: 2500 },
     ]);
   });
 });
