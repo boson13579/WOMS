@@ -81,6 +81,9 @@ NOTES.md
 TODO.local.md
 *.local.md
 
+# Stray nested git checkout on a teammate's machine — never re-commit as gitlink
+smart-order/
+
 # =============================================================================
 # Docker / OS / misc
 # =============================================================================
