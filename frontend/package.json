@@ -17,6 +17,7 @@
     "format": "prettier --write \"src/**/*.{ts,tsx,css,json,md}\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --passWithNoTests",
+    "test:e2e": "playwright test",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -42,6 +43,7 @@
     "zustand": "^5.0.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.0.1",
     "@testing-library/user-event": "^14.5.2",

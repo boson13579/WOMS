@@ -53,10 +53,10 @@ export function OrdersPage(): JSX.Element {
     <>
       <Header title="訂單列表" />
 
-      <div className="px-6 py-6 space-y-5">
+      <div className="px-6 py-6 space-y-5" data-testid="orders-page">
         <div className="flex flex-wrap items-center gap-2">
           {canWrite && (
-            <Button onClick={handleNewOrder} size="sm">
+            <Button onClick={handleNewOrder} size="sm" data-testid="orders-create-button">
               <Plus className="mr-1.5 h-4 w-4" />
               新增訂單
             </Button>
@@ -69,6 +69,7 @@ export function OrdersPage(): JSX.Element {
               onClick={() => {
                 setCalendarOpen(true);
               }}
+              data-testid="orders-calendar-button"
             >
               <CalendarDays className="mr-1.5 h-4 w-4" />
               日曆視圖
@@ -80,6 +81,7 @@ export function OrdersPage(): JSX.Element {
               size="sm"
               onClick={handleSchedule}
               disabled={triggerSchedule.isPending}
+              data-testid="orders-schedule-button"
             >
               <RefreshCw className="mr-1.5 h-4 w-4" />
               觸發排程器

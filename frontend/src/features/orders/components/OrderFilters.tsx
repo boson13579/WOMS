@@ -27,14 +27,21 @@ export function OrderFilters(): JSX.Element {
 
   // Debounce the search input by 300 ms to avoid spamming the API.
   const [localSearch, setLocalSearch] = useState(search);
+
+  useEffect(() => {
+    setLocalSearch(search);
+  }, [search]);
+
   useEffect(() => {
     const id = setTimeout(() => {
-      setSearch(localSearch);
+      if (localSearch !== search) {
+        setSearch(localSearch);
+      }
     }, 300);
     return () => {
       clearTimeout(id);
     };
-  }, [localSearch, setSearch]);
+  }, [localSearch, search, setSearch]);
 
   return (
     <div className="flex flex-wrap items-center gap-3">
@@ -46,6 +53,7 @@ export function OrderFilters(): JSX.Element {
         }}
         className="w-60"
         aria-label="搜尋訂單"
+        data-testid="orders-search-input"
       />
 
       <div className="flex items-center gap-1.5">
@@ -54,6 +62,7 @@ export function OrderFilters(): JSX.Element {
         </Label>
         <Select
           id="status-filter"
+          data-testid="orders-status-filter"
           value={status ?? ''}
           onChange={(e) => {
             const val = e.target.value as OrderStatus | '';
@@ -68,7 +77,7 @@ export function OrderFilters(): JSX.Element {
         </Select>
       </div>
 
-      <Button variant="outline" size="sm" onClick={reset}>
+      <Button variant="outline" size="sm" onClick={reset} data-testid="orders-reset-filters-button">
         重設
       </Button>
     </div>

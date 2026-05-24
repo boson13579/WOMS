@@ -45,6 +45,8 @@ npm-debug.log*
 .turbo/
 *.tsbuildinfo
 frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
 coverage/
 
 # =============================================================================
