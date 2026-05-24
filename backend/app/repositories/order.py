@@ -284,7 +284,7 @@ def set_schedule_dates(
 
     **Status preservation for terminal / in_production statuses**: this
     function flips ``status`` to ``scheduled`` only when the current
-    status is NOT in ``(in_production, cancelled)``.
+    status is NOT in ``(in_production, cancelled, completed)``.
 
     - ``in_production``: once ``advance_day_task::mark_in_production``
       promotes a row to ``in_production``, the materializer can still
@@ -304,6 +304,11 @@ def set_schedule_dates(
       materializer run), and the materializer's UPDATE could land
       AFTER the worker's cancel-write but before another user op fired
       — wiping out the cancel.
+    - ``completed``: once ``advance_day_task`` flips a finished
+      production run to ``completed``, the row is done. A late
+      materializer pass over a stale schedule snapshot that still
+      contains the order could otherwise resurrect it back to
+      ``scheduled`` — same shape as the ``cancelled`` race, same fix.
 
     **``is_processing_locked`` no longer touched here**: pre-fix this
     function unconditionally cleared the lock under the assumption that
@@ -326,7 +331,11 @@ def set_schedule_dates(
     order.scheduled_production_date = scheduled_production_date
     order.expected_delivery_date = expected_delivery_date
     order.daily_breakdown = daily_breakdown
-    if order.status not in (OrderStatus.in_production, OrderStatus.cancelled):
+    if order.status not in (
+        OrderStatus.in_production,
+        OrderStatus.cancelled,
+        OrderStatus.completed,
+    ):
         order.status = OrderStatus.scheduled
     order.is_pinned = is_pinned
     order.pinned_production_date = pinned_production_date if is_pinned else None

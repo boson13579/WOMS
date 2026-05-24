@@ -2672,11 +2672,7 @@ def test_extract_batch_ops_keeps_remove_of_pinned_order(
     counts as present. If the filter only checked pq, this would drop
     the remove and corrupt the tree on every pinned-delete.
     """
-    from app.services.scheduling import (
-        HORIZON_DAYS,
-        PinnedOrder,
-        SchedulerState,
-    )
+    from app.services.scheduling import PinnedOrder, SchedulerState
     from app.workers.scheduling import _extract_batch_ops
 
     state = SchedulerState.initial(base_date=date(2026, 5, 1))
@@ -2688,10 +2684,6 @@ def test_extract_batch_ops_keeps_remove_of_pinned_order(
         deadline=date(2026, 5, 10),
         fake_deadline=date(2026, 5, 5),
     )
-    # HORIZON_DAYS is referenced via the import-time check that the
-    # SchedulerState is wired up — touching it here keeps the import in
-    # use (and surfaces an obvious link if someone refactors the const).
-    assert HORIZON_DAYS > 0
 
     compound = _make_compound(
         ops=[

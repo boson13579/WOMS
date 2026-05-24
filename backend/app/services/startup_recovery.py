@@ -273,9 +273,11 @@ def _clear_orphan_locks(rds: Redis) -> None:
        clear the lock and write an ``order.lock_cleared_orphan`` audit
        row so ops can see the recovery happened.
 
-    Safe to run repeatedly: idempotent (clearing an already-cleared lock
-    is a no-op via the IS NOT NULL filter). Best-effort: any DB failure
-    is logged and swallowed; we never block startup on this.
+    Safe to run repeatedly: idempotent because the SELECT in step 2
+    only picks rows with ``is_processing_locked=True`` — a re-run after
+    every targeted row was already cleared finds zero rows to update.
+    Best-effort: any DB failure is logged and swallowed; we never
+    block startup on this.
 
     **Multi-replica TOCTOU caveat**: ``_RECOVERY_FLAG_KEY`` (NX) only
     guards against two replicas sweeping simultaneously — it does NOT
@@ -291,14 +293,14 @@ def _clear_orphan_locks(rds: Redis) -> None:
        order_id is in our locked-rows set is small.
     2. **Self-healing**: if we wrongly clear a lock, the worker is
        still going to process that compound. The compound's
-       ``_perform_compound_db_action`` ends with ``order.is_processing
-       _locked = False`` either way — the write is idempotent.
+       ``_perform_compound_db_action`` always ends by writing
+       ``is_processing_locked = False`` — the write is idempotent.
     3. **No data corruption**: a second user op slipping in during
-       this race window goes through the producer's ``get_by_id_for
-       _update`` row lock; if the worker is mid-flight on the original
-       compound, the second op sees ``is_processing_locked=True``
-       (since worker's FOR UPDATE write hasn't released the lock yet)
-       and gets a 409. Worst case: a producer briefly sees lock=False
+       this race window goes through the producer's row lock
+       (``get_by_id_for_update``); if the worker is mid-flight on the
+       original compound, the second op sees the lock still True
+       (worker's ``FOR UPDATE`` write hasn't released it) and gets
+       a 409. Worst case: a producer briefly sees the lock False
        between our clear and the worker's re-set, builds a compound
        on stale row state, and the worker hits the ``version_id``
        OCC guard or the synthetic-pq filter in
