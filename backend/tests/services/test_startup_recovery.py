@@ -498,10 +498,17 @@ def test_recovery_skips_soft_deleted_locked_rows(
     redis_client: Redis,
     db_session,
 ) -> None:
-    """Soft-deleted rows are filtered out of the orphan-lock scan — they
-    can't be opened by a user op anyway (``get_by_id_for_update`` filters
-    ``is_deleted=False``), so clearing their lock is pointless work. This
-    isn't a correctness test, more a sanity-check on the scan WHERE clause.
+    """Soft-deleted rows are filtered out of the orphan-lock scan via the
+    ``is_deleted=False`` filter in the SELECT — they can't be opened by
+    a user op anyway (``get_by_id_for_update`` has the same filter), so
+    clearing their lock is pointless work.
+
+    The contract under test: ``_clear_orphan_locks`` must NOT clear
+    ``is_processing_locked`` on a soft-deleted row even when its
+    order_id isn't in the in-flight set. Pre-strengthening this only
+    asserted "no crash"; now we explicitly verify lock state is
+    preserved — if a future refactor drops the ``is_deleted`` filter
+    from the SELECT, this test fails.
     """
     _patch_tasks(monkeypatch)
     _patch_recovery_sessionlocal(monkeypatch, db_session)
@@ -521,5 +528,7 @@ def test_recovery_skips_soft_deleted_locked_rows(
     run_startup_recovery()
 
     fetched = _refetch_order(db_session, deleted_id)
-    # Lock state is irrelevant for soft-deleted rows; we just assert no error.
-    assert fetched.is_deleted is True
+    assert fetched.is_deleted is True, "soft-delete flag must be preserved"
+    assert fetched.is_processing_locked is True, (
+        "soft-deleted rows must be SKIPPED by orphan-lock sweep — lock state must NOT be touched"
+    )

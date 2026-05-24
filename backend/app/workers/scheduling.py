@@ -602,10 +602,18 @@ def _extract_batch_ops(
                 continue
             order_id = uuid.UUID(leaf["order_id"])
             if kind == "remove" and order_id not in synthetic_pq:
+                # Defense-in-depth: should NOT fire in normal flow because
+                # ``delete_order``'s fast-path B short-circuits a delete on
+                # an already-cancelled row before any compound is enqueued.
+                # If this DOES fire, it points to either (a) a new producer
+                # code path bypassing fast-path B, (b) a manually-replayed
+                # DLQ compound, or (c) a race window that fast-path B
+                # didn't anticipate. Worth investigating, not noise.
                 logger.warning(
                     "schedule.batch.remove_skipped_not_in_pq",
                     order_id=str(order_id),
                     compound_id=compound.get("compound_id"),
+                    reason="defense_in_depth",
                 )
                 continue
             ops.append(

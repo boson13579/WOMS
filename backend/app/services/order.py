@@ -820,7 +820,30 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     # already true. Do that synchronously, audit it, return. No
     # compound, no lock dance.
     if order.status == OrderStatus.cancelled:
+        # Snapshot BEFORE mutation so ``old_value`` reflects the
+        # pre-change state — and so the audit insert lands in the SAME
+        # transaction as the row UPDATE. Pre-fix this was mutate →
+        # commit → refresh → record_audit → commit, which broke the
+        # "audit row + row UPDATE share one transaction" invariant —
+        # a process crash between the two commits would leave the row
+        # soft-deleted with no audit trail.
+        old_value = {
+            "status": order.status.value,
+            "is_deleted": False,
+            "wafer_quantity": order.wafer_quantity,
+            "requested_delivery_date": str(order.requested_delivery_date),
+            "notes": order.notes,
+            "assigned_to": (str(order.assigned_to) if order.assigned_to is not None else None),
+        }
         order.is_deleted = True
+        record_audit(
+            db,
+            action="order.deleted",
+            actor_id=actor.id,
+            resource_type="order",
+            resource_id=order.id,
+            old_value=old_value,
+        )
         try:
             db.commit()
         except StaleDataError as exc:
@@ -830,22 +853,29 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
                 detail="Order was modified by another user. Refresh and try again.",
             ) from exc
         db.refresh(order)
-        record_audit(
-            db,
-            action="order.deleted",
-            actor_id=actor.id,
-            resource_type="order",
-            resource_id=order.id,
-            old_value={
-                "status": order.status.value,
-                "is_deleted": False,
-                "wafer_quantity": order.wafer_quantity,
-                "requested_delivery_date": str(order.requested_delivery_date),
-                "notes": order.notes,
-                "assigned_to": (str(order.assigned_to) if order.assigned_to is not None else None),
-            },
-        )
-        db.commit()
+
+        # WebSocket cancellation notification — symmetric with the
+        # ``_is_cancel`` branch in ``compound_finalize`` (worker accept of
+        # a non-fast-path delete fires the same event). Without this,
+        # the frontend never sees the row leave the list and stays
+        # stale until next manual refetch. Best-effort: failures don't
+        # roll back the soft-delete that just committed.
+        try:
+            notification_service.create_notification(
+                db,
+                user_id=order.created_by,
+                order_id=order.id,
+                type="order_cancelled",
+                message=f"訂單 {order.order_number} 已被取消",
+            )
+        except Exception:
+            logger.warning(
+                "notification.create_failed",
+                order_id=str(order.id),
+                user_id=str(order.created_by),
+                exc_info=True,
+            )
+
         logger.info(
             "order.delete_fast_path_cancelled",
             order_id=str(order_id),

@@ -276,6 +276,39 @@ def _clear_orphan_locks(rds: Redis) -> None:
     Safe to run repeatedly: idempotent (clearing an already-cleared lock
     is a no-op via the IS NOT NULL filter). Best-effort: any DB failure
     is logged and swallowed; we never block startup on this.
+
+    **Multi-replica TOCTOU caveat**: ``_RECOVERY_FLAG_KEY`` (NX) only
+    guards against two replicas sweeping simultaneously — it does NOT
+    guard against a producer on a peer replica committing
+    ``is_processing_locked=True`` + ``ZADD pending_ops`` AFTER our
+    ``ZRANGE`` snapshot but BEFORE our UPDATE. In that narrow window
+    we could clear a lock whose compound is legitimately in flight.
+
+    Mitigations / why we accept the window:
+    1. **Window is short**: ZRANGE + DB SELECT + UPDATE is ~tens of
+       milliseconds. The probability that a peer producer's commit
+       lands inside that window AND its compound is reachable AND its
+       order_id is in our locked-rows set is small.
+    2. **Self-healing**: if we wrongly clear a lock, the worker is
+       still going to process that compound. The compound's
+       ``_perform_compound_db_action`` ends with ``order.is_processing
+       _locked = False`` either way — the write is idempotent.
+    3. **No data corruption**: a second user op slipping in during
+       this race window goes through the producer's ``get_by_id_for
+       _update`` row lock; if the worker is mid-flight on the original
+       compound, the second op sees ``is_processing_locked=True``
+       (since worker's FOR UPDATE write hasn't released the lock yet)
+       and gets a 409. Worst case: a producer briefly sees lock=False
+       between our clear and the worker's re-set, builds a compound
+       on stale row state, and the worker hits the ``version_id``
+       OCC guard or the synthetic-pq filter in
+       ``_extract_batch_ops`` — never a tree-corruption path.
+
+    For a true TOCTOU-free version we'd ``WATCH`` ``PENDING_OPS_KEY``
+    inside a MULTI/EXEC and re-check after each producer commit, or
+    move the lock-clear into the producer's commit path with a
+    deferred trigger. Both are more complex than the failure mode
+    warrants for a startup-only sweep.
     """
     # Lazy import for the rest (model + audit are stable to import top-level
     # too but keeping the lazy pattern matches the celery-task imports above
