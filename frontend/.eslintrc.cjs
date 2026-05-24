@@ -34,14 +34,14 @@ module.exports = {
   parserOptions: {
     ecmaVersion: 'latest',
     sourceType: 'module',
-    project: './tsconfig.json',
+    project: './tsconfig.eslint.json',
     tsconfigRootDir: __dirname,
   },
   plugins: ['react-refresh', 'react', 'react-hooks', '@typescript-eslint', 'import'],
   settings: {
     react: { version: 'detect' },
     'import/resolver': {
-      typescript: { project: './tsconfig.json' },
+      typescript: { project: './tsconfig.eslint.json' },
       node: true,
     },
   },
@@ -118,6 +118,8 @@ module.exports = {
           '**/*.test.{ts,tsx}',
           '**/*.spec.{ts,tsx}',
           '**/test/**',
+          'e2e/**/*.{ts,tsx}',
+          'playwright.config.ts',
           'vite.config.ts',
           'tailwind.config.ts',
           'postcss.config.js',
@@ -125,4 +127,12 @@ module.exports = {
       },
     ],
   },
+  overrides: [
+    {
+      files: ['e2e/**/*.ts', 'playwright.config.ts'],
+      rules: {
+        'no-await-in-loop': 'off',
+      },
+    },
+  ],
 };

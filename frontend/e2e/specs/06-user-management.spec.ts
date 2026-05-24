@@ -81,10 +81,7 @@ test.describe('User management', () => {
     await expect(page.getByTestId('orders-schedule-button')).toBeVisible();
   });
 
-  test('root 可以停用帳號且該帳號無法登入', async ({
-    page,
-    request,
-  }) => {
+  test('root 可以停用帳號且該帳號無法登入', async ({ page, request }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,

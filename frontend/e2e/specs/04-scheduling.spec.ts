@@ -15,10 +15,7 @@ function todayText(): string {
 }
 
 test.describe('Scheduling', () => {
-  test('scheduler 可以在日曆未排程清單看到 pending 訂單', async ({
-    page,
-    request,
-  }) => {
+  test('scheduler 可以在日曆未排程清單看到 pending 訂單', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,
@@ -48,10 +45,7 @@ test.describe('Scheduling', () => {
     await expect(firstUnscheduledOrder).toContainText(/ORD-\d{8}-\d{4}/);
   });
 
-  test('scheduler 可以在日曆用搜尋縮小未排程訂單清單', async ({
-    page,
-    request,
-  }) => {
+  test('scheduler 可以在日曆用搜尋縮小未排程訂單清單', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,

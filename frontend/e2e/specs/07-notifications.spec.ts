@@ -52,7 +52,8 @@ test.describe('Notifications', () => {
         response.request().method() === 'PATCH',
     );
     await page.getByTestId('notification-mark-read-button').click();
-    await expect((await readResponse).status()).toBe(200);
+    const response = await readResponse;
+    expect(response.status()).toBe(200);
 
     await expect(page.getByTestId('notifications-empty-state')).toBeVisible();
   });
@@ -86,7 +87,8 @@ test.describe('Notifications', () => {
         response.request().method() === 'PATCH',
     );
     await page.getByTestId('notification-mark-read-button').click();
-    await expect((await readResponse).status()).toBe(200);
+    const response = await readResponse;
+    expect(response.status()).toBe(200);
 
     await expect(page.getByTestId('notifications-empty-state')).toBeVisible();
 
@@ -124,15 +126,13 @@ test.describe('Notifications', () => {
         response.request().method() === 'PATCH',
     );
     await page.getByTestId('notifications-mark-all-read-button').click();
-    await expect((await readAllResponse).status()).toBe(200);
+    const response = await readAllResponse;
+    expect(response.status()).toBe(200);
 
     await expect(page.getByTestId('notifications-empty-state')).toBeVisible();
   });
 
-  test('全部標記為已讀後全部分頁仍會顯示通知', async ({
-    page,
-    request,
-  }) => {
+  test('全部標記為已讀後全部分頁仍會顯示通知', async ({ page, request }) => {
     test.setTimeout(120_000);
 
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
@@ -161,7 +161,8 @@ test.describe('Notifications', () => {
         response.request().method() === 'PATCH',
     );
     await page.getByTestId('notifications-mark-all-read-button').click();
-    await expect((await readAllResponse).status()).toBe(200);
+    const response = await readAllResponse;
+    expect(response.status()).toBe(200);
 
     await expect(page.getByTestId('notifications-empty-state')).toBeVisible();
 
@@ -202,7 +203,8 @@ test.describe('Notifications', () => {
         response.request().method() === 'PATCH',
     );
     await page.getByTestId('notifications-mark-all-read-button').click();
-    await expect((await readAllResponse).status()).toBe(200);
+    const response = await readAllResponse;
+    expect(response.status()).toBe(200);
 
     await expect(page.locator('[aria-label$=" unread notifications"]')).toHaveCount(0);
   });

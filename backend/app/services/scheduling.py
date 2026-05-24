@@ -134,41 +134,6 @@ class SegmentTreeInvariantError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class SegmentTreeInvariantError(RuntimeError):
-    """Segment-tree state has diverged from the order's expected obligation.
-
-    Raised from ``_apply_remove_to_trees`` / ``_apply_add_to_trees`` when
-    the per-tree accounting can't be reconciled with the order being
-    removed / added — typically because the in-memory state's record of
-    that order's ``wafer_quantity`` doesn't match what the tree actually
-    has reserved.
-
-    Most common cause in practice: a producer-side race where two
-    concurrent PATCH transactions both read the order at ``version_id=N``
-    (both see the same old qty), each build a compound with that old qty
-    in its ``remove`` op, and enqueue to Redis BEFORE either has
-    committed. PostgreSQL OCC saves DB consistency (one transaction's
-    commit fails with StaleDataError) but the Redis queue already has
-    the stale compound; when the worker processes it, the ``remove(old_qty)``
-    no longer matches the tree's actual record for that order. The
-    correct producer-side fix is row-level locking on the PATCH path
-    (``SELECT ... FOR UPDATE``) so the second transaction sees
-    ``is_processing_locked=True`` and gets rejected with 409 before
-    enqueueing. This exception is the defensive net at the worker level
-    — even with the producer fix, any other invariant break (programming
-    bug, manual Redis surgery, advance_day edge case) would hit this
-    path. Worker catches it per-leaf in ``_commit_accepted_batch``, logs
-    + emits ``schedule.compound_failed`` to the requester, and continues
-    with the next leaf — so a single bad compound never poisons the
-    whole drain.
-    """
-
-
-# ---------------------------------------------------------------------------
 # Redis-key + queue-encoding contract
 # ---------------------------------------------------------------------------
 #

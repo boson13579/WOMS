@@ -73,7 +73,8 @@ test.describe('Audit log', () => {
         response.request().method() === 'GET',
     );
     await page.getByRole('button', { name: 'Apply' }).click();
-    await expect((await eventsResponse).status()).toBe(200);
+    const response = await eventsResponse;
+    expect(response.status()).toBe(200);
 
     const auditRow = page
       .locator('tr[data-testid^="audit-row-"]:not([data-testid^="audit-row-detail-"])')
@@ -91,10 +92,7 @@ test.describe('Audit log', () => {
     await expect(detail).toContainText('scheduler');
   });
 
-  test('root 可以用 action resource type 和日期找到使用者停用紀錄', async ({
-    page,
-    request,
-  }) => {
+  test('root 可以用 action resource type 和日期找到使用者停用紀錄', async ({ page, request }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,
@@ -132,7 +130,8 @@ test.describe('Audit log', () => {
         response.request().method() === 'GET',
     );
     await page.getByRole('button', { name: 'Apply' }).click();
-    await expect((await eventsResponse).status()).toBe(200);
+    const response = await eventsResponse;
+    expect(response.status()).toBe(200);
 
     const auditRow = page
       .locator('tr[data-testid^="audit-row-"]:not([data-testid^="audit-row-detail-"])')
@@ -151,10 +150,7 @@ test.describe('Audit log', () => {
     await expect(detail).toContainText('false');
   });
 
-  test('root 可以用 action resource type 和日期找到訂單更新紀錄', async ({
-    page,
-    request,
-  }) => {
+  test('root 可以用 action resource type 和日期找到訂單更新紀錄', async ({ page, request }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,
@@ -213,7 +209,8 @@ test.describe('Audit log', () => {
         response.request().method() === 'GET',
     );
     await page.getByRole('button', { name: 'Apply' }).click();
-    await expect((await eventsResponse).status()).toBe(200);
+    const response = await eventsResponse;
+    expect(response.status()).toBe(200);
 
     const auditRow = page
       .locator('tr[data-testid^="audit-row-"]:not([data-testid^="audit-row-detail-"])')
