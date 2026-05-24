@@ -18,6 +18,7 @@ import { SessionBoundary } from '@/components/layout/SessionBoundary';
 import { AuditPage } from '@/features/audit/components/AuditPage';
 import { AuthPage } from '@/features/auth/components/AuthPage';
 import { DashboardPage } from '@/features/dashboard/components/DashboardPage';
+import { NotificationsPage } from '@/features/notifications/components/NotificationsPage';
 import { ObservabilityPage } from '@/features/observability/components/ObservabilityPage';
 import { OrdersPage } from '@/features/orders/components/OrdersPage';
 import { AdminUsersPage } from '@/features/users/components/AdminUsersPage';
@@ -35,6 +36,7 @@ export const routes: RouteObject[] = [
             children: [
               { index: true, element: <DashboardPage /> },
               { path: 'orders', element: <OrdersPage /> },
+              { path: 'notifications', element: <NotificationsPage /> },
               {
                 // Operator-grade observability page — scheduler + root only.
                 // Other roles get redirected to ``/`` by ``RoleProtectedRoute``.
