@@ -40,7 +40,7 @@ test.describe('Order search and filters', () => {
     await expect(orderRow(page, otherCustomer)).toBeHidden();
   });
 
-  test('can filter orders by pending status', async ({ page, request }) => {
+  test('可以用待處理狀態篩選訂單', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,
@@ -74,7 +74,7 @@ test.describe('Order search and filters', () => {
     await expect(orderRow(page, customerName)).toBeHidden();
   });
 
-  test('can reset search and status filters', async ({ page, request }) => {
+  test('可以重設搜尋與狀態篩選條件', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,
@@ -111,7 +111,7 @@ test.describe('Order search and filters', () => {
     await expect(page.getByRole('row').nth(1)).toBeVisible();
   });
 
-  test('can sort orders by customer name', async ({ page, request }) => {
+  test('可以依客戶名稱排序訂單', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,
@@ -155,7 +155,99 @@ test.describe('Order search and filters', () => {
     await expect(matchingRows.nth(1)).toContainText(firstCustomer);
   });
 
-  test('can search orders by order number', async ({ page, request }) => {
+  test('可以依需求交期排序訂單', async ({ page, request }) => {
+    const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
+    test.skip(
+      admin === null,
+      'Set E2E_ADMIN_PASSWORD, and optionally E2E_ADMIN_USERNAME, to create role-specific users.',
+    );
+
+    const orderManager = await createUserWithRole(
+      request,
+      admin,
+      'order_manager',
+      'sort_delivery_manager',
+    );
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const searchPrefix = `E2E Delivery Sort ${suffix}`;
+    const earlierCustomer = `${searchPrefix} Earlier`;
+    const laterCustomer = `${searchPrefix} Later`;
+    const matchingRows = page.getByRole('row').filter({ hasText: searchPrefix });
+
+    await loginViaUi(page, orderManager);
+    await page.getByRole('link', { name: 'Orders' }).click();
+    await createOrderViaUi(page, {
+      customerName: laterCustomer,
+      waferQuantity: '150',
+      requestedDeliveryDate: '2026-07-15',
+    });
+    await createOrderViaUi(page, {
+      customerName: earlierCustomer,
+      waferQuantity: '125',
+      requestedDeliveryDate: '2026-06-30',
+    });
+
+    await page.getByTestId('orders-search-input').fill(searchPrefix);
+    await expect(matchingRows).toHaveCount(2);
+
+    const requestedDeliveryDateHeader = page.getByTestId('orders-page').getByText('要求交貨日');
+
+    await requestedDeliveryDateHeader.click();
+    await expect(matchingRows.nth(0)).toContainText(earlierCustomer);
+    await expect(matchingRows.nth(1)).toContainText(laterCustomer);
+
+    await requestedDeliveryDateHeader.click();
+    await expect(matchingRows.nth(0)).toContainText(laterCustomer);
+    await expect(matchingRows.nth(1)).toContainText(earlierCustomer);
+  });
+
+  test('可以依晶圓數量排序訂單', async ({ page, request }) => {
+    const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
+    test.skip(
+      admin === null,
+      'Set E2E_ADMIN_PASSWORD, and optionally E2E_ADMIN_USERNAME, to create role-specific users.',
+    );
+
+    const orderManager = await createUserWithRole(
+      request,
+      admin,
+      'order_manager',
+      'sort_quantity_manager',
+    );
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const searchPrefix = `E2E Quantity Sort ${suffix}`;
+    const smallerCustomer = `${searchPrefix} Small`;
+    const largerCustomer = `${searchPrefix} Large`;
+    const matchingRows = page.getByRole('row').filter({ hasText: searchPrefix });
+
+    await loginViaUi(page, orderManager);
+    await page.getByRole('link', { name: 'Orders' }).click();
+    await createOrderViaUi(page, {
+      customerName: largerCustomer,
+      waferQuantity: '500',
+      requestedDeliveryDate: '2026-07-15',
+    });
+    await createOrderViaUi(page, {
+      customerName: smallerCustomer,
+      waferQuantity: '125',
+      requestedDeliveryDate: '2026-06-30',
+    });
+
+    await page.getByTestId('orders-search-input').fill(searchPrefix);
+    await expect(matchingRows).toHaveCount(2);
+
+    const waferQuantityHeader = page.getByTestId('orders-page').getByText('晶圓數量');
+
+    await waferQuantityHeader.click();
+    await expect(matchingRows.nth(0)).toContainText(smallerCustomer);
+    await expect(matchingRows.nth(1)).toContainText(largerCustomer);
+
+    await waferQuantityHeader.click();
+    await expect(matchingRows.nth(0)).toContainText(largerCustomer);
+    await expect(matchingRows.nth(1)).toContainText(smallerCustomer);
+  });
+
+  test('可以用訂單編號搜尋訂單', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,
@@ -191,7 +283,7 @@ test.describe('Order search and filters', () => {
     await expect(page.getByRole('row').filter({ hasText: orderNumber })).toHaveCount(1);
   });
 
-  test('shows an empty state when search has no matches', async ({ page, request }) => {
+  test('搜尋沒有符合結果時會顯示空狀態', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,

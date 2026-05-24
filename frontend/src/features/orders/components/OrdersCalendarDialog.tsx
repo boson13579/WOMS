@@ -298,6 +298,7 @@ function UnscheduledOrderLine({
 }): JSX.Element {
   return (
     <div
+      data-testid="orders-calendar-unscheduled-order"
       draggable={canDrag && !order.is_processing_locked}
       onDragStart={(event) => {
         onDragStart(event, order);
@@ -353,13 +354,14 @@ export function OrdersCalendarDialog({
   const [isSearching, setIsSearching] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const role = useCurrentRole();
+  const calendarSearch = isSearching ? searchQuery.trim() : '';
 
   const scheduleResult = useScheduleResult();
   const scheduleCapacity = useScheduleCapacity();
   const pinSchedule = usePinScheduleOperation();
   const pendingOrders = useOrders({
     status: 'pending',
-    search: null,
+    search: calendarSearch || null,
     page: 1,
     page_size: 100,
     sortBy: 'requested_delivery_date',
@@ -383,8 +385,8 @@ export function OrdersCalendarDialog({
     [scheduleResult.data, baseDate],
   );
   const filteredGrouped = useMemo(() => {
-    if (!searchQuery) return grouped;
-    const query = searchQuery.toLowerCase();
+    if (!calendarSearch) return grouped;
+    const query = calendarSearch.toLowerCase();
     return Object.keys(grouped).reduce<Record<string, ProductionCalendarItem[]>>((acc, date) => {
       const items = grouped[date];
       const matched = items.filter(
@@ -397,7 +399,7 @@ export function OrdersCalendarDialog({
       }
       return acc;
     }, {});
-  }, [grouped, searchQuery]);
+  }, [grouped, calendarSearch]);
 
   const dailyCapacityByDate = useMemo(() => {
     if (!scheduleCapacity.data)
@@ -418,14 +420,14 @@ export function OrdersCalendarDialog({
     [pendingOrders.data],
   );
   const filteredUnscheduled = useMemo(() => {
-    if (!searchQuery) return unscheduled;
-    const query = searchQuery.toLowerCase();
+    if (!calendarSearch) return unscheduled;
+    const query = calendarSearch.toLowerCase();
     return unscheduled.filter(
       (order) =>
         order.order_number.toLowerCase().includes(query) ||
         order.customer_name.toLowerCase().includes(query),
     );
-  }, [unscheduled, searchQuery]);
+  }, [unscheduled, calendarSearch]);
   const selectableOrders = useMemo(
     () => [...(scheduledOrders.data?.items ?? []), ...unscheduled],
     [scheduledOrders.data, unscheduled],
@@ -651,7 +653,7 @@ export function OrdersCalendarDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange} className="max-w-6xl">
-      <DialogContent className="p-0">
+      <DialogContent className="p-0" data-testid="orders-calendar-dialog">
         <DialogHeader className="border-b px-6 py-4">
           <DialogTitle className="flex items-center gap-2">
             <CalendarDays className="h-5 w-5" />
@@ -726,7 +728,7 @@ export function OrdersCalendarDialog({
                     </div>
                   ))}
                 </div>
-                <div className="grid grid-cols-7 border-l">
+                <div className="grid grid-cols-7 border-l" data-testid="orders-calendar-grid">
                   {days.map((day) => {
                     const key = dateKey(day);
                     const items = filteredGrouped[key] ?? [];
@@ -926,6 +928,7 @@ export function OrdersCalendarDialog({
                           setSearchQuery('');
                         }
                       }}
+                      data-testid="orders-calendar-search-toggle"
                       className="h-7 w-7 text-muted-foreground hover:text-foreground"
                     >
                       {isSearching ? <X className="h-4 w-4" /> : <Search className="h-4 w-4" />}
@@ -954,6 +957,7 @@ export function OrdersCalendarDialog({
                       type="text"
                       placeholder="輸入單號或客戶名稱..."
                       value={searchQuery}
+                      data-testid="orders-calendar-search-input"
                       onChange={(e) => {
                         setSearchQuery(e.target.value);
                       }}
@@ -1002,7 +1006,10 @@ export function OrdersCalendarDialog({
                   無法載入未排程訂單。
                 </div>
               ) : (
-                <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
+                <div
+                  className="max-h-80 space-y-2 overflow-y-auto pr-1"
+                  data-testid="orders-calendar-unscheduled-list"
+                >
                   {filteredUnscheduled.length > 0 ? (
                     filteredUnscheduled.map((order) => (
                       <UnscheduledOrderLine

@@ -43,6 +43,11 @@ export function OrderFilters(): JSX.Element {
     };
   }, [localSearch, search, setSearch]);
 
+  function handleReset(): void {
+    setLocalSearch('');
+    reset();
+  }
+
   return (
     <div className="flex flex-wrap items-center gap-3">
       <Input
@@ -77,7 +82,12 @@ export function OrderFilters(): JSX.Element {
         </Select>
       </div>
 
-      <Button variant="outline" size="sm" onClick={reset} data-testid="orders-reset-filters-button">
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={handleReset}
+        data-testid="orders-reset-filters-button"
+      >
         重設
       </Button>
     </div>

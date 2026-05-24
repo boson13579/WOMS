@@ -7,7 +7,7 @@ function userRow(page: Page, username: string) {
 }
 
 test.describe('User management', () => {
-  test('root can search registered accounts', async ({ page, request }) => {
+  test('root 可以搜尋已註冊帳號', async ({ page, request }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,
@@ -30,7 +30,7 @@ test.describe('User management', () => {
     await expect(row).toContainText(user.email);
   });
 
-  test('root can search accounts by email', async ({ page, request }) => {
+  test('root 可以用 email 搜尋帳號', async ({ page, request }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,
@@ -49,7 +49,7 @@ test.describe('User management', () => {
     await expect(row).toContainText(user.email);
   });
 
-  test('root can change an account role', async ({ page, request }) => {
+  test('root 可以變更帳號角色', async ({ page, request }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,
@@ -81,7 +81,7 @@ test.describe('User management', () => {
     await expect(page.getByTestId('orders-schedule-button')).toBeVisible();
   });
 
-  test('root can deactivate an account and that account cannot login', async ({
+  test('root 可以停用帳號且該帳號無法登入', async ({
     page,
     request,
   }) => {
@@ -114,7 +114,7 @@ test.describe('User management', () => {
     await expect(page.getByRole('alert')).toBeVisible();
   });
 
-  test('root cannot deactivate or change their own account', async ({ page }) => {
+  test('root 不能停用或變更自己的帳號', async ({ page }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,
@@ -131,7 +131,7 @@ test.describe('User management', () => {
     await expect(row.getByRole('button', { name: 'Deactivate' })).toBeDisabled();
   });
 
-  test('root sees an empty state when no accounts match search', async ({ page }) => {
+  test('搜尋沒有符合帳號時 root 會看到空狀態', async ({ page }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,

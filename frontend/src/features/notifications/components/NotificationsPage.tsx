@@ -146,7 +146,10 @@ export function NotificationsPage(): JSX.Element {
 
     if (listItems.length === 0) {
       return (
-        <Card className="flex h-64 flex-col items-center justify-center gap-4 bg-muted/20 border-dashed p-6 text-center">
+        <Card
+          className="flex h-64 flex-col items-center justify-center gap-4 bg-muted/20 border-dashed p-6 text-center"
+          data-testid="notifications-empty-state"
+        >
           <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground/60">
             <Inbox className="h-6 w-6" />
           </div>
@@ -175,7 +178,7 @@ export function NotificationsPage(): JSX.Element {
           );
 
           return (
-            <Card key={item.id} className={cardClass}>
+            <Card key={item.id} className={cardClass} data-testid="notification-card">
               {getNotificationIcon(item.type)}
 
               <div className="flex-1 min-w-0 space-y-1">
@@ -195,6 +198,7 @@ export function NotificationsPage(): JSX.Element {
                   type="button"
                   variant="ghost"
                   size="icon"
+                  data-testid="notification-mark-read-button"
                   onClick={() => {
                     handleMarkSingleRead(item.id);
                   }}
@@ -226,6 +230,7 @@ export function NotificationsPage(): JSX.Element {
           <div className="flex rounded-lg bg-muted p-1 w-full sm:w-[260px]">
             <button
               type="button"
+              data-testid="notifications-unread-tab"
               onClick={() => {
                 setActiveTab('unread');
               }}
@@ -245,6 +250,7 @@ export function NotificationsPage(): JSX.Element {
             </button>
             <button
               type="button"
+              data-testid="notifications-all-tab"
               onClick={() => {
                 setActiveTab('all');
               }}
@@ -263,6 +269,7 @@ export function NotificationsPage(): JSX.Element {
             <Button
               variant="outline"
               size="sm"
+              data-testid="notifications-mark-all-read-button"
               onClick={handleMarkAllRead}
               disabled={markAllRead.isPending}
               className="flex items-center gap-1.5 border-dashed border-primary/40 hover:border-primary shrink-0 transition-colors"

@@ -4,6 +4,7 @@ import {
   createTestUser,
   createUserWithRole,
   getEnvUser,
+  loginViaApi,
   loginViaUi,
   registerUser,
 } from '../helpers/auth';
@@ -61,7 +62,43 @@ test.describe('RBAC', () => {
     await expect(page.getByTestId('orders-schedule-button')).toBeHidden();
   });
 
-  test('order manager cannot edit another manager order', async ({ page, request }) => {
+  test('viewer 直接呼叫新增訂單後端介面會被拒絕', async ({ request }) => {
+    const viewer = createTestUser('rbac_api_viewer_create');
+    await registerUser(request, viewer);
+    await loginViaApi(request, viewer);
+
+    const response = await request.post('/api/v1/orders', {
+      data: {
+        customer_name: `E2E Forbidden Create ${Date.now()}`,
+        wafer_quantity: 125,
+        requested_delivery_date: '2026-06-30',
+      },
+    });
+
+    expect(response.status()).toBe(403);
+  });
+
+  test('order manager 直接呼叫觸發排程後端介面會被拒絕', async ({ request }) => {
+    const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
+    test.skip(
+      admin === null,
+      'Set E2E_ADMIN_PASSWORD, and optionally E2E_ADMIN_USERNAME, to create role-specific users.',
+    );
+
+    const orderManager = await createUserWithRole(
+      request,
+      admin,
+      'order_manager',
+      'rbac_api_schedule',
+    );
+    await loginViaApi(request, orderManager);
+
+    const response = await request.post('/api/v1/schedule/trigger');
+
+    expect(response.status()).toBe(403);
+  });
+
+  test('order manager 不能編輯其他 order manager 建立的訂單', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,
@@ -94,7 +131,7 @@ test.describe('RBAC', () => {
     await expect(row.getByTestId('orders-delete-button')).toBeHidden();
   });
 
-  test('non-root user is redirected away from user management', async ({ page, request }) => {
+  test('非 root 使用者進入使用者管理頁會被導回首頁', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,
@@ -110,7 +147,7 @@ test.describe('RBAC', () => {
     await expect(page.getByRole('heading', { name: 'User Management' })).toBeHidden();
   });
 
-  test('root can access audit log', async ({ page }) => {
+  test('root 可以進入稽核紀錄頁面', async ({ page }) => {
     const root = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       root === null,
@@ -124,7 +161,7 @@ test.describe('RBAC', () => {
     await expect(page.getByRole('heading', { name: 'Audit Log' })).toBeVisible();
   });
 
-  test('scheduler is redirected away from audit log', async ({ page, request }) => {
+  test('scheduler 進入稽核紀錄頁面會被導回首頁', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,
@@ -140,7 +177,7 @@ test.describe('RBAC', () => {
     await expect(page.getByRole('heading', { name: 'Audit Log' })).toBeHidden();
   });
 
-  test('scheduler can access observability but viewer cannot', async ({ page, request }) => {
+  test('scheduler 可以進入監控頁但 viewer 會被導回首頁', async ({ page, request }) => {
     const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
     test.skip(
       admin === null,

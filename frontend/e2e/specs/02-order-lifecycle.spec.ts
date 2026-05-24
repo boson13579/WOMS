@@ -84,6 +84,7 @@ test.describe('Order access', () => {
 
     await expect(page.getByTestId('order-modal')).toBeVisible();
     await expect(page.getByTestId('order-customer-name-input')).toHaveValue(customerName);
+    await expect(page.getByTestId('order-customer-name-input')).toBeDisabled();
     await expect(page.getByTestId('order-wafer-quantity-input')).toHaveValue('125');
     await expect(page.getByTestId('order-requested-delivery-date-input')).toHaveValue('2026-06-30');
     await page.getByTestId('order-wafer-quantity-input').fill('250');
@@ -161,5 +162,65 @@ test.describe('Order access', () => {
 
     await expect(modal).toBeVisible();
     await expect(modal.getByRole('alert')).toBeVisible();
+  });
+
+  test('order manager 建立訂單時必填欄位不可空白', async ({ page, request }) => {
+    const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
+    test.skip(
+      admin === null,
+      'Set E2E_ADMIN_PASSWORD, and optionally E2E_ADMIN_USERNAME, to create role-specific users.',
+    );
+
+    const orderManager = await createUserWithRole(
+      request,
+      admin,
+      'order_manager',
+      'orders_required_validation',
+    );
+
+    await loginViaUi(page, orderManager);
+    await page.getByRole('link', { name: 'Orders' }).click();
+    await page.getByTestId('orders-create-button').click();
+
+    const modal = page.getByTestId('order-modal');
+    await expect(modal).toBeVisible();
+
+    await page.getByTestId('order-modal-submit-button').click();
+
+    await expect(modal).toBeVisible();
+    await expect(modal.getByText('請填寫客戶名稱')).toBeVisible();
+    await expect(modal.getByText('請選擇要求交貨日')).toBeVisible();
+  });
+
+  test('order manager 建立訂單時負責人必須是系統使用者', async ({ page, request }) => {
+    const admin = getEnvUser('E2E_ADMIN_USERNAME', 'E2E_ADMIN_PASSWORD', 'admin');
+    test.skip(
+      admin === null,
+      'Set E2E_ADMIN_PASSWORD, and optionally E2E_ADMIN_USERNAME, to create role-specific users.',
+    );
+
+    const orderManager = await createUserWithRole(
+      request,
+      admin,
+      'order_manager',
+      'orders_assignee_validation',
+    );
+    const suffix = uniqueSuffix();
+
+    await loginViaUi(page, orderManager);
+    await page.getByRole('link', { name: 'Orders' }).click();
+    await page.getByTestId('orders-create-button').click();
+
+    const modal = page.getByTestId('order-modal');
+    await expect(modal).toBeVisible();
+
+    await page.getByTestId('order-customer-name-input').fill(`E2E Invalid Assignee ${suffix}`);
+    await page.getByTestId('order-wafer-quantity-input').fill('125');
+    await page.getByTestId('order-requested-delivery-date-input').fill('2026-06-30');
+    await page.getByLabel('負責人').fill(`missing-assignee-${suffix}@example.com`);
+    await page.getByTestId('order-modal-submit-button').click();
+
+    await expect(modal).toBeVisible();
+    await expect(modal.getByText('負責人必須是系統中現有的使用者')).toBeVisible();
   });
 });
