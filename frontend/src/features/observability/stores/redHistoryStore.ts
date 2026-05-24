@@ -19,22 +19,25 @@ import { create } from 'zustand';
 export const RED_HISTORY_CAPACITY = 20;
 
 /** Sparkline-renderable metric keys (one ring buffer each). */
-export type RedHistoryMetric = 'rate' | 'errorPct' | 'p95';
+export type RedHistoryMetric = 'rate' | 'errorPct' | 'p95' | 'lagP95';
 
 interface RedHistoryState {
   /** Per-metric ring buffer; oldest sample first, newest last. */
   series: Record<RedHistoryMetric, number[]>;
   /**
-   * Append one sample per metric. Implementation slices the front off
-   * when capacity is exceeded so the array stays bounded forever.
+   * Append one sample per provided metric key. Partial: callers push
+   * only the metrics they own (``useRedMetrics`` pushes rate/errorPct/
+   * p95; ``useScheduleLag`` pushes lagP95) so adding a new metric to
+   * the union doesn't break existing pushers. Implementation slices the
+   * front off when capacity is exceeded so each array stays bounded.
    */
-  push: (sample: Record<RedHistoryMetric, number>) => void;
+  push: (sample: Partial<Record<RedHistoryMetric, number>>) => void;
   /** Clear all buffers — used when the time-range window changes. */
   reset: () => void;
 }
 
 function emptySeries(): RedHistoryState['series'] {
-  return { rate: [], errorPct: [], p95: [] };
+  return { rate: [], errorPct: [], p95: [], lagP95: [] };
 }
 
 export const useRedHistoryStore = create<RedHistoryState>((set) => ({
@@ -43,9 +46,11 @@ export const useRedHistoryStore = create<RedHistoryState>((set) => ({
     set((state) => {
       const next = { ...state.series };
       (Object.keys(sample) as RedHistoryMetric[]).forEach((key) => {
+        const value = sample[key];
+        if (value === undefined) return;
         const prev = next[key];
         const appended = prev.length >= RED_HISTORY_CAPACITY ? prev.slice(1) : prev.slice();
-        appended.push(sample[key]);
+        appended.push(value);
         next[key] = appended;
       });
       return { series: next };

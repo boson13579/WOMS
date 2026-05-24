@@ -42,6 +42,7 @@ import structlog
 from redis import Redis
 
 from app.core.config import get_settings
+from app.core.db import SessionLocal
 from app.services.schedule_queue import _read_status
 from app.services.scheduling import (
     HORIZON_DAYS,
@@ -212,6 +213,9 @@ def _dispatch_recovery(rds: Redis) -> None:
     # --- Step 3: orphan pending ops → re-trigger drain ----------------------
     _maybe_kick_run(rds, run_scheduling_task)
 
+    # --- Step 4: orphan ``is_processing_locked`` rows → clear --------------
+    _clear_orphan_locks(rds)
+
 
 def _maybe_kick_run(rds: Redis, run_scheduling_task: object) -> None:
     """If queue has work but status isn't ``running``, dispatch a drain.
@@ -243,3 +247,136 @@ def _maybe_kick_run(rds: Redis, run_scheduling_task: object) -> None:
         action="kick_run",
     )
     run_scheduling_task.delay()  # type: ignore[attr-defined]
+
+
+def _clear_orphan_locks(rds: Redis) -> None:
+    """Clear ``is_processing_locked=True`` rows whose compound is no longer queued.
+
+    Producer commits ``is_processing_locked=True`` BEFORE enqueueing the
+    compound; worker clears the lock in
+    ``compound_finalize.perform_compound_db_action`` when accepting /
+    rejecting the compound. If the worker crashes between the producer's
+    commit and the worker's accept (or between accept and the lock-
+    clearing write), the lock survives indefinitely. With the
+    materializer no longer touching ``is_processing_locked``, no
+    background pass clears these — they would silently block future
+    PATCH / DELETE / cancel on the affected row until manual DB
+    intervention.
+
+    This sweep runs once at FastAPI startup. Algorithm:
+
+    1. ``ZRANGE pending_ops`` → JSON-parse each → collect every
+       ``ops[].order_id`` referenced by an in-flight compound.
+    2. Query DB for rows with ``is_processing_locked=True AND
+       is_deleted=False``.
+    3. For each such row whose ``order_id`` is NOT in the in-flight set,
+       clear the lock and write an ``order.lock_cleared_orphan`` audit
+       row so ops can see the recovery happened.
+
+    Safe to run repeatedly: idempotent because the SELECT in step 2
+    only picks rows with ``is_processing_locked=True`` — a re-run after
+    every targeted row was already cleared finds zero rows to update.
+    Best-effort: any DB failure is logged and swallowed; we never
+    block startup on this.
+
+    **Multi-replica TOCTOU caveat**: ``_RECOVERY_FLAG_KEY`` (NX) only
+    guards against two replicas sweeping simultaneously — it does NOT
+    guard against a producer on a peer replica committing
+    ``is_processing_locked=True`` + ``ZADD pending_ops`` AFTER our
+    ``ZRANGE`` snapshot but BEFORE our UPDATE. In that narrow window
+    we could clear a lock whose compound is legitimately in flight.
+
+    Mitigations / why we accept the window:
+    1. **Window is short**: ZRANGE + DB SELECT + UPDATE is ~tens of
+       milliseconds. The probability that a peer producer's commit
+       lands inside that window AND its compound is reachable AND its
+       order_id is in our locked-rows set is small.
+    2. **Self-healing**: if we wrongly clear a lock, the worker is
+       still going to process that compound. The compound's
+       ``_perform_compound_db_action`` always ends by writing
+       ``is_processing_locked = False`` — the write is idempotent.
+    3. **No data corruption**: a second user op slipping in during
+       this race window goes through the producer's row lock
+       (``get_by_id_for_update``); if the worker is mid-flight on the
+       original compound, the second op sees the lock still True
+       (worker's ``FOR UPDATE`` write hasn't released it) and gets
+       a 409. Worst case: a producer briefly sees the lock False
+       between our clear and the worker's re-set, builds a compound
+       on stale row state, and the worker hits the ``version_id``
+       OCC guard or the synthetic-pq filter in
+       ``_extract_batch_ops`` — never a tree-corruption path.
+
+    For a true TOCTOU-free version we'd ``WATCH`` ``PENDING_OPS_KEY``
+    inside a MULTI/EXEC and re-check after each producer commit, or
+    move the lock-clear into the producer's commit path with a
+    deferred trigger. Both are more complex than the failure mode
+    warrants for a startup-only sweep.
+    """
+    # Lazy import for the rest (model + audit are stable to import top-level
+    # too but keeping the lazy pattern matches the celery-task imports above
+    # — recovery module's defensible contract is "minimal module-load surface
+    # area; pull in heavy deps only when actually running recovery"). The
+    # ``SessionLocal`` import is at module top so tests can patch it.
+    import json  # noqa: PLC0415
+
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.core.audit import record_audit  # noqa: PLC0415
+    from app.models.order import Order  # noqa: PLC0415
+
+    try:
+        members = cast("list[str]", rds.zrange(PENDING_OPS_KEY, 0, -1))
+    except Exception:
+        logger.exception("schedule.startup_recovery.orphan_locks.zrange_failed")
+        return
+
+    in_flight_order_ids: set[str] = set()
+    for raw in members:
+        try:
+            compound = json.loads(raw)
+        except Exception:
+            logger.warning("schedule.startup_recovery.orphan_locks.bad_member")
+            continue
+        for op in compound.get("ops") or []:
+            oid = op.get("order_id")
+            if isinstance(oid, str):
+                in_flight_order_ids.add(oid)
+
+    db = SessionLocal()
+    try:
+        locked = list(
+            db.scalars(
+                select(Order).where(
+                    Order.is_processing_locked.is_(True),
+                    Order.is_deleted.is_(False),
+                )
+            )
+        )
+        cleared = 0
+        for order in locked:
+            if str(order.id) in in_flight_order_ids:
+                continue  # legitimately in flight
+            order.is_processing_locked = False
+            record_audit(
+                db,
+                action="order.lock_cleared_orphan",
+                actor_id=None,  # system action — no human actor
+                resource_type="order",
+                resource_id=order.id,
+                old_value={"is_processing_locked": True},
+                new_value={"is_processing_locked": False},
+            )
+            cleared += 1
+        if cleared:
+            db.commit()
+            logger.warning(
+                "schedule.startup_recovery.orphan_locks_cleared",
+                cleared=cleared,
+            )
+        else:
+            db.rollback()
+    except Exception:
+        logger.exception("schedule.startup_recovery.orphan_locks.db_failed")
+        db.rollback()
+    finally:
+        db.close()

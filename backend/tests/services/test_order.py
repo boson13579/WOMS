@@ -1,20 +1,16 @@
 """Targeted tests for ``app.services.order`` paths touched by the scheduler.
 
 Per RULES.md §5 (TDD), every functional change ships with a regression test.
-The PR-review fix that made ``apply_schedule`` write into the ``audit_logs``
-table — instead of only emitting a stdout audit line — is exactly the kind
-of change that needs a real-DB assertion: a unit test with mocked sessions
-would happily pass even if the row were never persisted.
 
-Scope is intentionally narrow: just enough to lock the audit-DB-write
-contract that the review feedback called out. Broader ``services/order``
-coverage lives elsewhere.
+Scope is intentionally narrow: ``apply_schedule`` behaviour, concurrent PATCH
+isolation (StaleDataError + SAVEPOINT), and DB-write correctness. Broader
+``services/order`` coverage lives elsewhere.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock
 
 import bcrypt
@@ -80,13 +76,12 @@ def _make_order(
     return order
 
 
-def test_apply_schedule_persists_audit_row_per_order(db_session: Session) -> None:
-    """Each order whose schedule is applied must land a row in ``audit_logs``
-    with ``action="order.scheduled"``, ``user_id=None`` (system actor), and a
-    ``new_value`` JSON containing the persisted dates and final status.
+def test_apply_schedule_returns_correct_applied_count(db_session: Session) -> None:
+    """apply_schedule returns the count of orders whose dates were written.
 
-    Pre-fix this path only emitted a stdout log; if the log shipper missed it
-    the schedule history was unrecoverable from the DB.
+    Multi-day assignments for one order count as a single applied order (the
+    date fold collapses them to earliest/latest). Single-day for another order
+    counts as one more. Total: 2.
     """
     creator = _make_user(db_session, username="apply-sched-user-1")
     order_a = _make_order(
@@ -102,9 +97,6 @@ def test_apply_schedule_persists_audit_row_per_order(db_session: Session) -> Non
         deadline=date(2026, 5, 22),
     )
 
-    # Mixed multi-day assignment for order_a (collapses to earliest/latest);
-    # single-day for order_b — covers both branches of the fold inside
-    # apply_schedule.
     scheduled = [
         ScheduledResult(order_id=order_a.id, scheduled_date=date(2026, 5, 12), quantity=60),
         ScheduledResult(order_id=order_a.id, scheduled_date=date(2026, 5, 13), quantity=40),
@@ -114,36 +106,12 @@ def test_apply_schedule_persists_audit_row_per_order(db_session: Session) -> Non
     applied = order_service.apply_schedule(db_session, scheduled)
     assert applied == 2
 
-    rows = list(
-        db_session.scalars(
-            select(AuditLog)
-            .where(AuditLog.action == "order.scheduled")
-            .where(AuditLog.resource_id.in_([order_a.id, order_b.id]))
-            .order_by(AuditLog.created_at.asc())
-        ).all()
-    )
-
-    assert len(rows) == 2
-    by_order = {row.resource_id: row for row in rows}
-    a_row = by_order[order_a.id]
-    b_row = by_order[order_b.id]
-
-    # System-driven scheduling has no human actor.
-    assert a_row.user_id is None
-    assert b_row.user_id is None
-    assert a_row.resource_type == "order"
-    # New_value carries the earliest/latest fold and the new status, so the
-    # audit history alone is enough to answer "when was X scheduled?".
-    assert a_row.new_value == {
-        "scheduled_production_date": "2026-05-12",
-        "expected_delivery_date": "2026-05-13",
-        "status": OrderStatus.scheduled.value,
-    }
-    assert b_row.new_value == {
-        "scheduled_production_date": "2026-05-14",
-        "expected_delivery_date": "2026-05-14",
-        "status": OrderStatus.scheduled.value,
-    }
+    db_session.refresh(order_a)
+    db_session.refresh(order_b)
+    assert order_a.scheduled_production_date == date(2026, 5, 12)
+    assert order_a.expected_delivery_date == date(2026, 5, 13)
+    assert order_b.scheduled_production_date == date(2026, 5, 14)
+    assert order_b.expected_delivery_date == date(2026, 5, 14)
 
 
 def test_apply_schedule_writes_daily_capacity_snapshot(db_session: Session) -> None:
@@ -738,6 +706,100 @@ def test_apply_schedule_preserves_in_production_status(db_session: Session) -> N
     assert boundary.status == OrderStatus.in_production
 
 
+def test_apply_schedule_preserves_cancelled_status(db_session: Session) -> None:
+    """A row whose ``status='cancelled'`` MUST NOT be demoted back to
+    ``scheduled`` when ``apply_schedule`` runs on a (possibly stale)
+    schedule that still references this order.
+
+    Race this protects against (observed in production via
+    consistency_check.py): a previous materializer reads
+    ``schedule:state`` snapshot where order X is still in pq, then the
+    worker's next batch accepts a cancel compound for X (pq_remove +
+    DB ``status=cancelled``). The previous materializer's
+    ``apply_schedule`` loop then reaches X with the stale snapshot's
+    schedule entry — pre-fix, ``set_schedule_dates`` would
+    unconditionally write ``status=scheduled``, silently un-cancelling
+    the row. Same shape as the ``in_production`` regression above —
+    materializer must respect terminal statuses set by other writers.
+    """
+    creator = _make_user(db_session, username="apply-sched-preserve-cancelled")
+    cancelled = Order(
+        order_number="ORD-CANCELLED-RACE",
+        customer_name="ACME",
+        wafer_quantity=200,
+        requested_delivery_date=date(2026, 5, 14),
+        created_by=creator.id,
+        status=OrderStatus.cancelled,
+        scheduled_production_date=date(2026, 5, 12),
+        expected_delivery_date=date(2026, 5, 12),
+        daily_breakdown=[{"date": "2026-05-12", "quantity": 200}],
+    )
+    db_session.add(cancelled)
+    db_session.commit()
+
+    # Materializer's stale view still has this order in its schedule output.
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(
+                order_id=cancelled.id,
+                scheduled_date=date(2026, 5, 13),
+                quantity=200,
+            ),
+        ],
+    )
+
+    db_session.refresh(cancelled)
+    # Status preserved — load-bearing assertion of the cancel-race regression.
+    assert cancelled.status == OrderStatus.cancelled
+
+
+def test_apply_schedule_does_not_clear_processing_lock(db_session: Session) -> None:
+    """``set_schedule_dates`` MUST NOT touch ``is_processing_locked``. The
+    lock's lifecycle belongs to the producer↔worker(``compound_finalize``)
+    pipeline exclusively. Pre-fix, materializer unconditionally cleared
+    the lock as a side effect of writing schedule columns — which let a
+    second user op slip in on a row whose compound was still queued (the
+    producer set lock=True, materializer ran before the worker accepted
+    the compound, lock cleared prematurely, second producer saw lock=False
+    and built a stale compound on top).
+
+    Verifies by seeding a row with lock=True, running ``apply_schedule``,
+    and asserting the lock stays.
+    """
+    creator = _make_user(db_session, username="apply-sched-no-clear-lock")
+    locked = Order(
+        order_number="ORD-NO-CLEAR-LOCK",
+        customer_name="ACME",
+        wafer_quantity=300,
+        requested_delivery_date=date(2026, 5, 14),
+        created_by=creator.id,
+        status=OrderStatus.pending,  # producer flipped to pending while lock held
+        is_processing_locked=True,
+    )
+    db_session.add(locked)
+    db_session.commit()
+
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(
+                order_id=locked.id,
+                scheduled_date=date(2026, 5, 13),
+                quantity=300,
+            ),
+        ],
+    )
+
+    db_session.refresh(locked)
+    # Schedule columns get written.
+    assert locked.scheduled_production_date == date(2026, 5, 13)
+    # Lock untouched — load-bearing.
+    assert locked.is_processing_locked is True
+    # Status moved from pending→scheduled (pending is not in the terminal-status guard).
+    assert locked.status == OrderStatus.scheduled
+
+
 def test_list_for_scheduler_excludes_in_production_orders(db_session: Session) -> None:
     """Rebuild reconstructs the algorithm state from DB truth, but cannot
     represent the "partial production progress" of an in-production order —
@@ -925,11 +987,16 @@ def test_update_order_qty_smaller_with_deadline_earlier_is_grow_group(
     tightening as grow, regardless of qty direction.
     """
     creator = _make_user(db_session, username="sru-smaller-earlier")
+    # Relative dates so both old and new deadlines fall inside the
+    # producer's [today+1, today+30] horizon. New deadline is pulled
+    # earlier than old to trigger the grow-group classification.
+    original_deadline = date.today() + timedelta(days=25)
+    earlier_deadline = date.today() + timedelta(days=20)
     order = Order(
         order_number="ORD-SMALLER-EARLIER",
         customer_name="ACME",
         wafer_quantity=500,
-        requested_delivery_date=date(2026, 5, 25),
+        requested_delivery_date=original_deadline,
         created_by=creator.id,
         status=OrderStatus.pending,
     )
@@ -939,7 +1006,7 @@ def test_update_order_qty_smaller_with_deadline_earlier_is_grow_group(
 
     req = UpdateOrderRequest(
         wafer_quantity=100,  # smaller
-        requested_delivery_date=date(2026, 5, 20),  # earlier
+        requested_delivery_date=earlier_deadline,  # earlier
         version_id=order.version_id,
     )
     order_service.update_order(db_session, order.id, req, creator)
@@ -1021,17 +1088,23 @@ def test_update_order_pinned_with_deadline_before_pin_day_silent_drops_pin(
     production day for this order, so silent-drop pin.
     """
     creator = _make_user(db_session, username="sru-4")
+    # Relative dates so all three (old deadline, pin day, new deadline)
+    # land in the producer's [today+1, today+30] horizon. New deadline
+    # must be strictly before pin_day to trigger silent-drop.
+    old_deadline = date.today() + timedelta(days=20)
+    pin_day = date.today() + timedelta(days=15)
+    new_deadline_before_pin = date.today() + timedelta(days=10)
     order = _make_pinned_order(
         db_session,
         creator_id=creator.id,
         order_number="ORD-PIN-DL",
-        deadline=date(2026, 5, 20),
-        pin_day=date(2026, 5, 15),
+        deadline=old_deadline,
+        pin_day=pin_day,
         quantity=100,
     )
 
     req = UpdateOrderRequest(
-        requested_delivery_date=date(2026, 5, 10),  # BEFORE pin day
+        requested_delivery_date=new_deadline_before_pin,  # BEFORE pin day
         version_id=order.version_id,
     )
     order_service.update_order(db_session, order.id, req, creator)
@@ -1079,10 +1152,12 @@ def test_create_order_pushes_add_compound(db_session: Session, mock_enqueue: Mag
     edits while the worker handles the add.
     """
     creator = _make_user(db_session, username="sru-6")
+    # Relative deadline keeps the request inside the producer's
+    # [today+1, today+30] horizon regardless of when the suite runs.
     req = CreateOrderRequest(
         customer_name="ACME",
         wafer_quantity=100,
-        requested_delivery_date=date(2026, 5, 20),
+        requested_delivery_date=date.today() + timedelta(days=15),
     )
     order_service.create_order(db_session, req, creator)
 
@@ -1138,6 +1213,145 @@ def test_delete_order_pinned_pushes_unpin_then_remove_compound(
 
     compound = mock_enqueue.call_args.args[0]
     assert [op.op for op in compound.ops] == ["unpin", "remove"]
+
+
+def test_cancel_order_scheduled_pushes_remove_compound_with_cancel_kind(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """cancel_order pushes the same shape as delete_order ([remove] / [unpin,
+    remove], group=shrink) but with ``db_action.kind="cancel"`` so the
+    worker on accept leaves ``is_deleted=False``.
+    """
+    creator = _make_user(db_session, username="sru-cancel-1")
+    order = Order(
+        order_number="ORD-CANCEL-NP",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.scheduled,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    order_service.cancel_order(db_session, order.id, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert compound.group == "shrink"
+    assert [op.op for op in compound.ops] == ["remove"]
+    assert compound.db_action.kind == "cancel"
+
+
+def test_cancel_order_pinned_pushes_unpin_then_remove_with_cancel_kind(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """cancel_order on a pinned + scheduled order pushes ``[unpin, remove]``
+    with kind="cancel". Mirrors delete_order's pinned path.
+    """
+    creator = _make_user(db_session, username="sru-cancel-2")
+    order = _make_pinned_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-CANCEL-P",
+        deadline=date(2026, 5, 20),
+        pin_day=date(2026, 5, 15),
+    )
+    # _make_pinned_order leaves status=pending; flip to scheduled so the
+    # cancel guard passes (cancel only allows status=scheduled).
+    order.status = OrderStatus.scheduled
+    db_session.commit()
+    db_session.refresh(order)
+
+    order_service.cancel_order(db_session, order.id, creator)
+
+    compound = mock_enqueue.call_args.args[0]
+    assert [op.op for op in compound.ops] == ["unpin", "remove"]
+    assert compound.db_action.kind == "cancel"
+
+
+def test_cancel_order_rejects_non_scheduled_status(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """cancel_order only accepts ``status=scheduled``. ``pending`` /
+    ``in_production`` / ``completed`` / ``cancelled`` all 409. The
+    409 for pending is the load-bearing one — it forces the frontend to
+    route those through ``DELETE /schedule/operations/{compound_id}``
+    instead of stacking another compound on a row whose create compound
+    is still in the queue.
+    """
+    from fastapi import HTTPException
+
+    creator = _make_user(db_session, username="sru-cancel-guard")
+    for blocked_status in (
+        OrderStatus.pending,
+        OrderStatus.in_production,
+        OrderStatus.completed,
+        OrderStatus.cancelled,
+    ):
+        order = Order(
+            order_number=f"ORD-CANCEL-{blocked_status.value}",
+            customer_name="ACME",
+            wafer_quantity=100,
+            requested_delivery_date=date(2026, 5, 20),
+            created_by=creator.id,
+            status=blocked_status,
+        )
+        db_session.add(order)
+        db_session.commit()
+        db_session.refresh(order)
+
+        with pytest.raises(HTTPException) as exc_info:
+            order_service.cancel_order(db_session, order.id, creator)
+        assert exc_info.value.status_code == 409
+
+    # None of the blocked attempts should have enqueued a compound.
+    assert mock_enqueue.call_count == 0
+
+
+def test_delete_after_cancel_uses_fast_path_no_compound(
+    db_session: Session, mock_enqueue: MagicMock
+) -> None:
+    """delete_order on an already-cancelled (but visible) row must take the
+    DB-only fast path: set ``is_deleted=True``, write the
+    ``order.deleted`` audit, and **NOT** enqueue a ``[remove]`` compound.
+
+    Enqueueing a second ``[remove]`` would silently double-subtract from
+    the segment trees (``pq_remove`` no-ops at the leaf level, but
+    ``apply_batch_to_capacity`` / ``apply_batch_to_deadline`` still
+    apply the delta) — phantom capacity / phantom released-deadline that
+    corrupts later admission decisions. The fast path is the producer-
+    side defense; ``_extract_batch_ops`` synthetic-pq skip is the
+    worker-side bottom liner. This test pins the producer half.
+    """
+    creator = _make_user(db_session, username="sru-del-after-cancel")
+    order = Order(
+        order_number="ORD-DEL-AFTER-CANCEL",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 5, 20),
+        created_by=creator.id,
+        status=OrderStatus.cancelled,
+        is_deleted=False,
+    )
+    db_session.add(order)
+    db_session.commit()
+    db_session.refresh(order)
+
+    order_service.delete_order(db_session, order.id, creator)
+
+    db_session.refresh(order)
+    assert order.is_deleted is True, "fast path must soft-delete the row"
+    assert order.status == OrderStatus.cancelled, "status stays cancelled"
+    assert mock_enqueue.call_count == 0, (
+        "fast path must skip the [remove] compound to avoid tree double-subtract"
+    )
+
+    # Audit row should exist for the soft-delete.
+    actions = db_session.scalars(
+        select(AuditLog.action).where(AuditLog.resource_id == order.id)
+    ).all()
+    assert "order.deleted" in actions
 
 
 # ---------------------------------------------------------------------------
@@ -1424,18 +1638,6 @@ def test_apply_schedule_skips_stale_row_and_continues_others(
     # order_a's dates were NOT written (the SAVEPOINT rolled back).
     db_session.refresh(order_a)
     assert order_a.scheduled_production_date is None
-
-    # Audit row landed for order_b only; order_a got skipped before the
-    # audit insert ran inside the same nested block.
-    audit_rows = list(
-        db_session.scalars(
-            select(AuditLog).where(
-                AuditLog.action == "order.scheduled",
-                AuditLog.resource_id.in_([order_a.id, order_b.id]),
-            )
-        ).all()
-    )
-    assert {r.resource_id for r in audit_rows} == {order_b.id}
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,10 @@ import { AuthOnlyRoute } from './AuthOnlyRoute';
 import { ProtectedRoute } from './ProtectedRoute';
 import { SessionBoundary } from './SessionBoundary';
 
+vi.mock('@/features/notifications/hooks/useNotificationsWs', () => ({
+  useNotificationsWs: vi.fn(),
+}));
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,

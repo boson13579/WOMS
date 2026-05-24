@@ -10,7 +10,9 @@
  * `schedule.updated` carry no correlation id, so treating them as a
  * single-task signal would mistakenly conflate other users' compounds with
  * the current session. Toasts for the user's own actions live with the
- * mutation that started them, not in here.
+ * mutation that started them, not in here. The exception is a failed compound:
+ * without a global fallback, rejected scheduler operations can be silent when
+ * the calendar dialog is not the active page.
  */
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
@@ -26,9 +28,8 @@ import { scheduleResultKeys } from '../api/scheduleResult';
 const wsEnvelopeSchema = z
   .object({
     type: z.string(),
-    message: z.string().optional(),
     reason: z.string().optional(),
-    order_number: z.string().optional(),
+    detail: z.string().optional(),
   })
   .passthrough();
 
@@ -56,14 +57,11 @@ export function useScheduleWs(): void {
         void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
         void qc.invalidateQueries({ queryKey: scheduleResultKeys.all });
       }
+
       if (env.type === 'schedule.compound_failed') {
-        const description = env.message ?? env.reason ?? '排程器拒絕這次操作，請檢查訂單日期與產能。';
+        const reason = env.reason ?? '排程器拒絕此操作';
+        const description = env.detail ? `${reason}: ${env.detail}` : reason;
         toast.error('排程失敗', { description });
-      }
-      if (env.type === 'schedule.materialized') {
-        toast.info('排程結果已更新', {
-          description: '已同步訂單狀態、生產日期與每日剩餘產能。',
-        });
       }
     };
 

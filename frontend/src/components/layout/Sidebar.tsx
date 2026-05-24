@@ -12,15 +12,7 @@
  * (`MobileNav`) can reuse the same markup at viewport widths where the
  * persistent sidebar is hidden (`<768px`).
  */
-import {
-  Activity,
-  Bell,
-  LayoutDashboard,
-  Package,
-  ScrollText,
-  Settings,
-  Users,
-} from 'lucide-react';
+import { Activity, Bell, LayoutDashboard, Package, ScrollText, Users } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 
@@ -184,10 +176,6 @@ export function SidebarNavContent({ onNavigate = NOOP }: SidebarNavContentProps 
       {/* Footer */}
       <div className="p-3">
         <Separator className="mb-3" />
-        <div className="flex cursor-not-allowed items-center gap-3 rounded-md px-3 py-2 text-sm text-muted-foreground/60">
-          <Settings className="h-4 w-4" />
-          <span className="flex-1">Settings</span>
-        </div>
         <div className="mt-2 px-3 text-[10px] text-muted-foreground">Phase 2 · v0.2.0</div>
       </div>
     </div>

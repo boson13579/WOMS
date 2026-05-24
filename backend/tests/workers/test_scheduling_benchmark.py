@@ -208,6 +208,13 @@ def _patch_worker_io(
         "app.workers.scheduling.SessionLocal",
         lambda: _NonClosingSession(db_session),
     )
+    # P1-2 refactor extracted ``perform_compound_db_action`` to
+    # ``app.services.compound_finalize``; its ``SessionLocal`` import is
+    # independent of the worker's so we have to redirect both.
+    monkeypatch.setattr(
+        "app.services.compound_finalize.SessionLocal",
+        lambda: _NonClosingSession(db_session),
+    )
     monkeypatch.setattr("app.workers.scheduling.websocket.broadcast", MagicMock())
     monkeypatch.setattr("app.workers.scheduling.websocket.notify_user", MagicMock())
     monkeypatch.setattr("app.workers.scheduling.run_scheduling_task.delay", MagicMock())

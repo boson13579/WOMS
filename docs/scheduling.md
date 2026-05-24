@@ -68,7 +68,14 @@
 - **pending_ops queue**：所有 compound（想排 / 想取消 / 想 pin 等的事件包成一組）先進這個 Redis sorted set，score 編碼 shrink-優先 + 組內 FIFO。worker 用 batch admission 一次處理 — `ZRANGE` 讀全部、二分搜尋找最大可行 prefix `[1..k]`、整 batch tree 一次更新後 `ZREM` 那 k 個 member。可行性 check 在 tree 變動前就做，所以不需要 snapshot rollback。詳見 §4.2。
 - **scheduler state**：序列化在 Redis 的線段樹 + pq + `pinned_orders` + `base_date`，跨次持久保存。
 - **schedule status**：`idle` / `running` / `failed`，由 worker 維護，API 跟 advance\_day 拿來判斷有沒有任務在跑。
-- **訂單生命週期 status**（DB 上的 `Order.status` 欄位，跟上面的 schedule status 是不同的東西）：`pending` → `scheduled` → `in_production` → `completed`。`pending` 是剛建立 / 剛 PATCH 的；scheduler 把它排進排程後變 `scheduled`；advance_day 在生產日當天 00:00 UTC 把它變 `in_production`、生產完那天 00:00 UTC 變 `completed`。`cancelled` 是 PATCH 軟刪除走的旁路。
+- **訂單生命週期 status**（DB 上的 `Order.status` 欄位，跟上面的 schedule status 是不同的東西）：`pending` → `scheduled` → `in_production` → `completed`。`pending` 是剛建立 / 剛 PATCH 的；scheduler 把它排進排程後變 `scheduled`；advance_day 在生產日當天 00:00 UTC 把它變 `in_production`、生產完那天 00:00 UTC 變 `completed`。`cancelled` 是「訂單沒能成功進入排程 / 被人工取消」的旁路（user 主動取消、user 刪除、worker reject 三種來源）。
+- **`cancelled` 跟 `is_deleted` 的區分**（兩個欄位獨立，組合決定可見性）：
+    - **使用者 `DELETE /orders/{id}`**（「刪除訂單」按鈕，僅適用 `scheduled` 訂單）：`status='cancelled'` + `is_deleted=True` + audit `order.deleted`。訂單從 list view 消失（`is_deleted=False` filter），但 audit log 還查得到（`/orders/{id}/audit` 不過 soft-delete filter）。
+    - **使用者 `POST /orders/{id}/cancel`**（「取消訂單」按鈕，僅適用 `scheduled` 訂單）：`status='cancelled'` + `is_deleted=False` + audit `order.cancelled`。訂單**保留在 list view**，跟「刪除」的差別只在 `is_deleted` 這一欄。compound shape 跟 delete 相同（`[remove]` / `[unpin, remove]`），只是 `db_action.kind="cancel"`。語意：「客戶反悔，把這張單從產線拉掉但保留紀錄」。
+    - **使用者 `DELETE /schedule/operations/{compound_id}`**（「取消訂單操作」按鈕，適用 pending list 中尚未被 worker 處理的 compound）：依被取消的 compound `kind` 走 reject 路徑 — `kind="create"` 走下面那條（cancelled + visible）、`kind="update"` / `"delete"` / `"cancel"` 只是 clear lock 還原 status。
+    - **Worker 拒絕一筆 create compound**（producer 已建 row、worker `add` 因 `capacity_exceeded` / `deadline_too_far` reject）**或上面那條 user 取消 create-kind compound**：`status='cancelled'` + `is_deleted=False` + audit `order.cancelled`。訂單**保留在 list view**，讓 user 知道「這張單沒有被成功收進排程，要不要改完再重送」。`compound_finalize._apply_db_action_reject(kind="create")` 是這條路徑的 single source of truth。
+    - 三條 user-facing path 都不會碰 DB 列的真實刪除 — `is_deleted` 是 soft delete flag。`GET /orders` 不變地用 `is_deleted.is_(False)` 篩；新邏輯下它會自然 surface 出 user-cancelled / worker-rejected / queue-cancelled 的 cancelled row。
+- **Audit action 字串**：`order.deleted`（DELETE 路徑） vs `order.cancelled`（其餘 cancel 路徑），兩種能在 audit trail 一眼分辨。
 
 WebSocket fan-out 走另一條 Redis pub/sub 通道（`schedule:ws:events`）：worker 用同步 `publish()`，FastAPI 進程在 lifespan 起 async subscriber，把訊息推到連線在 `/api/v1/ws` 的客戶端（§4.5 細講）。
 
@@ -708,19 +715,35 @@ WebSocket 整套已經實作完成，**你不用寫 backend code**。前端只�
 > **`db_action.old_*` 欄位在 delete compound 內被 worker 用於 audit**：`_build_delete_compound` 把 pre-delete 的 `wafer_quantity` / `requested_delivery_date` / `notes` / `assigned_to` 都塞進 `db_action`；worker accept 時把這四個欄位填進 `audit_logs.old_value`。Update compound 也帶 `old_pinned_production_date` / `old_is_pinned` 給 worker 寫 audit。
 >
 > **`_apply_db_action_reject` 防禦 `in_production` status**：reject path 預設「DB 沒被產品端寫過 → 清 lock + 用 `scheduled_production_date` 推導 status」。但若未來放寬 `MUTABLE_STATUSES` 讓 in_production row 也能 PATCH（例如改 notes），這條 reject 路徑會把 in_production 訂單默默 demote 回 `scheduled` — 跟 §4.4 P0-1 為 `set_schedule_dates` 加的防禦對稱。所以 reject path 顯式 `if status == in_production: return`，今天不可達、明天放寬時也不會踩雷。
+>
+> **Producer-side deadline fast-fail（B + worker C 雙層防禦）**：`create_order` / `update_order` 在 row-lock 後、build compound 前先過 `validate_deadline_in_horizon(deadline, today)`（`app/services/scheduling.py`）。落在 `[today + 1, today + 30]` 之外 → 同步 raise `HTTPException(422)`，前端立刻拿到錯誤訊息、worker 完全不被打擾。三種 reject reason：`in_past`（deadline ≤ 昨天）、`too_close`（deadline = 今天，違反「day 1 鎖定」業務規則）、`too_far`（deadline > today + HORIZON_DAYS）。`update_order` 只在 `req.requested_delivery_date` 真的有改 / `pin_day_set` 有設值時才檢查，純改 notes 不會無端 422。
+>
+> **為什麼還保留 worker 端 admission（option C，§4.2）**：producer fast-fail 是 happy-path 體驗（user 拿同步 422 比 fire-and-forget WS notify_failed 直覺得多）；worker 端的 `add_order` / `pin_order` 仍會回 `deadline_too_far`，作為「producer 沒檢查或繞過」的 defense-in-depth。Producer 檢查用「現在 wall clock」做基準，worker 檢查用 `state.base_date` — 兩者通常一致，但跨日換天時 producer 已經拒掉、worker 不用處理「user 在 23:59:59 送的 deadline=today+1 在 worker 跑到時變成 deadline=today」這種 race。
 
 訂單**送進 producer service** 後推 compound + 觸發排程。**沒有對外 raw 排程 API** — 從 `app/api/v1/orders.py` 進來的 Order CRUD endpoint 是唯一寫入路徑。**操作對應**：
 
 | Order 動作 | 推進 `pending_ops` 的 ops | `group` |
 |---|---|---|
 | `POST /orders` 新增 | 1 筆 `add` | `grow` |
-| `DELETE /orders/{id}` 軟刪除（非 pinned） | 1 筆 `remove`（用刪除前的 qty / deadline） | `shrink` |
-| `DELETE /orders/{id}` 軟刪除（pinned） | `unpin + remove` | `shrink` |
+| `DELETE /orders/{id}` 軟刪除（**status=`cancelled` 走 fast path**） | **無**：producer DB-only flip `is_deleted=True` + 寫 `order.deleted` audit，**不 enqueue compound**（見下方 callout） | — |
+| `DELETE /orders/{id}` 軟刪除（非 pinned） | 1 筆 `remove`（用刪除前的 qty / deadline）；`db_action.kind="delete"` | `shrink` |
+| `DELETE /orders/{id}` 軟刪除（pinned） | `unpin + remove`；`db_action.kind="delete"` | `shrink` |
+| `POST /orders/{id}/cancel` 取消（非 pinned） | 1 筆 `remove`；`db_action.kind="cancel"`，僅適用 `status=scheduled` | `shrink` |
+| `POST /orders/{id}/cancel` 取消（pinned） | `unpin + remove`；`db_action.kind="cancel"`，僅適用 `status=scheduled` | `shrink` |
 | `PATCH /orders/{id}` 延後 deadline 或縮減 qty | `remove`（舊）+ `add`（新），加上 pin 相關 ops | strict-AND ↓ |
 | `PATCH /orders/{id}` 提前 deadline 或增加 qty | `remove`（舊）+ `add`（新），加上 pin 相關 ops | `grow` |
 | `PATCH /orders/{id}` `pinned_production_date: "YYYY-MM-DD"` | `pin(target)`（若需要 qty/deadline 改，前面接 `unpin?, remove, add`） | strict-AND ↓ |
 | `PATCH /orders/{id}` `pinned_production_date: null` | `unpin`（若需要 qty/deadline 改，後面接 `remove, add`） | strict-AND ↓ |
 | `PATCH /orders/batch-update` | 每筆訂單獨立 1 個 compound | 每筆獨立判斷 |
+
+> **`delete_order` fast path（`status=cancelled` 短路）**：
+> 對「已被 `POST /cancel` 取消但 `is_deleted=False` 仍在 list」的 row 打 `DELETE /orders/{id}`，**producer 不 enqueue 任何 compound**。理由：cancel 那一輪 worker 已經把訂單從 `pq` / `pinned_orders` 拿掉、tree 容量也釋放完了；再送一筆 `[remove]` 進 batch 會被 `apply_batch_to_capacity` 重複算一次 `-qty`、`pq_remove` 在 leaf 階段 no-op（順帶留下 `schedule.batch.remove_skipped_not_in_pq` 警告）— **線段樹會浮出 phantom capacity，後續 admission 判斷全錯**。
+>
+> Fast path 流程（單一 transaction）：(1) snapshot `old_value`、(2) `order.is_deleted = True`、(3) `record_audit("order.deleted", ...)`、(4) `db.commit()`、(5) refresh、(6) best-effort `notification_service.create_notification(type="order_cancelled", ...)`、(7) return `OrderResponse`。
+>
+> 為什麼 audit 跟 row UPDATE 必須同一個 transaction：早期實作是 mutate → commit → refresh → audit → commit 兩段，中間 process crash 會留下「row 已 soft-deleted 但無 audit row」的 silent 失敗。Snapshot + 單一 commit 把「audit row 跟它記錄的 change 在同一個 transaction」這個 invariant 守住。
+>
+> Worker 端還有第二道防禦 `_extract_batch_ops` 的 synthetic-pq filter（§4.2）— 萬一未來有 producer 路徑繞過 fast path 或從 DLQ 手動 replay duplicate `[remove]`，filter 會把對應 op 從 batch delta 拿掉、log `schedule.batch.remove_skipped_not_in_pq` (`reason=defense_in_depth`)。Fast path 是主要防禦，filter 是 safety net。
 
 **Group strict-AND 規則**（`_build_patch_compound` 的實作）：
 ```python
@@ -779,13 +802,38 @@ enqueue_compound(compound)   # ← 同 process Redis call；條件式 .delay() �
 - **Producer ↔ consumer 契約**：Redis key 常數（`STATE_KEY` / `STATUS_KEY` / `PENDING_OPS_KEY` / `PENDING_OPS_SEQ_KEY`）跟 `score_for_op` 編碼也住在這個檔，因為兩端（API 跟 worker）都要對得上，把契約放在共同上游避免 api → workers 反向依賴（RULES.md §3）。
 - 演算法詳細推導見 [`backend/CLAUDE.md`](../backend/CLAUDE.md) §業務規則
 
-**Admission control invariant — 不可能有「pinned 滿載 10000 + pq 有 dl=today 訂單」這種 state**
+**Tree 結構：day 1 = 明天**（不是「今天但被 lock」）
 
-`pin_order` 跟 `add_order` 的容量檢查都用 `capacity_tree.query(rel)` — 它回傳的是「day 1 到 day `rel` 的累計剩餘產能」。配合 backward-fill 的 reservation：
-- pin Y(qty=10000) 到 today 之後，day 1 prefix sum = 0，任何後續 `add_order` with dl=today 必 reject。
-- 反過來：先 add X(qty=2000, dl=today)，day 1 prefix sum = 8000；後續 pin Y(qty=10000, fake=today) 看到 8000 < 10000 → reject；只有 pin Y(qty=8000, fake=today) 剛好用滿才會通過，此時 X 跟 Y 加總正好 10000，仍可行。
+業務規則：今天的生產線在前一晚 00:00 UTC 就已經由 `advance_day_task::mark_in_production` 把當天訂單升級成 `in_production` 確認下來。當天 user 新增訂單 / PATCH / pin 一律不能落在今天，只能 day 2（明天）以後。
 
-所以「pinned 把今天吃滿但 pq 還有 dl=today 訂單」這個 state 在 admission 正確的前提下**不可達**。reviewer 提出的 P1-1 場景（advance_day 之後該 pq 訂單卡死）的前提條件因此排除掉。`tests/services/test_scheduling.py::test_p1_1_invariant_*` 三個測試把這個 invariant 鎖住 — 如果後續有人改 admission control 把這個保證打破，test 立刻紅燈。
+實作層面採用**結構性設計**：兩棵 segment tree 只覆蓋「可放」的天，今天根本不在 tree 裡。`abs_to_rel(today, base_date)` 直接回 `None`，跟「超出 horizon」走同一條 reject 分支。
+
+| 對應關係 | 公式 |
+|---|---|
+| `state.base_date` | 今天的絕對日期 |
+| tree day 1 | `base_date + 1`（明天） |
+| tree day 30 | `base_date + 30` |
+| `abs_to_rel(d, base)` | `(d - base).days`，落在 `[1, 30]` 才合法；否則 `None` |
+| `rel_to_abs(rel, base)` | `base + timedelta(days=rel)`（rel=1 → tomorrow） |
+
+四個函式都用**標準形**，沒有任何 day-1 hack：
+
+| 函式 | 行為 |
+|---|---|
+| `add_order` | `available = capacity_tree.query(rel) >= wafer_quantity`。`deadline == today` 在 `abs_to_rel` 就回 None → 走 `deadline_too_far` 分支，rejection message 區分 `today` / `past` / `outside_horizon` 三種子情境 |
+| `pin_order` | 同上，`fake_deadline == today` → `deadline_too_far`，message 提示「pick tomorrow or later」 |
+| `compute_schedule` phase 2 | `for d in range(1, deadline_rel + 1)`，沒有 day-1 skip。`deadline_rel is None` 的 pq order（legacy / overdue）走既有的 `continue` 分支，不另開 log 路徑 |
+| `is_batch_feasible` | 標準累計 `cumulative_demand <= cumulative_capacity` ∀i ∈ [1, HORIZON_DAYS]，沒有 day-1 = 0 的特殊處理 |
+
+**為什麼這條規則**：原本算法把 day 1 當「跟其他 30 天一樣的 bucket」，新訂單塞滿後直接擠到 day 1 production line — 但 day 1 = 今天，生產已經在跑，物理上沒辦法臨時插一張單。改成 day 1 鎖定之後：(1) 新 admission 只能往 day 2+ 塞，符合「今天線不能動」的真實限制；(2) 前端 calendar 看到 day 1 一律是 `status='in_production'` 的訂單（pinned-today 或前一天承諾的 day-2），跟 list 表的 status 一致，沒有「calendar 顯示生產中但 list 顯示已排程」的不一致。
+
+**為什麼結構性比補丁式好**：第一版實作用 `FIRST_FILLABLE_DAY = 2` 常數 + `query(rel) - query(1)` 減法在四個地方各自把 day 1 排除掉。這個設計能 work，但每個函式都有特殊 case 要維護，未來重構容易漏掉一處導致 day-1 復活。改成「tree 從 tomorrow 開始」之後 invariant 自然成立 — 連 `FIRST_FILLABLE_DAY` 常數都不需要存在，函式回到標準型，無人能誤寫。
+
+**Admission control invariant — 不可能有「pinned 滿載 10000 + pq 有 dl=today 訂單」這種 state**（歷史 invariant，新規則下仍成立）
+
+`pin_order` 跟 `add_order` 的容量檢查都用 `capacity_tree.query(...)` — 配合 backward-fill 的 reservation。新規則下 admission 階段 `abs_to_rel(today, base) is None` 就 reject 了，所以 pq 不可能有 dl=today 訂單。這個 invariant 變成「結構性 vacuous true」 — 不靠 runtime check，靠 type/domain 構造保證。
+
+`tests/services/test_scheduling.py::test_p1_1_invariant_*` 三個測試把這個 invariant 鎖住 — 如果後續有人改 admission control 把這個保證打破，test 立刻紅燈。
 
 **Invariant break 時的處理：`SegmentTreeInvariantError` per-leaf 隔離**
 
@@ -835,7 +883,7 @@ remove 的 forward give-back 走完還有 `remaining > 0`，代表線段樹的 o
 | DB 欄位 | 由誰寫 | 對 scheduler state 的影響 | 對前端的意義 |
 |---|---|---|---|
 | `is_pinned` + `pinned_production_date` | worker 透過 `apply_schedule` | 訂單從 pq 搬到 `pinned_orders`，trees 改用 `fake_deadline` 索引 | 該訂單的實際生產日是 `pinned_production_date`，不會被 EDF 推遲 |
-| `is_processing_locked` | order CRUD service（create / update / batch-update 設 true）+ scheduler `apply_schedule`（清 false） | **無**（這個 flag 不影響演算法） | 「目前有 op 在排程器佇列裡」，前端據此 disable 該列的 inline edit |
+| `is_processing_locked` | **Producer 設**（create / update / delete / cancel 設 true，commit 後 enqueue compound）→ **Worker 清**（`compound_finalize.perform_compound_db_action` 在 accept / reject 兩條路徑都會清）。Materializer 的 `set_schedule_dates` **不再碰這個欄位**（見 §4.4 終端狀態保護）；`delete_order` 對 `status=cancelled` row 的 fast path 也不會經過 lock | **無**（這個 flag 不影響演算法） | 「目前有 op 在排程器佇列裡」，前端據此 disable 該列的 inline edit |
 
 **Production pin 接受條件**：跟 add\_order 一樣 — 把 `fake_deadline` 當成新 deadline 看，問「現在的 trees 容得下嗎？」更精確：
 
@@ -892,6 +940,21 @@ remove 的 forward give-back 走完還有 `remaining > 0`，代表線段樹的 o
    - 試 `[1..take]` → 用 `compute_batch_capacity_delta` 折成 per-day 表 → `is_batch_feasible(state, delta)` 比較 prefix sum 跟 `capacity_tree`。可行就接受。
    - 不可行 → 試 `[1..take//2]`，再 `[1..take//4]`...，到 `[1..1]` 仍不可行就 return `0`。
 4. **`k == 0`**（連第一筆 compound 都塞不下）：`_reject_first_compound` ZREM 那筆 + drop secondary index + `_perform_compound_db_action(rejected)` + WS `schedule.compound_failed`。`_update_reject_rate(rejected=1)` 把 p 往 1 推一個 EWMA 步。再 continue 外圈 while。
+
+   > `_perform_compound_db_action` 本體住在 **`app/services/compound_finalize.py`** 模組（worker 端 `from app.services.compound_finalize import perform_compound_db_action as _perform_compound_db_action`），跟 `app/services/schedule_queue.py::cancel_compound` 共用同一份 accept / reject 邏輯。Accept / reject 路徑依 `db_action.kind` 分四種：
+   >
+   > | kind | accept 行為 | reject 行為 |
+   > |---|---|---|
+   > | `create` | 清 lock；producer 已寫的 row 留下、由 materializer 接著 `status=scheduled` | `status=cancelled` + `is_deleted=False`（**保留在 list**）+ audit `order.cancelled` |
+   > | `update` | 寫 new\_\* 欄位 + audit `order.updated` | 清 lock，status 由 `scheduled_production_date` 推回 `scheduled` / `pending` |
+   > | `delete` | `is_deleted=True` + `status=cancelled` + audit `order.deleted` | 同 update reject |
+   > | `cancel` | `status=cancelled` + `is_deleted=False`（**保留在 list**）+ audit `order.cancelled` | 同 update reject |
+   >
+   > `delete` 跟 `cancel` 在 worker 端的 compound shape 完全一樣（`[remove]` / `[unpin, remove]`），accept 路徑只差「`is_deleted` 翻不翻」這一行 — 對應前端兩個按鈕（「刪除訂單」vs「取消訂單」）。一份程式碼涵蓋 worker 自動 reject 跟 user 手動 cancel-compound 兩條路徑，避免兩處 ownership 漂移。
+   >
+   > **`perform_compound_db_action` 用 `SELECT FOR UPDATE` 拿 row lock**：worker 對 row 的 SELECT 是 `.with_for_update()`。沒這道 lock 的話 `materialize_schedule_task::apply_schedule`（獨立 Celery task）可能在同 row 上跟 worker race — 兩邊都 SELECT 到同樣的 `version_id`、各自 mutate ORM、flush 時誰先寫誰贏，輸的那邊吃 `StaleDataError` 被 `record_audit` 的 SAVEPOINT 默默 rollback。Worker 輸的話 `is_deleted=True` / `status=cancelled` 的寫入會消失但沒人看得到失敗。加 `FOR UPDATE` 之後 materializer 的 SELECT 會 block 到 worker commit，commit 完它看到 worker 寫好的最終狀態 — 配合 §4.4 `set_schedule_dates` 的終端狀態 guard 不再覆寫。
+   >
+   > **Reject path 的終端狀態 guard**：`_apply_db_action_reject` 對 `update` / `delete` / `cancel` kind 統一走「清 lock + 從 `scheduled_production_date` 推 status」的 fallthrough。這條路徑加了一道 early-return：`if order.status == OrderStatus.cancelled or order.is_deleted: return`。Defense-in-depth — 目前 shrink batch 不會被 `is_batch_feasible` reject 所以這條 reject path 在 cancel / delete 上跑不到，但保護未來新增的 reject 來源（per-leaf invariants、手動 DLQ replay、未來新的 admission rule）不會在 terminal row 上把 `cancelled` 改回 `scheduled`。
 5. **`k > 0`**：`_commit_accepted_batch` 一口氣處理 `compounds[:k]`：
    - 用 batch delta 一次更新兩棵樹（`apply_batch_to_capacity` 用 carry-back distribution，`apply_batch_to_deadline` 直接 point_update）。**樹只動一次，不論 batch 裡有 k 個還是 1 個 compound**。
    - 逐 compound 逐 leaf 跑 `_apply_compound_leaf_structural`：`add` / `remove` 只動 pq（樹的部分剛剛 batch 寫完了）；`pin` / `unpin` 呼 既有的 `pin_order` / `unpin_order`（它們有自己的 tree swap，不在 batch delta 內）。
@@ -1146,7 +1209,7 @@ worker 端的實作是「**每跑完一筆就重新挑下一筆**」而不是「
 |---|---|---|
 | `get_scheduled(db) -> list[Order]` | `select(Order).where(status='scheduled', is_deleted=False).order_by(scheduled_production_date asc)` | `services.order.list_scheduled_orders` |
 | `clear_scheduled_dates(db) -> int` | bulk `UPDATE` 把所有 scheduled 訂單的兩個日期欄清成 `None`，一次往返；回傳影響列數 | `services.order.apply_schedule` 第 1 步 |
-| `set_schedule_dates(db, *, order_id, scheduled_production_date, expected_delivery_date) -> Order \| None` | 單筆 select → mutate 兩個日期 + status → `flush()` + `refresh()`；訂單不存在或軟刪除回 `None` | `services.order.apply_schedule` 對每筆排程結果呼叫一次 |
+| `set_schedule_dates(db, *, order_id, scheduled_production_date, expected_delivery_date, daily_breakdown, is_pinned, pinned_production_date) -> Order \| None` | 單筆 select → mutate scheduled / expected / daily_breakdown / pin 欄位、**only set status=scheduled if 目前 status ∉ {in_production, cancelled, completed}**、**不碰 `is_processing_locked`** → `flush()` + `refresh()`；訂單不存在或軟刪除回 `None` | `services.order.apply_schedule` 對每筆排程結果呼叫一次 |
 
 **`backend/app/services/order.py` 新增三個編排函式：**
 
@@ -1185,9 +1248,19 @@ worker 端的實作是「**每跑完一筆就重新挑下一筆**」而不是「
 
 **為什麼 `schedule_daily_capacity` 不繼承 Base 的語義欄位**：`id` (UUID) / `version_id` / `is_deleted` 對這張「派生 cache 表」沒意義 — `date` 才是 natural PK、單一 writer 已經序列化（在 `state_writer_lock` 內）、沒有 soft delete 需求。為了跟 Alembic autogen 一致仍 inherit `Base` 並保留那些欄位，但只當啞欄位用、不參與業務邏輯。詳見 `app/models/schedule_daily_capacity.py` 模組 docstring。
 
-**為什麼 `set_schedule_dates` 不能無條件覆寫 `status`**：`advance_day_task` 會把今天要做的訂單 status 標成 `in_production`；接下來任何 compound 被 accept、materializer 跑 `apply_schedule` 時，如果 `set_schedule_dates` 無條件把 status 寫回 `scheduled`，前端「正在做」就會突然變回「排隊中」 — 更嚴重的是 `mark_completed_outside_set` 只抓 `status='in_production'`，被 demote 後永遠收不到尾，訂單卡死在 `scheduled` 不會被歸檔成 `completed`。所以 `set_schedule_dates` 寫入前讀目前 status，是 `in_production` 就只更新排程欄位（dates / daily_breakdown / pin cols），status 不動。`apply_schedule` audit log 的 status 也從 hard-coded `"scheduled"` 改成讀 refreshed row 的真實狀態。
+**為什麼 `set_schedule_dates` 不能無條件覆寫 `status`**（終端狀態保護，三個 case）：
 
-修在 repo 層而不是 service 層，是因為 `set_schedule_dates` 是寫 status 的唯一入口；加一道條件 cheap、語義清楚，比把判斷散在每個 caller 好。`mark_in_production` 仍然是 `advance_day_task` 唯一寫 `in_production` 的地方 — ownership 不交叉。
+- **`in_production`**：`advance_day_task` 會把今天要做的訂單 status 標成 `in_production`；接下來任何 compound 被 accept、materializer 跑 `apply_schedule` 時，如果 `set_schedule_dates` 無條件把 status 寫回 `scheduled`，前端「正在做」就會突然變回「排隊中」 — 更嚴重的是 `mark_completed_outside_set` 只抓 `status='in_production'`，被 demote 後永遠收不到尾，訂單卡死在 `scheduled` 不會被歸檔成 `completed`。
+- **`cancelled`**：worker accept 一筆 cancel / delete compound 寫了 `status=cancelled`；但同時間可能有**前一輪**的 materializer 還在跑 `apply_schedule`，它讀到的 `schedule:state` snapshot 還包含這張訂單（cancel 還沒進那輪 state）。沒 guard 的話 materializer 的 `set_schedule_dates` 會把 `status=cancelled` 默默改回 `scheduled` — 然後 user 再打 op 就能對「已取消」的 row 操作，最後拿到的是「為什麼這個訂單我已經取消了還在排程裡？」這種 ghost 行為。
+- **`completed`**：`advance_day_task` 把已完成的生產 run 翻成 `completed`，這也是終端狀態。一支落後的 materializer 跑到還包含這筆訂單的 stale schedule snapshot，沒 guard 會把 `completed` 復活回 `scheduled`。同 cancelled case 的結構。
+
+實作就是把 status guard 從只擋 `!= in_production` 擴成 `not in (in_production, cancelled, completed)`。`apply_schedule` audit log 的 status 也從 hard-coded `"scheduled"` 改成讀 refreshed row 的真實狀態。
+
+修在 repo 層而不是 service 層，是因為 `set_schedule_dates` 是寫 status 的唯一入口；加一道條件 cheap、語義清楚，比把判斷散在每個 caller 好。`mark_in_production` / `mark_completed_outside_set` 仍然是 `advance_day_task` 唯一寫 `in_production` / `completed` 的地方 — ownership 不交叉。
+
+**為什麼 `set_schedule_dates` 不再清 `is_processing_locked`**（lock ownership 的歷史包袱）：早期實作 materializer 是 `run_scheduling_task` 的同步尾巴，跑完 `set_schedule_dates` 順手清 lock 邏輯上合理。後來 fast / slow path 拆開、materializer 變成獨立 Celery task 之後，這個假設失效 — 有可能 materializer 還沒處理到某 row、producer 已經 commit 下一筆 compound 設了 `lock=True`，這時 materializer 跑到該 row 把 lock 清掉，**讓第二個 user op 在 worker 還沒處理 compound 前就能繞過 producer guard 進來**。
+
+修法：lock 的 lifecycle 收回到 **producer ↔ worker pipeline** 獨家擁有（producer 設 / worker `compound_finalize.perform_compound_db_action` 清），`set_schedule_dates` 不再碰。代價是失去「materializer 兜底清 stuck lock」這條（不可靠的）safety net — 改用 §4.7 的 startup recovery `_clear_orphan_locks` sweep 明確處理 worker crash 留下的 orphan lock。
 
 worker 只負責 session 生命週期：
 
@@ -1289,15 +1362,16 @@ broadcast({...})  ──PUBLISH──▶ schedule:ws:events ──SUBSCRIBE─�
 
 ---
 
-### 4.7 Startup recovery — FastAPI 重啟時補三道缺口
+### 4.7 Startup recovery — FastAPI 重啟時補四道缺口
 
-排程模組有三個 runtime 自己補不回來的缺口，全部都跟「server 重啟時 Redis state 跟現實對不齊」有關：
+排程模組有四個 runtime 自己補不回來的缺口，全部都跟「server 重啟時 Redis state / DB 跟現實對不齊」有關：
 
 1. **`schedule:state.base_date` 過時**：Celery Beat 每天 00:00 UTC 觸發 `advance_day_task`。Stack 完整關閉跨過 N 個午夜的話，Beat 那 N 次 tick 就漏掉，`base_date` 卡在舊日期 — segment tree 的 day 1 不再是「今天」，後續所有 `add_order` / `compute_schedule` 都用錯誤日曆算。
 2. **`schedule:state` 不見**：Redis 被 flush、首次部署、state schema 升版。worker 會 fallback 到 `SchedulerState.initial(today)` 空狀態，**靜默忘記**現有 scheduled 訂單佔的容量。
 3. **`pending_ops` 卡住 compound**：worker 在 drain 中途 crash，queue 還有 entries 但 `schedule:status` 可能卡在 `running`（死掉的 worker 沒寫 `idle`）。producer 端的 `enqueue_compound` 看到 `running` 就不會 `.delay()`，於是這些 compound 永遠不會被處理。
+4. **`is_processing_locked=True` 的 orphan row**：producer commit 完 `lock=True` → 還沒 enqueue compound 或 enqueue 完還沒被 worker accept 前 process crash → lock 留在 row 上。Materializer 不再順手清 lock（見 §4.4 lock ownership），這些 orphan lock 會永遠卡住該 row 的後續 PATCH / DELETE / cancel。
 
-`app/services/startup_recovery.py::run_startup_recovery()` 在 FastAPI lifespan startup 段呼叫一次，依下面 matrix 派對應 Celery task：
+`app/services/startup_recovery.py::run_startup_recovery()` 在 FastAPI lifespan startup 段呼叫一次，依下面 matrix 派對應 Celery task / 跑 sweep：
 
 | 偵測條件 | 動作 |
 |---|---|
@@ -1305,6 +1379,7 @@ broadcast({...})  ──PUBLISH──▶ schedule:ws:events ──SUBSCRIBE─�
 | `state.base_date < today` 且 `today - base_date <= HORIZON_DAYS` | `advance_day_task.delay()` × N |
 | `state.base_date < today` 且 `today - base_date > HORIZON_DAYS` | `rebuild_schedule_task.delay()`（catchup 過 horizon = 純 churn 不如直接重建） |
 | `zcard(pending_ops) > 0` AND `status != "running"` | `run_scheduling_task.delay()` |
+| `is_processing_locked=True AND is_deleted=False` 且該 row 的 `order_id` **不**在 `pending_ops` 任一 compound 的 `ops[].order_id` 中 | DB UPDATE 清 `is_processing_locked=False` + 寫 `order.lock_cleared_orphan` audit row（系統觸發，`user_id=None`） |
 
 **Multi-replica 防重複派工**：`SET NX EX 60` 拿 `schedule:startup_recovery_running` mutex；第二個 replica 看到 flag 已存在就 log + skip。沒有這道防護的話 N 個 replica × N 個 advance_day 會把 state **過度推進** N 天。Dispatch 完顯式 `DEL` flag（不靠 TTL 收尾）— 避免 60 秒內連續重啟時第二次被誤擋。
 
@@ -1316,8 +1391,16 @@ broadcast({...})  ──PUBLISH──▶ schedule:ws:events ──SUBSCRIBE─�
 
 **為什麼 cap 在 HORIZON_DAYS（=30）**：超過 30 天的 catchup，每一天的 advance_day 都是在空 trees 上 churn（沒有訂單可以 advance、沒有 status 要轉換），跑 50 次 advance_day 不如一次 `rebuild_schedule_task` 直接從 DB 重建。
 
+**Orphan-lock sweep 的 TOCTOU caveat（multi-replica）**：`_clear_orphan_locks` 用 `ZRANGE pending_ops` 收集 in-flight order_ids，再 SELECT 出 `is_processing_locked=True` 的 row、比對後 UPDATE 清掉沒對應 compound 的那批。**`_RECOVERY_FLAG_KEY` 只防多個 replica 同時 sweep，不防 sweep 期間其他 replica 的 producer commit 進 compound**。In-flight 的 producer 剛好踩在 ZRANGE 跟 UPDATE 之間就可能被誤清。
+
+接受這個 window 的理由：
+- **Window 很短**：ZRANGE + SELECT + UPDATE 大概 tens of ms。
+- **Self-healing**：誤清 lock 不會丟資料 — worker 後續處理該 compound 時 `perform_compound_db_action` 終究會把 lock 寫成 False（同一個值，冪等）。
+- **不會破 tree**：second user op 即使在誤清窗口進來，仍會走 producer 的 `get_by_id_for_update` row lock；worker 正在 mid-flight 的話 `FOR UPDATE` 還沒釋放，second op 看到 lock=True → 409。真要在「誤清 → worker 重設 lock」之間的縫隙進來 build stale compound，worker 端 `version_id` OCC + `_extract_batch_ops` synthetic-pq filter 也擋得住，**不會走到 tree corruption 那條路**。
+
+真要 TOCTOU-free 做法是 `WATCH PENDING_OPS_KEY` 包 MULTI/EXEC，或把 lock 清掉這步丟給 producer commit path 跑 deferred trigger — 兩者都比「啟動一次 sweep」這個失敗模式應得的複雜度高。
+
 **沒做的（刻意不自動化）**：
-- **`is_processing_locked=True` 的 orphan row 清掃**：race-prone — 重啟瞬間 worker 可能正在處理某個 compound、那個 lock 不是 orphan；自動 sweep 會誤清。留給人工 SOP 或之後另寫一支 admin endpoint。
 - **強制 reset `schedule:status` 卡 `running`**：status 卡住的場景罕見，下次成功 task 會自然蓋掉；不值得寫額外邏輯。Ops 真要清也是一行 `redis-cli`。
 
 ---
