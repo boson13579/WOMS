@@ -4,7 +4,7 @@ import { createTestUser, loginViaUi, registerUser } from '../helpers/auth';
 
 test.describe('Auth flow', () => {
   test('未登入進入訂單頁會被導回登入頁', async ({ page }) => {
-    await page.goto('/orders');
+    await page.goto('/orders', { waitUntil: 'domcontentloaded' });
 
     await expect(page).toHaveURL(/\/login/);
   });

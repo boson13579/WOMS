@@ -112,3 +112,20 @@ export async function waitForOrderUnlocked(
 
   throw new Error(`Order stayed locked for customer ${customerName}`);
 }
+
+export async function waitForOrderStatus(
+  request: APIRequestContext,
+  customerName: string,
+  status: OrderApiItem['status'],
+): Promise<OrderApiItem> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const order = await findOrderByCustomer(request, customerName);
+    if (!order.is_processing_locked && order.status === status) return order;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 500);
+    });
+  }
+
+  const order = await findOrderByCustomer(request, customerName);
+  throw new Error(`Order ${customerName} stayed in status ${order.status}; expected ${status}`);
+}

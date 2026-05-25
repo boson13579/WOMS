@@ -2,7 +2,12 @@ import { expect, test } from '@playwright/test';
 
 import { createUserWithRole, getEnvUser, loginViaUi } from '../helpers/auth';
 import { dateFromToday } from '../helpers/data';
-import { createOrderViaUi, orderRow } from '../helpers/orders';
+import {
+  createOrderViaUi,
+  orderRow,
+  reloadOrdersPage,
+  waitForOrderStatus,
+} from '../helpers/orders';
 
 test.describe('Order search and filters', () => {
   test('可以用客戶名稱搜尋訂單', async ({ page, request }) => {
@@ -64,6 +69,8 @@ test.describe('Order search and filters', () => {
       waferQuantity: '125',
       requestedDeliveryDate: dateFromToday(20),
     });
+    await waitForOrderStatus(request, customerName, 'scheduled');
+    await reloadOrdersPage(page);
 
     await page.getByTestId('orders-search-input').fill(customerName);
     await expect(orderRow(page, customerName)).toBeVisible();
@@ -98,12 +105,14 @@ test.describe('Order search and filters', () => {
       waferQuantity: '125',
       requestedDeliveryDate: dateFromToday(20),
     });
+    await waitForOrderStatus(request, customerName, 'scheduled');
+    await reloadOrdersPage(page);
 
     await page.getByTestId('orders-search-input').fill(customerName);
     await expect(orderRow(page, customerName)).toBeVisible();
 
     await page.getByTestId('orders-status-filter').selectOption('scheduled');
-    await expect(orderRow(page, customerName)).toBeHidden();
+    await expect(orderRow(page, customerName)).toBeVisible();
 
     await page.getByTestId('orders-reset-filters-button').click();
 
