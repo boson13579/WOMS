@@ -1,9 +1,21 @@
-import { expect, type Locator, type Page } from '@playwright/test';
+import { expect, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 
 export interface OrderFormInput {
   customerName: string;
   waferQuantity: string;
   requestedDeliveryDate: string;
+}
+
+export interface OrderApiItem {
+  id: string;
+  order_number: string;
+  customer_name: string;
+  status: string;
+  is_processing_locked: boolean;
+}
+
+interface OrderListResponse {
+  items: OrderApiItem[];
 }
 
 export async function createOrderViaUi(page: Page, order: OrderFormInput): Promise<void> {
@@ -52,4 +64,51 @@ export async function createOrderViaUi(page: Page, order: OrderFormInput): Promi
 
 export function orderRow(page: Page, customerName: string): Locator {
   return page.getByRole('row').filter({ hasText: customerName });
+}
+
+export async function reloadOrdersPage(page: Page): Promise<void> {
+  await page.reload();
+  await expect(page).toHaveURL('/orders');
+  await expect(page.getByTestId('orders-page')).toBeVisible();
+  await expect(page.getByTestId('orders-search-input')).toBeVisible();
+}
+
+export async function findOrderByCustomer(
+  request: APIRequestContext,
+  customerName: string,
+): Promise<OrderApiItem> {
+  const response = await request.get('/api/v1/orders', {
+    params: {
+      search: customerName,
+      page_size: 100,
+    },
+  });
+
+  if (!response.ok()) {
+    throw new Error(`Failed to find order: ${response.status()} ${await response.text()}`);
+  }
+
+  const payload = (await response.json()) as OrderListResponse;
+  const order = payload.items.find((item) => item.customer_name === customerName);
+
+  if (!order) {
+    throw new Error(`Could not find order for customer ${customerName}`);
+  }
+
+  return order;
+}
+
+export async function waitForOrderUnlocked(
+  request: APIRequestContext,
+  customerName: string,
+): Promise<OrderApiItem> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const order = await findOrderByCustomer(request, customerName);
+    if (!order.is_processing_locked) return order;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 500);
+    });
+  }
+
+  throw new Error(`Order stayed locked for customer ${customerName}`);
 }

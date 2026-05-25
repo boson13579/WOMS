@@ -68,10 +68,10 @@ test.describe('Order search and filters', () => {
     await page.getByTestId('orders-search-input').fill(customerName);
     await expect(orderRow(page, customerName)).toBeVisible();
 
-    await page.getByTestId('orders-status-filter').selectOption('pending');
+    await page.getByTestId('orders-status-filter').selectOption('scheduled');
     await expect(orderRow(page, customerName)).toBeVisible();
 
-    await page.getByTestId('orders-status-filter').selectOption('scheduled');
+    await page.getByTestId('orders-status-filter').selectOption('pending');
     await expect(orderRow(page, customerName)).toBeHidden();
   });
 

@@ -8,7 +8,12 @@ import {
   registerUser,
 } from '../helpers/auth';
 import { dateFromToday, uniqueSuffix } from '../helpers/data';
-import { createOrderViaUi, orderRow } from '../helpers/orders';
+import {
+  createOrderViaUi,
+  orderRow,
+  reloadOrdersPage,
+  waitForOrderUnlocked,
+} from '../helpers/orders';
 
 test.describe('Order access', () => {
   test('viewer 可以進入訂單頁但看不到寫入操作', async ({ page, request }) => {
@@ -76,6 +81,8 @@ test.describe('Order access', () => {
       waferQuantity: '125',
       requestedDeliveryDate: dateFromToday(20),
     });
+    await waitForOrderUnlocked(request, customerName);
+    await reloadOrdersPage(page);
     await page.getByTestId('orders-search-input').fill(customerName);
 
     const row = orderRow(page, customerName);

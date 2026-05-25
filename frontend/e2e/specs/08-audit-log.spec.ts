@@ -8,7 +8,12 @@ import {
   registerUser,
 } from '../helpers/auth';
 import { dateFromToday, uniqueSuffix } from '../helpers/data';
-import { createOrderViaUi, orderRow } from '../helpers/orders';
+import {
+  createOrderViaUi,
+  orderRow,
+  reloadOrdersPage,
+  waitForOrderUnlocked,
+} from '../helpers/orders';
 
 function userRow(page: Page, username: string) {
   return page.getByRole('row').filter({ hasText: username });
@@ -174,6 +179,8 @@ test.describe('Audit log', () => {
       waferQuantity: '125',
       requestedDeliveryDate: dateFromToday(20),
     });
+    await waitForOrderUnlocked(request, customerName);
+    await reloadOrdersPage(page);
     await page.getByTestId('orders-search-input').fill(customerName);
 
     const row = orderRow(page, customerName);

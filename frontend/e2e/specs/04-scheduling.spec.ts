@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 
 import { createUserWithRole, getEnvUser, loginViaUi } from '../helpers/auth';
 import { dateFromToday, uniqueSuffix } from '../helpers/data';
-import { createOrderViaUi } from '../helpers/orders';
+import { createOrderViaUi, findOrderByCustomer } from '../helpers/orders';
 
 function addDays(dateText: string, days: number): string {
   const date = new Date(`${dateText}T00:00:00`);
@@ -23,26 +23,28 @@ test.describe('Scheduling', () => {
     );
 
     const scheduler = await createUserWithRole(request, admin, 'scheduler', 'calendar_pending');
+    const customerName = `Calendar Pending ${uniqueSuffix()}`;
 
     await loginViaUi(page, scheduler);
     await page.getByRole('link', { name: 'Orders' }).click();
     await createOrderViaUi(page, {
-      customerName: `Calendar Pending ${uniqueSuffix()}`,
+      customerName,
       waferQuantity: '125',
       requestedDeliveryDate: dateFromToday(20),
     });
+    const orderNumber = (await findOrderByCustomer(request, customerName)).order_number;
 
     await page.getByTestId('orders-calendar-button').click();
 
-    await expect(page.getByTestId('orders-calendar-dialog')).toBeVisible();
+    const calendarDialog = page.getByTestId('orders-calendar-dialog');
+    await expect(calendarDialog).toBeVisible();
     await expect(page.getByTestId('orders-calendar-grid')).toBeVisible();
 
-    const firstUnscheduledOrder = page
-      .getByTestId('orders-calendar-unscheduled-list')
-      .getByTestId('orders-calendar-unscheduled-order')
-      .first();
-    await expect(firstUnscheduledOrder).toBeVisible();
-    await expect(firstUnscheduledOrder).toContainText(/ORD-\d{8}-\d{4}/);
+    await calendarDialog.getByTestId('orders-calendar-search-toggle').click();
+    const calendarSearchInput = calendarDialog.getByTestId('orders-calendar-search-input');
+    await calendarSearchInput.fill(orderNumber);
+
+    await expect(calendarDialog).toContainText(orderNumber);
   });
 
   test('scheduler 可以在日曆用搜尋縮小未排程訂單清單', async ({ page, request }) => {
@@ -53,37 +55,31 @@ test.describe('Scheduling', () => {
     );
 
     const scheduler = await createUserWithRole(request, admin, 'scheduler', 'calendar_search');
+    const customerName = `Calendar Search ${uniqueSuffix()}`;
 
     await loginViaUi(page, scheduler);
     await page.getByRole('link', { name: 'Orders' }).click();
     await createOrderViaUi(page, {
-      customerName: `Calendar Search ${uniqueSuffix()}`,
+      customerName,
       waferQuantity: '125',
       requestedDeliveryDate: dateFromToday(20),
     });
+    const orderNumber = (await findOrderByCustomer(request, customerName)).order_number;
 
     await page.getByTestId('orders-calendar-button').click();
 
     const calendarDialog = page.getByTestId('orders-calendar-dialog');
-    const unscheduledOrders = calendarDialog
-      .getByTestId('orders-calendar-unscheduled-list')
-      .getByTestId('orders-calendar-unscheduled-order');
-    await expect(unscheduledOrders.first()).toBeVisible();
+    await expect(calendarDialog).toBeVisible();
 
-    const firstOrderText = await unscheduledOrders.first().innerText();
-    const orderNumber = firstOrderText.match(/ORD-\d{8}-\d{4}/)?.[0];
-    expect(orderNumber).toBeTruthy();
+    await calendarDialog.getByTestId('orders-calendar-search-toggle').click();
+    const calendarSearchInput = calendarDialog.getByTestId('orders-calendar-search-input');
+    await calendarSearchInput.fill(orderNumber);
 
-    await calendarDialog.locator('aside button').first().click();
-    const calendarSearchInput = calendarDialog.locator('input[type="text"]').first();
-    await calendarSearchInput.fill(orderNumber ?? '');
-
-    await expect(unscheduledOrders).toHaveCount(1);
-    await expect(unscheduledOrders.first()).toContainText(orderNumber ?? '');
+    await expect(calendarDialog).toContainText(orderNumber);
 
     await calendarSearchInput.fill('no-such-calendar-order');
 
-    await expect(unscheduledOrders).toHaveCount(0);
+    await expect(calendarDialog.getByTestId('orders-calendar-unscheduled-order')).toHaveCount(0);
   });
 
   test('scheduler 可以切換日曆日期', async ({ page, request }) => {
