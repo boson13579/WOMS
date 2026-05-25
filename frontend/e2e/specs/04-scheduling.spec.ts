@@ -56,6 +56,11 @@ test.describe('Scheduling', () => {
 
     await loginViaUi(page, scheduler);
     await page.getByRole('link', { name: 'Orders' }).click();
+    await createOrderViaUi(page, {
+      customerName: `Calendar Search ${uniqueSuffix()}`,
+      waferQuantity: '125',
+      requestedDeliveryDate: dateFromToday(20),
+    });
 
     await page.getByTestId('orders-calendar-button').click();
 
