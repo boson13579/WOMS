@@ -1,0 +1,26 @@
+import { defineConfig, devices } from '@playwright/test';
+
+const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://localhost:5173';
+
+export default defineConfig({
+  testDir: './e2e/specs',
+  timeout: process.env.CI ? 45_000 : 30_000,
+  expect: {
+    timeout: process.env.CI ? 10_000 : 5_000,
+  },
+  fullyParallel: false,
+  workers: 1,
+  retries: 0,
+  reporter: process.env.CI ? [['html'], ['list']] : [['list']],
+  use: {
+    baseURL,
+    screenshot: 'only-on-failure',
+    trace: 'on-first-retry',
+  },
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],
+});

@@ -11,7 +11,7 @@ import path from 'node:path';
 
 import react from '@vitejs/plugin-react';
 /// <reference types="vitest" />
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
   plugins: [react()],
@@ -46,5 +46,6 @@ export default defineConfig({
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
     css: false,
+    exclude: ['e2e/**', ...configDefaults.exclude],
   },
 });

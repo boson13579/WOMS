@@ -150,6 +150,7 @@ export function OrderFilters(): JSX.Element {
           setLocalSearch(e.target.value);
         }}
         className="w-60"
+        data-testid="orders-search-input"
         aria-label="搜尋訂單"
       />
 
@@ -163,6 +164,7 @@ export function OrderFilters(): JSX.Element {
               setAssigneeInput(e.target.value);
             }}
             className="w-52"
+            data-testid="orders-assignee-filter"
             aria-label="搜尋負責人"
             autoComplete="off"
           />
@@ -175,6 +177,7 @@ export function OrderFilters(): JSX.Element {
               setCreatorInput(e.target.value);
             }}
             className="w-52"
+            data-testid="orders-creator-filter"
             aria-label="搜尋建立者"
             autoComplete="off"
           />
@@ -196,6 +199,7 @@ export function OrderFilters(): JSX.Element {
         </Label>
         <Select
           id="status-filter"
+          data-testid="orders-status-filter"
           value={status ?? ''}
           onChange={(e) => {
             const val = e.target.value as OrderStatus | '';
@@ -210,7 +214,12 @@ export function OrderFilters(): JSX.Element {
         </Select>
       </div>
 
-      <Button variant="outline" size="sm" onClick={handleReset}>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={handleReset}
+        data-testid="orders-reset-filters-button"
+      >
         重設
       </Button>
     </div>

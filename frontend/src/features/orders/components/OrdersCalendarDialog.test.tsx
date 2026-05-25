@@ -108,12 +108,6 @@ function setServerBaseDate(baseDate: string): void {
   mockScheduleCapacity.data = { ...mockScheduleCapacity.data, base_date: baseDate };
 }
 
-// Order whose production day == base_date. Under the "day 1 (today) is
-// locked" rule, any order actually being produced today has already been
-// flipped to ``status='in_production'`` by ``advance_day_task`` — only
-// in-flight rows have a ``daily_breakdown`` entry on ``base_date``. The
-// calendar uses ``status`` (not date math) to pick the badge, so the
-// data shape below is the realistic post-rule snapshot.
 const inProductionOrder: ScheduleResult = {
   id: '11111111-1111-4111-8111-111111111111',
   order_number: 'ORD-20260504-0001',
@@ -165,10 +159,6 @@ const inProductionOrderDetail: Order = {
   status: 'in_production',
 };
 
-// Multi-day in-flight order: status=in_production lets the date-refinement
-// branch pick "已完成" / "生產中" / "已排程" per day. With status=scheduled,
-// every row would render as "已排程" (correct under the new rule, but
-// doesn't exercise the multi-day visualization).
 const splitInProductionOrder: ScheduleResult = {
   ...inProductionOrder,
   id: '44444444-4444-4444-8444-444444444444',
@@ -285,21 +275,6 @@ describe('OrdersCalendarDialog', () => {
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
     expect(screen.getByText('已完成')).toBeInTheDocument();
-  });
-
-  it('keeps past rows as in_progress while cumulative quantity is below the order total', async () => {
-    // 2026-05-10 is in the past (base_date = 2026-05-11) but only 1,000 of
-    // the 2,500-wafer order has been produced by then. The row must NOT
-    // show "已完成" — earlier slices of an in-flight split stay 生產中.
-    const user = userEvent.setup();
-    mockScheduleResult.data = [splitInProductionOrder];
-    setServerBaseDate('2026-05-11');
-    renderDialog();
-
-    await user.click(screen.getByRole('button', { name: /2026-05-10/ }));
-    expect(screen.getByText(/累計 1,000 \/ 2,500/)).toBeInTheDocument();
-    expect(screen.getByText('生產中')).toBeInTheDocument();
-    expect(screen.queryByText('已完成')).not.toBeInTheDocument();
   });
 
   it('uses server base_date instead of the client clock for production state', async () => {

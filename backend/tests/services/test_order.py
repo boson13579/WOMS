@@ -910,11 +910,13 @@ def test_update_order_unpinned_pushes_remove_add_compound(
     No pin / unpin appear in the compound for a never-pinned order.
     """
     creator = _make_user(db_session, username="sru-1")
+    old_deadline = date.today() + timedelta(days=10)
+    new_deadline = date.today() + timedelta(days=15)
     order = Order(
         order_number="ORD-NP",
         customer_name="ACME",
         wafer_quantity=100,
-        requested_delivery_date=date(2026, 5, 20),
+        requested_delivery_date=old_deadline,
         created_by=creator.id,
         status=OrderStatus.pending,
     )
@@ -923,7 +925,7 @@ def test_update_order_unpinned_pushes_remove_add_compound(
     db_session.refresh(order)
 
     req = UpdateOrderRequest(
-        requested_delivery_date=date(2026, 5, 25),  # defer
+        requested_delivery_date=new_deadline,  # defer
         version_id=order.version_id,
     )
     order_service.update_order(db_session, order.id, req, creator)
@@ -933,8 +935,8 @@ def test_update_order_unpinned_pushes_remove_add_compound(
     assert compound.group == "shrink"  # defer = shrink
     op_kinds = [op.op for op in compound.ops]
     assert op_kinds == ["remove", "add"]
-    assert compound.ops[0].deadline == date(2026, 5, 20)  # old
-    assert compound.ops[1].deadline == date(2026, 5, 25)  # new
+    assert compound.ops[0].deadline == old_deadline
+    assert compound.ops[1].deadline == new_deadline
 
 
 def test_update_order_qty_grow_with_deadline_later_is_grow_group(
@@ -952,11 +954,13 @@ def test_update_order_qty_grow_with_deadline_later_is_grow_group(
     worker would binary-search-reject it. Strict-AND rule fixes that.
     """
     creator = _make_user(db_session, username="sru-grow-defer")
+    old_deadline = date.today() + timedelta(days=10)
+    new_deadline = date.today() + timedelta(days=15)
     order = Order(
         order_number="ORD-GROW-DEFER",
         customer_name="ACME",
         wafer_quantity=100,
-        requested_delivery_date=date(2026, 5, 20),
+        requested_delivery_date=old_deadline,
         created_by=creator.id,
         status=OrderStatus.pending,
     )
@@ -966,7 +970,7 @@ def test_update_order_qty_grow_with_deadline_later_is_grow_group(
 
     req = UpdateOrderRequest(
         wafer_quantity=2500,  # grew (clamped to CHECK constraint max)
-        requested_delivery_date=date(2026, 5, 25),  # defer
+        requested_delivery_date=new_deadline,  # defer
         version_id=order.version_id,
     )
     order_service.update_order(db_session, order.id, req, creator)
@@ -1025,19 +1029,21 @@ def test_update_order_pinned_with_compatible_change_auto_re_pins(
     Auto re-pin preserves the user's pin intent without them re-issuing it.
     """
     creator = _make_user(db_session, username="sru-2")
-    pin_day = date(2026, 5, 15)
+    pin_day = date.today() + timedelta(days=5)
+    old_deadline = date.today() + timedelta(days=10)
+    new_deadline = date.today() + timedelta(days=15)
     order = _make_pinned_order(
         db_session,
         creator_id=creator.id,
         order_number="ORD-PIN-OK",
-        deadline=date(2026, 5, 20),
+        deadline=old_deadline,
         pin_day=pin_day,
         quantity=100,
     )
 
     req = UpdateOrderRequest(
         wafer_quantity=80,  # smaller — OK
-        requested_delivery_date=date(2026, 5, 25),  # deferred — still ≥ pin day
+        requested_delivery_date=new_deadline,  # deferred — still ≥ pin day
         version_id=order.version_id,
     )
     order_service.update_order(db_session, order.id, req, creator)
@@ -1050,7 +1056,7 @@ def test_update_order_pinned_with_compatible_change_auto_re_pins(
     pin_op = compound.ops[3]
     assert pin_op.fake_deadline == pin_day
     assert pin_op.wafer_quantity == 80
-    assert pin_op.deadline == date(2026, 5, 25)
+    assert pin_op.deadline == new_deadline
 
 
 def test_update_order_pinned_with_qty_increase_silent_drops_pin(
@@ -1379,7 +1385,7 @@ def test_update_order_pin_unpinned_order_to_specific_day(
         order_number="ORD-PIN-NEW",
         deadline=date(2026, 6, 1),
     )
-    pin_day = date(2026, 5, 25)
+    pin_day = date.today() + timedelta(days=5)
 
     req = UpdateOrderRequest(
         pinned_production_date=pin_day,
@@ -1482,7 +1488,7 @@ def test_update_order_pin_plus_qty_change_combined(
         deadline=date(2026, 6, 1),
         quantity=100,
     )
-    pin_day = date(2026, 5, 25)
+    pin_day = date.today() + timedelta(days=5)
 
     req = UpdateOrderRequest(
         wafer_quantity=200,  # grows

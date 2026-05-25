@@ -1,0 +1,158 @@
+# End-to-end tests for the full Smart Order stack.
+#
+# This workflow is separate from ci.yml because E2E needs the whole app:
+# Postgres, Redis, backend, worker, frontend, migrations, seed data, and a
+# browser. Keeping it separate makes failures easier to read.
+
+name: E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  playwright:
+    name: playwright e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      E2E_ADMIN_USERNAME: admin
+      E2E_ADMIN_PASSWORD: testpassword123
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read .nvmrc
+        id: node
+        run: echo "version=$(cat .nvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.3
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+          cache: "pnpm"
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Write CI environment file
+        run: |
+          cat > .env <<'EOF'
+          APP_ENV=test
+          LOG_LEVEL=INFO
+          POSTGRES_USER=postgres
+          POSTGRES_PASSWORD=postgres
+          POSTGRES_DB=smart_order_e2e
+          JWT_SECRET=ci-e2e-secret-not-for-prod
+          CORS_ORIGINS=http://localhost:5173
+          SCHEDULER_DAILY_CAPACITY=10000
+          SCHEDULER_HORIZON_DAYS=30
+          SCHEDULER_RUN_WAIT_TIMEOUT_SECONDS=300
+          SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS=2
+          SCHEDULER_WAITER_FLAG_TTL_SECONDS=600
+          EOF
+
+      - name: Build and start application stack
+        run: docker compose up -d --build db redis backend nginx worker frontend
+
+      - name: Wait for backend
+        run: |
+          for i in {1..60}; do
+            if curl --fail --silent http://localhost:8000/api/v1/health >/dev/null; then
+              exit 0
+            fi
+            docker compose ps
+            sleep 2
+          done
+          docker compose logs backend nginx --tail=200
+          exit 1
+
+      - name: Run database migrations
+        run: docker compose exec -T backend alembic upgrade head
+
+      - name: Seed E2E root user
+        run: |
+          docker compose exec -T backend python - <<'PY'
+          from sqlalchemy import select
+
+          from app.core.db import SessionLocal
+          from app.core.security import hash_password
+          from app.models.user import User, UserRole
+
+          username = "admin"
+          password = "testpassword123"
+
+          with SessionLocal() as db:
+              user = db.scalars(select(User).where(User.username == username)).first()
+              if user is None:
+                  user = User(
+                      username=username,
+                      email="admin@example.com",
+                      password_hash=hash_password(password),
+                      role=UserRole.root,
+                      is_active=True,
+                  )
+                  db.add(user)
+              else:
+                  user.password_hash = hash_password(password)
+                  user.role = UserRole.root
+                  user.is_active = True
+              db.commit()
+          PY
+
+      - name: Wait for frontend
+        run: |
+          for i in {1..60}; do
+            if curl --fail --silent http://localhost:5173 >/dev/null; then
+              exit 0
+            fi
+            docker compose ps
+            sleep 2
+          done
+          docker compose logs backend nginx frontend --tail=200
+          exit 1
+
+      - name: Run Playwright E2E
+        working-directory: frontend
+        run: pnpm test:e2e
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: frontend/playwright-report
+          retention-days: 7
+
+      - name: Upload Playwright test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-test-results
+          path: frontend/test-results
+          retention-days: 7
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs --tail=300
+
+      - name: Stop application stack
+        if: always()
+        run: docker compose down -v

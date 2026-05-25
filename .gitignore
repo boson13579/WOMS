@@ -45,6 +45,8 @@ npm-debug.log*
 .turbo/
 *.tsbuildinfo
 frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
 coverage/
 
 # =============================================================================
@@ -90,6 +92,8 @@ smart-order/
 *.log
 *.pid
 docker-compose.override.yml
+AGENTS.md
+FRONTEND_SPEC.md
 
 # =============================================================================
 # Terraform — never commit local state or *.tfvars (may contain DB passwords,
