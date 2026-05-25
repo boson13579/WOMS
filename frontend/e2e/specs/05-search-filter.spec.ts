@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 import { createUserWithRole, getEnvUser, loginViaUi } from '../helpers/auth';
+import { dateFromToday } from '../helpers/data';
 import { createOrderViaUi, orderRow } from '../helpers/orders';
 
 test.describe('Order search and filters', () => {
@@ -26,12 +27,12 @@ test.describe('Order search and filters', () => {
     await createOrderViaUi(page, {
       customerName: targetCustomer,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
     await createOrderViaUi(page, {
       customerName: otherCustomer,
       waferQuantity: '150',
-      requestedDeliveryDate: '2026-07-15',
+      requestedDeliveryDate: dateFromToday(25),
     });
 
     await page.getByTestId('orders-search-input').fill(targetCustomer);
@@ -61,7 +62,7 @@ test.describe('Order search and filters', () => {
     await createOrderViaUi(page, {
       customerName,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
 
     await page.getByTestId('orders-search-input').fill(customerName);
@@ -95,7 +96,7 @@ test.describe('Order search and filters', () => {
     await createOrderViaUi(page, {
       customerName,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
 
     await page.getByTestId('orders-search-input').fill(customerName);
@@ -135,12 +136,12 @@ test.describe('Order search and filters', () => {
     await createOrderViaUi(page, {
       customerName: firstCustomer,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
     await createOrderViaUi(page, {
       customerName: secondCustomer,
       waferQuantity: '150',
-      requestedDeliveryDate: '2026-07-15',
+      requestedDeliveryDate: dateFromToday(25),
     });
 
     await page.getByTestId('orders-search-input').fill(searchPrefix);
@@ -179,12 +180,12 @@ test.describe('Order search and filters', () => {
     await createOrderViaUi(page, {
       customerName: laterCustomer,
       waferQuantity: '150',
-      requestedDeliveryDate: '2026-07-15',
+      requestedDeliveryDate: dateFromToday(25),
     });
     await createOrderViaUi(page, {
       customerName: earlierCustomer,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
 
     await page.getByTestId('orders-search-input').fill(searchPrefix);
@@ -225,12 +226,12 @@ test.describe('Order search and filters', () => {
     await createOrderViaUi(page, {
       customerName: largerCustomer,
       waferQuantity: '500',
-      requestedDeliveryDate: '2026-07-15',
+      requestedDeliveryDate: dateFromToday(25),
     });
     await createOrderViaUi(page, {
       customerName: smallerCustomer,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
 
     await page.getByTestId('orders-search-input').fill(searchPrefix);
@@ -268,7 +269,7 @@ test.describe('Order search and filters', () => {
     await createOrderViaUi(page, {
       customerName,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
 
     await page.getByTestId('orders-search-input').fill(customerName);

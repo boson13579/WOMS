@@ -10,16 +10,32 @@ export async function createOrderViaUi(page: Page, order: OrderFormInput): Promi
   await page.getByTestId('orders-create-button').click();
   await expect(page.getByTestId('order-modal')).toBeVisible();
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    await page.getByTestId('order-wafer-quantity-input').fill(order.waferQuantity);
-    await page.getByTestId('order-requested-delivery-date-input').fill(order.requestedDeliveryDate);
-    await page.getByTestId('order-customer-name-input').fill(order.customerName);
+  const customerInput = page.getByTestId('order-customer-name-input');
+  const quantityInput = page.getByTestId('order-wafer-quantity-input');
+  const deliveryDateInput = page.getByTestId('order-requested-delivery-date-input');
 
-    await expect(page.getByTestId('order-customer-name-input')).toHaveValue(order.customerName);
-    await expect(page.getByTestId('order-wafer-quantity-input')).toHaveValue(order.waferQuantity);
-    await expect(page.getByTestId('order-requested-delivery-date-input')).toHaveValue(
-      order.requestedDeliveryDate,
-    );
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let fillAttempt = 0; fillAttempt < 3; fillAttempt += 1) {
+      await customerInput.fill(order.customerName);
+      await deliveryDateInput.fill(order.requestedDeliveryDate);
+      await quantityInput.fill(order.waferQuantity);
+
+      const [customerName, waferQuantity, requestedDeliveryDate] = await Promise.all([
+        customerInput.inputValue(),
+        quantityInput.inputValue(),
+        deliveryDateInput.inputValue(),
+      ]);
+
+      if (
+        customerName === order.customerName &&
+        waferQuantity === order.waferQuantity &&
+        requestedDeliveryDate === order.requestedDeliveryDate
+      ) {
+        break;
+      }
+
+      await page.waitForTimeout(100);
+    }
 
     await page.getByTestId('order-modal-submit-button').click();
 

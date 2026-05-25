@@ -7,7 +7,7 @@ import {
   loginViaUi,
   registerUser,
 } from '../helpers/auth';
-import { uniqueSuffix } from '../helpers/data';
+import { dateFromToday, uniqueSuffix } from '../helpers/data';
 import { createOrderViaUi, orderRow } from '../helpers/orders';
 
 test.describe('Order access', () => {
@@ -43,7 +43,7 @@ test.describe('Order access', () => {
     const order = {
       customerName,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     };
 
     await loginViaUi(page, orderManager);
@@ -74,7 +74,7 @@ test.describe('Order access', () => {
     await createOrderViaUi(page, {
       customerName,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
     await page.getByTestId('orders-search-input').fill(customerName);
 
@@ -86,9 +86,11 @@ test.describe('Order access', () => {
     await expect(page.getByTestId('order-customer-name-input')).toHaveValue(customerName);
     await expect(page.getByTestId('order-customer-name-input')).toBeDisabled();
     await expect(page.getByTestId('order-wafer-quantity-input')).toHaveValue('125');
-    await expect(page.getByTestId('order-requested-delivery-date-input')).toHaveValue('2026-06-30');
+    await expect(page.getByTestId('order-requested-delivery-date-input')).toHaveValue(
+      dateFromToday(20),
+    );
     await page.getByTestId('order-wafer-quantity-input').fill('250');
-    await page.getByTestId('order-requested-delivery-date-input').fill('2026-07-15');
+    await page.getByTestId('order-requested-delivery-date-input').fill(dateFromToday(25));
     await page.getByTestId('order-modal-submit-button').click();
 
     await expect(page.getByTestId('order-modal')).toBeHidden();
@@ -111,7 +113,7 @@ test.describe('Order access', () => {
     await createOrderViaUi(page, {
       customerName,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
     await page.getByTestId('orders-search-input').fill(customerName);
 
@@ -150,7 +152,7 @@ test.describe('Order access', () => {
     await expect(modal).toBeVisible();
 
     await page.getByTestId('order-customer-name-input').fill(`E2E Invalid Low ${suffix}`);
-    await page.getByTestId('order-requested-delivery-date-input').fill('2026-06-30');
+    await page.getByTestId('order-requested-delivery-date-input').fill(dateFromToday(20));
     await page.getByTestId('order-wafer-quantity-input').fill('24');
     await page.getByTestId('order-modal-submit-button').click();
 
@@ -216,8 +218,8 @@ test.describe('Order access', () => {
 
     await page.getByTestId('order-customer-name-input').fill(`E2E Invalid Assignee ${suffix}`);
     await page.getByTestId('order-wafer-quantity-input').fill('125');
-    await page.getByTestId('order-requested-delivery-date-input').fill('2026-06-30');
-    await page.getByLabel('負責人').fill(`missing-assignee-${suffix}@example.com`);
+    await page.getByTestId('order-requested-delivery-date-input').fill(dateFromToday(20));
+    await modal.getByLabel('負責人').fill(`missing-assignee-${suffix}@example.com`);
     await page.getByTestId('order-modal-submit-button').click();
 
     await expect(modal).toBeVisible();

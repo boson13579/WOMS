@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 import { createUserWithRole, getEnvUser, loginViaUi } from '../helpers/auth';
-import { uniqueSuffix } from '../helpers/data';
+import { dateFromToday, uniqueSuffix } from '../helpers/data';
 import { createOrderViaUi } from '../helpers/orders';
 
 function addDays(dateText: string, days: number): string {
@@ -29,7 +29,7 @@ test.describe('Scheduling', () => {
     await createOrderViaUi(page, {
       customerName: `Calendar Pending ${uniqueSuffix()}`,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
 
     await page.getByTestId('orders-calendar-button').click();

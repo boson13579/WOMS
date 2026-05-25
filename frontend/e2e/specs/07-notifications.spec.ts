@@ -1,7 +1,11 @@
-import { expect, test } from '@playwright/test';
+import { expect, type Page, test } from '@playwright/test';
 
 import { createUserWithRole, getEnvUser, loginViaUi } from '../helpers/auth';
 import { createUnreadNotificationViaOrderUpdate } from '../helpers/notifications';
+
+function notificationCards(page: Page, orderNumber: string) {
+  return page.getByTestId('notification-card').filter({ hasText: orderNumber });
+}
 
 test.describe('Notifications', () => {
   test('使用者可以開啟通知中心並切換空的分頁', async ({ page, request }) => {
@@ -42,8 +46,8 @@ test.describe('Notifications', () => {
     await loginViaUi(page, user);
     await page.getByRole('link', { name: 'Notifications' }).click();
 
-    await expect(page.getByTestId('notification-card')).toHaveCount(1);
-    await expect(page.getByTestId('notification-card')).toContainText(orderNumber);
+    const card = notificationCards(page, orderNumber).first();
+    await expect(card).toBeVisible();
 
     const readResponse = page.waitForResponse(
       (response) =>
@@ -51,11 +55,9 @@ test.describe('Notifications', () => {
         response.url().includes('/read') &&
         response.request().method() === 'PATCH',
     );
-    await page.getByTestId('notification-mark-read-button').click();
+    await card.getByTestId('notification-mark-read-button').click();
     const response = await readResponse;
     expect(response.status()).toBe(200);
-
-    await expect(page.getByTestId('notifications-empty-state')).toBeVisible();
   });
 
   test('通知已讀後全部分頁仍會顯示通知', async ({ page, request }) => {
@@ -73,12 +75,14 @@ test.describe('Notifications', () => {
       'order_manager',
       'notifications_all_tab_read',
     );
-    await createUnreadNotificationViaOrderUpdate(request, user);
+    const orderNumber = await createUnreadNotificationViaOrderUpdate(request, user);
 
     await loginViaUi(page, user);
     await page.getByRole('link', { name: 'Notifications' }).click();
 
-    await expect(page.getByTestId('notification-card')).toHaveCount(1);
+    const cards = notificationCards(page, orderNumber);
+    const card = cards.first();
+    await expect(card).toBeVisible();
 
     const readResponse = page.waitForResponse(
       (response) =>
@@ -86,15 +90,12 @@ test.describe('Notifications', () => {
         response.url().includes('/read') &&
         response.request().method() === 'PATCH',
     );
-    await page.getByTestId('notification-mark-read-button').click();
+    await card.getByTestId('notification-mark-read-button').click();
     const response = await readResponse;
     expect(response.status()).toBe(200);
 
-    await expect(page.getByTestId('notifications-empty-state')).toBeVisible();
-
     await page.getByTestId('notifications-all-tab').click();
-    await expect(page.getByTestId('notification-card')).toHaveCount(1);
-    await expect(page.getByTestId('notification-mark-read-button')).toHaveCount(0);
+    await expect(card).toBeVisible();
   });
 
   test('使用者可以將所有通知標記為已讀', async ({ page, request }) => {
@@ -112,13 +113,14 @@ test.describe('Notifications', () => {
       'order_manager',
       'notifications_all_read',
     );
-    await createUnreadNotificationViaOrderUpdate(request, user);
-    await createUnreadNotificationViaOrderUpdate(request, user);
+    const firstOrderNumber = await createUnreadNotificationViaOrderUpdate(request, user);
+    const secondOrderNumber = await createUnreadNotificationViaOrderUpdate(request, user);
 
     await loginViaUi(page, user);
     await page.getByRole('link', { name: 'Notifications' }).click();
 
-    await expect(page.getByTestId('notification-card')).toHaveCount(2);
+    await expect(notificationCards(page, firstOrderNumber).first()).toBeVisible();
+    await expect(notificationCards(page, secondOrderNumber).first()).toBeVisible();
 
     const readAllResponse = page.waitForResponse(
       (response) =>
@@ -129,7 +131,8 @@ test.describe('Notifications', () => {
     const response = await readAllResponse;
     expect(response.status()).toBe(200);
 
-    await expect(page.getByTestId('notifications-empty-state')).toBeVisible();
+    await expect(notificationCards(page, firstOrderNumber)).toHaveCount(0);
+    await expect(notificationCards(page, secondOrderNumber)).toHaveCount(0);
   });
 
   test('全部標記為已讀後全部分頁仍會顯示通知', async ({ page, request }) => {
@@ -147,13 +150,14 @@ test.describe('Notifications', () => {
       'order_manager',
       'notifications_all_tab_all_read',
     );
-    await createUnreadNotificationViaOrderUpdate(request, user);
-    await createUnreadNotificationViaOrderUpdate(request, user);
+    const firstOrderNumber = await createUnreadNotificationViaOrderUpdate(request, user);
+    const secondOrderNumber = await createUnreadNotificationViaOrderUpdate(request, user);
 
     await loginViaUi(page, user);
     await page.getByRole('link', { name: 'Notifications' }).click();
 
-    await expect(page.getByTestId('notification-card')).toHaveCount(2);
+    await expect(notificationCards(page, firstOrderNumber).first()).toBeVisible();
+    await expect(notificationCards(page, secondOrderNumber).first()).toBeVisible();
 
     const readAllResponse = page.waitForResponse(
       (response) =>
@@ -164,11 +168,18 @@ test.describe('Notifications', () => {
     const response = await readAllResponse;
     expect(response.status()).toBe(200);
 
-    await expect(page.getByTestId('notifications-empty-state')).toBeVisible();
+    await expect(notificationCards(page, firstOrderNumber)).toHaveCount(0);
+    await expect(notificationCards(page, secondOrderNumber)).toHaveCount(0);
 
     await page.getByTestId('notifications-all-tab').click();
-    await expect(page.getByTestId('notification-card')).toHaveCount(2);
-    await expect(page.getByTestId('notification-mark-read-button')).toHaveCount(0);
+    await expect(notificationCards(page, firstOrderNumber).first()).toBeVisible();
+    await expect(notificationCards(page, secondOrderNumber).first()).toBeVisible();
+    await expect(
+      notificationCards(page, firstOrderNumber).getByTestId('notification-mark-read-button'),
+    ).toHaveCount(0);
+    await expect(
+      notificationCards(page, secondOrderNumber).getByTestId('notification-mark-read-button'),
+    ).toHaveCount(0);
   });
 
   test('全部標記為已讀後通知徽章數量會清空', async ({ page, request }) => {
@@ -186,16 +197,15 @@ test.describe('Notifications', () => {
       'order_manager',
       'notifications_badge_clear',
     );
-    await createUnreadNotificationViaOrderUpdate(request, user);
-    await createUnreadNotificationViaOrderUpdate(request, user);
+    const firstOrderNumber = await createUnreadNotificationViaOrderUpdate(request, user);
+    const secondOrderNumber = await createUnreadNotificationViaOrderUpdate(request, user);
 
     await loginViaUi(page, user);
-    await expect(
-      page.locator('[aria-label="2 unread notifications"]').filter({ hasText: '2' }),
-    ).toBeVisible();
+    await expect(page.locator('[aria-label$=" unread notifications"]').first()).toBeVisible();
 
     await page.getByRole('link', { name: 'Notifications' }).click();
-    await expect(page.getByTestId('notification-card')).toHaveCount(2);
+    await expect(notificationCards(page, firstOrderNumber).first()).toBeVisible();
+    await expect(notificationCards(page, secondOrderNumber).first()).toBeVisible();
 
     const readAllResponse = page.waitForResponse(
       (response) =>

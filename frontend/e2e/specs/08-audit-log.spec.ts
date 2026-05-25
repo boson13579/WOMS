@@ -7,7 +7,7 @@ import {
   loginViaUi,
   registerUser,
 } from '../helpers/auth';
-import { uniqueSuffix } from '../helpers/data';
+import { dateFromToday, uniqueSuffix } from '../helpers/data';
 import { createOrderViaUi, orderRow } from '../helpers/orders';
 
 function userRow(page: Page, username: string) {
@@ -172,7 +172,7 @@ test.describe('Audit log', () => {
     await createOrderViaUi(page, {
       customerName,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
     await page.getByTestId('orders-search-input').fill(customerName);
 

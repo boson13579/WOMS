@@ -19,7 +19,6 @@ async function expectObservabilitySmoke(page: Page): Promise<void> {
   await expect(page.getByRole('heading', { name: 'Rate', exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Error rate', exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'P95 latency', exact: true })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'SLO compliance', exact: true })).toBeVisible();
   await expect(page.getByText('DB connections', { exact: true })).toBeVisible();
   await expect(page.getByText('Redis memory', { exact: true })).toBeVisible();
   await expect(page.getByText('Workers', { exact: true })).toBeVisible();

@@ -8,6 +8,7 @@ import {
   loginViaUi,
   registerUser,
 } from '../helpers/auth';
+import { dateFromToday } from '../helpers/data';
 import { createOrderViaUi, orderRow } from '../helpers/orders';
 
 test.describe('RBAC', () => {
@@ -71,7 +72,7 @@ test.describe('RBAC', () => {
       data: {
         customer_name: `E2E Forbidden Create ${Date.now()}`,
         wafer_quantity: 125,
-        requested_delivery_date: '2026-06-30',
+        requested_delivery_date: dateFromToday(20),
       },
     });
 
@@ -115,7 +116,7 @@ test.describe('RBAC', () => {
     await createOrderViaUi(page, {
       customerName,
       waferQuantity: '125',
-      requestedDeliveryDate: '2026-06-30',
+      requestedDeliveryDate: dateFromToday(20),
     });
 
     await page.getByRole('button', { name: 'Logout' }).click();

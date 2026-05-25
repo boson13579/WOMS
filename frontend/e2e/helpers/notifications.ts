@@ -1,7 +1,7 @@
 import type { APIRequestContext } from '@playwright/test';
 
 import { loginViaApi, type LoginUser } from './auth';
-import { uniqueSuffix } from './data';
+import { dateFromToday, uniqueSuffix } from './data';
 
 interface OrderResponse {
   id: string;
@@ -15,7 +15,7 @@ async function createOrderViaApi(request: APIRequestContext): Promise<OrderRespo
     data: {
       customer_name: `E2E Notification ${uniqueSuffix()}`,
       wafer_quantity: 125,
-      requested_delivery_date: '2026-06-30',
+      requested_delivery_date: dateFromToday(20),
     },
   });
 
@@ -61,19 +61,27 @@ export async function createUnreadNotificationViaOrderUpdate(
 ): Promise<string> {
   await loginViaApi(request, user);
   const createdOrder = await createOrderViaApi(request);
-  const unlockedOrder = await waitForOrderUnlocked(request, createdOrder.id);
+  let unlockedOrder = await waitForOrderUnlocked(request, createdOrder.id);
 
-  const response = await request.patch(`/api/v1/orders/${unlockedOrder.id}`, {
-    data: {
-      wafer_quantity: 150,
-      version_id: unlockedOrder.version_id,
-    },
-  });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await request.patch(`/api/v1/orders/${unlockedOrder.id}`, {
+      data: {
+        wafer_quantity: 150 + attempt,
+        version_id: unlockedOrder.version_id,
+      },
+    });
 
-  if (!response.ok()) {
-    throw new Error(
-      `Failed to trigger notification: ${response.status()} ${await response.text()}`,
-    );
+    if (response.ok()) {
+      return unlockedOrder.order_number;
+    }
+
+    if (response.status() !== 409 || attempt === 2) {
+      throw new Error(
+        `Failed to trigger notification: ${response.status()} ${await response.text()}`,
+      );
+    }
+
+    unlockedOrder = await waitForOrderUnlocked(request, createdOrder.id);
   }
 
   return unlockedOrder.order_number;
