@@ -70,7 +70,7 @@ jobs:
           EOF
 
       - name: Build and start application stack
-        run: docker compose up -d --build db redis backend worker frontend
+        run: docker compose up -d --build db redis backend nginx worker frontend
 
       - name: Wait for backend
         run: |
@@ -81,7 +81,7 @@ jobs:
             docker compose ps
             sleep 2
           done
-          docker compose logs backend --tail=200
+          docker compose logs backend nginx --tail=200
           exit 1
 
       - name: Run database migrations
@@ -126,7 +126,7 @@ jobs:
             docker compose ps
             sleep 2
           done
-          docker compose logs backend frontend --tail=200
+          docker compose logs backend nginx frontend --tail=200
           exit 1
 
       - name: Run Playwright E2E
