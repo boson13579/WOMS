@@ -27,7 +27,31 @@ import { ApiError } from '@/lib/apiFetch';
 import { toastApiError } from '@/lib/toastApiError';
 
 import { useCreateOrder, useUpdateOrder } from '../api/orders';
+import { useScheduleCapacity } from '../api/scheduleCapacity';
 import type { Order } from '../types';
+
+// ---------------------------------------------------------------------------
+// Date helpers — keep the producer-side rules in sync with backend
+// `_validate_deadline_or_422`: deadline must be in [today+1, today+HORIZON].
+// Mirrors backend `SCHEDULER_HORIZON_DAYS` default. If the deploy ever
+// changes it on the backend, update here too.
+// ---------------------------------------------------------------------------
+
+const HORIZON_DAYS = 30;
+
+function toISODate(d: Date): string {
+  // Use local-tz Y-M-D so the string matches what <input type="date"> emits.
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function addDays(d: Date, n: number): Date {
+  const next = new Date(d);
+  next.setDate(next.getDate() + n);
+  return next;
+}
 
 // ---------------------------------------------------------------------------
 // Form schema — matches backend CreateOrderRequest / UpdateOrderRequest
@@ -64,6 +88,18 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const isPending = createMutation.isPending || updateMutation.isPending;
   const users = useAssignableUsers();
   const assignedToDisabled = isEdit;
+  const { data: capacity } = useScheduleCapacity();
+
+  const { tomorrowISO, horizonEndISO, fullDates } = useMemo(() => {
+    const today = new Date();
+    return {
+      tomorrowISO: toISODate(addDays(today, 1)),
+      horizonEndISO: toISODate(addDays(today, HORIZON_DAYS)),
+      fullDates: new Set(
+        (capacity?.entries ?? []).filter((e) => e.remaining <= 0).map((e) => e.date),
+      ),
+    };
+  }, [capacity]);
 
   const dynamicSchema = useMemo(() => {
     // Skip the assignee refinement in edit mode: the field is disabled there
@@ -71,18 +107,40 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
     // anyway. Without this guard, an order whose original assignee has since
     // been deactivated would fail validation on a field the user can't edit,
     // leaving the modal permanently unsubmittable.
-    if (isEdit) return formSchema;
-    return formSchema.refine(
-      (data) => {
-        if (!data.assigned_to_email) return true;
-        return users.some((u) => u.email === data.assigned_to_email);
-      },
-      {
-        message: '負責人必須是系統中現有的使用者',
-        path: ['assigned_to_email'],
-      },
-    );
-  }, [users, isEdit]);
+    return formSchema
+      .refine(
+        (data) => !data.requested_delivery_date || data.requested_delivery_date >= tomorrowISO,
+        {
+          message: '交貨日必須是明天之後',
+          path: ['requested_delivery_date'],
+        },
+      )
+      .refine(
+        (data) => !data.requested_delivery_date || data.requested_delivery_date <= horizonEndISO,
+        {
+          message: '交貨日超過 30 天排程範圍，請改選較近的日期',
+          path: ['requested_delivery_date'],
+        },
+      )
+      .refine(
+        (data) => !data.requested_delivery_date || !fullDates.has(data.requested_delivery_date),
+        {
+          message: '該日排程已滿，請選擇其他日期',
+          path: ['requested_delivery_date'],
+        },
+      )
+      .refine(
+        (data) => {
+          if (isEdit) return true;
+          if (!data.assigned_to_email) return true;
+          return users.some((u) => u.email === data.assigned_to_email);
+        },
+        {
+          message: '負責人必須是系統中現有的使用者',
+          path: ['assigned_to_email'],
+        },
+      );
+  }, [users, isEdit, tomorrowISO, horizonEndISO, fullDates]);
 
   const {
     register,
@@ -239,6 +297,8 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
             <Input
               id="requested_delivery_date"
               type="date"
+              min={tomorrowISO}
+              max={horizonEndISO}
               aria-invalid={!!errors.requested_delivery_date}
               aria-describedby={
                 errors.requested_delivery_date ? 'requested_delivery_date-error' : undefined

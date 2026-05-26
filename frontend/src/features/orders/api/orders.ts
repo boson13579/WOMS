@@ -180,15 +180,62 @@ export function useUpdateOrder(): ReturnType<
   });
 }
 
-export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error, string>> {
+export function useDeleteOrder(): ReturnType<
+  typeof useMutation<
+    undefined,
+    Error,
+    string,
+    { snapshots: [readonly unknown[], OrderListResponse | undefined][] }
+  >
+> {
   const qc = useQueryClient();
 
-  return useMutation<undefined, Error, string>({
+  return useMutation<
+    undefined,
+    Error,
+    string,
+    { snapshots: [readonly unknown[], OrderListResponse | undefined][] }
+  >({
     mutationFn: (id) =>
       apiFetch<undefined>(
         `/api/v1/orders/${id}`,
         { method: 'DELETE', credentials: 'include' },
         () => undefined,
+      ),
+    // Optimistically remove the row from every cached list so the order
+    // visually disappears the instant the user clicks the trash icon.
+    onMutate: async (id) => {
+      await qc.cancelQueries({ queryKey: orderKeys.all });
+      const snapshots = qc.getQueriesData<OrderListResponse>({ queryKey: orderKeys.all });
+      snapshots.forEach(([key, data]) => {
+        if (!data) return;
+        const next: OrderListResponse = {
+          ...data,
+          items: data.items.filter((o) => o.id !== id),
+          total: Math.max(0, data.total - (data.items.some((o) => o.id === id) ? 1 : 0)),
+        };
+        qc.setQueryData<OrderListResponse>(key, next);
+      });
+      return { snapshots };
+    },
+    onError: (_err, _id, context) => {
+      context?.snapshots.forEach(([key, data]) => {
+        qc.setQueryData(key, data);
+      });
+    },
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: orderKeys.all });
+    },
+  });
+}
+
+export function useCancelOrder(): ReturnType<typeof useMutation<Order, Error, string>> {
+  const qc = useQueryClient();
+
+  return useMutation<Order, Error, string>({
+    mutationFn: (id) =>
+      apiFetch(`/api/v1/orders/${id}/cancel`, { method: 'POST', credentials: 'include' }, (d) =>
+        orderSchema.parse(d),
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: orderKeys.all });
