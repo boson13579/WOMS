@@ -27,7 +27,6 @@ import { ApiError } from '@/lib/apiFetch';
 import { toastApiError } from '@/lib/toastApiError';
 
 import { useCreateOrder, useUpdateOrder } from '../api/orders';
-import { useScheduleCapacity } from '../api/scheduleCapacity';
 import type { Order } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -88,18 +87,14 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const isPending = createMutation.isPending || updateMutation.isPending;
   const users = useAssignableUsers();
   const assignedToDisabled = isEdit;
-  const { data: capacity } = useScheduleCapacity();
 
-  const { tomorrowISO, horizonEndISO, fullDates } = useMemo(() => {
+  const { tomorrowISO, horizonEndISO } = useMemo(() => {
     const today = new Date();
     return {
       tomorrowISO: toISODate(addDays(today, 1)),
       horizonEndISO: toISODate(addDays(today, HORIZON_DAYS)),
-      fullDates: new Set(
-        (capacity?.entries ?? []).filter((e) => e.remaining <= 0).map((e) => e.date),
-      ),
     };
-  }, [capacity]);
+  }, []);
 
   const dynamicSchema = useMemo(() => {
     // Skip the assignee refinement in edit mode: the field is disabled there
@@ -107,6 +102,14 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
     // anyway. Without this guard, an order whose original assignee has since
     // been deactivated would fail validation on a field the user can't edit,
     // leaving the modal permanently unsubmittable.
+    //
+    // Note on capacity: we do NOT block based on
+    // ``useScheduleCapacity().entries[date].remaining`` here.
+    // ``requested_delivery_date`` is a deadline, not a production date —
+    // the scheduler can still admit an order whose deadline-day is
+    // already full by producing earlier and back-filling. The producer-
+    // side `_validate_deadline_or_422` only enforces the horizon window;
+    // real admission control lives in the worker's compound finalize.
     return formSchema
       .refine(
         (data) => !data.requested_delivery_date || data.requested_delivery_date >= tomorrowISO,
@@ -123,13 +126,6 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
         },
       )
       .refine(
-        (data) => !data.requested_delivery_date || !fullDates.has(data.requested_delivery_date),
-        {
-          message: '該日排程已滿，請選擇其他日期',
-          path: ['requested_delivery_date'],
-        },
-      )
-      .refine(
         (data) => {
           if (isEdit) return true;
           if (!data.assigned_to_email) return true;
@@ -140,7 +136,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
           path: ['assigned_to_email'],
         },
       );
-  }, [users, isEdit, tomorrowISO, horizonEndISO, fullDates]);
+  }, [users, isEdit, tomorrowISO, horizonEndISO]);
 
   const {
     register,

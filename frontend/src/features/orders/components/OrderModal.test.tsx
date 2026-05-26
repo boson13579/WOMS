@@ -8,7 +8,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '@/lib/apiFetch';
 
-import type { ScheduleCapacity } from '../api/scheduleCapacity';
 import type { Order } from '../types';
 
 import { OrderModal } from './OrderModal';
@@ -49,14 +48,6 @@ vi.mock('@/features/auth/api/users', () => {
   ];
   return { useAssignableUsers: () => stableUsers };
 });
-
-// Capacity data is mocked per test. Default is undefined so the
-// "remaining=0" branch only fires when a test explicitly sets it.
-let mockCapacity: ScheduleCapacity | undefined;
-
-vi.mock('../api/scheduleCapacity', () => ({
-  useScheduleCapacity: () => ({ data: mockCapacity }),
-}));
 
 // Radix Dialog has animation timers that keep the test runner alive.
 // Replace with a plain stub so tests exit cleanly.
@@ -123,7 +114,6 @@ describe('OrderModal', () => {
     vi.clearAllMocks();
     createState = { mutate: mockCreateMutate, isPending: false, isError: false, error: null };
     updateState = { mutate: mockUpdateMutate, isPending: false, isError: false, error: null };
-    mockCapacity = undefined;
   });
 
   // --- create mode ---
@@ -266,31 +256,6 @@ describe('OrderModal', () => {
     await user.click(screen.getByRole('button', { name: '新增' }));
 
     expect(screen.getByText(/超過 30 天排程範圍/)).toBeInTheDocument();
-    expect(mockCreateMutate).not.toHaveBeenCalled();
-  });
-
-  it('create mode: rejects a delivery date whose capacity is already exhausted', async () => {
-    const fullDate = daysFromToday(15);
-    mockCapacity = {
-      base_date: daysFromToday(0),
-      daily_capacity: 200,
-      entries: [
-        { date: fullDate, used: 200, remaining: 0 },
-        { date: daysFromToday(16), used: 50, remaining: 150 },
-      ],
-    };
-
-    const user = userEvent.setup();
-    render(<OrderModal open order={undefined} onClose={onClose} />);
-
-    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
-    await user.clear(screen.getByLabelText(/晶圓數量/));
-    await user.type(screen.getByLabelText(/晶圓數量/), '200');
-    await user.type(screen.getByLabelText(/要求交貨日/), fullDate);
-
-    await user.click(screen.getByRole('button', { name: '新增' }));
-
-    expect(screen.getByText(/該日排程已滿/)).toBeInTheDocument();
     expect(mockCreateMutate).not.toHaveBeenCalled();
   });
 
