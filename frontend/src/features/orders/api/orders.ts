@@ -180,57 +180,17 @@ export function useUpdateOrder(): ReturnType<
   });
 }
 
-export function useDeleteOrder(): ReturnType<
-  typeof useMutation<
-    undefined,
-    Error,
-    string,
-    { snapshots: [readonly unknown[], OrderListResponse | undefined][] }
-  >
-> {
+export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error, string>> {
   const qc = useQueryClient();
 
-  return useMutation<
-    undefined,
-    Error,
-    string,
-    { snapshots: [readonly unknown[], OrderListResponse | undefined][] }
-  >({
+  return useMutation<undefined, Error, string>({
     mutationFn: (id) =>
       apiFetch<undefined>(
         `/api/v1/orders/${id}`,
         { method: 'DELETE', credentials: 'include' },
         () => undefined,
       ),
-    // Optimistically remove the row from every cached list so the order
-    // visually disappears the instant the user clicks the trash icon.
-    //
-    // Why we DON'T invalidate on success: backend delete for non-cancelled
-    // statuses is async — it sets is_processing_locked=True and enqueues a
-    // compound; the actual soft-delete (is_deleted=True) happens later in
-    // the worker. An immediate refetch would re-include the row (locked but
-    // still alive), overwriting the optimistic empty state and producing a
-    // flash of the row reappearing. ``useScheduleWs`` invalidates the cache
-    // when the worker broadcasts ``schedule.*`` after completion, so the
-    // optimistic state stays correct until the canonical refresh arrives.
-    onMutate: async (id) => {
-      await qc.cancelQueries({ queryKey: orderKeys.all });
-      const snapshots = qc.getQueriesData<OrderListResponse>({ queryKey: orderKeys.all });
-      snapshots.forEach(([key, data]) => {
-        if (!data) return;
-        const next: OrderListResponse = {
-          ...data,
-          items: data.items.filter((o) => o.id !== id),
-          total: Math.max(0, data.total - (data.items.some((o) => o.id === id) ? 1 : 0)),
-        };
-        qc.setQueryData<OrderListResponse>(key, next);
-      });
-      return { snapshots };
-    },
-    onError: (_err, _id, context) => {
-      context?.snapshots.forEach(([key, data]) => {
-        qc.setQueryData(key, data);
-      });
+    onSuccess: () => {
       void qc.invalidateQueries({ queryKey: orderKeys.all });
     },
   });
