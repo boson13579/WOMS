@@ -204,6 +204,15 @@ export function useDeleteOrder(): ReturnType<
       ),
     // Optimistically remove the row from every cached list so the order
     // visually disappears the instant the user clicks the trash icon.
+    //
+    // Why we DON'T invalidate on success: backend delete for non-cancelled
+    // statuses is async — it sets is_processing_locked=True and enqueues a
+    // compound; the actual soft-delete (is_deleted=True) happens later in
+    // the worker. An immediate refetch would re-include the row (locked but
+    // still alive), overwriting the optimistic empty state and producing a
+    // flash of the row reappearing. ``useScheduleWs`` invalidates the cache
+    // when the worker broadcasts ``schedule.*`` after completion, so the
+    // optimistic state stays correct until the canonical refresh arrives.
     onMutate: async (id) => {
       await qc.cancelQueries({ queryKey: orderKeys.all });
       const snapshots = qc.getQueriesData<OrderListResponse>({ queryKey: orderKeys.all });
@@ -222,8 +231,6 @@ export function useDeleteOrder(): ReturnType<
       context?.snapshots.forEach(([key, data]) => {
         qc.setQueryData(key, data);
       });
-    },
-    onSettled: () => {
       void qc.invalidateQueries({ queryKey: orderKeys.all });
     },
   });
