@@ -49,6 +49,33 @@ vi.mock('@/features/auth/api/users', () => {
   return { useAssignableUsers: () => stableUsers };
 });
 
+// The modal derives its deadline window from the scheduler's authoritative
+// base_date (UTC) + horizon via useScheduleCapacity — NOT the local clock.
+// Mock a fixed base_date with a full 30-entry horizon so the window is
+// deterministic and timezone-independent. Factory is self-contained (no outer
+// refs) to satisfy vi.mock hoisting.
+vi.mock('../api/scheduleCapacity', () => {
+  const base = '2026-06-01';
+  const addUTC = (n: number): string => {
+    const d = new Date(`${base}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  };
+  return {
+    useScheduleCapacity: () => ({
+      data: {
+        base_date: base,
+        daily_capacity: 200,
+        entries: Array.from({ length: 30 }, (_, i) => ({
+          date: addUTC(i),
+          used: 0,
+          remaining: 200,
+        })),
+      },
+    }),
+  };
+});
+
 // Radix Dialog has animation timers that keep the test runner alive.
 // Replace with a plain stub so tests exit cleanly.
 vi.mock('@/components/ui/dialog', () => ({
@@ -64,13 +91,26 @@ vi.mock('@/components/ui/dialog', () => ({
 // Fixtures
 // ---------------------------------------------------------------------------
 
+// Mirrors the mocked scheduler base_date above. `fromBase(n)` returns the UTC
+// Y-M-D string for base_date+n; the modal's valid window is [base+1, base+30].
+const BASE_DATE = '2026-06-01';
+
+function fromBase(days: number): string {
+  const d = new Date(`${BASE_DATE}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// Valid date well inside the horizon — used by every "happy path" test.
+const FUTURE_DATE = fromBase(15);
+
 function makeOrder(overrides: Partial<Order> = {}): Order {
   return {
     id: '11111111-0000-0000-0000-000000000001',
-    order_number: 'ORD-20260504-0001',
+    order_number: 'ORD-TEST-0001',
     customer_name: 'TSMC',
     wafer_quantity: 500,
-    requested_delivery_date: '2026-06-01',
+    requested_delivery_date: fromBase(10),
     scheduled_production_date: null,
     expected_delivery_date: null,
     status: 'pending',
@@ -78,8 +118,8 @@ function makeOrder(overrides: Partial<Order> = {}): Order {
     created_by: 'aaaaaaaa-0000-0000-0000-000000000001',
     notes: '測試備註',
     version_id: 1,
-    created_at: '2026-05-04T08:00:00Z',
-    updated_at: '2026-05-04T08:00:00Z',
+    created_at: '2026-01-01T08:00:00Z',
+    updated_at: '2026-01-01T08:00:00Z',
     pinned_production_date: null,
     is_pinned: false,
     is_processing_locked: false,
@@ -135,7 +175,7 @@ describe('OrderModal', () => {
     await user.clear(screen.getByLabelText(/晶圓數量/));
     await user.type(screen.getByLabelText(/晶圓數量/), '200');
 
-    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
+    await user.type(screen.getByLabelText(/要求交貨日/), FUTURE_DATE);
 
     await user.type(screen.getByLabelText(/負責人/), 'alice@example.com');
 
@@ -145,7 +185,7 @@ describe('OrderModal', () => {
       expect.objectContaining({
         customer_name: 'Samsung',
         wafer_quantity: 200,
-        requested_delivery_date: '2026-08-01',
+        requested_delivery_date: FUTURE_DATE,
       }),
       expect.anything(),
     );
@@ -169,7 +209,7 @@ describe('OrderModal', () => {
     await user.clear(screen.getByLabelText(/晶圓數量/));
     await user.type(screen.getByLabelText(/晶圓數量/), '200');
 
-    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
+    await user.type(screen.getByLabelText(/要求交貨日/), FUTURE_DATE);
 
     await user.type(screen.getByLabelText(/負責人/), 'invalid-email@random.com');
 
@@ -189,7 +229,7 @@ describe('OrderModal', () => {
     await user.clear(screen.getByLabelText(/晶圓數量/));
     await user.type(screen.getByLabelText(/晶圓數量/), '200');
 
-    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
+    await user.type(screen.getByLabelText(/要求交貨日/), FUTURE_DATE);
     await user.type(screen.getByLabelText(/負責人/), 'bob@example.com');
 
     await user.click(screen.getByRole('button', { name: '新增' }));
@@ -203,6 +243,57 @@ describe('OrderModal', () => {
     );
   });
 
+  // --- date validation ---
+
+  it('create mode: sets min/max on the date input matching today+1 and today+30', () => {
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    const dateInput = screen.getByLabelText(/要求交貨日/);
+    expect(dateInput).toHaveAttribute('min', fromBase(1));
+    expect(dateInput).toHaveAttribute('max', fromBase(30));
+  });
+
+  it('create mode: rejects a delivery date that is today or earlier', async () => {
+    const user = userEvent.setup();
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
+    await user.clear(screen.getByLabelText(/晶圓數量/));
+    await user.type(screen.getByLabelText(/晶圓數量/), '200');
+    await user.type(screen.getByLabelText(/要求交貨日/), fromBase(0));
+
+    await user.click(screen.getByRole('button', { name: '新增' }));
+
+    expect(screen.getByText(/交貨日必須是明天之後/)).toBeInTheDocument();
+    expect(mockCreateMutate).not.toHaveBeenCalled();
+  });
+
+  it('create mode: rejects a delivery date past the 30-day horizon', async () => {
+    const user = userEvent.setup();
+    render(<OrderModal open order={undefined} onClose={onClose} />);
+
+    await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
+    await user.clear(screen.getByLabelText(/晶圓數量/));
+    await user.type(screen.getByLabelText(/晶圓數量/), '200');
+    await user.type(screen.getByLabelText(/要求交貨日/), fromBase(31));
+
+    await user.click(screen.getByRole('button', { name: '新增' }));
+
+    expect(screen.getByText(/超過 30 天排程範圍/)).toBeInTheDocument();
+    expect(mockCreateMutate).not.toHaveBeenCalled();
+  });
+
+  it('edit mode: rejects saving when the existing order date is now in the past', async () => {
+    const user = userEvent.setup();
+    const stale = makeOrder({ requested_delivery_date: fromBase(-14) });
+    render(<OrderModal open order={stale} onClose={onClose} />);
+
+    await user.click(screen.getByRole('button', { name: '儲存' }));
+
+    expect(screen.getByText(/交貨日必須是明天之後/)).toBeInTheDocument();
+    expect(mockUpdateMutate).not.toHaveBeenCalled();
+  });
+
   it('create mode: passes validation if responsible email is empty', async () => {
     const user = userEvent.setup();
     render(<OrderModal open order={undefined} onClose={onClose} />);
@@ -213,7 +304,7 @@ describe('OrderModal', () => {
     await user.clear(screen.getByLabelText(/晶圓數量/));
     await user.type(screen.getByLabelText(/晶圓數量/), '200');
 
-    await user.type(screen.getByLabelText(/要求交貨日/), '2026-08-01');
+    await user.type(screen.getByLabelText(/要求交貨日/), FUTURE_DATE);
 
     // responsible email is left empty
 

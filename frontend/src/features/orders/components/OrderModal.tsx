@@ -27,7 +27,32 @@ import { ApiError } from '@/lib/apiFetch';
 import { toastApiError } from '@/lib/toastApiError';
 
 import { useCreateOrder, useUpdateOrder } from '../api/orders';
+import { useScheduleCapacity } from '../api/scheduleCapacity';
 import type { Order } from '../types';
+
+// ---------------------------------------------------------------------------
+// Date helpers — mirror backend `_validate_deadline_or_422`, whose window is
+// [base_date + 1, base_date + HORIZON_DAYS]. The authoritative base_date and
+// horizon come from the scheduler (see useScheduleCapacity); we only fall back
+// to a hard-coded horizon when that query hasn't loaded yet.
+//
+// All arithmetic is done in UTC. The backend derives "today" from
+// datetime.now(UTC).date(); computing the client window in local time would
+// drift one day ahead during the UTC+8 morning (Taiwan 00:00–07:59), wrongly
+// rejecting deadlines the backend would accept.
+// ---------------------------------------------------------------------------
+
+const FALLBACK_HORIZON_DAYS = 30;
+
+function todayUTCISO(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addDaysToISO(isoDate: string, days: number): string {
+  const d = new Date(`${isoDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
 // ---------------------------------------------------------------------------
 // Form schema — matches backend CreateOrderRequest / UpdateOrderRequest
@@ -64,6 +89,21 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const isPending = createMutation.isPending || updateMutation.isPending;
   const users = useAssignableUsers();
   const assignedToDisabled = isEdit;
+  const { data: capacity } = useScheduleCapacity();
+
+  const { tomorrowISO, horizonEndISO } = useMemo(() => {
+    // Prefer the scheduler's authoritative UTC base_date + horizon
+    // (entries.length is exactly SCHEDULER_HORIZON_DAYS) so the client window
+    // matches backend validation regardless of timezone or a horizon config
+    // change. Fall back to the UTC wall-clock date + 30 only while the
+    // capacity query is still loading.
+    const baseDate = capacity?.base_date ?? todayUTCISO();
+    const horizon = capacity?.entries.length ?? FALLBACK_HORIZON_DAYS;
+    return {
+      tomorrowISO: addDaysToISO(baseDate, 1),
+      horizonEndISO: addDaysToISO(baseDate, horizon),
+    };
+  }, [capacity]);
 
   const dynamicSchema = useMemo(() => {
     // Skip the assignee refinement in edit mode: the field is disabled there
@@ -71,18 +111,41 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
     // anyway. Without this guard, an order whose original assignee has since
     // been deactivated would fail validation on a field the user can't edit,
     // leaving the modal permanently unsubmittable.
-    if (isEdit) return formSchema;
-    return formSchema.refine(
-      (data) => {
-        if (!data.assigned_to_email) return true;
-        return users.some((u) => u.email === data.assigned_to_email);
-      },
-      {
-        message: '負責人必須是系統中現有的使用者',
-        path: ['assigned_to_email'],
-      },
-    );
-  }, [users, isEdit]);
+    //
+    // We use the capacity payload only for its base_date + horizon length
+    // (above). We deliberately do NOT block on per-day
+    // ``entries[date].remaining``: ``requested_delivery_date`` is a deadline,
+    // not a production date — the scheduler can still admit an order whose
+    // deadline-day is full by producing earlier and back-filling. The
+    // producer-side `_validate_deadline_or_422` only enforces the horizon
+    // window; real admission control lives in the worker's compound finalize.
+    return formSchema
+      .refine(
+        (data) => !data.requested_delivery_date || data.requested_delivery_date >= tomorrowISO,
+        {
+          message: '交貨日必須是明天之後',
+          path: ['requested_delivery_date'],
+        },
+      )
+      .refine(
+        (data) => !data.requested_delivery_date || data.requested_delivery_date <= horizonEndISO,
+        {
+          message: '交貨日超過 30 天排程範圍，請改選較近的日期',
+          path: ['requested_delivery_date'],
+        },
+      )
+      .refine(
+        (data) => {
+          if (isEdit) return true;
+          if (!data.assigned_to_email) return true;
+          return users.some((u) => u.email === data.assigned_to_email);
+        },
+        {
+          message: '負責人必須是系統中現有的使用者',
+          path: ['assigned_to_email'],
+        },
+      );
+  }, [users, isEdit, tomorrowISO, horizonEndISO]);
 
   const {
     register,
@@ -239,6 +302,8 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
             <Input
               id="requested_delivery_date"
               type="date"
+              min={tomorrowISO}
+              max={horizonEndISO}
               aria-invalid={!!errors.requested_delivery_date}
               aria-describedby={
                 errors.requested_delivery_date ? 'requested_delivery_date-error' : undefined

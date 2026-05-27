@@ -2,7 +2,7 @@
  * Paginated order list table.
  * Exposes onEdit callback so the parent page can manage modal open state.
  */
-import { ArrowDown, ArrowUp, ArrowUpDown, Loader2, Lock, Pencil, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, Ban, Loader2, Lock, Pencil, Trash2 } from 'lucide-react';
 import { useMemo, type ReactNode } from 'react';
 import { toast } from 'sonner';
 
@@ -22,7 +22,7 @@ import { useCanWrite, useCurrentRole, useCurrentUserId } from '@/lib/auth';
 import { toastApiError } from '@/lib/toastApiError';
 import { cn } from '@/lib/utils';
 
-import { useDeleteOrder, useOrders } from '../api/orders';
+import { useCancelOrder, useDeleteOrder, useOrders } from '../api/orders';
 import { useOrderStore } from '../stores/orderStore';
 import type { Order, OrderStatus, SortField } from '../types';
 
@@ -115,6 +115,7 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
   });
 
   const deleteMutation = useDeleteOrder();
+  const cancelMutation = useCancelOrder();
   const canWrite = useCanWrite();
   const role = useCurrentRole();
   const currentUserId = useCurrentUserId();
@@ -145,14 +146,36 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
   function handleDelete(order: Order): void {
     // eslint-disable-next-line no-alert
     if (!window.confirm(`確定要刪除訂單 ${order.order_number}？`)) return;
+    // Backend DELETE is async for non-cancelled orders: it locks the row and
+    // enqueues a worker compound that performs the soft-delete on accept. The
+    // row only leaves the list once the worker finishes, so the toast must not
+    // claim the order is already gone.
     deleteMutation.mutate(order.id, {
       onSuccess: () => {
-        toast.success('訂單已刪除', {
-          description: `訂單 ${order.order_number} 已移除，排程資料會同步更新。`,
+        toast.success('刪除請求已送出', {
+          description: `訂單 ${order.order_number} 排程處理完成後會從列表移除。`,
         });
       },
       onError: (err) => {
         toastApiError('刪除訂單失敗', err);
+      },
+    });
+  }
+
+  function handleCancel(order: Order): void {
+    // eslint-disable-next-line no-alert
+    if (!window.confirm(`確定要取消訂單 ${order.order_number}？`)) return;
+    // Backend POST /cancel only locks the row and enqueues a worker compound;
+    // the status flips to cancelled when the worker accepts, not on this
+    // response. Word the toast as a queued request, not a completed change.
+    cancelMutation.mutate(order.id, {
+      onSuccess: () => {
+        toast.success('取消請求已送出', {
+          description: `訂單 ${order.order_number} 排程處理完成後狀態會更新為已取消。`,
+        });
+      },
+      onError: (err) => {
+        toastApiError('取消訂單失敗', err);
       },
     });
   }
@@ -271,35 +294,83 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center justify-end gap-1">
-                        {canEditOrder(order) && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={() => {
-                              onEdit(order);
-                            }}
-                            title={order.is_processing_locked ? '排程處理中，請稍候' : '編輯'}
-                            disabled={order.is_processing_locked}
-                            data-testid="orders-edit-button"
-                          >
-                            <Pencil className="h-4 w-4" />
-                          </Button>
-                        )}
-                        {canEditOrder(order) && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={() => {
-                              handleDelete(order);
-                            }}
-                            title={order.is_processing_locked ? '排程處理中，請稍候' : '刪除'}
-                            disabled={deleteMutation.isPending || order.is_processing_locked}
-                            className="text-destructive hover:text-destructive"
-                            data-testid="orders-delete-button"
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                        )}
+                        {canEditOrder(order) &&
+                          (() => {
+                            // Mirror backend constraints:
+                            //   PATCH /orders/{id}        → 422 if status ∈ {in_production, completed, cancelled}
+                            //   POST  /orders/{id}/cancel → 409 unless status === 'scheduled'
+                            //   DELETE /orders/{id}       → no status guard (only is_processing_locked)
+                            const isCancelled = order.status === 'cancelled';
+                            const isCompleted = order.status === 'completed';
+                            const isInProduction = order.status === 'in_production';
+                            const isScheduled = order.status === 'scheduled';
+                            const isImmutable = isInProduction || isCompleted || isCancelled;
+                            const locked = order.is_processing_locked;
+                            function statusBlockedTitle(): string | null {
+                              if (isInProduction) return '訂單生產中，無法編輯或取消';
+                              if (isCompleted) return '訂單已完成，無法編輯或取消';
+                              if (isCancelled) return '訂單已取消，無法編輯或取消';
+                              return null;
+                            }
+                            function editButtonTitle(): string {
+                              const blocked = statusBlockedTitle();
+                              if (blocked) return blocked;
+                              if (locked) return '排程處理中，請稍候';
+                              return '編輯';
+                            }
+                            function cancelButtonTitle(): string {
+                              const blocked = statusBlockedTitle();
+                              if (blocked) return blocked;
+                              if (!isScheduled) return '只有已排程的訂單可以取消';
+                              if (locked) return '排程處理中，請稍候';
+                              return '取消訂單';
+                            }
+                            function deleteButtonTitle(): string {
+                              if (locked) return '排程處理中，請稍候';
+                              return '刪除';
+                            }
+                            return (
+                              <>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => {
+                                    onEdit(order);
+                                  }}
+                                  title={editButtonTitle()}
+                                  disabled={locked || isImmutable}
+                                  data-testid="orders-edit-button"
+                                >
+                                  <Pencil className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => {
+                                    handleCancel(order);
+                                  }}
+                                  title={cancelButtonTitle()}
+                                  disabled={cancelMutation.isPending || locked || !isScheduled}
+                                  data-testid="orders-cancel-button"
+                                >
+                                  <Ban className="h-4 w-4" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => {
+                                    handleDelete(order);
+                                  }}
+                                  title={deleteButtonTitle()}
+                                  disabled={deleteMutation.isPending || locked}
+                                  className="text-destructive hover:text-destructive"
+                                  data-testid="orders-delete-button"
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              </>
+                            );
+                          })()}
                       </div>
                     </TableCell>
                   </TableRow>

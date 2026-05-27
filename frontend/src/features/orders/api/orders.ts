@@ -19,6 +19,8 @@ import type {
   ScheduleTriggerResponse,
 } from '../types';
 
+import { scheduleCapacityKeys } from './scheduleCapacity';
+
 // ---------------------------------------------------------------------------
 // Zod schemas (runtime validation of API responses)
 // ---------------------------------------------------------------------------
@@ -136,6 +138,15 @@ export function useOrders(
   });
 }
 
+/**
+ * All four mutations below invalidate ``scheduleCapacityKeys.all`` in addition
+ * to ``orderKeys.all``. Creating, editing, deleting, or cancelling an order
+ * eventually shifts the scheduler's per-day used/remaining via a worker
+ * compound; ``useScheduleWs`` will refresh capacity once the worker emits
+ * ``schedule.*``, but the eager local invalidate closes the window between
+ * the API ack and the worker broadcast — important for any UI surface that
+ * reads capacity (e.g. ``OrdersCalendarDialog``).
+ */
 export function useCreateOrder(): ReturnType<typeof useMutation<Order, Error, OrderCreate>> {
   const qc = useQueryClient();
 
@@ -153,6 +164,7 @@ export function useCreateOrder(): ReturnType<typeof useMutation<Order, Error, Or
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: orderKeys.all });
+      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
     },
   });
 }
@@ -176,6 +188,7 @@ export function useUpdateOrder(): ReturnType<
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: orderKeys.all });
+      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
     },
   });
 }
@@ -192,6 +205,22 @@ export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: orderKeys.all });
+      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+    },
+  });
+}
+
+export function useCancelOrder(): ReturnType<typeof useMutation<Order, Error, string>> {
+  const qc = useQueryClient();
+
+  return useMutation<Order, Error, string>({
+    mutationFn: (id) =>
+      apiFetch(`/api/v1/orders/${id}/cancel`, { method: 'POST', credentials: 'include' }, (d) =>
+        orderSchema.parse(d),
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: orderKeys.all });
+      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
     },
   });
 }
