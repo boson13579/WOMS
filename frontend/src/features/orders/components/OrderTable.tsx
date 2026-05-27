@@ -146,10 +146,14 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
   function handleDelete(order: Order): void {
     // eslint-disable-next-line no-alert
     if (!window.confirm(`確定要刪除訂單 ${order.order_number}？`)) return;
+    // Backend DELETE is async for non-cancelled orders: it locks the row and
+    // enqueues a worker compound that performs the soft-delete on accept. The
+    // row only leaves the list once the worker finishes, so the toast must not
+    // claim the order is already gone.
     deleteMutation.mutate(order.id, {
       onSuccess: () => {
-        toast.success('訂單已刪除', {
-          description: `訂單 ${order.order_number} 已移除，排程資料會同步更新。`,
+        toast.success('刪除請求已送出', {
+          description: `訂單 ${order.order_number} 排程處理完成後會從列表移除。`,
         });
       },
       onError: (err) => {
@@ -161,10 +165,13 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
   function handleCancel(order: Order): void {
     // eslint-disable-next-line no-alert
     if (!window.confirm(`確定要取消訂單 ${order.order_number}？`)) return;
+    // Backend POST /cancel only locks the row and enqueues a worker compound;
+    // the status flips to cancelled when the worker accepts, not on this
+    // response. Word the toast as a queued request, not a completed change.
     cancelMutation.mutate(order.id, {
       onSuccess: () => {
-        toast.success('訂單已取消', {
-          description: `訂單 ${order.order_number} 狀態已改為已取消。`,
+        toast.success('取消請求已送出', {
+          description: `訂單 ${order.order_number} 排程處理完成後狀態會更新為已取消。`,
         });
       },
       onError: (err) => {
