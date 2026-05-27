@@ -61,6 +61,7 @@ from app.services.schedule_queue import (
 from app.services.scheduling import (
     DAILY_CAPACITY,
     HORIZON_DAYS,
+    REBUILD_IN_FLIGHT_KEY,
     STATE_KEY,
     STATUS_KEY,
     SchedulerState,
@@ -454,13 +455,50 @@ def rebuild_schedule(
     4. Re-triggers ``run_scheduling_task`` so any pending ops queued during
        the wait are drained on top of the fresh state.
 
-    No 409 is raised even when a run is in progress — the task self-serializes
-    by polling status. This endpoint never blocks; results / skipped orders
-    are surfaced via WebSocket events the caller subscribes to.
+    **Single-flight guard**: a rebuild can sit waiting up to the run-wait
+    timeout (5 min) for an in-flight run to drain before it even starts its
+    own work. Without a guard, spamming the rebuild button queues N
+    ``rebuild_schedule_task`` instances that each wait + run serially —
+    the pile-up blows past the frontend's request timeout and surfaces as
+    "fail to load". So we claim ``REBUILD_IN_FLIGHT_KEY`` with ``SET NX EX``
+    BEFORE dispatch (covers the dispatch → task-start gap) and reject a
+    second concurrent rebuild with 409. The task clears the flag in its
+    ``finally`` block; the TTL is a crash safety net only.
+
+    The flag is set here (producer side) rather than inside the task
+    because the task starts asynchronously — if we set it in the task,
+    a burst of requests would all dispatch before the first task ran and
+    claimed the flag, defeating the guard.
+
+    Errors:
+        409: a rebuild is already in progress (queued or running).
 
     Permission: scheduler+.
     """
-    async_result = rebuild_schedule_task.delay()
+    # TTL covers the worst-case rebuild lifetime (wait-for-idle + lock
+    # acquire + rebuild) so a crashed worker that never reaches the
+    # task's ``finally`` can't suppress rebuilds forever. Reuse the
+    # waiter-flag TTL — same "crashed waiter" semantics.
+    ttl = get_settings().SCHEDULER_WAITER_FLAG_TTL_SECONDS
+    claimed = _redis().set(REBUILD_IN_FLIGHT_KEY, "1", nx=True, ex=ttl)
+    if not claimed:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A schedule rebuild is already in progress; please wait for it to finish.",
+        )
+
+    try:
+        async_result = rebuild_schedule_task.delay()
+    except Exception as exc:
+        # Dispatch failed (broker down etc.) — release the flag so the
+        # next request isn't wrongly rejected. The task never ran, so
+        # nothing else will clear it (only the TTL would, eventually).
+        _redis().delete(REBUILD_IN_FLIGHT_KEY)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not queue rebuild task (scheduler broker unavailable); please retry.",
+        ) from exc
+
     return ScheduleRebuildResponse(
         task_id=str(async_result.id),
         message="Rebuild queued; will run after any in-flight scheduling completes.",

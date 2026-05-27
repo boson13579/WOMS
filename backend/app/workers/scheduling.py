@@ -53,6 +53,7 @@ from app.services.scheduling import (
     MATERIALIZE_NOTIFY_PROCESSING_KEY,
     MATERIALIZE_RUNNING_KEY,
     PENDING_OPS_KEY,
+    REBUILD_IN_FLIGHT_KEY,
     STATE_KEY,
     STATUS_KEY,
     BatchOp,
@@ -1711,6 +1712,11 @@ def rebuild_schedule_task() -> None:
         if lock_acquired:
             _release_state_lock(lock_holder_id)
         _clear_waiter_flag()
+        # Release the single-flight rebuild guard claimed by
+        # ``POST /schedule/rebuild`` so the next rebuild request is
+        # accepted. Best-effort: the key also has a TTL safety net in
+        # case this task crashed before reaching ``finally``.
+        _get_redis().delete(REBUILD_IN_FLIGHT_KEY)
         # Same as advance_day_task: refresh materialized DB columns
         # to overwrite any racing materializer that read the pre-
         # rebuild state. See ``materialize_schedule_task`` body for

@@ -961,6 +961,86 @@ def test_rebuild_dispatches_even_when_run_scheduling_is_running(
     rebuild_delay_mock.assert_called_once()
 
 
+def test_rebuild_second_request_returns_409_when_rebuild_in_flight(
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
+) -> None:
+    """Single-flight guard: while a rebuild is in flight (REBUILD_IN_FLIGHT_KEY
+    held), a second rebuild request is rejected with 409 instead of piling
+    another ``rebuild_schedule_task`` onto the queue. Spamming the button
+    is the bug this guards — N queued rebuilds each wait + run serially and
+    blow past the frontend's request timeout.
+    """
+    from app.services.scheduling import REBUILD_IN_FLIGHT_KEY
+
+    _patch_delay(monkeypatch)
+    rebuild_delay_mock = _patch_rebuild_delay(monkeypatch)
+
+    _make_user(db_session, username="sched_rebuild_dup", role=UserRole.scheduler)
+    token = _login(client, "sched_rebuild_dup")
+
+    # First request claims the flag and dispatches.
+    res1 = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+    assert res1.status_code == 202
+    rebuild_delay_mock.assert_called_once()
+    assert redis_client.get(REBUILD_IN_FLIGHT_KEY) is not None
+
+    # Second request while the flag is still held → 409, no extra dispatch.
+    res2 = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+    assert res2.status_code == 409
+    assert res2.json()["error"]["code"] == 409
+    rebuild_delay_mock.assert_called_once()  # still only the first dispatch
+
+
+def test_rebuild_accepts_again_after_flag_cleared(
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
+) -> None:
+    """Once the in-flight flag is gone (task finished + cleared it, or TTL
+    expired), a fresh rebuild is accepted again. Simulate the task's
+    ``finally`` cleanup by deleting the key between the two requests.
+    """
+    from app.services.scheduling import REBUILD_IN_FLIGHT_KEY
+
+    _patch_delay(monkeypatch)
+    rebuild_delay_mock = _patch_rebuild_delay(monkeypatch)
+
+    _make_user(db_session, username="sched_rebuild_again", role=UserRole.scheduler)
+    token = _login(client, "sched_rebuild_again")
+
+    res1 = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+    assert res1.status_code == 202
+
+    # Task finished → flag cleared (mirrors rebuild_schedule_task's finally).
+    redis_client.delete(REBUILD_IN_FLIGHT_KEY)
+
+    res2 = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+    assert res2.status_code == 202
+    assert rebuild_delay_mock.call_count == 2
+
+
+def test_rebuild_releases_flag_when_dispatch_fails(
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
+) -> None:
+    """If ``rebuild_schedule_task.delay()`` raises (broker down), the
+    endpoint must release the flag it just claimed — otherwise the task
+    never runs to clear it and every later rebuild is wrongly 409'd until
+    the TTL expires.
+    """
+    from app.services.scheduling import REBUILD_IN_FLIGHT_KEY
+
+    _patch_delay(monkeypatch)
+    boom = MagicMock(side_effect=RuntimeError("broker unreachable"))
+    monkeypatch.setattr("app.api.v1.schedule.rebuild_schedule_task.delay", boom)
+
+    _make_user(db_session, username="sched_rebuild_boom", role=UserRole.scheduler)
+    token = _login(client, "sched_rebuild_boom")
+
+    res = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+
+    assert res.status_code == 503
+    # Flag released so the next request isn't wrongly blocked.
+    assert redis_client.get(REBUILD_IN_FLIGHT_KEY) is None
+
+
 def test_rebuild_by_viewer_returns_403(
     client: TestClient, db_session: Session, monkeypatch
 ) -> None:

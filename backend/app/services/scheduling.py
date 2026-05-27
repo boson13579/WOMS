@@ -37,6 +37,7 @@ __all__ = [
     "MATERIALIZE_RUNNING_KEY",
     "PENDING_OPS_KEY",
     "PENDING_OPS_SEQ_KEY",
+    "REBUILD_IN_FLIGHT_KEY",
     "STATE_KEY",
     "STATUS_KEY",
     "BatchOp",
@@ -155,6 +156,19 @@ PENDING_OPS_KEY = "schedule:pending_ops"
 
 PENDING_OPS_SEQ_KEY = "schedule:pending_ops:seq"
 """Redis monotonic counter (INCR) for the ``seq`` field embedded in op scores."""
+
+REBUILD_IN_FLIGHT_KEY = "schedule:rebuild_in_flight"
+"""Redis SET-NX-EX flag: a rebuild has been requested and not yet finished.
+
+Set by ``POST /schedule/rebuild`` BEFORE dispatching ``rebuild_schedule_task``
+(so the guard covers the dispatch → task-start gap), cleared by the task's
+``finally`` block. A second rebuild request while the flag is held gets a
+409 instead of piling another ``rebuild_schedule_task`` onto the queue —
+unlike a regular scheduling run, a rebuild can sit waiting up to the run-wait
+timeout for an in-flight run to drain, so naive spam of the rebuild button
+queues N tasks that each wait + run serially and blow past the frontend's
+request timeout. The TTL is a crash safety net only (worker died before the
+``finally`` cleared it); the happy path always DELs explicitly."""
 
 # ---------------------------------------------------------------------------
 # Materializer-side coordination keys (Phase 4 fast/slow split)

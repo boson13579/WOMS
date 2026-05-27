@@ -1211,8 +1211,13 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
     No skipped orders in this path — the next test covers that branch.
     """
 
+    from app.services.scheduling import REBUILD_IN_FLIGHT_KEY
+
     base = date(2026, 5, 5)
     redis_client.set(STATE_KEY, SchedulerState.initial(base).to_json())
+    # Simulate the endpoint having claimed the single-flight guard before
+    # dispatch; the task's finally must clear it.
+    redis_client.set(REBUILD_IN_FLIGHT_KEY, "1")
     # One pending op so the conditional retrigger fires after rebuild.
     _enqueue(redis_client, _make_op(order_number="POST-REBUILD"))
 
@@ -1279,6 +1284,9 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
     notify_mock.assert_not_called()
     # run_scheduling_task was kicked off because POST-REBUILD is pending.
     assert delay_mock.called
+    # Single-flight guard released in the task's finally so the next
+    # rebuild request is accepted.
+    assert redis_client.get(REBUILD_IN_FLIGHT_KEY) is None
 
 
 def test_rebuild_task_notifies_each_skipped_orders_creator(
