@@ -49,6 +49,33 @@ vi.mock('@/features/auth/api/users', () => {
   return { useAssignableUsers: () => stableUsers };
 });
 
+// The modal derives its deadline window from the scheduler's authoritative
+// base_date (UTC) + horizon via useScheduleCapacity — NOT the local clock.
+// Mock a fixed base_date with a full 30-entry horizon so the window is
+// deterministic and timezone-independent. Factory is self-contained (no outer
+// refs) to satisfy vi.mock hoisting.
+vi.mock('../api/scheduleCapacity', () => {
+  const base = '2026-06-01';
+  const addUTC = (n: number): string => {
+    const d = new Date(`${base}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  };
+  return {
+    useScheduleCapacity: () => ({
+      data: {
+        base_date: base,
+        daily_capacity: 200,
+        entries: Array.from({ length: 30 }, (_, i) => ({
+          date: addUTC(i),
+          used: 0,
+          remaining: 200,
+        })),
+      },
+    }),
+  };
+});
+
 // Radix Dialog has animation timers that keep the test runner alive.
 // Replace with a plain stub so tests exit cleanly.
 vi.mock('@/components/ui/dialog', () => ({
@@ -64,21 +91,18 @@ vi.mock('@/components/ui/dialog', () => ({
 // Fixtures
 // ---------------------------------------------------------------------------
 
-// Dates are computed relative to the real wall clock so the suite doesn't
-// drift out of the 30-day horizon as time passes. `daysFromToday(n)` returns
-// the local-tz Y-M-D string for today+n, matching what `<input type="date">`
-// emits and what OrderModal's `toISODate` produces.
-function daysFromToday(n: number): string {
-  const d = new Date();
-  d.setDate(d.getDate() + n);
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+// Mirrors the mocked scheduler base_date above. `fromBase(n)` returns the UTC
+// Y-M-D string for base_date+n; the modal's valid window is [base+1, base+30].
+const BASE_DATE = '2026-06-01';
+
+function fromBase(days: number): string {
+  const d = new Date(`${BASE_DATE}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
 }
 
 // Valid date well inside the horizon — used by every "happy path" test.
-const FUTURE_DATE = daysFromToday(15);
+const FUTURE_DATE = fromBase(15);
 
 function makeOrder(overrides: Partial<Order> = {}): Order {
   return {
@@ -86,7 +110,7 @@ function makeOrder(overrides: Partial<Order> = {}): Order {
     order_number: 'ORD-TEST-0001',
     customer_name: 'TSMC',
     wafer_quantity: 500,
-    requested_delivery_date: daysFromToday(10),
+    requested_delivery_date: fromBase(10),
     scheduled_production_date: null,
     expected_delivery_date: null,
     status: 'pending',
@@ -225,8 +249,8 @@ describe('OrderModal', () => {
     render(<OrderModal open order={undefined} onClose={onClose} />);
 
     const dateInput = screen.getByLabelText(/要求交貨日/);
-    expect(dateInput).toHaveAttribute('min', daysFromToday(1));
-    expect(dateInput).toHaveAttribute('max', daysFromToday(30));
+    expect(dateInput).toHaveAttribute('min', fromBase(1));
+    expect(dateInput).toHaveAttribute('max', fromBase(30));
   });
 
   it('create mode: rejects a delivery date that is today or earlier', async () => {
@@ -236,7 +260,7 @@ describe('OrderModal', () => {
     await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
     await user.clear(screen.getByLabelText(/晶圓數量/));
     await user.type(screen.getByLabelText(/晶圓數量/), '200');
-    await user.type(screen.getByLabelText(/要求交貨日/), daysFromToday(0));
+    await user.type(screen.getByLabelText(/要求交貨日/), fromBase(0));
 
     await user.click(screen.getByRole('button', { name: '新增' }));
 
@@ -251,7 +275,7 @@ describe('OrderModal', () => {
     await user.type(screen.getByLabelText(/客戶名稱/), 'Samsung');
     await user.clear(screen.getByLabelText(/晶圓數量/));
     await user.type(screen.getByLabelText(/晶圓數量/), '200');
-    await user.type(screen.getByLabelText(/要求交貨日/), daysFromToday(31));
+    await user.type(screen.getByLabelText(/要求交貨日/), fromBase(31));
 
     await user.click(screen.getByRole('button', { name: '新增' }));
 
@@ -261,7 +285,7 @@ describe('OrderModal', () => {
 
   it('edit mode: rejects saving when the existing order date is now in the past', async () => {
     const user = userEvent.setup();
-    const stale = makeOrder({ requested_delivery_date: daysFromToday(-14) });
+    const stale = makeOrder({ requested_delivery_date: fromBase(-14) });
     render(<OrderModal open order={stale} onClose={onClose} />);
 
     await user.click(screen.getByRole('button', { name: '儲存' }));

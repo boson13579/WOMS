@@ -27,29 +27,31 @@ import { ApiError } from '@/lib/apiFetch';
 import { toastApiError } from '@/lib/toastApiError';
 
 import { useCreateOrder, useUpdateOrder } from '../api/orders';
+import { useScheduleCapacity } from '../api/scheduleCapacity';
 import type { Order } from '../types';
 
 // ---------------------------------------------------------------------------
-// Date helpers — keep the producer-side rules in sync with backend
-// `_validate_deadline_or_422`: deadline must be in [today+1, today+HORIZON].
-// Mirrors backend `SCHEDULER_HORIZON_DAYS` default. If the deploy ever
-// changes it on the backend, update here too.
+// Date helpers — mirror backend `_validate_deadline_or_422`, whose window is
+// [base_date + 1, base_date + HORIZON_DAYS]. The authoritative base_date and
+// horizon come from the scheduler (see useScheduleCapacity); we only fall back
+// to a hard-coded horizon when that query hasn't loaded yet.
+//
+// All arithmetic is done in UTC. The backend derives "today" from
+// datetime.now(UTC).date(); computing the client window in local time would
+// drift one day ahead during the UTC+8 morning (Taiwan 00:00–07:59), wrongly
+// rejecting deadlines the backend would accept.
 // ---------------------------------------------------------------------------
 
-const HORIZON_DAYS = 30;
+const FALLBACK_HORIZON_DAYS = 30;
 
-function toISODate(d: Date): string {
-  // Use local-tz Y-M-D so the string matches what <input type="date"> emits.
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+function todayUTCISO(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
-function addDays(d: Date, n: number): Date {
-  const next = new Date(d);
-  next.setDate(next.getDate() + n);
-  return next;
+function addDaysToISO(isoDate: string, days: number): string {
+  const d = new Date(`${isoDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -87,14 +89,21 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const isPending = createMutation.isPending || updateMutation.isPending;
   const users = useAssignableUsers();
   const assignedToDisabled = isEdit;
+  const { data: capacity } = useScheduleCapacity();
 
   const { tomorrowISO, horizonEndISO } = useMemo(() => {
-    const today = new Date();
+    // Prefer the scheduler's authoritative UTC base_date + horizon
+    // (entries.length is exactly SCHEDULER_HORIZON_DAYS) so the client window
+    // matches backend validation regardless of timezone or a horizon config
+    // change. Fall back to the UTC wall-clock date + 30 only while the
+    // capacity query is still loading.
+    const baseDate = capacity?.base_date ?? todayUTCISO();
+    const horizon = capacity?.entries.length ?? FALLBACK_HORIZON_DAYS;
     return {
-      tomorrowISO: toISODate(addDays(today, 1)),
-      horizonEndISO: toISODate(addDays(today, HORIZON_DAYS)),
+      tomorrowISO: addDaysToISO(baseDate, 1),
+      horizonEndISO: addDaysToISO(baseDate, horizon),
     };
-  }, []);
+  }, [capacity]);
 
   const dynamicSchema = useMemo(() => {
     // Skip the assignee refinement in edit mode: the field is disabled there
@@ -103,13 +112,13 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
     // been deactivated would fail validation on a field the user can't edit,
     // leaving the modal permanently unsubmittable.
     //
-    // Note on capacity: we do NOT block based on
-    // ``useScheduleCapacity().entries[date].remaining`` here.
-    // ``requested_delivery_date`` is a deadline, not a production date —
-    // the scheduler can still admit an order whose deadline-day is
-    // already full by producing earlier and back-filling. The producer-
-    // side `_validate_deadline_or_422` only enforces the horizon window;
-    // real admission control lives in the worker's compound finalize.
+    // We use the capacity payload only for its base_date + horizon length
+    // (above). We deliberately do NOT block on per-day
+    // ``entries[date].remaining``: ``requested_delivery_date`` is a deadline,
+    // not a production date — the scheduler can still admit an order whose
+    // deadline-day is full by producing earlier and back-filling. The
+    // producer-side `_validate_deadline_or_422` only enforces the horizon
+    // window; real admission control lives in the worker's compound finalize.
     return formSchema
       .refine(
         (data) => !data.requested_delivery_date || data.requested_delivery_date >= tomorrowISO,
