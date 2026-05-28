@@ -7,6 +7,8 @@ import {
   GripVertical,
   Loader2,
   Lock,
+  Pin,
+  PinOff,
   PackageOpen,
   Search,
   X,
@@ -83,6 +85,14 @@ interface ProductionCalendarItem extends ScheduleResult {
 }
 
 type ProductionState = 'in_progress' | 'complete' | 'scheduled';
+
+interface PinAction {
+  label: string;
+  title: string;
+  disabled: boolean;
+  onClick: () => void;
+  icon: JSX.Element;
+}
 
 function getProductionStateLabel(state: ProductionState): string {
   if (state === 'complete') return '已完成';
@@ -248,6 +258,7 @@ function OrderLine({
   onDragStart,
   selected,
   onSelectedChange,
+  pinAction,
 }: {
   order: ProductionCalendarItem;
   dragOrder?: DraggableOrder;
@@ -255,6 +266,7 @@ function OrderLine({
   onDragStart: (event: DragEvent, order: DraggableOrder) => void;
   selected: boolean;
   onSelectedChange: (orderId: string, selected: boolean) => void;
+  pinAction?: PinAction | null;
 }): JSX.Element {
   return (
     <div
@@ -292,9 +304,25 @@ function OrderLine({
             />
           )}
         </span>
-        <Badge variant={getProductionStateVariant(order.productionState)} className="shrink-0">
-          {getProductionStateLabel(order.productionState)}
-        </Badge>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <Badge variant={getProductionStateVariant(order.productionState)} className="shrink-0">
+            {getProductionStateLabel(order.productionState)}
+          </Badge>
+          {pinAction && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={pinAction.onClick}
+              disabled={pinAction.disabled}
+              title={pinAction.title}
+              className="h-6 px-2 text-[10px]"
+            >
+              {pinAction.icon}
+              <span className="ml-1">{pinAction.label}</span>
+            </Button>
+          )}
+        </div>
       </div>
       <div className="mt-1 truncate text-muted-foreground">
         {order.customer_name} · 今日 {order.productionQuantity.toLocaleString()} / 累計{' '}
@@ -513,6 +541,39 @@ export function OrdersCalendarDialog({
       });
     },
     [canManageSchedule],
+  );
+
+  const handlePinAction = useCallback(
+    (order: DraggableOrder, targetDate: string | null) => {
+      if (!canManageSchedule) return;
+      if (order.is_processing_locked) {
+        toast.error('這筆訂單仍在排程處理中，請稍後再試。');
+        return;
+      }
+      if (targetDate && isTargetAfterDeadline(order, targetDate)) {
+        toast.error('目標日期不能晚於客戶要求交期。');
+        return;
+      }
+      const compoundId = crypto.randomUUID();
+      const actionLabel = targetDate ? `固定至 ${targetDate}` : '解除固定';
+      pinSchedule.mutate(
+        {
+          compoundId,
+          targets: [{ order, targetDate }],
+        },
+        {
+          onSuccess: () => {
+            toast.success(`已送出${actionLabel}`, {
+              description: `訂單 ${order.order_number}`,
+            });
+          },
+          onError: (error) => {
+            toast.error('無法送出排程操作', { description: error.message });
+          },
+        },
+      );
+    },
+    [canManageSchedule, pinSchedule],
   );
 
   const removePendingMove = useCallback((orderId: string) => {
@@ -804,7 +865,16 @@ export function OrdersCalendarDialog({
                           </span>
                         </div>
                         <div className="space-y-1">
-                          {items.slice(0, MAX_ITEMS_PER_DAY).map((order) => {
+                          {[...items]
+                            .sort((a, b) => {
+                              const aOrder = scheduledOrderById.get(a.id);
+                              const bOrder = scheduledOrderById.get(b.id);
+                              const aPinned = aOrder?.is_pinned ? 1 : 0;
+                              const bPinned = bOrder?.is_pinned ? 1 : 0;
+                              return bPinned - aPinned;
+                            })
+                            .slice(0, MAX_ITEMS_PER_DAY)
+                            .map((order) => {
                             const draggableOrder = scheduledOrderById.get(order.id);
                             const isDraggable = canDragScheduledOrder(
                               order,
@@ -819,11 +889,19 @@ export function OrdersCalendarDialog({
                                   if (draggableOrder) handleDragStart(event, draggableOrder);
                                 }}
                                 className={cn(
-                                  'truncate rounded bg-sky-100 px-1.5 py-1 text-[11px] text-sky-950 dark:bg-sky-900 dark:text-sky-50',
+                                  'flex min-w-0 items-center gap-1 rounded bg-sky-100 px-1.5 py-1 text-[11px] text-sky-950 dark:bg-sky-900 dark:text-sky-50',
                                   isDraggable && 'cursor-grab active:cursor-grabbing',
                                 )}
                               >
-                                {order.order_number} · {order.productionQuantity.toLocaleString()}
+                                {draggableOrder?.is_pinned && (
+                                  <Lock
+                                    aria-label="已固定"
+                                    className="h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400"
+                                  />
+                                )}
+                                <span className="truncate">
+                                  {order.order_number} · {order.productionQuantity.toLocaleString()}
+                                </span>
                               </div>
                             );
                           })}
@@ -995,6 +1073,41 @@ export function OrdersCalendarDialog({
                   selectedItems.map((order) => {
                     const dragOrder = scheduledOrderById.get(order.id);
                     const canDrag = canDragScheduledOrder(order, dragOrder, canManageSchedule);
+                    const pinAction = (() => {
+                      if (!canManageSchedule || !dragOrder) return null;
+                      const isPinnedToSelected =
+                        dragOrder.is_pinned && dragOrder.pinned_production_date === selectedDate;
+                      const targetDate = isPinnedToSelected ? null : selectedDate;
+                      const isImmutable =
+                        dragOrder.status !== 'scheduled' && dragOrder.status !== 'pending';
+                      const exceedsDeadline =
+                        targetDate !== null && isTargetAfterDeadline(dragOrder, targetDate);
+                      let title = isPinnedToSelected ? '取消固定' : '固定到此日';
+                      if (dragOrder.is_processing_locked) {
+                        title = '排程處理中，請稍候';
+                      } else if (isImmutable) {
+                        title = '訂單狀態無法固定';
+                      } else if (exceedsDeadline) {
+                        title = '目標日期不能晚於客戶要求交期';
+                      }
+                      return {
+                        label: isPinnedToSelected ? '取消固定' : '固定到此日',
+                        title,
+                        disabled:
+                          pinSchedule.isPending ||
+                          dragOrder.is_processing_locked ||
+                          isImmutable ||
+                          exceedsDeadline,
+                        onClick: () => {
+                          handlePinAction(dragOrder, targetDate);
+                        },
+                        icon: isPinnedToSelected ? (
+                          <PinOff className="h-3 w-3" />
+                        ) : (
+                          <Pin className="h-3 w-3" />
+                        ),
+                      };
+                    })();
                     return (
                       <OrderLine
                         key={order.id}
@@ -1004,6 +1117,7 @@ export function OrdersCalendarDialog({
                         onDragStart={handleDragStart}
                         selected={selectedOrderIds.includes(order.id)}
                         onSelectedChange={updateSelectedOrder}
+                        pinAction={pinAction}
                       />
                     );
                   })

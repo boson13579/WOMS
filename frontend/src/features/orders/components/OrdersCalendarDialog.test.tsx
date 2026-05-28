@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -159,6 +159,32 @@ const inProductionOrderDetail: Order = {
   status: 'in_production',
 };
 
+const scheduledOrderDetail: Order = {
+  ...pendingOrder,
+  id: '55555555-5555-4555-8555-555555555555',
+  order_number: 'ORD-20260504-0005',
+  customer_name: 'Nanya',
+  wafer_quantity: 800,
+  requested_delivery_date: '2026-05-12',
+  scheduled_production_date: '2026-05-09',
+  expected_delivery_date: '2026-05-10',
+  status: 'scheduled',
+  pinned_production_date: null,
+  is_pinned: false,
+};
+
+const scheduledOrderResult: ScheduleResult = {
+  id: scheduledOrderDetail.id,
+  order_number: scheduledOrderDetail.order_number,
+  customer_name: scheduledOrderDetail.customer_name,
+  wafer_quantity: scheduledOrderDetail.wafer_quantity,
+  requested_delivery_date: scheduledOrderDetail.requested_delivery_date,
+  scheduled_production_date: scheduledOrderDetail.scheduled_production_date,
+  expected_delivery_date: scheduledOrderDetail.expected_delivery_date,
+  status: 'scheduled',
+  daily_breakdown: [{ date: '2026-05-09', quantity: 800 }],
+};
+
 const splitInProductionOrder: ScheduleResult = {
   ...inProductionOrder,
   id: '44444444-4444-4444-8444-444444444444',
@@ -230,6 +256,97 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText('剩餘 1,500')).toBeInTheDocument();
   });
 
+  it('shows a lock mark on pinned calendar items', () => {
+    mockScheduleResult.data = [scheduledOrderResult];
+    mockScheduledOrders.data = {
+      items: [
+        {
+          ...scheduledOrderDetail,
+          is_pinned: true,
+          pinned_production_date: '2026-05-09',
+        },
+      ],
+      total: 1,
+      page: 1,
+      page_size: 100,
+    };
+    renderDialog();
+
+    expect(screen.getByLabelText('已固定')).toBeInTheDocument();
+  });
+
+  it('renders pinned orders first within the same day', () => {
+    mockScheduleResult.data = [inProductionOrder, scheduledOrderResult];
+    mockScheduledOrders.data = {
+      items: [
+        inProductionOrderDetail,
+        {
+          ...scheduledOrderDetail,
+          is_pinned: true,
+          pinned_production_date: '2026-05-09',
+        },
+      ],
+      total: 2,
+      page: 1,
+      page_size: 100,
+    };
+    renderDialog();
+
+    const dayCell = screen.getByRole('button', { name: /2026-05-09/ });
+    const items = within(dayCell).getAllByText(/ORD-20260504-000[15]/);
+    expect(items[0]).toHaveTextContent('ORD-20260504-0005');
+  });
+
+  it('pins a scheduled order from the right panel', async () => {
+    const user = userEvent.setup();
+    mockScheduleResult.data = [scheduledOrderResult];
+    mockScheduledOrders.data = {
+      items: [scheduledOrderDetail],
+      total: 1,
+      page: 1,
+      page_size: 100,
+    };
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
+    await user.click(screen.getByRole('button', { name: '固定到此日' }));
+
+    const [payload] = mockPinMutate.mock.calls[0] as [
+      { targets: { order: { id: string }; targetDate: string | null }[] },
+      unknown,
+    ];
+    expect(payload.targets[0].order.id).toBe(scheduledOrderDetail.id);
+    expect(payload.targets[0].targetDate).toBe('2026-05-09');
+  });
+
+  it('unpins a scheduled order from the right panel', async () => {
+    const user = userEvent.setup();
+    mockScheduleResult.data = [scheduledOrderResult];
+    mockScheduledOrders.data = {
+      items: [
+        {
+          ...scheduledOrderDetail,
+          is_pinned: true,
+          pinned_production_date: '2026-05-09',
+        },
+      ],
+      total: 1,
+      page: 1,
+      page_size: 100,
+    };
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
+    await user.click(screen.getByRole('button', { name: '取消固定' }));
+
+    const [payload] = mockPinMutate.mock.calls[0] as [
+      { targets: { order: { id: string }; targetDate: string | null }[] },
+      unknown,
+    ];
+    expect(payload.targets[0].order.id).toBe(scheduledOrderDetail.id);
+    expect(payload.targets[0].targetDate).toBeNull();
+  });
+
   it('renders pending orders without expected delivery date in the unscheduled panel', () => {
     renderDialog();
 
@@ -263,13 +380,18 @@ describe('OrdersCalendarDialog', () => {
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
     expect(screen.getByText(/今日 1,500/)).toBeInTheDocument();
     expect(screen.getByText(/累計 2,500 \/ 2,500/)).toBeInTheDocument();
-    expect(screen.getByText('已排程')).toBeInTheDocument();
+    expect(screen.getByText('生產中')).toBeInTheDocument();
     expect(screen.getByText('剩餘 0')).toBeInTheDocument();
   });
 
-  it('shows split production as completed when base_date is past the final production date', async () => {
+  it('shows split production as completed when status is completed', async () => {
     const user = userEvent.setup();
-    mockScheduleResult.data = [splitInProductionOrder];
+    mockScheduleResult.data = [
+      {
+        ...splitInProductionOrder,
+        status: 'completed',
+      },
+    ];
     setServerBaseDate('2026-05-12');
     renderDialog();
 
@@ -277,7 +399,7 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText('已完成')).toBeInTheDocument();
   });
 
-  it('uses server base_date instead of the client clock for production state', async () => {
+  it('uses order status instead of the client clock for production state', async () => {
     const user = userEvent.setup();
     vi.setSystemTime(new Date('2026-05-12T00:00:00Z'));
     setServerBaseDate('2026-05-10');
@@ -286,7 +408,7 @@ describe('OrdersCalendarDialog', () => {
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
 
-    expect(screen.getByText('已排程')).toBeInTheDocument();
+    expect(screen.getByText('生產中')).toBeInTheDocument();
   });
 
   it('displays a padlock icon for production-active or pinned orders', async () => {
