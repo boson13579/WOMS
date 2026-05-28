@@ -115,6 +115,89 @@ function dateKey(date: Date): string {
   return `${year}-${month}-${day}`;
 }
 
+const COLOR_PALETTE = [
+  'bg-red-100 dark:bg-red-900',
+  'bg-red-50 dark:bg-red-950',
+  'bg-orange-100 dark:bg-orange-900',
+  'bg-orange-50 dark:bg-orange-950',
+  'bg-amber-100 dark:bg-amber-900',
+  'bg-amber-50 dark:bg-amber-950',
+  'bg-yellow-100 dark:bg-yellow-900',
+  'bg-yellow-50 dark:bg-yellow-950',
+  'bg-lime-100 dark:bg-lime-900',
+  'bg-lime-50 dark:bg-lime-950',
+  'bg-green-100 dark:bg-green-900',
+  'bg-green-50 dark:bg-green-950',
+  'bg-emerald-100 dark:bg-emerald-900',
+  'bg-emerald-50 dark:bg-emerald-950',
+  'bg-teal-100 dark:bg-teal-900',
+  'bg-teal-50 dark:bg-teal-950',
+  'bg-cyan-100 dark:bg-cyan-900',
+  'bg-cyan-50 dark:bg-cyan-950',
+  'bg-blue-100 dark:bg-blue-900',
+  'bg-blue-50 dark:bg-blue-950',
+  'bg-indigo-100 dark:bg-indigo-900',
+  'bg-indigo-50 dark:bg-indigo-950',
+  'bg-purple-100 dark:bg-purple-900',
+  'bg-purple-50 dark:bg-purple-950',
+  'bg-pink-100 dark:bg-pink-900',
+  'bg-pink-50 dark:bg-pink-950',
+  'bg-rose-100 dark:bg-rose-900',
+  'bg-rose-50 dark:bg-rose-950',
+];
+
+function getOrderColor(orderId: string): string {
+  let hash = 0;
+  for (let i = 0; i < orderId.length; i++) {
+    hash = ((hash << 5) - hash) + orderId.charCodeAt(i);
+    hash = hash & hash;
+  }
+  const index = Math.abs(hash) % COLOR_PALETTE.length;
+  return COLOR_PALETTE[index];
+}
+
+function getOrderTextColor(orderId: string): string {
+  let hash = 0;
+  for (let i = 0; i < orderId.length; i++) {
+    hash = ((hash << 5) - hash) + orderId.charCodeAt(i);
+    hash = hash & hash;
+  }
+  const index = Math.abs(hash) % COLOR_PALETTE.length;
+  
+  const textColors = [
+    'text-red-950 dark:text-red-50',
+    'text-red-950 dark:text-red-50',
+    'text-orange-950 dark:text-orange-50',
+    'text-orange-950 dark:text-orange-50',
+    'text-amber-950 dark:text-amber-50',
+    'text-amber-950 dark:text-amber-50',
+    'text-yellow-950 dark:text-yellow-50',
+    'text-yellow-950 dark:text-yellow-50',
+    'text-lime-950 dark:text-lime-50',
+    'text-lime-950 dark:text-lime-50',
+    'text-green-950 dark:text-green-50',
+    'text-green-950 dark:text-green-50',
+    'text-emerald-950 dark:text-emerald-50',
+    'text-emerald-950 dark:text-emerald-50',
+    'text-teal-950 dark:text-teal-50',
+    'text-teal-950 dark:text-teal-50',
+    'text-cyan-950 dark:text-cyan-50',
+    'text-cyan-950 dark:text-cyan-50',
+    'text-blue-950 dark:text-blue-50',
+    'text-blue-950 dark:text-blue-50',
+    'text-indigo-950 dark:text-indigo-50',
+    'text-indigo-950 dark:text-indigo-50',
+    'text-purple-950 dark:text-purple-50',
+    'text-purple-950 dark:text-purple-50',
+    'text-pink-950 dark:text-pink-50',
+    'text-pink-950 dark:text-pink-50',
+    'text-rose-950 dark:text-rose-50',
+    'text-rose-950 dark:text-rose-50',
+  ];
+  
+  return textColors[index];
+}
+
 function startOfMonth(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth(), 1);
 }
@@ -275,12 +358,13 @@ function OrderLine({
         if (dragOrder) onDragStart(event, dragOrder);
       }}
       className={cn(
-        'rounded-md border border-border/70 bg-background px-2 py-1.5 text-xs',
+        'rounded-md border border-border/70 px-2 py-1.5 text-xs',
+        getOrderColor(order.id),
         canDrag && dragOrder && 'cursor-grab active:cursor-grabbing',
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="flex min-w-0 items-center gap-1 truncate font-medium">
+        <span className={cn('flex min-w-0 items-center gap-1 truncate font-medium', getOrderTextColor(order.id))}>
           {canDrag && dragOrder && (
             <input
               type="checkbox"
@@ -360,12 +444,13 @@ function UnscheduledOrderLine({
       }}
       className={cn(
         'rounded-md border border-dashed px-3 py-2 text-sm',
+        getOrderColor(order.id),
         canDrag && !order.is_processing_locked && 'cursor-grab active:cursor-grabbing',
         order.is_processing_locked && 'opacity-60',
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="flex min-w-0 items-center gap-1 truncate font-medium">
+        <span className={cn('flex min-w-0 items-center gap-1 truncate font-medium', getOrderTextColor(order.id))}>
           {canDrag && !order.is_processing_locked && (
             <input
               type="checkbox"
@@ -896,7 +981,9 @@ export function OrdersCalendarDialog({
                                   if (draggableOrder) handleDragStart(event, draggableOrder);
                                 }}
                                 className={cn(
-                                  'truncate rounded bg-sky-100 px-1.5 py-1 text-[11px] text-sky-950 dark:bg-sky-900 dark:text-sky-50',
+                                  'truncate rounded px-1.5 py-1 text-[11px]',
+                                  getOrderColor(order.id),
+                                  getOrderTextColor(order.id),
                                   isDraggable && 'cursor-grab active:cursor-grabbing',
                                 )}
                               >
