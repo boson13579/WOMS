@@ -826,6 +826,7 @@ export function OrdersCalendarDialog({
                     const capacity = dailyCapacityByDate.get(key);
                     const isCurrentMonth = day.getMonth() === visibleMonth.getMonth();
                     const isSelected = key === selectedDate;
+                    const isToday = key === dateKey(new Date());
                     return (
                       <button
                         key={key}
@@ -834,7 +835,9 @@ export function OrdersCalendarDialog({
                         className={cn(
                           'min-h-28 border-b border-r p-2 text-left align-top transition-colors hover:bg-muted/60',
                           !isCurrentMonth && 'bg-muted/30 text-muted-foreground',
-                          isSelected &&
+                          isToday && isSelected && 'bg-amber-50 ring-2 ring-inset ring-sky-500 dark:bg-amber-950/30',
+                          isToday && !isSelected && 'bg-amber-50 ring-2 ring-inset ring-amber-400 dark:bg-amber-950/30',
+                          isSelected && !isToday &&
                             'bg-sky-50 ring-2 ring-inset ring-sky-500 dark:bg-sky-950/40',
                         )}
                         onClick={() => {
@@ -849,7 +852,14 @@ export function OrdersCalendarDialog({
                         }}
                       >
                         <div className="mb-1 flex items-center justify-between">
-                          <span className="text-xs font-semibold">{day.getDate()}</span>
+                          <span
+                            className={cn(
+                              'text-xs font-semibold',
+                              isToday && 'text-amber-700 dark:text-amber-300',
+                            )}
+                          >
+                            {day.getDate()}
+                          </span>
                           <span className="flex items-center gap-1">
                             {capacity && (
                               <span

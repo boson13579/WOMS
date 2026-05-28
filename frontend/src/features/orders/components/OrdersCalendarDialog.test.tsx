@@ -532,4 +532,48 @@ describe('OrdersCalendarDialog', () => {
       '2026-05-11',
     ]);
   });
+
+  it('highlights today\'s date with amber styling when not selected', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+    
+    // Get today's date and a different date
+    const today = new Date();
+    const todayDateString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    
+    // Get tomorrow's date to click on
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowDateString = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`;
+    
+    // Click tomorrow to deselect today
+    const tomorrowButton = screen.getByRole('button', { name: new RegExp(`^${tomorrowDateString}`) });
+    await user.click(tomorrowButton);
+    
+    // Find today's button
+    const todayButton = screen.getByRole('button', { name: new RegExp(`^${todayDateString}`) });
+    
+    // When today is not selected, it should have amber styling
+    expect(todayButton).toHaveClass('bg-amber-50');
+    expect(todayButton).toHaveClass('ring-amber-400');
+    expect(todayButton).toHaveClass('dark:bg-amber-950/30');
+  });
+
+  it('highlights today\'s date with blue ring when selected', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+    
+    // Get today's date
+    const today = new Date();
+    const todayDateString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    
+    // Find and click today's date to ensure it's selected
+    const todayButton = screen.getByRole('button', { name: new RegExp(`^${todayDateString}`) });
+    await user.click(todayButton);
+    
+    // When today is selected, it should have amber background with blue ring
+    expect(todayButton).toHaveClass('bg-amber-50');
+    expect(todayButton).toHaveClass('ring-sky-500');
+    expect(todayButton).toHaveClass('dark:bg-amber-950/30');
+  });
 });
