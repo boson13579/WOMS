@@ -282,7 +282,7 @@ function groupByProductionDate(
         productionQuantity: assignment.quantity,
         cumulativeQuantity,
         productionState,
-        is_pinned: orderMap?.get(item.id)?.is_pinned,
+        is_pinned: orderMap?.get(item.id)?.is_pinned ?? false,
       };
       acc[assignment.date] = [...(acc[assignment.date] ?? []), productionItem];
     });
