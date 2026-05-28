@@ -324,9 +324,15 @@ function OrderLine({
           )}
         </div>
       </div>
-      <div className="mt-1 truncate text-muted-foreground">
-        {order.customer_name} · 今日 {order.productionQuantity.toLocaleString()} / 累計{' '}
-        {order.cumulativeQuantity.toLocaleString()} / {order.wafer_quantity.toLocaleString()}
+      <div className="mt-1 space-y-0.5 text-muted-foreground">
+        <div className="flex min-w-0 items-center justify-between gap-2 text-[11px]">
+          <span className="truncate">{order.customer_name}</span>
+          <span className="shrink-0">需求日 {order.requested_delivery_date}</span>
+        </div>
+        <div className="text-[11px]">
+          今日 {order.productionQuantity.toLocaleString()} / 累計 {order.cumulativeQuantity.toLocaleString()} /{' '}
+          {order.wafer_quantity.toLocaleString()}
+        </div>
       </div>
     </div>
   );
@@ -865,16 +871,7 @@ export function OrdersCalendarDialog({
                           </span>
                         </div>
                         <div className="space-y-1">
-                          {[...items]
-                            .sort((a, b) => {
-                              const aOrder = scheduledOrderById.get(a.id);
-                              const bOrder = scheduledOrderById.get(b.id);
-                              const aPinned = aOrder?.is_pinned ? 1 : 0;
-                              const bPinned = bOrder?.is_pinned ? 1 : 0;
-                              return bPinned - aPinned;
-                            })
-                            .slice(0, MAX_ITEMS_PER_DAY)
-                            .map((order) => {
+                          {items.slice(0, MAX_ITEMS_PER_DAY).map((order) => {
                             const draggableOrder = scheduledOrderById.get(order.id);
                             const isDraggable = canDragScheduledOrder(
                               order,
@@ -889,19 +886,11 @@ export function OrdersCalendarDialog({
                                   if (draggableOrder) handleDragStart(event, draggableOrder);
                                 }}
                                 className={cn(
-                                  'flex min-w-0 items-center gap-1 rounded bg-sky-100 px-1.5 py-1 text-[11px] text-sky-950 dark:bg-sky-900 dark:text-sky-50',
+                                  'truncate rounded bg-sky-100 px-1.5 py-1 text-[11px] text-sky-950 dark:bg-sky-900 dark:text-sky-50',
                                   isDraggable && 'cursor-grab active:cursor-grabbing',
                                 )}
                               >
-                                {draggableOrder?.is_pinned && (
-                                  <Lock
-                                    aria-label="已固定"
-                                    className="h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400"
-                                  />
-                                )}
-                                <span className="truncate">
-                                  {order.order_number} · {order.productionQuantity.toLocaleString()}
-                                </span>
+                                {order.order_number} · {order.productionQuantity.toLocaleString()}
                               </div>
                             );
                           })}

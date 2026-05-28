@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -251,50 +251,10 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText('2026-05-09 生產訂單')).toBeInTheDocument();
     expect(screen.getAllByText('ORD-20260504-0001').length).toBeGreaterThan(0);
     expect(screen.getByText(/TSMC/)).toBeInTheDocument();
+    expect(screen.getAllByText('需求日 2026-06-01').length).toBeGreaterThan(0);
     expect(screen.getByText(/今日 500/)).toBeInTheDocument();
     expect(screen.getByText('生產中')).toBeInTheDocument();
     expect(screen.getByText('剩餘 1,500')).toBeInTheDocument();
-  });
-
-  it('shows a lock mark on pinned calendar items', () => {
-    mockScheduleResult.data = [scheduledOrderResult];
-    mockScheduledOrders.data = {
-      items: [
-        {
-          ...scheduledOrderDetail,
-          is_pinned: true,
-          pinned_production_date: '2026-05-09',
-        },
-      ],
-      total: 1,
-      page: 1,
-      page_size: 100,
-    };
-    renderDialog();
-
-    expect(screen.getByLabelText('已固定')).toBeInTheDocument();
-  });
-
-  it('renders pinned orders first within the same day', () => {
-    mockScheduleResult.data = [inProductionOrder, scheduledOrderResult];
-    mockScheduledOrders.data = {
-      items: [
-        inProductionOrderDetail,
-        {
-          ...scheduledOrderDetail,
-          is_pinned: true,
-          pinned_production_date: '2026-05-09',
-        },
-      ],
-      total: 2,
-      page: 1,
-      page_size: 100,
-    };
-    renderDialog();
-
-    const dayCell = screen.getByRole('button', { name: /2026-05-09/ });
-    const items = within(dayCell).getAllByText(/ORD-20260504-000[15]/);
-    expect(items[0]).toHaveTextContent('ORD-20260504-0005');
   });
 
   it('pins a scheduled order from the right panel', async () => {
