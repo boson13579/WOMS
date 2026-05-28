@@ -157,6 +157,7 @@ const inProductionOrderDetail: Order = {
   scheduled_production_date: inProductionOrder.scheduled_production_date,
   expected_delivery_date: inProductionOrder.expected_delivery_date,
   status: 'in_production',
+  is_pinned: true,
 };
 
 const scheduledOrderDetail: Order = {
@@ -376,7 +377,7 @@ describe('OrdersCalendarDialog', () => {
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
-    expect(screen.getAllByLabelText('處理鎖定中').length).toBeGreaterThan(0);
+    expect(screen.getAllByLabelText('已鎖定').length).toBeGreaterThan(0);
   });
 
   it('does not drag a scheduled calendar item when the canonical order record is not loaded', () => {

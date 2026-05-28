@@ -82,6 +82,7 @@ interface ProductionCalendarItem extends ScheduleResult {
   productionQuantity: number;
   cumulativeQuantity: number;
   productionState: ProductionState;
+  is_pinned?: boolean;
 }
 
 type ProductionState = 'in_progress' | 'complete' | 'scheduled';
@@ -236,7 +237,10 @@ function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): 
 // the badge per-day; that produced inconsistent badges across an
 // order's multi-day breakdown and flipped a day's badge whenever
 // ``advance_day_task`` rolled the calendar.
-function groupByProductionDate(items: ScheduleResult[]): Record<string, ProductionCalendarItem[]> {
+function groupByProductionDate(
+  items: ScheduleResult[],
+  orderMap?: Map<string, { is_pinned?: boolean }>,
+): Record<string, ProductionCalendarItem[]> {
   return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
@@ -281,6 +285,7 @@ function groupByProductionDate(items: ScheduleResult[]): Record<string, Producti
         productionQuantity: assignment.quantity,
         cumulativeQuantity,
         productionState,
+        is_pinned: orderMap?.get(item.id)?.is_pinned,
       };
       acc[assignment.date] = [...(acc[assignment.date] ?? []), productionItem];
     });
@@ -381,9 +386,9 @@ function OrderLine({
           )}
           {canDrag && dragOrder && <GripVertical className="h-3.5 w-3.5 shrink-0" />}
           <span className="truncate">{order.order_number}</span>
-          {(order.productionState === 'in_progress' || dragOrder?.is_processing_locked) && (
+          {order.is_pinned && (
             <Lock
-              aria-label="處理鎖定中"
+              aria-label="已鎖定"
               className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0"
             />
           )}
@@ -524,8 +529,13 @@ export function OrdersCalendarDialog({
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
   const grouped = useMemo(
-    () => groupByProductionDate(scheduleResult.data ?? []),
-    [scheduleResult.data],
+    () => {
+      const orderMap = new Map(
+        (scheduledOrders.data?.items ?? []).map((order) => [order.id, order]),
+      );
+      return groupByProductionDate(scheduleResult.data ?? [], orderMap);
+    },
+    [scheduleResult.data, scheduledOrders.data],
   );
   const filteredGrouped = useMemo(() => {
     if (!searchQuery) return grouped;
@@ -981,13 +991,16 @@ export function OrdersCalendarDialog({
                                   if (draggableOrder) handleDragStart(event, draggableOrder);
                                 }}
                                 className={cn(
-                                  'truncate rounded px-1.5 py-1 text-[11px]',
+                                  'rounded px-1.5 py-1 text-[11px] flex items-center gap-1',
                                   getOrderColor(order.id),
                                   getOrderTextColor(order.id),
                                   isDraggable && 'cursor-grab active:cursor-grabbing',
                                 )}
                               >
-                                {order.order_number} · {order.productionQuantity.toLocaleString()}
+                                {order.is_pinned && (
+                                  <Lock className="h-3 w-3 shrink-0" />
+                                )}
+                                <span className="truncate">{order.order_number} · {order.productionQuantity.toLocaleString()}</span>
                               </div>
                             );
                           })}
