@@ -28,12 +28,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from typing import Any, cast
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from redis import Redis
 from sqlalchemy.orm import Session
 
@@ -272,8 +272,25 @@ def get_schedule_status(
 def get_schedule_result(
     db: Session = Depends(get_db),
     current_user: User = Depends(_READ_ROLES),
+    include_completed: bool = Query(
+        default=False,
+        description=(
+            "Include ``completed`` orders alongside ``scheduled`` / "
+            "``in_production``. The default is False to preserve legacy "
+            "behavior; the calendar view passes True."
+        ),
+    ),
+    completed_since: date | None = Query(
+        default=None,
+        description=(
+            "Lower-bound (inclusive) on ``scheduled_production_date`` for "
+            "completed orders. Ignored when ``include_completed`` is False. "
+            "When ``include_completed`` is True and this is omitted, defaults "
+            "to today - ``SCHEDULER_HORIZON_DAYS`` days."
+        ),
+    ),
 ) -> list[ScheduleResultResponse]:
-    """Return every order currently in ``scheduled`` status, with per-day breakdown.
+    """Return every order on the production timeline, with per-day breakdown.
 
     Sorted by ``scheduled_production_date`` ascending so the timeline is
     natural for the UI. Both the summary dates and the ``daily_breakdown``
@@ -286,9 +303,22 @@ def get_schedule_result(
     Empty when no scheduler run has happened yet (column NULL → empty
     list).
 
+    ``include_completed=true`` adds completed orders to the response,
+    restricted to ``scheduled_production_date >= completed_since``.
+    When ``completed_since`` is omitted the window defaults to
+    ``today - SCHEDULER_HORIZON_DAYS`` so the visible history mirrors
+    the forward planning horizon — same number of days in each
+    direction keeps the calendar symmetric and bounds the response.
+
     Permission: order_manager+.
     """
-    return order_service.list_scheduled_orders(db)
+    effective_since: date | None = None
+    if include_completed:
+        lookback_days = get_settings().SCHEDULER_HORIZON_DAYS
+        effective_since = completed_since or (
+            datetime.now(tz=UTC).date() - timedelta(days=lookback_days)
+        )
+    return order_service.list_scheduled_orders(db, completed_since=effective_since)
 
 
 # ---------------------------------------------------------------------------

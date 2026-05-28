@@ -203,6 +203,107 @@ def test_apply_schedule_snapshot_replaces_previous_run(db_session: Session) -> N
     )
 
 
+def test_apply_schedule_preserves_today_snapshot_row(db_session: Session) -> None:
+    """``preserve_capacity_for=today`` keeps that day's
+    ``schedule_daily_capacity`` row across the truncate-and-insert.
+
+    Used by ``materialize_schedule_task`` / ``rebuild_schedule_task``
+    whose ``compute_schedule`` output only covers future days
+    (``base_date + 1`` and later) — without this preserve, today's
+    row (= in_production wafer量 written by ``advance_day_task``) gets
+    wiped on every subsequent materialize and ``GET
+    /schedule/capacity-usage`` shows 0 used for today, even though
+    13+ wafers are actively being produced.
+
+    Regression case from production: after 5/27→5/28 advance,
+    advance_day_task wrote schedule_daily_capacity[5/28]=10000. Next
+    compound landed, materializer triggered, the old code wiped the
+    5/28 row → frontend "today used = 0".
+    """
+    from app.models.schedule_daily_capacity import ScheduleDailyCapacity
+
+    creator = _make_user(db_session, username="apply-sched-preserve-today")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-PRESERVE",
+        deadline=date(2026, 6, 1),
+    )
+    today = date(2026, 5, 28)
+
+    # Simulate advance_day_task's write: today's in_production wafer量.
+    db_session.add(ScheduleDailyCapacity(date=today, used_quantity=9_500))
+    db_session.commit()
+
+    # Materializer's next pass: ``compute_schedule`` only sees future
+    # days, no entries on ``today``. Pre-fix this would wipe today's
+    # row; with ``preserve_capacity_for=today`` it survives.
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(
+                order_id=order.id,
+                scheduled_date=date(2026, 5, 29),
+                quantity=300,
+            ),
+        ],
+        preserve_capacity_for=today,
+    )
+
+    rows = {
+        r.date: r.used_quantity for r in db_session.scalars(select(ScheduleDailyCapacity)).all()
+    }
+    assert rows == {today: 9_500, date(2026, 5, 29): 300}, (
+        "preserve_capacity_for=today must keep today's snapshot row intact "
+        "while still replacing future-day rows."
+    )
+
+
+def test_apply_schedule_preserve_capacity_ignores_today_entry_in_new_set(
+    db_session: Session,
+) -> None:
+    """When the caller passes a ``scheduled_date == preserve_capacity_for``
+    entry, the preserved existing row wins — the conflicting "new" entry
+    is dropped so it can't double-write or override.
+
+    Defends against a caller accidentally including a today-row entry
+    in ``scheduled_results`` while also asking to preserve today: the
+    semantics stay "today's row is owned by advance_day_task only".
+    """
+    from app.models.schedule_daily_capacity import ScheduleDailyCapacity
+
+    creator = _make_user(db_session, username="apply-sched-preserve-collide")
+    order = _make_order(
+        db_session,
+        creator_id=creator.id,
+        order_number="ORD-COLLIDE",
+        deadline=date(2026, 6, 1),
+    )
+    today = date(2026, 5, 28)
+
+    db_session.add(ScheduleDailyCapacity(date=today, used_quantity=7_000))
+    db_session.commit()
+
+    order_service.apply_schedule(
+        db_session,
+        [
+            # Bad caller: passes a same-day entry alongside preserve.
+            ScheduledResult(
+                order_id=order.id,
+                scheduled_date=today,
+                quantity=999,
+            ),
+        ],
+        preserve_capacity_for=today,
+    )
+
+    rows = {
+        r.date: r.used_quantity for r in db_session.scalars(select(ScheduleDailyCapacity)).all()
+    }
+    # Preserved row survives; the 999 entry on today is dropped.
+    assert rows == {today: 7_000}
+
+
 def test_apply_schedule_with_empty_list_clears_snapshot(db_session: Session) -> None:
     """Materialize-with-no-orders (entire schedule cleared) must wipe the
     snapshot too — leaving stale rows would have the dashboard show wafers
@@ -642,24 +743,27 @@ def test_apply_schedule_clears_stale_pin_columns_on_orders_no_longer_in_state(
     assert stale.pinned_production_date is None
 
 
-def test_apply_schedule_preserves_in_production_status(db_session: Session) -> None:
-    """A boundary order whose status is already ``in_production`` (advance_day
-    promoted it because its production day arrived) MUST NOT be demoted back
-    to ``scheduled`` when materialize runs another pass.
+def test_apply_schedule_skips_in_production_rows_entirely(db_session: Session) -> None:
+    """A row whose status is already ``in_production`` MUST NOT have its
+    schedule columns (``scheduled_production_date`` / ``expected_delivery
+    _date`` / ``daily_breakdown``) touched by ``apply_schedule``.
 
-    Scenario reproducing the bug: boundary order made some wafers today,
-    rest carries into tomorrow. advance_day sets status=in_production and
-    advances base_date; the carried portion is still in pq, so the next
-    accepted compound triggers materialize_schedule_task. ``apply_schedule``
-    will see this order in its ``ScheduledResult`` list (because it still
-    has work scheduled tomorrow) and call ``set_schedule_dates`` — which
-    pre-fix would unconditionally write status=scheduled, breaking:
+    Why all-or-nothing skip rather than "preserve status only":
+    ``advance_day_task`` writes the full multi-day ``daily_breakdown``
+    for the locked-in row (today's portion + any carry into following
+    days) when promoting it to ``in_production``. Subsequent
+    materializer passes only see the REMAINING work in the in-memory
+    state — so if ``set_schedule_dates`` ran on an in_production row
+    it would overwrite the multi-day breakdown to a single-day one,
+    making the boundary order vanish from the calendar's "today" cell
+    and shrinking ``schedule_daily_capacity`` to exclude today's
+    in_production wafers.
 
-    1. The UI label flips from "producing now" to "queued".
-    2. ``advance_day_task::mark_completed_outside_set`` only collects
-       rows with ``status='in_production'``, so once demoted the order
-       can never be flipped to ``completed`` and gets stuck in scheduled
-       forever.
+    Scenario: boundary order produced 1,500 wafers yesterday (5/12)
+    and the remaining 500 today (5/13). DB reflects the full
+    breakdown. ``materialize_schedule_task`` triggers
+    ``apply_schedule`` with the state-derived view (only "5/13, 500"
+    remaining). The schedule columns MUST stay frozen.
     """
     creator = _make_user(db_session, username="apply-sched-preserve-status")
     boundary = Order(
@@ -696,14 +800,16 @@ def test_apply_schedule_preserves_in_production_status(db_session: Session) -> N
     )
 
     db_session.refresh(boundary)
-    # Schedule columns updated to reflect the carried portion.
-    assert boundary.scheduled_production_date == date(2026, 5, 13)
+    # All schedule columns frozen — the multi-day breakdown that
+    # advance_day_task wrote when promoting this row to in_production
+    # must survive subsequent materializer passes.
+    assert boundary.status == OrderStatus.in_production
+    assert boundary.scheduled_production_date == date(2026, 5, 12)
     assert boundary.expected_delivery_date == date(2026, 5, 13)
     assert boundary.daily_breakdown == [
+        {"date": "2026-05-12", "quantity": 1_500},
         {"date": "2026-05-13", "quantity": 500},
     ]
-    # Status preserved — this is the load-bearing assertion of the regression.
-    assert boundary.status == OrderStatus.in_production
 
 
 def test_apply_schedule_preserves_cancelled_status(db_session: Session) -> None:
@@ -1379,13 +1485,16 @@ def test_update_order_pin_unpinned_order_to_specific_day(
     against the producer-side race.
     """
     creator = _make_user(db_session, username="sru-pin-new")
+    # Relative dates: deadline must stay > pin_day and inside the horizon
+    # regardless of the wall-clock day the suite runs on (a hardcoded
+    # deadline went stale once "today" advanced past it).
+    pin_day = date.today() + timedelta(days=5)
     order = _make_order(
         db_session,
         creator_id=creator.id,
         order_number="ORD-PIN-NEW",
-        deadline=date(2026, 6, 1),
+        deadline=date.today() + timedelta(days=10),
     )
-    pin_day = date.today() + timedelta(days=5)
 
     req = UpdateOrderRequest(
         pinned_production_date=pin_day,
@@ -1416,15 +1525,19 @@ def test_update_order_change_pin_day_emits_unpin_and_pin(
       earlier = grow.
     """
     creator = _make_user(db_session, username="sru-pin-move")
+    # Relative dates so deadline > new_pin_day > old_pin_day stays inside
+    # the [today + 1, today + HORIZON_DAYS] window regardless of when
+    # the suite runs.
+    old_pin_day = date.today() + timedelta(days=3)
+    new_pin_day = date.today() + timedelta(days=8)
     order = _make_pinned_order(
         db_session,
         creator_id=creator.id,
         order_number="ORD-PIN-MOVE",
-        deadline=date(2026, 6, 1),
-        pin_day=date(2026, 5, 20),
+        deadline=date.today() + timedelta(days=15),
+        pin_day=old_pin_day,
     )
     # Move pin LATER → cumulative demand only flatter or unchanged → shrink.
-    new_pin_day = date(2026, 5, 28)
 
     req = UpdateOrderRequest(
         pinned_production_date=new_pin_day,
@@ -1439,7 +1552,7 @@ def test_update_order_change_pin_day_emits_unpin_and_pin(
     assert compound.group == "shrink"  # later pin day = looser
     assert compound.db_action.new_pinned_production_date_set is True
     assert compound.db_action.new_pinned_production_date == new_pin_day
-    assert compound.db_action.old_pinned_production_date == date(2026, 5, 20)
+    assert compound.db_action.old_pinned_production_date == old_pin_day
 
 
 def test_update_order_unpin_pinned_order(db_session: Session, mock_enqueue: MagicMock) -> None:
@@ -1481,14 +1594,16 @@ def test_update_order_pin_plus_qty_change_combined(
       then pin with the new qty/new_deadline + new fake_deadline.
     """
     creator = _make_user(db_session, username="sru-pin-qty")
+    # Relative dates so deadline stays > pin_day inside the horizon
+    # regardless of the suite's wall-clock day.
+    pin_day = date.today() + timedelta(days=5)
     order = _make_order(
         db_session,
         creator_id=creator.id,
         order_number="ORD-PIN-QTY",
-        deadline=date(2026, 6, 1),
+        deadline=date.today() + timedelta(days=10),
         quantity=100,
     )
-    pin_day = date.today() + timedelta(days=5)
 
     req = UpdateOrderRequest(
         wafer_quantity=200,  # grows

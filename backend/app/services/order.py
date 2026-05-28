@@ -1112,17 +1112,27 @@ def get_audit_log(db: Session, order_id: uuid.UUID, current_user: User) -> list[
 # ---------------------------------------------------------------------------
 
 
-def list_scheduled_orders(db: Session) -> list[ScheduleResultResponse]:
-    """Return every order currently in ``scheduled`` status, sorted by start date.
+def list_scheduled_orders(
+    db: Session, *, completed_since: date | None = None
+) -> list[ScheduleResultResponse]:
+    """Return every order on the production timeline, sorted by start date.
+
+    Always includes ``scheduled`` + ``in_production`` rows. When
+    ``completed_since`` is given, additionally returns ``completed``
+    rows whose ``scheduled_production_date`` is on/after that date —
+    the API layer typically passes today - 30 days so the calendar
+    view shows a rolling month of history without dragging the entire
+    archive every fetch.
 
     Reads the per-day breakdown straight from the DB column
-    ``orders.daily_breakdown`` (JSONB) that the materializer keeps in sync.
-    No live Redis state is consulted on this read path — the column IS the
-    source of truth for "what will this order's day-by-day production look
-    like under the most recent accepted schedule". A NULL column degrades
-    to an empty ``daily_breakdown`` list in the response.
+    ``orders.daily_breakdown`` (JSONB) that the materializer keeps in
+    sync. No live Redis state is consulted on this read path — the
+    column IS the source of truth for "what will this order's
+    day-by-day production look like under the most recent accepted
+    schedule". A NULL column degrades to an empty ``daily_breakdown``
+    list in the response.
     """
-    rows = order_repo.get_scheduled(db)
+    rows = order_repo.get_timeline(db, completed_since=completed_since)
     out: list[ScheduleResultResponse] = []
     for r in rows:
         breakdown_payload: list[DailyAssignment] = []
@@ -1254,6 +1264,8 @@ def apply_schedule(
     db: Session,
     scheduled: list[ScheduledResult],
     pinned: dict[uuid.UUID, date] | None = None,
+    *,
+    preserve_capacity_for: date | None = None,
 ) -> int:
     """Persist a freshly-computed schedule to the orders table.
 
@@ -1268,6 +1280,18 @@ def apply_schedule(
     orders absent from it have both pin columns cleared. Pass ``None`` (or
     omit) when no pin information is available — equivalent to "no orders
     are pinned".
+
+    ``preserve_capacity_for`` (typically the scheduler's current
+    ``base_date`` = "today"): forwarded to
+    ``daily_cap_repo.replace_all`` to keep that day's snapshot row
+    intact across the truncate-and-insert. Callers that DO write the
+    today row themselves (``advance_day_task`` via the ``today_portion``
+    entries) leave this ``None`` so their write goes through. Callers
+    whose ``scheduled`` list never contains the today row
+    (``materialize_schedule_task`` / ``rebuild_schedule_task``: their
+    ``compute_schedule`` output starts at ``base_date + 1``) pass
+    ``state.base_date`` so today's in_production capacity usage —
+    written earlier by ``advance_day_task`` — survives.
 
     Returns the number of orders that were marked as scheduled.
     """
@@ -1409,7 +1433,7 @@ def apply_schedule(
     # the snapshot with fresh data) and the alternative — recomputing
     # daily_totals from only successfully-written rows — adds bookkeeping
     # complexity for no real user-visible win.
-    daily_cap_repo.replace_all(db, entries=daily_totals)
+    daily_cap_repo.replace_all(db, entries=daily_totals, preserve_date=preserve_capacity_for)
 
     db.commit()
     logger.info(

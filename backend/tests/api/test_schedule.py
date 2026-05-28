@@ -454,6 +454,134 @@ def test_result_excludes_soft_deleted_orders(
     assert res.json() == []
 
 
+def test_result_excludes_completed_by_default(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """Legacy contract: ``GET /schedule/result`` without query params returns
+    ``scheduled`` + ``in_production`` only. Completed orders MUST NOT appear
+    when ``include_completed`` is omitted (default = False) — otherwise
+    callers that opt out would silently start seeing history rows.
+    """
+    _patch_delay(monkeypatch)
+    user = _make_user(db_session, username="mgr_result_default", role=UserRole.order_manager)
+    token = _login(client, "mgr_result_default")
+
+    _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=date(2026, 5, 20),
+        expected_delivery_date=date(2026, 5, 22),
+    )
+    _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=date(2026, 5, 18),
+        expected_delivery_date=date(2026, 5, 19),
+    )
+
+    res = client.get("/api/v1/schedule/result", headers=_auth(token))
+
+    assert res.status_code == 200
+    statuses = {item["status"] for item in res.json()}
+    assert statuses == {"scheduled"}, (
+        "completed rows leaked into the default response — legacy callers "
+        "(e.g. pre-calendar-update consumers) would see them unexpectedly"
+    )
+
+
+def test_result_include_completed_returns_recent_completed_within_horizon_window(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """``include_completed=true`` (no explicit ``completed_since``) returns
+    completed rows from the last ``SCHEDULER_HORIZON_DAYS`` days. Rows
+    older than the window MUST be excluded so the calendar payload stays
+    bounded as the archive grows.
+
+    The lookback window mirrors the forward scheduling horizon — same
+    setting drives both directions so the calendar shows symmetric
+    past/future windows by default.
+
+    Setup: today - (horizon/2) days (in window) + today - (horizon + 30)
+    days (outside) + an active scheduled row that always shows. We pick
+    relative offsets instead of literal day counts so the test stays
+    valid if the operator widens / narrows ``SCHEDULER_HORIZON_DAYS``.
+    """
+    from app.core.config import get_settings
+
+    horizon = get_settings().SCHEDULER_HORIZON_DAYS
+    in_window_offset = max(1, horizon // 2)
+    outside_window_offset = horizon + 30
+
+    _patch_delay(monkeypatch)
+    user = _make_user(db_session, username="mgr_result_include", role=UserRole.order_manager)
+    token = _login(client, "mgr_result_include")
+
+    today = date.today()
+    recent_completed = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=today - timedelta(days=in_window_offset),
+        expected_delivery_date=today - timedelta(days=in_window_offset - 1),
+    )
+    _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=today - timedelta(days=outside_window_offset),
+        expected_delivery_date=today - timedelta(days=outside_window_offset - 1),
+    )
+    active = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=today + timedelta(days=5),
+        expected_delivery_date=today + timedelta(days=6),
+    )
+
+    res = client.get("/api/v1/schedule/result?include_completed=true", headers=_auth(token))
+
+    assert res.status_code == 200
+    ids = {item["id"] for item in res.json()}
+    # Recent completed in, ancient completed out, scheduled always in.
+    assert ids == {str(recent_completed.id), str(active.id)}
+
+
+def test_result_include_completed_honors_explicit_completed_since(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """When the caller passes both ``include_completed=true`` and
+    ``completed_since``, the explicit date wins over the 30-day default.
+    Lets callers either narrow the window (debugging) or widen it
+    (admin/history view) without a code change.
+    """
+    _patch_delay(monkeypatch)
+    user = _make_user(db_session, username="mgr_result_since", role=UserRole.order_manager)
+    token = _login(client, "mgr_result_since")
+
+    today = date.today()
+    far_past = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=today - timedelta(days=100),
+        expected_delivery_date=today - timedelta(days=99),
+    )
+
+    # Widen the window to 200 days: the 100d-old row should now appear.
+    since = (today - timedelta(days=200)).isoformat()
+    res = client.get(
+        f"/api/v1/schedule/result?include_completed=true&completed_since={since}",
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    ids = {item["id"] for item in res.json()}
+    assert str(far_past.id) in ids
+
+
 def test_result_by_viewer_returns_403(client: TestClient, db_session: Session, monkeypatch) -> None:
     _patch_delay(monkeypatch)
     _make_user(db_session, username="viewer_result", role=UserRole.viewer)

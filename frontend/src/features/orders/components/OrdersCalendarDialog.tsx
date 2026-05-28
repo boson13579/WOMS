@@ -135,52 +135,50 @@ function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): 
     .reduce((total, assignment) => total + assignment.quantity, 0);
 }
 
-// `baseDate` is the server's production "today" anchor. When it is undefined
-// (capacity query still loading / errored), every row collapses to `scheduled`
-// so the UI never quietly falls back to the client clock — that fallback
-// would re-introduce the timezone bug this view was rewritten to avoid.
-function groupByProductionDate(
-  items: ScheduleResult[],
-  baseDate: string | undefined,
-): Record<string, ProductionCalendarItem[]> {
+// Each order's ``daily_breakdown`` is fanned out into one calendar item
+// per day. The badge for each day is derived purely from the order's
+// DB ``status`` (see the if/else below) — the caller doesn't need to
+// thread ``base_date`` through anymore. Older versions of this view
+// compared each ``assignment.date`` against ``base_date`` to refine
+// the badge per-day; that produced inconsistent badges across an
+// order's multi-day breakdown and flipped a day's badge whenever
+// ``advance_day_task`` rolled the calendar.
+function groupByProductionDate(items: ScheduleResult[]): Record<string, ProductionCalendarItem[]> {
   return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
 
-      // ``productionState`` is driven by the order's DB ``status`` first,
-      // with a date-based refinement only for the multi-day in-flight case.
-      // The earlier version computed state purely from ``assignment.date``
-      // vs ``baseDate`` — which gave the wrong answer in the window between
-      // an order being scheduled and ``advance_day_task`` actually flipping
-      // its status to ``in_production`` at midnight: the calendar showed
-      // "生產中" while the table view still showed "已排程" and the order
-      // was still editable. Sourcing the status from the same field both
-      // views read keeps them in lockstep.
+      // ``productionState`` is driven entirely by the order's DB
+      // ``status``. Each day of a multi-day order carries the SAME badge
+      // so the calendar reads consistently — if the order is still
+      // ``in_production`` on any of its days, EVERY day in its
+      // ``daily_breakdown`` shows "生產中" (including future portions
+      // not yet started and past portions whose wafers were already
+      // produced).
       //
-      // Date refinement for ``in_production`` multi-day orders only:
-      // - future days of an in-flight order: still "scheduled" visually
-      //   (those days haven't started)
-      // - past days where the order completed: "complete"
-      // - the current production day and any unfinished past day: "in_progress"
+      // Rationale for skipping per-day date refinement: an earlier
+      // version split a boundary order's badges by comparing each
+      // ``assignment.date`` to ``baseDate`` (future→已排程, past→已完成,
+      // today→生產中). That refinement made the SAME order render
+      // differently on adjacent days, and worse, made the same day's
+      // badge flip across an ``advance_day`` tick — confusing for ops
+      // who treat the daily badge as "what is this order doing right
+      // now". Order-level status is the single source of truth; let
+      // ``status='completed'`` (set by ``advance_day_task`` when the
+      // last portion finishes) be the signal that "this order is now
+      // done across all its days".
+      //
+      // Sourcing badge from ``status`` (not from date math vs baseDate)
+      // also keeps the calendar in lockstep with the table view,
+      // which reads the same ``status`` column.
       let productionState: ProductionState;
-      if (baseDate === undefined) {
-        productionState = 'scheduled';
-      } else if (item.status === 'completed') {
+      if (item.status === 'completed') {
         productionState = 'complete';
       } else if (item.status === 'in_production') {
-        if (assignment.date > baseDate) {
-          productionState = 'scheduled';
-        } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
-          productionState = 'complete';
-        } else {
-          productionState = 'in_progress';
-        }
+        productionState = 'in_progress';
       } else {
         // ``scheduled`` / ``pending`` — never show in_progress until the
-        // backend flips status. Under the "no scheduling for today" rule,
-        // ``status='scheduled'`` orders should not have any
-        // daily_breakdown rows on ``baseDate`` (today) at all, so this
-        // branch only ever produces "scheduled" badges in steady state.
+        // backend flips status.
         productionState = 'scheduled';
       }
 
@@ -378,7 +376,12 @@ export function OrdersCalendarDialog({
   const [searchQuery, setSearchQuery] = useState('');
   const role = useCurrentRole();
 
-  const scheduleResult = useScheduleResult();
+  // Calendar shows ``completed`` orders alongside scheduled / in-production
+  // so the user can see the production history in context. The backend
+  // restricts completed rows to the last ~30 days (see
+  // ``_COMPLETED_LOOKBACK_DAYS`` in schedule.py) so the payload stays
+  // bounded as archive size grows.
+  const scheduleResult = useScheduleResult({ includeCompleted: true });
   const scheduleCapacity = useScheduleCapacity();
   const pinSchedule = usePinScheduleOperation();
   const pendingOrders = useOrders({
@@ -401,10 +404,9 @@ export function OrdersCalendarDialog({
   const canReadSchedule = role !== 'viewer';
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
-  const baseDate = scheduleCapacity.data?.base_date;
   const grouped = useMemo(
-    () => groupByProductionDate(scheduleResult.data ?? [], baseDate),
-    [scheduleResult.data, baseDate],
+    () => groupByProductionDate(scheduleResult.data ?? []),
+    [scheduleResult.data],
   );
   const filteredGrouped = useMemo(() => {
     if (!searchQuery) return grouped;

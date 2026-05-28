@@ -23,6 +23,7 @@ __all__ = [
     "get_many",
     "get_scheduled",
     "get_scheduled_for_rebuild",
+    "get_timeline",
     "mark_completed_outside_set",
     "mark_in_production",
     "set_schedule_dates",
@@ -196,6 +197,56 @@ def get_scheduled(db: Session) -> list[Order]:
     return list(db.scalars(stmt).all())
 
 
+def get_timeline(db: Session, *, completed_since: date | None = None) -> list[Order]:
+    """Timeline view: every active order that has a place on the calendar.
+
+    Returns ``scheduled`` + ``in_production`` always (= what
+    :func:`get_scheduled` returns). When ``completed_since`` is given,
+    additionally returns ``completed`` orders whose
+    ``scheduled_production_date`` falls on or after that date. Without
+    it, no ``completed`` rows are returned (= identical to
+    :func:`get_scheduled`).
+
+    Why a separate function: :func:`get_scheduled` is also called by
+    ``apply_schedule`` to snapshot prior dates for the
+    "only-notify-when-date-changed" dedup; adding ``completed`` rows
+    there would bloat that snapshot with no behavioural benefit and
+    muddy the function's name. ``get_timeline`` is explicitly for the
+    user-facing calendar view (``GET /schedule/result``) where
+    completed orders show as "已完成" badges on their production day.
+
+    ``completed_since`` is a hard floor on production date, not a
+    rolling window — caller (typically the API layer) decides the
+    window length (today - 30 days for the default calendar view).
+    """
+    status_filter: tuple[OrderStatus, ...]
+    if completed_since is None:
+        status_filter = (OrderStatus.scheduled, OrderStatus.in_production)
+    else:
+        status_filter = (
+            OrderStatus.scheduled,
+            OrderStatus.in_production,
+            OrderStatus.completed,
+        )
+    stmt = (
+        select(Order)
+        .where(Order.is_deleted.is_(False))
+        .where(Order.status.in_(status_filter))
+        .order_by(Order.scheduled_production_date.asc())
+    )
+    if completed_since is not None:
+        # ``completed_since`` only restricts completed rows. Use
+        # ``OR (status != completed)`` so scheduled / in_production
+        # rows pass regardless of their date (they may have None).
+        stmt = stmt.where(
+            or_(
+                Order.status != OrderStatus.completed,
+                Order.scheduled_production_date >= completed_since,
+            )
+        )
+    return list(db.scalars(stmt).all())
+
+
 def get_scheduled_for_rebuild(db: Session) -> list[Order]:
     """Return only ``status=scheduled`` orders for ``rebuild_state``.
 
@@ -328,11 +379,24 @@ def set_schedule_dates(
     order = db.scalars(stmt).first()
     if order is None:
         return None
+    if order.status == OrderStatus.in_production:
+        # ``advance_day_task`` wrote the full multi-day
+        # ``daily_breakdown`` for this row at the boundary when it
+        # entered production (the day's full production + any carry
+        # into following days). Subsequent materializer passes only
+        # see the REMAINING work in the in-memory state, so calling
+        # ``set_schedule_dates`` on an in_production row would
+        # overwrite the multi-day breakdown to a single-day one,
+        # making the calendar lose the "today's portion" entry for
+        # boundary orders. Skip — the schedule columns for
+        # in_production rows are frozen until completion (where they
+        # become "past" columns and the row gets
+        # ``mark_completed_outside_set``'ed).
+        return order
     order.scheduled_production_date = scheduled_production_date
     order.expected_delivery_date = expected_delivery_date
     order.daily_breakdown = daily_breakdown
     if order.status not in (
-        OrderStatus.in_production,
         OrderStatus.cancelled,
         OrderStatus.completed,
     ):
