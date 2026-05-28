@@ -147,24 +147,21 @@ const COLOR_PALETTE = [
   'bg-rose-50 dark:bg-rose-950',
 ];
 
+function hashOrderId(orderId: string): number {
+  const hash = Array.from(orderId).reduce(
+    (acc, ch) => (acc * 33 + ch.charCodeAt(0)) % Number.MAX_SAFE_INTEGER,
+    5381,
+  );
+  return hash % COLOR_PALETTE.length;
+}
+
 function getOrderColor(orderId: string): string {
-  let hash = 0;
-  for (let i = 0; i < orderId.length; i++) {
-    hash = ((hash << 5) - hash) + orderId.charCodeAt(i);
-    hash = hash & hash;
-  }
-  const index = Math.abs(hash) % COLOR_PALETTE.length;
-  return COLOR_PALETTE[index];
+  return COLOR_PALETTE[hashOrderId(orderId)];
 }
 
 function getOrderTextColor(orderId: string): string {
-  let hash = 0;
-  for (let i = 0; i < orderId.length; i++) {
-    hash = ((hash << 5) - hash) + orderId.charCodeAt(i);
-    hash = hash & hash;
-  }
-  const index = Math.abs(hash) % COLOR_PALETTE.length;
-  
+  const index = hashOrderId(orderId);
+
   const textColors = [
     'text-red-950 dark:text-red-50',
     'text-red-950 dark:text-red-50',
@@ -195,7 +192,7 @@ function getOrderTextColor(orderId: string): string {
     'text-rose-950 dark:text-rose-50',
     'text-rose-950 dark:text-rose-50',
   ];
-  
+
   return textColors[index];
 }
 
@@ -241,7 +238,7 @@ function groupByProductionDate(
   items: ScheduleResult[],
   orderMap?: Map<string, { is_pinned?: boolean }>,
 ): Record<string, ProductionCalendarItem[]> {
-  return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
+  const result = items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
 
@@ -291,6 +288,19 @@ function groupByProductionDate(
     });
     return acc;
   }, {});
+
+  // Pinned orders float to the top of each day so they're immediately
+  // visible in both the calendar grid (which truncates to MAX_ITEMS_PER_DAY)
+  // and the right-panel detail list.
+  Object.values(result).forEach((dayItems) => {
+    dayItems.sort((a, b) => {
+      const aPinned = a.is_pinned ? 1 : 0;
+      const bPinned = b.is_pinned ? 1 : 0;
+      return bPinned - aPinned;
+    });
+  });
+
+  return result;
 }
 
 function capacityTone(remaining: number, dailyCapacity: number): string {
@@ -369,7 +379,12 @@ function OrderLine({
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className={cn('flex min-w-0 items-center gap-1 truncate font-medium', getOrderTextColor(order.id))}>
+        <span
+          className={cn(
+            'flex min-w-0 items-center gap-1 truncate font-medium',
+            getOrderTextColor(order.id),
+          )}
+        >
           {canDrag && dragOrder && (
             <input
               type="checkbox"
@@ -419,8 +434,8 @@ function OrderLine({
           <span className="shrink-0">需求日 {order.requested_delivery_date}</span>
         </div>
         <div className="text-[11px]">
-          今日 {order.productionQuantity.toLocaleString()} / 累計 {order.cumulativeQuantity.toLocaleString()} /{' '}
-          {order.wafer_quantity.toLocaleString()}
+          今日 {order.productionQuantity.toLocaleString()} / 累計{' '}
+          {order.cumulativeQuantity.toLocaleString()} / {order.wafer_quantity.toLocaleString()}
         </div>
       </div>
     </div>
@@ -455,7 +470,12 @@ function UnscheduledOrderLine({
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className={cn('flex min-w-0 items-center gap-1 truncate font-medium', getOrderTextColor(order.id))}>
+        <span
+          className={cn(
+            'flex min-w-0 items-center gap-1 truncate font-medium',
+            getOrderTextColor(order.id),
+          )}
+        >
           {canDrag && !order.is_processing_locked && (
             <input
               type="checkbox"
@@ -528,15 +548,10 @@ export function OrdersCalendarDialog({
   const canReadSchedule = role !== 'viewer';
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
-  const grouped = useMemo(
-    () => {
-      const orderMap = new Map(
-        (scheduledOrders.data?.items ?? []).map((order) => [order.id, order]),
-      );
-      return groupByProductionDate(scheduleResult.data ?? [], orderMap);
-    },
-    [scheduleResult.data, scheduledOrders.data],
-  );
+  const grouped = useMemo(() => {
+    const orderMap = new Map((scheduledOrders.data?.items ?? []).map((order) => [order.id, order]));
+    return groupByProductionDate(scheduleResult.data ?? [], orderMap);
+  }, [scheduleResult.data, scheduledOrders.data]);
   const filteredGrouped = useMemo(() => {
     if (!searchQuery) return grouped;
     const query = searchQuery.toLowerCase();
@@ -930,9 +945,14 @@ export function OrdersCalendarDialog({
                         className={cn(
                           'min-h-28 border-b border-r p-2 text-left align-top transition-colors hover:bg-muted/60',
                           !isCurrentMonth && 'bg-muted/30 text-muted-foreground',
-                          isToday && isSelected && 'bg-amber-50 ring-2 ring-inset ring-sky-500 dark:bg-amber-950/30',
-                          isToday && !isSelected && 'bg-amber-50 ring-2 ring-inset ring-amber-400 dark:bg-amber-950/30',
-                          isSelected && !isToday &&
+                          isToday &&
+                            isSelected &&
+                            'bg-amber-50 ring-2 ring-inset ring-sky-500 dark:bg-amber-950/30',
+                          isToday &&
+                            !isSelected &&
+                            'bg-amber-50 ring-2 ring-inset ring-amber-400 dark:bg-amber-950/30',
+                          isSelected &&
+                            !isToday &&
                             'bg-sky-50 ring-2 ring-inset ring-sky-500 dark:bg-sky-950/40',
                         )}
                         onClick={() => {
@@ -997,10 +1017,10 @@ export function OrdersCalendarDialog({
                                   isDraggable && 'cursor-grab active:cursor-grabbing',
                                 )}
                               >
-                                {order.is_pinned && (
-                                  <Lock className="h-3 w-3 shrink-0" />
-                                )}
-                                <span className="truncate">{order.order_number} · {order.productionQuantity.toLocaleString()}</span>
+                                {order.is_pinned && <Lock className="h-3 w-3 shrink-0" />}
+                                <span className="truncate">
+                                  {order.order_number} · {order.productionQuantity.toLocaleString()}
+                                </span>
                               </div>
                             );
                           })}
