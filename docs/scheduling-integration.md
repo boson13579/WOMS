@@ -403,7 +403,7 @@ celery_app.conf.update(
 celery_app.conf.beat_schedule = {
     "scheduling.advance_day": {
         "task": "scheduling.advance_day",
-        "schedule": crontab(hour=0, minute=0),  # 每天 00:00 UTC
+        "schedule": crontab(hour=0, minute=0),  # 每天 00:00 Asia/Taipei（依 celery_app.py 的 timezone 設定）
     },
 }
 ```
@@ -414,7 +414,7 @@ uv run celery -A app.workers.celery_app worker --loglevel=INFO
 uv run celery -A app.workers.celery_app beat   --loglevel=INFO   # 換天作業需要 beat
 ```
 
-⚠️ **沒設 beat 換天作業不會跑**，每天 00:00 UTC 應該推進 `base_date` 但實際上會卡住。Beat 漏跑的場景（worker 重啟跨日、整個 stack 關過夜）由 FastAPI startup recovery 偵測 + 自動補；但 beat 還是必須設好，不然每天都要靠重啟才會 advance。
+⚠️ **沒設 beat 換天作業不會跑**，每天 00:00 `Asia/Taipei`（依 `celery_app.py` 的 `timezone`）應該推進 `base_date` 但實際上會卡住。Beat 漏跑的場景（worker 重啟跨日、整個 stack 關過夜）由 FastAPI startup recovery 偵測 + 自動補；但 beat 還是必須設好，不然每天都要靠重啟才會 advance。
 
 ### 4.2 環境變數
 
@@ -470,7 +470,7 @@ $ uv run python -c "from redis import Redis; from app.core.config import get_set
 
 | 症狀 | 怎麼辦 |
 |---|---|
-| 重啟跨過一個或多個 00:00 UTC | **自動處理**：startup recovery 偵測 `base_date < today` → 派 `advance_day_task` × (today - base_date)；差超過 30 天直接 rebuild。 |
+| 重啟跨過一個或多個日界（目前 00:00 `Asia/Taipei`） | **自動處理**：startup recovery 偵測 `base_date < today` → 派 `advance_day_task` × (today - base_date)；差超過 30 天直接 rebuild。 |
 | `schedule:state` key 不見 / Redis 被 flush | **自動處理**：startup recovery 偵測缺 state → 派 `rebuild_schedule_task.delay()`。手動觸發仍可用 `POST /api/v1/schedule/rebuild`。 |
 | `pending_ops` 有 compound 但 worker 沒在動 | **自動處理**：startup recovery 偵測 `zcard > 0` AND `status != running` → 派 `run_scheduling_task.delay()`。 |
 | 前端 `daily_breakdown` 一直是空 | 表示 `orders.daily_breakdown` 欄位是 NULL — 通常代表 materializer 還沒跑過或寫入失敗。觸發一次 `POST /api/v1/schedule/trigger` 讓 worker 跑完整流程；如果還是空就 `POST /api/v1/schedule/rebuild` 強制重建。 |

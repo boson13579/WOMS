@@ -274,7 +274,8 @@ class DeadlineOutOfRangeError(ValueError):
     the "POST 200 then WS compound_failed" two-step. Worker's
     ``abs_to_rel``-based rejection inside ``add_order`` / ``pin_order``
     remains as defense in depth — if a producer accepts a deadline but
-    the scheduler's ``base_date`` has just advanced (00:00 UTC race),
+    the scheduler's ``base_date`` has just advanced (Beat-tick race at
+    the day boundary, currently 00:00 ``Asia/Taipei``),
     the worker still rejects safely.
 
     Attributes mirror what an HTTP response would need:
@@ -1511,8 +1512,10 @@ def advance_day(state: SchedulerState) -> SchedulerState:
     **Timing note**: this function operates on the **pre-increment** state.
     ``state.base_date`` is still today's calendar date and tree day 1 (= rel
     == 1) is therefore ``base_date + 1`` = tomorrow from the caller's
-    perspective. But this function is called at the 00:00 UTC boundary
-    when "tomorrow" is about to become "today" — so the orders we
+    perspective. But this function is called at the calendar-day
+    boundary (currently 00:00 ``Asia/Taipei`` per
+    ``celery_app.py::beat_schedule``) when "tomorrow" is about to
+    become "today" — so the orders we
     process on rel == 1 are the orders that, after Step 5 below, will
     be **the new today**. The "pinned-today" / "fully done today"
     terminology in the steps below refers to that post-increment view

@@ -21,7 +21,7 @@
                                              ▼
                                   ┌──────────────────────┐         ┌──────────────────┐
                                   │ Redis                │         │ Celery Beat      │
-                                  │  schedule:pending_ops│         │  每天 00:00 UTC  │
+                                  │  schedule:pending_ops│         │  每天 00:00 TPE  │
                                   │   (sorted set)       │         └────────┬─────────┘
                                   │  schedule:pending_ops│                  │
                                   │   :seq (INCR)        │                  │
@@ -68,7 +68,7 @@
 - **pending_ops queue**：所有 compound（想排 / 想取消 / 想 pin 等的事件包成一組）先進這個 Redis sorted set，score 編碼 shrink-優先 + 組內 FIFO。worker 用 batch admission 一次處理 — `ZRANGE` 讀全部、二分搜尋找最大可行 prefix `[1..k]`、整 batch tree 一次更新後 `ZREM` 那 k 個 member。可行性 check 在 tree 變動前就做，所以不需要 snapshot rollback。詳見 §4.2。
 - **scheduler state**：序列化在 Redis 的線段樹 + pq + `pinned_orders` + `base_date`，跨次持久保存。
 - **schedule status**：`idle` / `running` / `failed`，由 worker 維護，API 跟 advance\_day 拿來判斷有沒有任務在跑。
-- **訂單生命週期 status**（DB 上的 `Order.status` 欄位，跟上面的 schedule status 是不同的東西）：`pending` → `scheduled` → `in_production` → `completed`。`pending` 是剛建立 / 剛 PATCH 的；scheduler 把它排進排程後變 `scheduled`；advance_day 在生產日當天 00:00 UTC 把它變 `in_production`、生產完那天 00:00 UTC 變 `completed`。`cancelled` 是「訂單沒能成功進入排程 / 被人工取消」的旁路（user 主動取消、user 刪除、worker reject 三種來源）。
+- **訂單生命週期 status**（DB 上的 `Order.status` 欄位，跟上面的 schedule status 是不同的東西）：`pending` → `scheduled` → `in_production` → `completed`。`pending` 是剛建立 / 剛 PATCH 的；scheduler 把它排進排程後變 `scheduled`；advance_day 在生產日當天的日界（目前為 00:00 `Asia/Taipei`，見 `celery_app.py::beat_schedule`）把它變 `in_production`、生產完那天的日界變 `completed`。`cancelled` 是「訂單沒能成功進入排程 / 被人工取消」的旁路（user 主動取消、user 刪除、worker reject 三種來源）。
 - **`cancelled` 跟 `is_deleted` 的區分**（兩個欄位獨立，組合決定可見性）：
     - **使用者 `DELETE /orders/{id}`**（「刪除訂單」按鈕，僅適用 `scheduled` 訂單）：`status='cancelled'` + `is_deleted=True` + audit `order.deleted`。訂單從 list view 消失（`is_deleted=False` filter），但 audit log 還查得到（`/orders/{id}/audit` 不過 soft-delete filter）。
     - **使用者 `POST /orders/{id}/cancel`**（「取消訂單」按鈕，僅適用 `scheduled` 訂單）：`status='cancelled'` + `is_deleted=False` + audit `order.cancelled`。訂單**保留在 list view**，跟「刪除」的差別只在 `is_deleted` 這一欄。compound shape 跟 delete 相同（`[remove]` / `[unpin, remove]`），只是 `db_action.kind="cancel"`。語意：「客戶反悔，把這張單從產線拉掉但保留紀錄」。
@@ -673,7 +673,7 @@ celery_app.conf.update(
 celery_app.conf.beat_schedule = {
     "scheduling.advance_day": {
         "task": "scheduling.advance_day",
-        "schedule": crontab(hour=0, minute=0),  # 每天 00:00 UTC
+        "schedule": crontab(hour=0, minute=0),  # 每天 00:00 Asia/Taipei（依 celery_app.py 的 timezone 設定）
     },
 }
 ```
@@ -811,7 +811,7 @@ enqueue_compound(compound)   # ← 同 process Redis call；條件式 .delay() �
 
 **Tree 結構：day 1 = 明天**（不是「今天但被 lock」）
 
-業務規則：今天的生產線在前一晚 00:00 UTC 就已經由 `advance_day_task::mark_in_production` 把當天訂單升級成 `in_production` 確認下來。當天 user 新增訂單 / PATCH / pin 一律不能落在今天，只能 day 2（明天）以後。
+業務規則：今天的生產線在前一晚的日界（目前是 00:00 `Asia/Taipei`，由 `celery_app.py::beat_schedule['advance-day']` 控制）就已經由 `advance_day_task::mark_in_production` 把當天訂單升級成 `in_production` 確認下來。當天 user 新增訂單 / PATCH / pin 一律不能落在今天，只能 day 2（明天）以後。
 
 實作層面採用**結構性設計**：兩棵 segment tree 只覆蓋「可放」的天，今天根本不在 tree 裡。`abs_to_rel(today, base_date)` 直接回 `None`，跟「超出 horizon」走同一條 reject 分支。
 
@@ -1111,7 +1111,7 @@ waiter flag + status claim 兩層解決了「同類型 task 串接 race」（adv
 
 選 SETNX + CAS-delete 而不是 Redlock：單一 Redis 實例的場景用單一 SETNX 就夠，Redlock 是給多 Redis 副本的、會引入不必要複雜度。也不選「靠 Celery `--concurrency=1` 約束」把正確性壓在 ops 紀律上太脆，文件講過很容易忘記。`status` + `waiter_pending` 仍然保留，因為它們提供 observability（`GET /schedule/status`）跟 cooperative retrigger（讓 waiter 知道誰要接手 delay）— lock 補的是正確性層的洞，這兩層是 UX / ergonomics 層、互補不互斥。
 
-#### `advance_day_task`（每天 00:00 UTC，由 Beat 觸發）
+#### `advance_day_task`（每天日界，目前為 00:00 `Asia/Taipei`，由 Beat 觸發）
 
 整個 task body 包在 `try / finally` 裡 — 進入時 `_set_waiter_flag()`，離開時 `_clear_waiter_flag()`。等 in-flight run 結束之後，再用一層 inner `try / except` claim `schedule:status`：成功走完寫 `idle`，body 任何一步 raise 寫 `failed` 並 re-raise。
 
@@ -1373,7 +1373,7 @@ broadcast({...})  ──PUBLISH──▶ schedule:ws:events ──SUBSCRIBE─�
 
 排程模組有四個 runtime 自己補不回來的缺口，全部都跟「server 重啟時 Redis state / DB 跟現實對不齊」有關：
 
-1. **`schedule:state.base_date` 過時**：Celery Beat 每天 00:00 UTC 觸發 `advance_day_task`。Stack 完整關閉跨過 N 個午夜的話，Beat 那 N 次 tick 就漏掉，`base_date` 卡在舊日期 — segment tree 的 day 1 不再是「今天」，後續所有 `add_order` / `compute_schedule` 都用錯誤日曆算。
+1. **`schedule:state.base_date` 過時**：Celery Beat 每天 00:00 `Asia/Taipei`（見 `celery_app.py::beat_schedule`）觸發 `advance_day_task`。Stack 完整關閉跨過 N 個午夜的話，Beat 那 N 次 tick 就漏掉，`base_date` 卡在舊日期 — segment tree 的 day 1 不再是「今天」，後續所有 `add_order` / `compute_schedule` 都用錯誤日曆算。
 2. **`schedule:state` 不見**：Redis 被 flush、首次部署、state schema 升版。worker 會 fallback 到 `SchedulerState.initial(today)` 空狀態，**靜默忘記**現有 scheduled 訂單佔的容量。
 3. **`pending_ops` 卡住 compound**：worker 在 drain 中途 crash，queue 還有 entries 但 `schedule:status` 可能卡在 `running`（死掉的 worker 沒寫 `idle`）。producer 端的 `enqueue_compound` 看到 `running` 就不會 `.delay()`，於是這些 compound 永遠不會被處理。
 4. **`is_processing_locked=True` 的 orphan row**：producer commit 完 `lock=True` → 還沒 enqueue compound 或 enqueue 完還沒被 worker accept 前 process crash → lock 留在 row 上。Materializer 不再順手清 lock（見 §4.4 lock ownership），這些 orphan lock 會永遠卡住該 row 的後續 PATCH / DELETE / cancel。
@@ -2121,7 +2121,7 @@ uv run pytest tests/services tests/workers tests/api      # 全部
 
 ## 8. 已知限制 / 後續工作
 
-- `celery_app.py` 已照 §3.1 顯式加 `imports=("app.workers.scheduling",)`，但 Beat schedule（換天 task 每天 00:00 UTC 觸發）仍需要部署環境另外註冊 `beat_schedule=`，沒寫的話 advance_day 不會自動跑。
+- `celery_app.py` 已照 §3.1 顯式加 `imports=("app.workers.scheduling",)`，但 Beat schedule（換天 task 每天 00:00 `Asia/Taipei` 觸發）仍需要部署環境另外註冊 `beat_schedule=`，沒寫的話 advance_day 不會自動跑。
 - WebSocket 是 in-memory `ConnectionManager`：每個 FastAPI worker 進程各自持有自己的連線，靠 Redis pub/sub fan-out 同步事件。橫向擴展（uvicorn `--workers N` 或多台機器）時是 fan-out 模式（每個 worker 都收訊息但只送給自己手上的連線），不需要 sticky session；要把 `ConnectionManager` 的 metrics 暴露給 Prometheus 之類的監控時要 per-process aggregate。
 - WebSocket 是 best-effort：worker `publish` 失敗會被 `services/websocket.py` 內部 catch 起來只 log warning，不會擋住 caller 的 transaction。如果 Redis pub/sub 中斷時段較長要保證訊息不漏，請另外加持久化（例如 Redis Streams + consumer group），目前的 `pub/sub` 不重送。
 - `apply_schedule` 用 ORM session 更新每筆訂單，會 bump `version_id` 但不檢查它，理論上會跟同時的人工 PATCH 撞到 — 演算法有最終決定權，前端讀到時請以 server 值為準。

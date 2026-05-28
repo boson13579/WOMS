@@ -62,8 +62,9 @@ celery_app.conf.update(
 celery_app.autodiscover_tasks(packages=["app.workers"])
 
 # Periodic-task schedule consumed by ``celery -A app.workers.celery_app beat``.
-# Times are in UTC (matches ``timezone="UTC"`` above). Keep the list small
-# and easy to read — each entry is one well-defined operational concern.
+# Times are interpreted in the ``timezone`` set above (``Asia/Taipei``).
+# Keep the list small and easy to read — each entry is one well-defined
+# operational concern.
 celery_app.conf.beat_schedule = {
     # Roll the scheduler horizon forward one day: advance ``base_date``,
     # mark today's orders ``in_production``, flip finished runs to
@@ -76,9 +77,8 @@ celery_app.conf.beat_schedule = {
     # ``scheduled`` instead of ``in_production``.
     #
     # Time is in ``Asia/Taipei`` (see ``timezone`` above) = Taiwan
-    # calendar-day boundary. 00:40 (not 00:00) gives a small buffer past
-    # midnight so any in-flight ``run_scheduling_task`` from late-night
-    # activity has settled before the horizon roll waits on it.
+    # calendar-day boundary, so a fresh day's locked-in production line
+    # is set as the Taiwan operator's working day begins.
     "advance-day": {
         "task": "scheduling.advance_day",
         "schedule": crontab(hour="0", minute="0"),

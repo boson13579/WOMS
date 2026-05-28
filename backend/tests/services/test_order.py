@@ -812,10 +812,10 @@ def test_apply_schedule_skips_in_production_rows_entirely(db_session: Session) -
     ]
 
 
-def test_apply_schedule_preserves_cancelled_status(db_session: Session) -> None:
-    """A row whose ``status='cancelled'`` MUST NOT be demoted back to
-    ``scheduled`` when ``apply_schedule`` runs on a (possibly stale)
-    schedule that still references this order.
+def test_apply_schedule_skips_cancelled_rows_entirely(db_session: Session) -> None:
+    """A row whose ``status='cancelled'`` MUST NOT have its status,
+    schedule dates, or breakdown touched when ``apply_schedule`` runs
+    on a (possibly stale) schedule that still references this order.
 
     Race this protects against (observed in production via
     consistency_check.py): a previous materializer reads
@@ -826,7 +826,9 @@ def test_apply_schedule_preserves_cancelled_status(db_session: Session) -> None:
     schedule entry — pre-fix, ``set_schedule_dates`` would
     unconditionally write ``status=scheduled``, silently un-cancelling
     the row. Same shape as the ``in_production`` regression above —
-    materializer must respect terminal statuses set by other writers.
+    materializer must respect terminal statuses set by other writers,
+    and the historical ``daily_breakdown`` on a cancelled row is audit
+    residue that must survive the race too.
     """
     creator = _make_user(db_session, username="apply-sched-preserve-cancelled")
     cancelled = Order(
@@ -856,8 +858,64 @@ def test_apply_schedule_preserves_cancelled_status(db_session: Session) -> None:
     )
 
     db_session.refresh(cancelled)
-    # Status preserved — load-bearing assertion of the cancel-race regression.
+    # All schedule columns frozen — symmetric with the in_production
+    # full-skip case. Pre-fix only status was preserved; dates and
+    # breakdown got silently overwritten.
     assert cancelled.status == OrderStatus.cancelled
+    assert cancelled.scheduled_production_date == date(2026, 5, 12)
+    assert cancelled.expected_delivery_date == date(2026, 5, 12)
+    assert cancelled.daily_breakdown == [{"date": "2026-05-12", "quantity": 200}]
+
+
+def test_apply_schedule_skips_completed_rows_entirely(db_session: Session) -> None:
+    """A row whose ``status='completed'`` MUST NOT have its status,
+    schedule dates, or breakdown touched when ``apply_schedule`` runs
+    on a stale schedule that still references this order.
+
+    Same race shape as the cancelled case but worse in impact: the
+    completed row's ``daily_breakdown`` is the user-visible "what was
+    produced on each day" history the calendar renders via
+    ``include_completed=true``. A racing materializer overwriting it
+    with a partial in-memory snapshot would corrupt the displayed
+    historical record.
+    """
+    creator = _make_user(db_session, username="apply-sched-preserve-completed")
+    completed = Order(
+        order_number="ORD-COMPLETED-RACE",
+        customer_name="ACME",
+        wafer_quantity=2_000,
+        requested_delivery_date=date(2026, 5, 14),
+        created_by=creator.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=date(2026, 5, 12),
+        expected_delivery_date=date(2026, 5, 13),
+        daily_breakdown=[
+            {"date": "2026-05-12", "quantity": 1_500},
+            {"date": "2026-05-13", "quantity": 500},
+        ],
+    )
+    db_session.add(completed)
+    db_session.commit()
+
+    order_service.apply_schedule(
+        db_session,
+        [
+            ScheduledResult(
+                order_id=completed.id,
+                scheduled_date=date(2026, 5, 13),
+                quantity=500,
+            ),
+        ],
+    )
+
+    db_session.refresh(completed)
+    assert completed.status == OrderStatus.completed
+    assert completed.scheduled_production_date == date(2026, 5, 12)
+    assert completed.expected_delivery_date == date(2026, 5, 13)
+    assert completed.daily_breakdown == [
+        {"date": "2026-05-12", "quantity": 1_500},
+        {"date": "2026-05-13", "quantity": 500},
+    ]
 
 
 def test_apply_schedule_does_not_clear_processing_lock(db_session: Session) -> None:

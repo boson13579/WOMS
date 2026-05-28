@@ -108,12 +108,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
   # Celery Beat — periodic-task scheduler. MUST be a singleton: it's the
-  # only thing that fires `scheduling.advance_day` at 00:00 UTC (roll the
-  # horizon, mark today's orders in_production, flip finished runs to
-  # completed) and `audit.cleanup_old_logs` at 02:00 UTC. Kept as its own
-  # service — separate from `worker` — so the worker can be scaled without
-  # running multiple Beats (two Beats would fire advance_day twice and
-  # over-advance base_date).
+  # only thing that fires `scheduling.advance_day` at 00:00 Asia/Taipei
+  # (roll the horizon, mark today's orders in_production, flip finished
+  # runs to completed) and `audit.cleanup_old_logs` at 02:00 Asia/Taipei.
+  # Times are owned by `backend/app/workers/celery_app.py` — the
+  # ``timezone`` + ``beat_schedule`` settings; change them there, this
+  # comment will rot. Kept as its own service — separate from `worker` —
+  # so the worker can be scaled without running multiple Beats (two
+  # Beats would fire advance_day twice and over-advance base_date).
   beat:
     build:
       context: ./backend

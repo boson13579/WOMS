@@ -16,8 +16,9 @@ Three tasks live here:
 
 - ``run_scheduling_task`` — drain pending ops, mutate state, persist, notify,
   and re-fire itself if more ops queued during the run.
-- ``advance_day_task`` — daily 00:00 UTC tick; waits for any in-flight run,
-  rolls the horizon forward by a day, then re-triggers scheduling.
+- ``advance_day_task`` — daily 00:00 ``Asia/Taipei`` tick (see
+  ``celery_app.py`` for the timezone + crontab); waits for any in-flight
+  run, rolls the horizon forward by a day, then re-triggers scheduling.
 - ``rebuild_schedule_task`` — fired by ``POST /schedule/rebuild``; waits for
   any in-flight run, rebuilds state from DB, notifies skipped orders'
   creators, then re-triggers scheduling.
@@ -1439,7 +1440,16 @@ def _wait_for_idle_run(*, log_event: str) -> None:
     retry_jitter=True,
 )
 def advance_day_task() -> None:  # noqa: PLR0915 — orchestrates many DB steps in one txn
-    """Roll the scheduler horizon forward one day at 00:00 UTC.
+    """Roll the scheduler horizon forward one day at the Taiwan-calendar boundary.
+
+    Triggered by Celery Beat at 00:00 ``Asia/Taipei`` (see
+    ``celery_app.py::beat_schedule['advance-day']``). Earlier revisions
+    were anchored to UTC midnight, which on a Taipei-localised fab gave
+    an 8-hour window every night where the browser-local calendar
+    showed a new day but ``base_date`` had not yet advanced. The
+    business day is the Taiwan calendar day; the Beat firing time is
+    what defines that boundary (``advance_day`` itself just does
+    ``base_date += 1`` and never reads a wall clock).
 
     Polls ``schedule:status`` for up to 5 minutes waiting for any in-flight
     ``run_scheduling_task`` to finish. After the wait window we proceed

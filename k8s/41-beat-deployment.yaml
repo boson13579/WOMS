@@ -2,8 +2,10 @@
 # worker, different command.
 #
 # MUST stay a singleton (replicas: 1, never scaled). Beat is the only
-# thing that fires `scheduling.advance_day` at 00:00 UTC — the daily
-# horizon roll that advances base_date, marks today's orders
+# thing that fires `scheduling.advance_day` at the configured day
+# boundary (currently 00:00 ``Asia/Taipei`` — see
+# ``backend/app/workers/celery_app.py::beat_schedule['advance-day']``) —
+# the daily horizon roll that advances base_date, marks today's orders
 # in_production, and flips finished runs to completed. Two Beat replicas
 # would each fire advance_day and over-advance base_date by a day. The
 # worker deployment can scale freely; Beat cannot.

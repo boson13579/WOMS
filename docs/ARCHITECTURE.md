@@ -136,7 +136,7 @@ Celery tasks. Broker + result backend = Redis.
 |---|---|---|
 | `run_scheduling_task` | `POST /schedule/trigger`, after every compound enqueue (if idle), and recursively at the end of itself if more ops are queued | Drains `schedule:pending_ops`, applies each compound atomically inside the in-memory `SchedulerState`, broadcasts `schedule.compound_accepted` / `_failed`, then `schedule.updated`. Hands off DB writes to the materializer. |
 | `materialize_schedule_task` | After every accepted compound | Writes `daily_breakdown` JSONB into `orders` for the affected users, emits per-user `schedule.materialized` events. Self-coalescing — multiple accepted compounds in flight collapse into one DB write batch. |
-| `advance_day_task` | Celery Beat at 00:00 UTC daily | Rolls the planning horizon forward one day, advances order statuses, triggers a fresh scheduling run. |
+| `advance_day_task` | Celery Beat at the day boundary (currently 00:00 `Asia/Taipei`; see `backend/app/workers/celery_app.py::beat_schedule['advance-day']`) | Rolls the planning horizon forward one day, advances order statuses, triggers a fresh scheduling run. |
 | `rebuild_schedule_task` | `POST /schedule/rebuild` | Discards Redis `schedule:state`, walks Postgres to reconstruct it, notifies any orders that got skipped, re-triggers scheduling. |
 
 ### 3.6 Redis keys

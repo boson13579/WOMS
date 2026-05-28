@@ -324,7 +324,10 @@ def set_schedule_dates(
     """Mark an order as scheduled with full materialized per-day info.
 
     Writes the summary dates, the JSONB ``daily_breakdown`` (per-day
-    quantity split) and the pin columns.
+    quantity split) and the pin columns — but **only** for rows whose
+    status is still actively scheduled. Rows in any terminal /
+    in-flight state (``in_production`` / ``cancelled`` / ``completed``)
+    early-return with no writes (see below).
 
     ``daily_breakdown`` is expected to be a chronologically-sorted list of
     ``{"date": "YYYY-MM-DD", "quantity": int}`` dicts. Pass ``None`` (or
@@ -333,33 +336,46 @@ def set_schedule_dates(
     materializer always passes a non-empty list since the order is by
     definition currently scheduled.
 
-    **Status preservation for terminal / in_production statuses**: this
-    function flips ``status`` to ``scheduled`` only when the current
-    status is NOT in ``(in_production, cancelled, completed)``.
+    **Frozen-row contract for ``in_production`` / ``cancelled`` /
+    ``completed``**: this function ignores all three statuses
+    completely — ``scheduled_production_date`` / ``expected_delivery
+    _date`` / ``daily_breakdown`` / pin columns / status are all
+    untouched. Same early-return covers each. The reasons are
+    related but not identical:
 
-    - ``in_production``: once ``advance_day_task::mark_in_production``
-      promotes a row to ``in_production``, the materializer can still
-      freely re-write its scheduling columns (the boundary case where
-      today's portion finished and the remainder is rolled into
-      tomorrow) but MUST NOT demote it back to ``scheduled``. Demoting
-      would (1) silently flip the frontend's "currently producing"
-      flag to "queued" mid-shift and (2) cause
-      ``mark_completed_outside_set`` (which only collects rows with
-      ``status='in_production'``) to skip the order on completion,
-      leaving it stuck in ``scheduled`` forever.
+    - ``in_production``: ``advance_day_task::mark_in_production`` wrote
+      the full multi-day ``daily_breakdown`` at the boundary when this
+      row entered production (today's full production + any carry into
+      following days). Subsequent materializer passes only see the
+      REMAINING work in the in-memory state, so re-writing here would
+      overwrite the multi-day breakdown to a single-day one and the
+      calendar would lose the "today's portion" entry for boundary
+      orders. Demoting the status would also (1) silently flip the
+      frontend's "currently producing" flag to "queued" mid-shift and
+      (2) cause ``mark_completed_outside_set`` (which only collects
+      rows with ``status='in_production'``) to skip the order on
+      completion, leaving it stuck in ``scheduled`` forever.
     - ``cancelled``: a row that's been cancelled (either by user-cancel
       or worker auto-reject of a create compound) must not be silently
-      un-cancelled. Pre-fix the materializer rewrote ``status=scheduled``
-      on cancelled rows whenever its in-memory state still had the row
-      in pq (race window between cancel-compound enqueue and the next
-      materializer run), and the materializer's UPDATE could land
-      AFTER the worker's cancel-write but before another user op fired
-      — wiping out the cancel.
+      un-cancelled. The historical date/breakdown on a cancelled row is
+      also the "what was scheduled before cancel" audit residue —
+      worth keeping intact for forensics rather than getting rewritten
+      by a racing materializer that still has the row in its pq
+      snapshot.
     - ``completed``: once ``advance_day_task`` flips a finished
-      production run to ``completed``, the row is done. A late
-      materializer pass over a stale schedule snapshot that still
-      contains the order could otherwise resurrect it back to
-      ``scheduled`` — same shape as the ``cancelled`` race, same fix.
+      production run to ``completed``, both the status and the
+      historical ``daily_breakdown`` are frozen. The breakdown's
+      per-day entries are exactly the user-visible "this is what was
+      produced on each day" history the calendar renders via
+      ``include_completed=true``; allowing a late stale materializer
+      to overwrite them would corrupt the displayed history.
+
+    In normal flow ``apply_schedule`` never reaches this function for a
+    terminal-status row anyway (compute_schedule iterates pq +
+    pinned_orders, both of which exclude completed and cancelled
+    rows). The full early-return is defence in depth for the races
+    where a stale materializer still has the row in its in-memory
+    snapshot.
 
     **``is_processing_locked`` no longer touched here**: pre-fix this
     function unconditionally cleared the lock under the assumption that
@@ -373,34 +389,23 @@ def set_schedule_dates(
     ``compound_finalize.perform_compound_db_action`` clears).
 
     Returns the refreshed entity, or `None` if the order is missing or
-    soft-deleted (caller decides how to react).
+    soft-deleted (caller decides how to react). For a terminal-status
+    row the returned entity is the unchanged read result.
     """
     stmt = select(Order).where(Order.id == order_id, Order.is_deleted.is_(False))
     order = db.scalars(stmt).first()
     if order is None:
         return None
-    if order.status == OrderStatus.in_production:
-        # ``advance_day_task`` wrote the full multi-day
-        # ``daily_breakdown`` for this row at the boundary when it
-        # entered production (the day's full production + any carry
-        # into following days). Subsequent materializer passes only
-        # see the REMAINING work in the in-memory state, so calling
-        # ``set_schedule_dates`` on an in_production row would
-        # overwrite the multi-day breakdown to a single-day one,
-        # making the calendar lose the "today's portion" entry for
-        # boundary orders. Skip — the schedule columns for
-        # in_production rows are frozen until completion (where they
-        # become "past" columns and the row gets
-        # ``mark_completed_outside_set``'ed).
+    if order.status in (
+        OrderStatus.in_production,
+        OrderStatus.cancelled,
+        OrderStatus.completed,
+    ):
         return order
     order.scheduled_production_date = scheduled_production_date
     order.expected_delivery_date = expected_delivery_date
     order.daily_breakdown = daily_breakdown
-    if order.status not in (
-        OrderStatus.cancelled,
-        OrderStatus.completed,
-    ):
-        order.status = OrderStatus.scheduled
+    order.status = OrderStatus.scheduled
     order.is_pinned = is_pinned
     order.pinned_production_date = pinned_production_date if is_pinned else None
     db.flush()
