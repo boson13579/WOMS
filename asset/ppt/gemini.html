@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Order Management System - PPT</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            blue: '#0033A0',     /* TSMC 深藍 */
+                            light: '#0056D6',
+                            accent: '#F59E0B',   /* 亮橘色強調 (gemini / min / xixi / ctj) */
+                            /* extra tokens used by cerosop slides */
+                            accentLight: '#ffedd5',
+                            slateText: '#334155',
+                            dark: '#1e293b',
+                            grayBg: '#f8fafc',
+                            gray: '#f8fafc'
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['"Noto Sans TC"', 'sans-serif'],
+                        mono: ['"JetBrains Mono"', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #333; color: #1e293b; }
+        .slide-container {
+            display: none;
+            width: 100vw;
+            height: 100vh;
+            background-color: white;
+            position: absolute;
+            top: 0; left: 0;
+        }
+        .slide-container.active { 
+            display: flex; 
+            flex-direction: column; 
+            animation: fadeIn 0.4s ease-out forwards;
+        }
+        .slide-content {
+            flex-grow: 1;
+            /* Bottom padding 4rem keeps content clear of the page-number
+               (positioned bottom: 2rem) so they never overlap. */
+            padding: 2.5rem 4rem 4rem;
+            display: flex;
+            flex-direction: column;
+            max-width: 100%;
+            margin: 0 auto;
+            width: 100%;
+        }
+        .slide-title {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #0033A0;
+            border-left: 8px solid #0033A0;
+            padding-left: 1rem;
+            margin-bottom: 2rem;
+            line-height: 1.2;
+        }
+        .page-number { 
+            position: absolute; 
+            bottom: 2rem; 
+            right: 3rem; 
+            font-family: 'JetBrains Mono', monospace; 
+            font-size: 1.25rem; 
+            color: #94a3b8; 
+            font-weight: 700;
+        }
+        .nav-dots { 
+            position: absolute; 
+            bottom: 2.5rem; 
+            left: 50%; 
+            transform: translateX(-50%); 
+            display: flex; 
+            gap: 0.75rem; 
+            z-index: 10;
+        }
+        .dot { 
+            width: 12px; height: 12px; 
+            border-radius: 50%; 
+            background-color: #cbd5e1; 
+            cursor: pointer; 
+            transition: all 0.2s;
+        }
+        .dot.active { background-color: #0033A0; transform: scale(1.2); }
+        .tech-font { font-family: 'JetBrains Mono', monospace; }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Highlight box styles */
+        .highlight-box {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 0.5rem;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="slide-container active" id="slide-1">
+        <div class="slide-content justify-center items-center h-full">
+            <div class="grid grid-cols-2 gap-16 items-center w-full max-w-5xl">
+                <!-- 左側：標題 -->
+                <div class="border-l-8 border-brand-blue pl-8">
+                    <h1 class="text-6xl font-black text-brand-dark leading-snug mb-6 tracking-tight">
+                        Smart Order <br>
+                        <span class="text-brand-blue">Management System</span> <br>
+                        <span class="text-3xl text-gray-500 font-bold tech-font">(WOMS)</span>
+                    </h1>
+                    <p class="text-2xl text-gray-600 font-medium mt-6 leading-relaxed">
+                        晶圓代工訂單管理 <span class="text-brand-accent mx-2">+</span> 智慧排程系統
+                    </p>
+                </div>
+                <!-- 右側：Agenda -->
+                <div class="bg-gray-50 p-10 rounded-2xl shadow-lg border border-gray-100">
+                    <h3 class="text-2xl font-bold text-brand-blue mb-6 flex items-center border-b pb-4">
+                        <i class="fas fa-list-ul mr-3"></i> Agenda
+                    </h3>
+                    <ul class="space-y-4 text-xl font-medium text-gray-700">
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">01</span> 開發規範與 CI</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">02</span> User Story 與整體架構</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">03</span> 三大功能區塊</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">04</span> 測試與排程設計</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">05</span> AWS 部署</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">06</span> Demo</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">1</div>
+    </div>
+
+    <div class="slide-container" id="slide-2">
+        <div class="slide-content">
+            <h2 class="slide-title">工程紀律 <span class="text-2xl text-gray-500 font-normal tech-font">(RULE.md)</span></h2>
+            
+            <div class="flex-grow grid grid-cols-2 gap-8 mb-6">
+                <!-- 左側：規範 -->
+                <div class="highlight-box flex flex-col h-full">
+                    <h3 class="text-2xl font-bold text-brand-dark mb-6 flex items-center border-b-2 border-brand-blue pb-2 inline-block">
+                        <i class="fas fa-ruler-combined text-brand-blue mr-3"></i> 規範
+                    </h3>
+                    <ul class="space-y-6 text-xl text-gray-700 flex-grow pt-4 flex flex-col justify-center">
+                        <li class="flex items-start"><i class="fas fa-check-circle text-brand-blue mt-1 mr-3"></i> <span><strong class="tech-font">12-Factor App</strong> 原則</span></li>
+                        <li class="flex items-start"><i class="fas fa-check-circle text-brand-blue mt-1 mr-3"></i> <span><strong class="tech-font">Bulletproof React</strong> 架構</span></li>
+                        <li class="flex items-start"><i class="fas fa-check-circle text-brand-blue mt-1 mr-3"></i> <span><strong class="tech-font">Google API / Python</strong> 規範</span></li>
+                        <li class="flex items-start"><i class="fas fa-check-circle text-brand-blue mt-1 mr-3"></i> <span><strong class="tech-font">FastAPI</strong> 嚴格分層架構</span></li>
+                    </ul>
+                </div>
+
+                <!-- 右側：CI -->
+                <div class="highlight-box flex flex-col items-center justify-center bg-blue-50/50 h-full">
+                    <h3 class="text-2xl font-bold text-brand-dark mb-6 flex items-center w-full border-b-2 border-brand-blue pb-2">
+                        <i class="fas fa-cog text-brand-blue mr-3"></i> CI 管線
+                    </h3>
+                    
+                    <div class="flex flex-col items-center w-full max-w-sm font-bold text-lg mt-2">
+                        <div class="bg-gray-800 text-white px-6 py-2 rounded-full shadow-md w-32 text-center tech-font">PR</div>
+                        <i class="fas fa-arrow-down text-brand-blue my-2"></i>
+                        
+                        <!-- Backend Box -->
+                        <div class="border-2 border-brand-blue bg-white rounded-lg w-full p-4 shadow-sm text-center">
+                            <div class="text-brand-blue font-black mb-2 uppercase tracking-wide">Backend</div>
+                            <div class="grid grid-cols-1 gap-2 text-sm tech-font text-gray-700">
+                                <div class="bg-gray-100 py-1 rounded">ruff</div>
+                                <div class="bg-gray-100 py-1 rounded">mypy --strict</div>
+                                <div class="bg-brand-accent/20 py-1 rounded text-brand-dark">pytest (testcontainers)</div>
+                            </div>
+                        </div>
+                        
+                        <i class="fas fa-arrow-down text-brand-blue my-2"></i>
+                        
+                        <!-- Frontend Box -->
+                        <div class="border-2 border-green-600 bg-white rounded-lg w-full p-4 shadow-sm text-center">
+                            <div class="text-green-600 font-black mb-2 uppercase tracking-wide">Frontend</div>
+                            <div class="grid grid-cols-3 gap-2 text-sm tech-font text-gray-700">
+                                <div class="bg-gray-100 py-1 rounded">eslint</div>
+                                <div class="bg-gray-100 py-1 rounded">tsc</div>
+                                <div class="bg-gray-100 py-1 rounded">vitest</div>
+                            </div>
+                        </div>
+
+                        <i class="fas fa-arrow-down text-brand-blue my-2"></i>
+                        <div class="text-green-600 flex items-center text-xl bg-green-50 px-6 py-2 rounded-full shadow-sm tech-font">
+                            merge 🟢
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+        <div class="page-number">2</div>
+    </div>
+
+    <!-- Slide 3 — Dashboard 截圖 -->
+    <div class="slide-container" id="slide-3">
+        <div class="slide-content">
+            <h2 class="slide-title">
+                Dashboard
+                <span class="text-xl text-gray-500 font-normal ml-3">Real-time scheduler operations</span>
+            </h2>
+
+            <!-- 截圖容器 -->
+            <div class="flex-grow flex items-center justify-center bg-gray-50 rounded-xl p-4 shadow-inner overflow-hidden mb-4">
+                <img src="dashboard.jpeg" alt="Dashboard screenshot"
+                     class="max-w-full max-h-[65vh] object-contain rounded-md shadow-lg border border-gray-200" />
+            </div>
+
+            <!-- 底部 4 個 callout、對應截圖四個區塊 -->
+            <div class="grid grid-cols-4 gap-3">
+                <div class="bg-blue-50 border-l-4 border-brand-blue p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">Scheduler 狀態</div>
+                    <div class="text-base text-gray-600 tech-font">state · task ID · 時間</div>
+                </div>
+                <div class="bg-blue-50 border-l-4 border-brand-blue p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">30 天累積產能</div>
+                    <div class="text-base text-gray-600">業務面 capacity 折線</div>
+                </div>
+                <div class="bg-blue-50 border-l-4 border-brand-blue p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">Pending Ops queue</div>
+                    <div class="text-base text-gray-600">worker queue 即時深度</div>
+                </div>
+                <div class="bg-blue-50 border-l-4 border-brand-accent p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">訂單分布 by status</div>
+                    <div class="text-base text-gray-600 tech-font">pending / scheduled / …</div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">3</div>
+    </div>
+
+    <!-- Slide 4 — Observability 截圖 -->
+    <div class="slide-container" id="slide-4">
+        <div class="slide-content">
+            <h2 class="slide-title">
+                Observability
+                <span class="text-xl text-gray-500 font-normal ml-3">三層指標 + 業務 SLI</span>
+            </h2>
+
+            <!-- 截圖容器 -->
+            <div class="flex-grow flex items-center justify-center bg-gray-50 rounded-xl p-4 shadow-inner overflow-hidden mb-4">
+                <img src="observability.png" alt="Observability screenshot"
+                     class="max-w-full max-h-[65vh] object-contain rounded-md shadow-lg border border-gray-200" />
+            </div>
+
+            <!-- 底部 4 個 callout、對應截圖從上到下四段 -->
+            <div class="grid grid-cols-4 gap-3">
+                <div class="bg-blue-50 border-l-4 border-brand-blue p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">Services 健康燈</div>
+                    <div class="text-base text-gray-600 tech-font">API · DB · Redis · Celery</div>
+                </div>
+                <div class="bg-amber-50 border-l-4 border-brand-accent p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">RED + ★ Schedule Lag</div>
+                    <div class="text-base text-gray-600">業務 SLI、不是教科書 RED</div>
+                </div>
+                <div class="bg-blue-50 border-l-4 border-brand-blue p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">USE — 資源層</div>
+                    <div class="text-base text-gray-600 tech-font">DB pool 跨 pod 聚合</div>
+                </div>
+                <div class="bg-blue-50 border-l-4 border-brand-blue p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">Top Endpoints</div>
+                    <div class="text-base text-gray-600">最熱 API · P50/P95/P99</div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">4</div>
+    </div>
+
+    <!-- Slide 5 — Audit Log 截圖 -->
+    <div class="slide-container" id="slide-5">
+        <div class="slide-content">
+            <h2 class="slide-title">
+                Audit Log
+                <span class="text-xl text-gray-500 font-normal ml-3">Cross-resource activity feed · root only</span>
+            </h2>
+
+            <div class="flex-grow flex items-center justify-center bg-gray-50 rounded-xl p-4 shadow-inner overflow-hidden mb-4">
+                <img src="audit_log.png" alt="Audit Log screenshot"
+                     class="max-w-full max-h-[65vh] object-contain rounded-md shadow-lg border border-gray-200" />
+            </div>
+
+            <!-- 底部 2 個 callout -->
+            <div class="grid grid-cols-2 gap-3">
+                <div class="bg-blue-50 border-l-4 border-brand-blue p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">4 維度 filter</div>
+                    <div class="text-base text-gray-600 tech-font">Actor · Action · Resource · Time</div>
+                </div>
+                <div class="bg-blue-50 border-l-4 border-brand-accent p-2 rounded-r">
+                    <div class="font-bold text-brand-blue text-lg">完整 activity feed</div>
+                    <div class="text-base text-gray-600">timestamp / actor / action / resource — 點開看 diff</div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">5</div>
+    </div>
+
+    <script>
+        const slides = document.querySelectorAll('.slide-container');
+        let currentSlide = 0;
+
+        function goToSlide(n) {
+            slides[currentSlide].classList.remove('active');
+            currentSlide = (n + slides.length) % slides.length;
+            slides[currentSlide].classList.add('active');
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'Space' || e.key === 'PageDown') {
+                goToSlide(currentSlide + 1);
+            } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+                goToSlide(currentSlide - 1);
+            }
+        });
+    </script>
+</body>
+</html>

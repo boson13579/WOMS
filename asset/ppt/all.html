@@ -1,0 +1,2623 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Order Management System - PPT</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            blue: '#0033A0',     /* TSMC 深藍 */
+                            light: '#0056D6',
+                            accent: '#F59E0B',   /* 亮橘色強調 (gemini / min / xixi / ctj) */
+                            /* extra tokens used by cerosop slides */
+                            accentLight: '#ffedd5',
+                            slateText: '#334155',
+                            dark: '#1e293b',
+                            grayBg: '#f8fafc',
+                            gray: '#f8fafc'
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['"Noto Sans TC"', 'sans-serif'],
+                        mono: ['"JetBrains Mono"', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #333; color: #1e293b; }
+        .slide-container {
+            display: none;
+            width: 100vw;
+            height: 100vh;
+            background-color: white;
+            position: absolute;
+            top: 0; left: 0;
+        }
+        .slide-container.active { 
+            display: flex; 
+            flex-direction: column; 
+            animation: fadeIn 0.4s ease-out forwards;
+        }
+        .slide-content {
+            flex-grow: 1;
+            /* Bottom padding 4rem keeps content clear of the page-number
+               (positioned bottom: 2rem) so they never overlap. */
+            padding: 2.5rem 4rem 4rem;
+            display: flex;
+            flex-direction: column;
+            max-width: 100%;
+            margin: 0 auto;
+            width: 100%;
+        }
+        .slide-title {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #0033A0;
+            border-left: 8px solid #0033A0;
+            padding-left: 1rem;
+            margin-bottom: 2rem;
+            line-height: 1.2;
+        }
+        .page-number { 
+            position: absolute; 
+            bottom: 2rem; 
+            right: 3rem; 
+            font-family: 'JetBrains Mono', monospace; 
+            font-size: 1.25rem; 
+            color: #94a3b8; 
+            font-weight: 700;
+        }
+        .nav-dots { 
+            position: absolute; 
+            bottom: 2.5rem; 
+            left: 50%; 
+            transform: translateX(-50%); 
+            display: flex; 
+            gap: 0.75rem; 
+            z-index: 10;
+        }
+        .dot { 
+            width: 12px; height: 12px; 
+            border-radius: 50%; 
+            background-color: #cbd5e1; 
+            cursor: pointer; 
+            transition: all 0.2s;
+        }
+        .dot.active { background-color: #0033A0; transform: scale(1.2); }
+        .tech-font { font-family: 'JetBrains Mono', monospace; }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Highlight box styles */
+        .highlight-box {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 0.5rem;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+        }
+    
+        /* ===== injected from author files ===== */
+/* === min styles (scoped) === */
+.slide-container[data-author='min'] .slide-header {
+  flex-shrink:0; padding:0.85rem 2.4rem 0.5rem;
+  border-bottom:1px solid #e2e8f0;
+  display:flex; align-items:center; gap:0.75rem;
+}
+.slide-container[data-author='min'] .hbar { width:10px; height:2rem; background:#0033A0; border-radius:2px; flex-shrink:0; }
+.slide-container[data-author='min'] .htitle { font-size:2rem; font-weight:900; color:#0033A0; line-height:1; }
+.slide-container[data-author='min'] .s1-wrap { display:flex; flex-direction:column; height:100%; gap:0.4rem; }
+.slide-container[data-author='min'] .s1-group { flex:1; display:flex; flex-direction:column; }
+.slide-container[data-author='min'] .s1-role-bar {
+  background:#0033A0; color:white;
+  padding:0.3rem 1rem;
+  font-size:1rem; line-height:1.35;
+  flex-shrink:0;
+}
+.slide-container[data-author='min'] .s1-role-bar .desc { font-size:0.84rem; color:rgba(255,255,255,.85); }
+.slide-container[data-author='min'] .s1-role-bar .name { font-weight:700; }
+.slide-container[data-author='min'] .s1-stories { flex:1; display:flex; flex-direction:column; border:1px solid #e2e8f0; }
+.slide-container[data-author='min'] .s1-story {
+  flex:1; display:grid;
+  grid-template-columns:2rem 1fr 1fr;
+  align-items:center;
+  padding:0.3rem 0.8rem;
+  gap:0 0.7rem;
+  border-bottom:1px solid #f1f5f9;
+}
+.slide-container[data-author='min'] .s1-story:last-child { border-bottom:none; }
+.slide-container[data-author='min'] .s1-story:nth-child(even) { background:#f8fafc; }
+.slide-container[data-author='min'] .s1-num {
+  background:#0033A0; color:white;
+  border-radius:50%; width:1.55rem; height:1.55rem;
+  display:flex; align-items:center; justify-content:center;
+  font-size:0.78rem; font-weight:700; flex-shrink:0;
+}
+.slide-container[data-author='min'] .s1-col { display:flex; flex-direction:column; gap:0.08rem; }
+.slide-container[data-author='min'] .s1-lbl { font-size:0.68rem; font-weight:700; color:#0033A0; letter-spacing:.04em; }
+.slide-container[data-author='min'] .s1-txt { font-size:0.88rem; color:#1e293b; line-height:1.4; }
+.slide-container[data-author='min'] .s1-val { font-size:0.86rem; color:#475569; line-height:1.4; }
+.slide-container[data-author='min'] .grp-b .s1-role-bar { background:#0056D6; }
+.slide-container[data-author='min'] .grp-b .s1-num { background:#0056D6; }
+.slide-container[data-author='min'] .grp-b .s1-lbl { color:#0056D6; }
+.slide-container[data-author='min'] .hi { color:#DC2626; font-weight:600; }
+.slide-container[data-author='min'] .s2-grid {
+  display:grid; grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr;
+  gap:0.6rem; height:100%;
+}
+.slide-container[data-author='min'] .s2-card { border:1.5px solid #dbeafe; border-radius:6px; overflow:hidden; display:flex; flex-direction:column; background:#EFF6FF; }
+.slide-container[data-author='min'] .s2-head {
+  background:#0033A0; color:white;
+  padding:0.35rem 0.9rem; font-size:1rem; font-weight:700;
+  flex-shrink:0;
+}
+.slide-container[data-author='min'] .s2-body { padding:0.45rem 0.9rem; flex:1; display:flex; flex-direction:column; gap:0.35rem; }
+.slide-container[data-author='min'] .s2-row {}
+.slide-container[data-author='min'] .s2-story { font-size:0.88rem; font-weight:700; color:#0056D6; }
+.slide-container[data-author='min'] .s2-desc { font-size:0.84rem; color:#475569; margin-top:0.08rem; }
+.slide-container[data-author='min'] .hi2 { color:#DC2626; font-weight:600; }
+.slide-container[data-author='min'] .s3-wrap { display:flex; gap:1.0rem; height:100%; }
+.slide-container[data-author='min'] .s3-left { width:59%; flex-shrink:0; display:flex; flex-direction:column; overflow:hidden; }
+.slide-container[data-author='min'] .s3-right { flex:1; display:flex; align-items:stretch; justify-content:center; }
+.slide-container[data-author='min'] .s3-bullets { flex:1; display:flex; flex-direction:column; justify-content:space-evenly; }
+.slide-container[data-author='min'] .s3-item { display:flex; align-items:flex-start; gap:0.5rem; }
+.slide-container[data-author='min'] .s3-num {
+  background:#0033A0; color:white; border-radius:50%;
+  width:1.45rem; height:1.45rem; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center;
+  font-size:0.74rem; font-weight:700; margin-top:0.05rem;
+}
+.slide-container[data-author='min'] .s3-txt { font-size:0.85rem; color:#1e293b; line-height:1.5; }
+.slide-container[data-author='min'] .s3-title { font-weight:700; color:#0033A0; }
+.slide-container[data-author='min'] .s3-tbl-wrap { flex:2; display:flex; flex-direction:column; padding-top:0.3rem; padding-bottom:0.55rem; }
+.slide-container[data-author='min'] .s3-tbl-title { flex-shrink:0; font-size:0.84rem; font-weight:700; color:#0033A0; margin-bottom:0.28rem; }
+.slide-container[data-author='min'] .s3-tbl { width:100%; border-collapse:collapse; font-size:0.80rem; }
+.slide-container[data-author='min'] .s3-tbl th { background:#0033A0; color:white; padding:0.42rem 0.5rem; border:1px solid #2d5298; text-align:center; }
+.slide-container[data-author='min'] .s3-tbl td { padding:0.4rem 0.45rem; border:1px solid #94a3b8; text-align:center; background:white; }
+.slide-container[data-author='min'] .s3-tbl td:first-child { text-align:left; font-weight:600; background:white; }
+.slide-container[data-author='min'] .tok { color:#059669; font-weight:700; }
+.slide-container[data-author='min'] .tno { color:#DC2626; font-weight:700; }
+.slide-container[data-author='min'] .teye { color:#0056D6; }
+.slide-container[data-author='min'] .s3-img {
+  width:100%; height:100%; max-height:100%;
+  border:1.5px solid #dbeafe; border-radius:10px; overflow:hidden;
+  box-shadow:0 3px 12px rgba(0,51,160,.08);
+  display:flex; align-items:center; justify-content:center;
+}
+.slide-container[data-author='min'] .s3-img img { width:100%; height:100%; object-fit:contain; display:block; }
+.slide-container[data-author='min'] .s4-wrap { display:flex; flex-direction:column; height:100%; gap:0.4rem; }
+.slide-container[data-author='min'] .s4-frame {
+  flex:1; border:1px solid #dbeafe; border-radius:8px;
+  overflow:hidden; box-shadow:0 2px 12px rgba(0,51,160,.07);
+  background:#f8fafc;
+  display:flex; align-items:center; justify-content:center;
+  padding:0.6rem 1rem;
+}
+.slide-container[data-author='min'] .s4-frame img { max-width:100%; max-height:100%; object-fit:contain; border-radius:4px; }
+/* === cerosop styles (scoped) === */
+.slide-container[data-author='cerosop'] .text-[8px] { font-size: 11px !important; }
+.slide-container[data-author='cerosop'] .text-[9px] { font-size: 13px !important; }
+.slide-container[data-author='cerosop'] .text-[10px] { font-size: 14px !important; }
+.slide-container[data-author='cerosop'] .text-[11px] { font-size: 15px !important; }
+.slide-container[data-author='cerosop'] .text-xs { font-size: 1.1rem !important; }
+.slide-container[data-author='cerosop'] .text-sm { font-size: 1.25rem !important; }
+.slide-container[data-author='cerosop'] .text-base { font-size: 1.45rem !important; }
+.slide-container[data-author='cerosop'] .text-lg { font-size: 1.7rem !important; }
+.slide-container[data-author='cerosop'] .text-xl { font-size: 1.95rem !important; }
+.slide-container[data-author='cerosop'] .text-2xl { font-size: 2.4rem !important; }
+.slide-container[data-author='cerosop'] .text-3xl { font-size: 3rem !important; }
+.slide-container[data-author='cerosop'] header, .slide-container[data-author='cerosop'] footer, .slide-container[data-author='cerosop'] #notes-panel, .slide-container[data-author='cerosop'] .fixed.bottom-14.left-4.z-40 {
+            display: none !important;
+        }
+.slide-container[data-author='cerosop'] .slide-content.mt-16 {
+            margin-top: 1.5rem !important; 
+        }
+.slide-container[data-author='cerosop'] [id^="node-c"] {
+            height: 140px !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: space-between !important;
+            align-items: center !important;
+            padding: 12px 4px 14px 4px !important;
+        }
+.slide-container[data-author='cerosop'] [id^="sub-c"] {
+            font-size: 12px !important;
+            line-height: normal !important;
+            margin-top: 2px !important;
+            margin-bottom: 0px !important;
+        }
+.slide-container[data-author='cerosop'] .highlight-box:hover {
+            border-color: #c084fc; 
+            box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.06);
+        }
+@keyframes slideInFade {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+.slide-container[data-author='cerosop'] .data-placeholder {
+            border: 2px dashed #ea580c;
+            background-color: #fffaf0;
+            padding: 0.15rem 0.4rem;
+            border-radius: 0.375rem;
+            font-weight: 700;
+            color: #ea580c;
+            display: inline-block;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+.slide-container[data-author='cerosop'] .data-placeholder:hover {
+            background-color: #ffedd5;
+            scale: 1.05;
+        }
+.slide-container[data-author='cerosop'] .custom-scroll::-webkit-scrollbar {
+            width: 6px;
+        }
+.slide-container[data-author='cerosop'] .custom-scroll::-webkit-scrollbar-track {
+            background: #0f172a;
+        }
+.slide-container[data-author='cerosop'] .custom-scroll::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 3px;
+        }
+.slide-container[data-author='cerosop'] .custom-scroll::-webkit-scrollbar-thumb:hover {
+            background: #475569;
+        }
+/* === xixi styles (scoped) === */
+.slide-container[data-author='xixi'] .layer-card {
+            border-left: 8px solid #0033A0;
+            background: #fff;
+            border-radius: 0.5rem;
+            box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+        }
+/* === ctj styles (scoped) === */
+.slide-container[data-author='ctj'] .mono { font-family: "JetBrains Mono", monospace; }
+.slide-container[data-author='ctj'] .panel-amber {
+            background: rgba(255, 251, 235, 0.55);
+            border: 2px solid #F59E0B;
+        }
+.slide-container[data-author='ctj'] .panel-header {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            padding-bottom: 12px;
+            margin-bottom: 18px;
+            border-bottom: 3px solid #F59E0B;
+        }
+.slide-container[data-author='ctj'] .panel-header.blue { border-bottom-color: #0033A0; }
+.slide-container[data-author='ctj'] .panel-header h3 {
+            font-size: var(--type-h3);
+            font-weight: 900;
+            color: #1e293b;
+        }
+.slide-container[data-author='ctj'] .panel-header .meta {
+            font-family: "JetBrains Mono", monospace;
+            color: #64748b;
+            font-weight: 700;
+            font-size: var(--type-small);
+        }
+.slide-container[data-author='ctj'] .trigger-bar {
+            background: #1e293b;
+            color: #fff;
+            border-radius: 12px;
+            padding: 14px 22px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+.slide-container[data-author='ctj'] .trigger-bar .icon {
+            color: #F59E0B;
+            font-size: 30px;
+        }
+.slide-container[data-author='ctj'] .trigger-bar .cmd {
+            font-family: "JetBrains Mono", monospace;
+            font-size: 24px;
+            font-weight: 700;
+        }
+.slide-container[data-author='ctj'] .trigger-bar .desc {
+            color: #cbd5e1;
+            font-size: var(--type-small);
+            margin-top: 4px;
+        }
+.slide-container[data-author='ctj'] .trigger-bar .tag {
+            margin-left: auto;
+            font-family: "JetBrains Mono", monospace;
+            color: #94a3b8;
+            font-size: var(--type-small);
+        }
+.slide-container[data-author='ctj'] .cd-step {
+            display: grid;
+            grid-template-columns: 48px 1fr auto;
+            align-items: center;
+            gap: 20px;
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 12px 20px;
+        }
+.slide-container[data-author='ctj'] .cd-step + .cd-step { margin-top: 10px; }
+.slide-container[data-author='ctj'] .cd-step.gated {
+            background: #fffbeb;
+            border: 2.5px solid #F59E0B;
+        }
+.slide-container[data-author='ctj'] .cd-num {
+            width: 48px;
+            height: 48px;
+            border-radius: 999px;
+            background: #0033A0;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: "JetBrains Mono", monospace;
+            font-size: 24px;
+            font-weight: 700;
+        }
+.slide-container[data-author='ctj'] .cd-num.acc {
+            background: #F59E0B;
+            color: #1e293b;
+        }
+.slide-container[data-author='ctj'] .cd-title {
+            font-size: 24px;
+            font-weight: 900;
+            color: #1e293b;
+            line-height: 1.25;
+        }
+.slide-container[data-author='ctj'] .cd-sub {
+            color: #64748b;
+            font-size: var(--type-small);
+            margin-top: 4px;
+            line-height: 1.3;
+        }
+.slide-container[data-author='ctj'] .cd-tag {
+            font-family: "JetBrains Mono", monospace;
+            font-weight: 700;
+            font-size: var(--type-small);
+            border-radius: 8px;
+            padding: 6px 12px;
+            color: #0033A0;
+            background: #dbeafe;
+            white-space: nowrap;
+        }
+.slide-container[data-author='ctj'] .cd-tag.dark { color: #fff; background: #1e293b; }
+.slide-container[data-author='ctj'] .cd-tag.gray { color: #334155; background: #e2e8f0; }
+.slide-container[data-author='ctj'] .cd-tag.acc { color: #1e293b; background: #F59E0B; }
+.slide-container[data-author='ctj'] .cd-tag.ok { color: #047857; background: #d1fae5; }
+.slide-container[data-author='ctj'] .layer-row {
+            display: grid;
+            grid-template-columns: 240px 1fr;
+            align-items: center;
+            gap: 24px;
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 12px 20px;
+        }
+.slide-container[data-author='ctj'] .layer-row + .layer-row { margin-top: 8px; }
+.slide-container[data-author='ctj'] .layer-label {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #0033A0;
+            color: #fff;
+            border-radius: 10px;
+            padding: 12px 14px;
+        }
+.slide-container[data-author='ctj'] .layer-label .name {
+            font-family: "JetBrains Mono", monospace;
+            font-weight: 700;
+            font-size: 24px;
+            letter-spacing: 0.01em;
+            white-space: nowrap;
+        }
+.slide-container[data-author='ctj'] .layer-label .zh {
+            font-size: 24px;
+            color: #cbd5e1;
+            margin-top: 2px;
+            font-weight: 500;
+        }
+.slide-container[data-author='ctj'] .layer-content {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 12px;
+        }
+.slide-container[data-author='ctj'] .layer-stack {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            width: 100%;
+        }
+.slide-container[data-author='ctj'] .layer-line {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+.slide-container[data-author='ctj'] .layer-pill {
+            font-family: "JetBrains Mono", monospace;
+            font-weight: 700;
+            font-size: 24px;
+            color: #0033A0;
+            background: #dbeafe;
+            border-radius: 8px;
+            padding: 6px 14px;
+            white-space: nowrap;
+        }
+.slide-container[data-author='ctj'] .layer-pill.dark {
+            color: #fff;
+            background: #1e293b;
+        }
+.slide-container[data-author='ctj'] .layer-pill.acc {
+            color: #1e293b;
+            background: #F59E0B;
+        }
+.slide-container[data-author='ctj'] .layer-tag-right {
+            font-family: "JetBrains Mono", monospace;
+            font-weight: 700;
+            font-size: 24px;
+            color: #0033A0;
+            background: #fff;
+            border: 2px solid #0033A0;
+            border-radius: 8px;
+            padding: 4px 12px;
+            white-space: nowrap;
+        }
+.slide-container[data-author='ctj'] .layer-tag-right.dark {
+            color: #fff;
+            background: #1e293b;
+            border-color: #1e293b;
+        }
+.slide-container[data-author='ctj'] .layer-arrow {
+            margin-left: auto;
+            color: #94a3b8;
+            font-size: 22px;
+        }
+.slide-container[data-author='ctj'] .takeaway {
+            background: #1e293b;
+            color: #fff;
+            border-radius: 12px;
+            border-left: 10px solid #F59E0B;
+            padding: 16px 26px;
+            margin-top: 16px;
+            text-align: center;
+            font-size: 24px;
+            font-weight: 900;
+            line-height: 1.4;
+        }
+
+        /* ctj sections were originally inside <deck-stage>; re-target so they
+           fill our slide-container and pick up ctj's padding. */
+        .slide-container[data-author="ctj"] > section[data-label] {
+            display: flex;
+            flex-direction: column;
+            background: #fff;
+            box-sizing: border-box;
+            width: 100%;
+            height: 100%;
+            padding: var(--pad-top, 36px) var(--pad-x, 64px) var(--pad-bottom, 28px);
+            overflow: hidden;
+        }
+
+        /* min slides use .slide-header + .htitle bar; restyle to match
+           gemini's blue title style. */
+        /* Unify title top spacing across every author so the blue title bar
+           sits at the same vertical offset on every slide.
+           Target: 2.5rem above the title (= gemini's .slide-content
+           padding-top). */
+        .slide-container[data-author="min"] .slide-header {
+            border-bottom: none;
+            padding: 2.5rem 4rem 0;
+            background: transparent;
+        }
+        /* cerosop authored some slides with .slide-content.mt-16 (=4rem
+           top margin) which pushed titles way lower than the deck baseline.
+           Zero it out so cerosop titles line up with gemini's. */
+        .slide-container[data-author="cerosop"] .slide-content {
+            margin-top: 0 !important;
+        }
+        /* ctj: --pad-top governs section top padding (=title-top space).
+           Bump to ~2.5rem to match the rest. */
+        .slide-container[data-author="ctj"] {
+            --pad-top: 40px;
+        }
+        .slide-container[data-author="min"] .slide-header .hbar { display: none; }
+        .slide-container[data-author="min"] .slide-header .htitle {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #0033A0;
+            border-left: 8px solid #0033A0;
+            padding-left: 1rem;
+            line-height: 1.2;
+            margin-bottom: 1rem;
+        }
+        .slide-container[data-author="min"] .slide-header + .slide-content {
+            /* 4rem bottom so content stays clear of page-number. */
+            padding: 1rem 4rem 4rem;
+        }
+
+        /* min was sized for 1280x720; bump text sizes in our full-viewport deck. */
+        .slide-container[data-author="min"] .s1-role-bar {
+            font-size: 1.4rem !important; padding: 0.6rem 1.4rem;
+        }
+        .slide-container[data-author="min"] .s1-role-bar .desc {
+            font-size: 1.2rem !important;
+        }
+        .slide-container[data-author="min"] .s1-num {
+            width: 2.2rem; height: 2.2rem; font-size: 1.1rem !important;
+        }
+        .slide-container[data-author="min"] .s1-lbl { font-size: 1rem !important; }
+        .slide-container[data-author="min"] .s1-txt { font-size: 1.3rem !important; }
+        .slide-container[data-author="min"] .s1-val { font-size: 1.25rem !important; }
+        .slide-container[data-author="min"] .s2-head { font-size: 1.3rem !important; padding: 0.5rem 1rem; }
+        .slide-container[data-author="min"] .s2-body { font-size: 1.2rem !important; padding: 0.6rem 1rem; }
+        .slide-container[data-author="min"] .s2-story { font-size: 1.25rem !important; }
+        .slide-container[data-author="min"] .s2-desc { font-size: 1.15rem !important; }
+        .slide-container[data-author="min"] .s3-txt { font-size: 1.25rem !important; }
+        .slide-container[data-author="min"] .s3-tbl { font-size: 1.2rem !important; }
+        .slide-container[data-author="min"] .s3-tbl-title { font-size: 1.3rem !important; }
+        .slide-container[data-author="min"] .s3-title { font-size: 1.5rem !important; }
+        .slide-container[data-author="min"] .s3-num { font-size: 1.2rem !important; }
+        .slide-container[data-author="min"] .s3-img {
+            max-height: 70vh;
+        }
+        .slide-container[data-author="min"] .s4-frame {
+            min-height: 70vh;
+        }
+
+        /* xixi: shrink text utilities inside xixi scope. */
+        .slide-container[data-author="xixi"] .text-5xl { font-size: 2.5rem !important; }
+        .slide-container[data-author="xixi"] .text-4xl { font-size: 2rem !important; }
+        .slide-container[data-author="xixi"] .text-3xl { font-size: 1.7rem !important; }
+        .slide-container[data-author="xixi"] .text-2xl { font-size: 1.4rem !important; }
+        .slide-container[data-author="xixi"] .text-xl { font-size: 1.2rem !important; }
+
+        /* ctj: override --type-* tokens since stage is now 100vw/100vh
+           rather than 1920x1080 fixed. */
+        .slide-container[data-author="ctj"] {
+            --type-title: 38px;
+            --type-subtitle: 20px;
+            --type-h3: 24px;
+            --type-body: 18px;
+            --type-small: 16px;
+            --type-mono: 16px;
+            --pad-top: 40px;
+            --pad-bottom: 64px;
+            --pad-x: 64px;
+        }
+
+        /* gemini 3-5 callout labels: ensure they keep .text-lg / .text-base
+           sizes despite cerosop's redefinitions (defensive — cerosop is now
+           scoped so this is mostly belt+suspenders). */
+        .slide-container[data-author="gemini"] .text-lg { font-size: 1.125rem; }
+        .slide-container[data-author="gemini"] .text-base { font-size: 1rem; }
+        .slide-container[data-author="gemini"] .text-xl { font-size: 1.25rem; }
+
+        /* === pages 2, 4, 5, 18, 19: bump body text to roughly match page 8 (~1.5-1.7rem) === */
+        #slide-2 .highlight-box ul li { font-size: 1.5rem !important; line-height: 1.4; }
+        #slide-18 .layer-card p.text-xl { font-size: 1.55rem !important; }
+        #slide-18 .layer-card p.text-lg { font-size: 1.35rem !important; }
+        #slide-19 .text-xl { font-size: 1.55rem !important; }
+        #slide-19 .text-lg { font-size: 1.35rem !important; }
+
+        /* === page 7: shrink lead sentence to match page 8 (cerosop text-lg = 1.7rem) === */
+        #slide-7 > .slide-content > p.text-xl { font-size: 1.7rem !important; margin-bottom: 1.5rem !important; }
+
+        /* === pages 20, 21: shrink ctj content so it does not cover page-number === */
+        #slide-20 .layer-pill,
+        #slide-21 .layer-pill { font-size: 17px !important; padding: 4px 10px !important; }
+        #slide-20 .layer-label,
+        #slide-21 .layer-label { padding: 8px 12px !important; }
+        #slide-20 .layer-label .name,
+        #slide-21 .layer-label .name { font-size: 18px !important; }
+        #slide-20 .layer-label .zh,
+        #slide-21 .layer-label .zh { font-size: 14px !important; }
+        #slide-20 .layer-tag-right,
+        #slide-21 .layer-tag-right { font-size: 15px !important; padding: 3px 10px !important; }
+        #slide-21 .layer-row { padding: 8px 14px !important; }
+        #slide-20 .layer-row { padding: 12px 20px !important; }
+        #slide-20 .layer-row + .layer-row,
+        #slide-21 .layer-row + .layer-row { margin-top: 6px !important; }
+        #slide-20 .panel-header,
+        #slide-21 .panel-header { padding-bottom: 8px !important; margin-bottom: 12px !important; }
+        #slide-20 .panel-header h3,
+        #slide-21 .panel-header h3 { font-size: 20px !important; }
+        #slide-21 .cd-step { padding: 10px 16px !important; gap: 16px !important; }
+        #slide-21 .cd-step + .cd-step { margin-top: 0 !important; }
+        #slide-21 .cd-num { width: 40px !important; height: 40px !important; font-size: 20px !important; }
+        #slide-21 .cd-title { font-size: 20px !important; }
+        #slide-21 .cd-sub { font-size: 17px !important; }
+        #slide-21 .cd-tag { font-size: 16px !important; padding: 5px 12px !important; }
+        #slide-21 .trigger-bar { padding: 10px 18px !important; margin-bottom: 10px !important; }
+        #slide-21 .trigger-bar .cmd { font-size: 18px !important; }
+        #slide-21 .trigger-bar .icon { font-size: 22px !important; }
+        #slide-21 .trigger-bar .desc { font-size: 15px !important; }
+
+        /* === floating info box (URL + credentials) shown on pages 3-21 === */
+        .info-box {
+            position: absolute;
+            top: 1.1rem;
+            right: 1.5rem;
+            z-index: 30;
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 0.5rem;
+            padding: 0.4rem 1.2rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+            line-height: 1.25;
+        }
+        .info-box .url {
+            font-family: "JetBrains Mono", monospace;
+            font-weight: 700;
+            color: #0033A0;
+            font-size: 0.95rem;
+            text-align: center;
+        }
+        .info-box .creds {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.85rem;
+            margin-top: 0.15rem;
+            color: #475569;
+            font-size: 0.78rem;
+        }
+        .info-box .creds .divider {
+            width: 1px;
+            height: 0.85rem;
+            background: #d1d5db;
+        }
+        .info-box .creds .v {
+            font-family: "JetBrains Mono", monospace;
+            font-weight: 700;
+            color: #1e293b;
+        }
+        .info-box .creds .muted {
+            color: #94a3b8;
+            font-size: 0.7rem;
+        }
+
+        </style>
+</head>
+<body>
+
+    <!-- ===== page 1 :: gemini 1 ===== -->
+    <div class="slide-container active" id="slide-1" data-author="gemini">
+
+        <div class="slide-content justify-center items-center h-full">
+            <div class="grid grid-cols-2 gap-16 items-center w-full max-w-5xl">
+                <!-- 左側：標題 -->
+                <div class="border-l-8 border-brand-blue pl-8">
+                    <h1 class="text-6xl font-black text-brand-dark leading-snug mb-6 tracking-tight">
+                        Smart Order <br>
+                        <span class="text-brand-blue">Management System</span> <br>
+                        <span class="text-3xl text-gray-500 font-bold tech-font">(WOMS)</span>
+                    </h1>
+                    <p class="text-2xl text-gray-600 font-medium mt-6 leading-relaxed">
+                        晶圓代工訂單管理 <span class="text-brand-accent mx-2">+</span> 智慧排程系統
+                    </p>
+                </div>
+                <!-- 右側：Agenda -->
+                <div class="bg-gray-50 p-10 rounded-2xl shadow-lg border border-gray-100">
+                    <h3 class="text-2xl font-bold text-brand-blue mb-6 flex items-center border-b pb-4">
+                        <i class="fas fa-list-ul mr-3"></i> Agenda
+                    </h3>
+                    <ul class="space-y-4 text-xl font-medium text-gray-700">
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">01</span> User Story 與需求</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">02</span> 功能 demo</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">03</span> 開發規範與 CI</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">04</span> 訂單排程設計細節</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">05</span> 測試</li>
+                        <li class="flex items-center"><span class="tech-font text-brand-blue font-bold mr-4 bg-blue-100 px-2 py-1 rounded">06</span> AWS 部署與 CD</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">1</div>
+    
+    </div>
+    <!-- ===== page 3 :: min 1 ===== -->
+    <div class="slide-container" id="slide-3" data-author="min">
+
+  <div class="slide-header">
+    <div class="hbar"></div>
+    <div class="htitle">User Story</div>
+  </div>
+  <div class="slide-content">
+    <div class="s1-wrap">
+
+      <!-- 資深廠長 -->
+      <div class="s1-group grp-a">
+        <div class="s1-role-bar">
+          <span class="desc">統籌全局排程、熟悉現場限制、每天面對大量訂單的</span>
+          <span class="name">資深廠長(Scheduler)</span>
+        </div>
+        <div class="s1-stories">
+          <div class="s1-story">
+            <div class="s1-num">1</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">排程大部分交給系統<span class="hi">自動處理</span>，遇到例外時能透過<span class="hi">直觀介面</span>快速<span class="hi">微調</span></div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">把精力留在真正需要人工判斷的地方</div>
+            </div>
+          </div>
+          <div class="s1-story">
+            <div class="s1-num">2</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">針對特定客戶或<span class="hi">特殊情況</span>所做的排程安排，能確保<span class="hi">被系統保留</span></div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">不管系統怎麼重新排程，指定的訂單都會待在原來的位置</div>
+            </div>
+          </div>
+          <div class="s1-story">
+            <div class="s1-num">3</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">能即時查看整體<span class="hi">排程狀態</span>與<span class="hi">剩餘產能</span></div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">訂單有異動時掌握全局，做出正確的調度決策</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 訂單管理專員 -->
+      <div class="s1-group grp-b">
+        <div class="s1-role-bar">
+          <span class="desc">同時追蹤多筆訂單、及時掌握動態、隨時因應客戶臨時變更的</span>
+          <span class="name">訂單管理專員(Order Manager)</span>
+        </div>
+        <div class="s1-stories">
+          <div class="s1-story">
+            <div class="s1-num">4</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt"><span class="hi">即時</span>查看<span class="hi">自己</span>經手訂單目前的狀態（待排程／已排程／生產中／已完成／已取消）</div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">被詢問時能立即回覆，不需要花時間四處確認</div>
+            </div>
+          </div>
+          <div class="s1-story">
+            <div class="s1-num">5</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">清楚知道訂單現在<span class="hi">能不能改</span>，<span class="hi">操作後</span>立即知道有沒有成功</div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">避免在不該動的訂單上誤操作，每次都有明確的回饋</div>
+            </div>
+          </div>
+          <div class="s1-story">
+            <div class="s1-num">6</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">自己經手的訂單發生狀態<span class="hi">異動</span>時收到<span class="hi">即時通知</span></div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">第一時間掌握情況，不會在不知情下對客戶做出錯誤承諾</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  <div class="page-number">2</div>
+
+    </div>
+    <!-- ===== page 2 :: gemini 2 ===== -->
+    <div class="slide-container" id="slide-2" data-author="gemini">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">工程紀律 <span class="text-2xl text-gray-500 font-normal tech-font">(RULE.md)</span></h2>
+            <div class="flex-grow grid grid-cols-2 gap-8 mb-6">
+                <!-- 左側：規範 -->
+                <div class="highlight-box flex flex-col h-full">
+                    <h3 class="text-2xl font-bold text-brand-dark mb-6 flex items-center border-b-2 border-brand-blue pb-2">
+                        <i class="fas fa-ruler-combined text-brand-blue mr-3"></i> 規範
+                    </h3>
+                    <ul class="space-y-6 text-xl text-gray-700 flex-grow pt-4 flex flex-col">
+                        <li class="flex items-start"><i class="fas fa-check-circle text-brand-blue mt-1 mr-3"></i> <span><strong class="tech-font">12-Factor App</strong> 原則</span></li>
+                        <li class="flex items-start"><i class="fas fa-check-circle text-brand-blue mt-1 mr-3"></i> <span><strong class="tech-font">Bulletproof React</strong> 架構</span></li>
+                        <li class="flex items-start"><i class="fas fa-check-circle text-brand-blue mt-1 mr-3"></i> <span><strong class="tech-font">Google API / Python</strong> 規範</span></li>
+                        <li class="flex items-start"><i class="fas fa-check-circle text-brand-blue mt-1 mr-3"></i> <span><strong class="tech-font">FastAPI</strong> 嚴格分層架構</span></li>
+                    </ul>
+                </div>
+
+                <!-- 右側：CI -->
+                <div class="highlight-box flex flex-col bg-blue-50/50 h-full">
+                    <h3 class="text-2xl font-bold text-brand-dark mb-6 flex items-center w-full border-b-2 border-brand-blue pb-2">
+                        <i class="fas fa-cog text-brand-blue mr-3"></i> CI 管線
+                    </h3>
+
+                    <div class="flex flex-col items-center w-full max-w-sm font-bold text-lg mt-2 mx-auto">
+                        <div class="bg-gray-800 text-white px-6 py-2 rounded-full shadow-md w-32 text-center tech-font">PR</div>
+                        <i class="fas fa-arrow-down text-brand-blue my-2"></i>
+                        
+                        <!-- Backend Box -->
+                        <div class="border-2 border-brand-blue bg-white rounded-lg w-full p-4 shadow-sm text-center">
+                            <div class="text-brand-blue font-black mb-2 uppercase tracking-wide">Backend</div>
+                            <div class="grid grid-cols-1 gap-2 text-sm tech-font text-gray-700">
+                                <div class="bg-gray-100 py-1 rounded">ruff</div>
+                                <div class="bg-gray-100 py-1 rounded">mypy --strict</div>
+                                <div class="bg-brand-accent/20 py-1 rounded text-brand-dark">pytest (testcontainers)</div>
+                            </div>
+                        </div>
+                        
+                        <i class="fas fa-arrow-down text-brand-blue my-2"></i>
+                        
+                        <!-- Frontend Box -->
+                        <div class="border-2 border-green-600 bg-white rounded-lg w-full p-4 shadow-sm text-center">
+                            <div class="text-green-600 font-black mb-2 uppercase tracking-wide">Frontend</div>
+                            <div class="grid grid-cols-3 gap-2 text-sm tech-font text-gray-700">
+                                <div class="bg-gray-100 py-1 rounded">eslint</div>
+                                <div class="bg-gray-100 py-1 rounded">tsc</div>
+                                <div class="bg-gray-100 py-1 rounded">vitest</div>
+                            </div>
+                        </div>
+
+                        <i class="fas fa-arrow-down text-brand-blue my-2"></i>
+                        <div class="text-green-600 flex items-center text-xl bg-green-50 px-6 py-2 rounded-full shadow-sm tech-font">
+                            merge 🟢
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+        <div class="page-number">3</div>
+    
+    </div>
+    <!-- ===== page 4 :: inserted ===== -->
+    <div class="slide-container" id="slide-23" data-author="gemini">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">SonarScanner 檢測報告</h2>
+            <div class="flex-grow flex items-center justify-center">
+                <img src="sonar.png" alt="SonarScanner 檢測報告" class="max-w-full max-h-[85vh] object-contain rounded-md" />
+            </div>
+        </div>
+        <div class="page-number">4</div>
+
+    </div>
+    <!-- ===== page 5 :: inserted ===== -->
+    <div class="slide-container" id="slide-24" data-author="gemini">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">系統架構圖(本地端)</h2>
+            <div class="flex-grow flex items-center justify-center">
+                <img src="ar1.png" alt="系統架構圖(本地端)" class="max-w-full max-h-[80vh] object-contain rounded-md" />
+            </div>
+        </div>
+        <div class="page-number">5</div>
+
+    </div>
+    <!-- ===== page 6 :: inserted ===== -->
+    <div class="slide-container" id="slide-25" data-author="gemini">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">Sequence Diagram</h2>
+            <div class="flex-grow flex items-center justify-center">
+                <img src="ar2.png" alt="Sequence Diagram" class="max-w-full max-h-[80vh] object-contain rounded-md" />
+            </div>
+        </div>
+        <div class="page-number">6</div>
+
+    </div>
+    <!-- ===== page 7 :: inserted ===== -->
+    <div class="slide-container" id="slide-26" data-author="gemini">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">Sequence Diagram</h2>
+            <div class="flex-grow flex items-center justify-center">
+                <img src="ar3.png" alt="Sequence Diagram" class="max-w-full max-h-[80vh] object-contain rounded-md" />
+            </div>
+        </div>
+        <div class="page-number">7</div>
+
+    </div>
+    <!-- ===== page 8 :: inserted ===== -->
+    <div class="slide-container" id="slide-27" data-author="gemini">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">Sequence Diagram</h2>
+            <div class="flex-grow flex items-center justify-center">
+                <img src="ar4.png" alt="Sequence Diagram" class="max-w-full max-h-[80vh] object-contain rounded-md" />
+            </div>
+        </div>
+        <div class="page-number">8</div>
+
+    </div>
+    <!-- ===== page 9 :: inserted ===== -->
+    <div class="slide-container" id="slide-28" data-author="gemini">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">ER Model</h2>
+            <div class="flex-grow flex items-center justify-center">
+                <img src="ar5.png" alt="ER Model" class="max-w-full max-h-[80vh] object-contain rounded-md" />
+            </div>
+        </div>
+        <div class="page-number">9</div>
+
+    </div>
+    <!-- ===== page 7 :: cerosop 1 ===== -->
+    <div class="slide-container" id="slide-7" data-author="cerosop">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content mt-16">
+            <h2 class="slide-title">WOMS 架構 Pipeline 設計細節</h2>
+            
+            <p class="text-xl text-brand-slateText font-medium mb-8 leading-loose">
+                整體 pipeline 由 <span class="text-brand-accent font-bold">佇列解耦</span>、<span class="text-brand-accent font-bold">Worker 批次處理</span>、<span class="text-brand-accent font-bold">即時推播</span>三段組成。
+            </p>
+
+            <div class="flex-grow flex flex-col justify-center">
+                <!-- Visual Pipeline Diagram -->
+                <div class="relative grid grid-cols-4 gap-8 w-full max-w-7xl mx-auto items-stretch mt-8 mb-8">
+                    
+                    <!-- Line segment backdrop -->
+                    <div class="absolute left-10 right-10 top-1/2 h-1.5 bg-gradient-to-r from-brand-blue via-amber-500 via-purple-500 to-emerald-500 -translate-y-1/2 -z-10 opacity-30 rounded"></div>
+
+                    <!-- 1. Producer Node -->
+                    <div class="highlight-box bg-white flex flex-col justify-between p-6">
+                        <div>
+                            <div class="flex items-center gap-2.5 mb-4">
+                                <span class="w-10 h-10 rounded-xl bg-blue-100 flex items-center justify-center text-brand-blue text-sm"><i class="fa-solid fa-cloud"></i></span>
+                                <h4 class="font-bold text-slate-800 text-sm">Producer (FastAPI)</h4>
+                            </div>
+                            <p class="text-sm text-slate-600 mb-4 font-semibold leading-relaxed">接收使用者請求，鎖定訂單後將操作放入佇列。</p>
+                            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1.5 text-slate-700">
+                                <div class="text-brand-blue font-bold text-sm">訂單更新 API</div>
+                                <div class="text-xs text-slate-500">❶ 取得訂單鎖、標記處理中</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 2. Queue (Redis) -->
+                    <div class="highlight-box bg-white flex flex-col justify-between relative border-l-4 border-l-amber-500 p-6">
+                        <div>
+                            <div class="flex items-center gap-2.5 mb-4">
+                                <span class="w-10 h-10 rounded-xl bg-orange-100 flex items-center justify-center text-brand-accent text-sm"><i class="fa-solid fa-database"></i></span>
+                                <h4 class="font-bold text-slate-800 text-sm">Queue & State (Redis)</h4>
+                            </div>
+                            <p class="text-sm text-slate-600 mb-4 font-semibold leading-relaxed">暫存待處理的訂單操作與排程狀態。</p>
+                            <div class="bg-orange-50/50 border border-orange-200 rounded-xl p-3 text-slate-700 space-y-1.5">
+                                <div class="text-brand-accent font-bold text-sm">pending_ops</div>
+                                <div class="text-brand-blue font-bold text-sm">schedule:state</div>
+                            </div>
+                        </div>
+                        <div class="absolute top-1/2 -left-3.5 -translate-y-1/2 bg-brand-blue text-white w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shadow">1</div>
+                    </div>
+
+                    <!-- 3. Worker Node -->
+                    <div class="highlight-box bg-white flex flex-col justify-between relative border-l-4 border-l-purple-500 p-6">
+                        <div>
+                            <div class="flex items-center gap-2.5 mb-4">
+                                <span class="w-10 h-10 rounded-xl bg-purple-100 flex items-center justify-center text-purple-600 text-sm"><i class="fa-solid fa-gears"></i></span>
+                                <h4 class="font-bold text-slate-800 text-sm">Celery Worker</h4>
+                            </div>
+                            <p class="text-sm text-slate-600 mb-4 font-semibold leading-relaxed">從佇列取出整批操作，計算可接受的批次後更新排程。</p>
+                            <div class="bg-purple-50 border border-purple-200 rounded-xl p-3 text-slate-700 space-y-1.5">
+                                <div class="text-purple-700 font-bold text-sm">batch_admission()</div>
+                                <div class="text-xs text-slate-500">❷ 二分搜找最大可接受批次</div>
+                                <div class="text-xs text-slate-500">❸ 更新排程狀態</div>
+                            </div>
+                        </div>
+                        <div class="absolute top-1/2 -left-3.5 -translate-y-1/2 bg-purple-600 text-white w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shadow">2</div>
+                    </div>
+
+                    <!-- 4. Persistence & WS Node -->
+                    <div class="highlight-box bg-white flex flex-col justify-center relative border-l-4 border-l-emerald-500 p-6">
+                        <div class="space-y-3">
+                            <div class="border border-indigo-200 p-4 rounded-xl bg-indigo-50/40 space-y-1.5">
+                                <div class="text-sm font-bold text-indigo-800 flex items-center gap-1.5"><i class="fa-solid fa-server"></i> Postgres (DB)</div>
+                                <div class="text-xs text-slate-500 whitespace-nowrap">❹ 背景寫入訂單欄位</div>
+                                <div class="text-xs text-slate-500 whitespace-nowrap">❺ 解鎖、清除佇列</div>
+                            </div>
+                            <div class="border border-emerald-200 p-4 rounded-xl bg-emerald-50/40 space-y-1.5">
+                                <div class="text-sm font-bold text-emerald-800 flex items-center gap-1.5"><i class="fa-solid fa-wifi"></i> WebSocket</div>
+                                <div class="text-xs text-slate-500 whitespace-nowrap">❻ 推送結果至前端</div>
+                            </div>
+                        </div>
+                        <div class="absolute top-1/2 -left-3.5 -translate-y-1/2 bg-emerald-600 text-white w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shadow">3</div>
+                    </div>
+
+                </div>
+
+                <!-- Scheduling Timer Node -->
+                <div class="mt-6 flex justify-center">
+                    <div class="bg-amber-50 border border-amber-200 text-amber-800 font-bold px-5 py-2 rounded-full text-sm shadow-sm flex items-center gap-2">
+                        <i class="fa-regular fa-clock text-brand-accent"></i>
+                        <span>每天凌晨自動將時間軸往後推一天，並重新計算排程。</span>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+        <div class="page-number">10</div>
+    
+    </div>
+    <!-- ===== page 8 :: cerosop 2 ===== -->
+    <div class="slide-container" id="slide-8" data-author="cerosop">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content mt-16">
+            <h2 class="slide-title">演算法層分離 — 可維護性</h2>
+            
+            <p class="text-lg text-brand-slateText font-medium mb-6 leading-loose">
+                排程演算法獨立為 <span class="text-brand-accent font-bold">純邏輯模組</span>，與框架／儲存層完全解耦 → 易測試、易維護、易重建。
+            </p>
+
+            <div class="flex-grow flex items-center justify-center">
+                <div class="w-full max-w-5xl flex flex-col items-center">
+                    
+                    <!-- Core Pure Module Box -->
+                    <div class="bg-white border-2 border-brand-blue shadow-lg rounded-2xl px-10 py-8 relative w-full max-w-2xl text-center">
+                        <div class="absolute top-0 right-0 bg-brand-blue text-white text-xs px-4 py-1.5 rounded-bl font-bold">
+                            純邏輯模組
+                        </div>
+                        <div class="text-sm font-bold font-mono text-brand-blue mb-3">app/services/scheduling.py</div>
+                        <h3 class="text-2xl font-black text-slate-800 mb-4">排程演算法核心</h3>
+                        <div class="flex justify-center gap-6 text-base text-slate-600 font-semibold">
+                            <span class="flex items-center gap-1.5"><i class="fa-solid fa-circle-check text-emerald-600"></i>純函式</span>
+                            <span class="flex items-center gap-1.5"><i class="fa-solid fa-circle-xmark text-rose-500"></i>無 DB 依賴</span>
+                            <span class="flex items-center gap-1.5"><i class="fa-solid fa-circle-xmark text-rose-500"></i>無框架依賴</span>
+                        </div>
+                    </div>
+
+                    <!-- Arrow Branches -->
+                    <div class="w-full max-w-3xl flex justify-around items-start mt-2 relative" style="height: 60px;">
+                        <svg class="absolute inset-0 w-full h-full" viewBox="0 0 600 60" preserveAspectRatio="none">
+                            <path d="M 300 0 L 100 60" stroke="#0033A0" stroke-width="2" fill="none" opacity="0.5"/>
+                            <path d="M 300 0 L 300 60" stroke="#0033A0" stroke-width="2" fill="none" opacity="0.5"/>
+                            <path d="M 300 0 L 500 60" stroke="#0033A0" stroke-width="2" fill="none" opacity="0.5"/>
+                        </svg>
+                    </div>
+
+                    <!-- 3 共用路徑（簡潔的小 label 而非完整卡片）-->
+                    <div class="w-full max-w-3xl grid grid-cols-3 gap-4">
+                        <div class="bg-blue-50 border border-blue-200 rounded-xl py-3 px-4 text-center">
+                            <div class="text-base font-bold text-brand-blue">Worker 排程</div>
+                            <div class="text-xs text-slate-500 mt-1">背景批次計算</div>
+                        </div>
+                        <div class="bg-emerald-50 border border-emerald-200 rounded-xl py-3 px-4 text-center">
+                            <div class="text-base font-bold text-emerald-700">單元測試</div>
+                            <div class="text-xs text-slate-500 mt-1">毫秒級驗證</div>
+                        </div>
+                        <div class="bg-purple-50 border border-purple-200 rounded-xl py-3 px-4 text-center">
+                            <div class="text-base font-bold text-purple-700">災後重建</div>
+                            <div class="text-xs text-slate-500 mt-1">從 DB 重算排程</div>
+                        </div>
+                    </div>
+
+                    <!-- Bottom callout for maintainability -->
+                    <div class="mt-8 bg-amber-50 border border-amber-200 rounded-xl px-6 py-3 text-base text-slate-700 font-semibold flex items-center gap-2">
+                        <i class="fa-solid fa-wrench text-brand-accent"></i>
+                        <span>改一處邏輯，<span class="text-brand-accent font-bold">三處同時生效</span> ── 維護成本顯著降低</span>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+        <div class="page-number">11</div>
+    
+    </div>
+    <!-- ===== page 9 :: cerosop 3 ===== -->
+    <div class="slide-container" id="slide-9" data-author="cerosop">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content mt-16">
+            <h2 class="slide-title">Batch Admission 二分搜算力優化</h2>
+            
+            <p class="text-lg text-brand-slateText font-medium mb-3 leading-loose">
+                <span class="text-brand-accent font-bold">批次准入 (Batch Admission)</span>：用<span class="text-brand-accent font-bold">二分搜</span>一次找出最大可接受批次，避免逐筆計算的重複成本。
+            </p>
+
+            <!-- Compare Box Side by Side -->
+            <div class="grid grid-cols-2 gap-6 mb-4">
+                <!-- Red Box: Per-op -->
+                <div class="bg-rose-50/70 border-2 border-rose-100 rounded-xl p-4 flex flex-col justify-between shadow-sm">
+                    <div>
+                        <div class="flex items-center justify-between border-b border-rose-100 pb-2 mb-2">
+                            <span class="bg-rose-100 text-rose-700 px-3 py-1 rounded-lg text-sm font-bold">❌ 逐筆處理</span>
+                        </div>
+                        <p class="text-sm text-slate-600 leading-relaxed font-semibold mt-1">
+                            N 筆訂單操作需做 N 次獨立的排程結構維護。
+                        </p>
+                    </div>
+                    <!-- Complexity highlight -->
+                    <div class="mt-4 pt-3 border-t border-rose-100/50 flex items-center justify-between">
+                        <span class="text-sm font-bold text-slate-500">時間複雜度</span>
+                        <div class="bg-rose-100 text-rose-800 font-mono font-black text-base px-3 py-1 rounded-lg border border-rose-200">
+                            O(N &middot; D log D)
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Green Box: Batch Admission -->
+                <div class="bg-emerald-50/70 border-2 border-emerald-100 rounded-xl p-4 flex flex-col justify-between shadow-sm">
+                    <div>
+                        <div class="flex items-center justify-between border-b border-emerald-100 pb-2 mb-2">
+                            <span class="bg-emerald-100 text-emerald-800 px-3 py-1 rounded-lg text-sm font-bold">✅ 批次准入</span>
+                        </div>
+                        <p class="text-sm text-slate-600 leading-relaxed font-semibold mt-1">
+                            用二分搜找最大可接受批次後，<span class="text-emerald-700 font-bold">只做 1 次結構維護</span>。
+                        </p>
+                    </div>
+                    <!-- Complexity highlight -->
+                    <div class="mt-4 pt-3 border-t border-emerald-100 flex items-center justify-between">
+                        <span class="text-sm font-bold text-slate-600">時間複雜度</span>
+                        <div class="bg-emerald-600 text-white font-mono font-black text-base px-3 py-1 rounded-lg border border-emerald-500">
+                            O((N + D log D) log N)
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Algorithm 4 Steps (No Click Required) -->
+            <div class="bg-white border-2 border-slate-200 shadow-md rounded-2xl p-5 flex-grow flex flex-col justify-between">
+                <!-- Header with Automatic Indicator -->
+                <div class="flex justify-between items-center pb-2.5 border-b border-slate-100 mb-3">
+                    <div class="flex items-center gap-2">
+                        <span class="bg-brand-blue text-white text-sm font-bold px-2.5 py-0.5 rounded">批次二分搜演示</span>
+                    </div>
+                    <div class="flex items-center gap-2 text-xs font-bold text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>
+                        <span id="auto-play-status">自動播放中</span>
+                    </div>
+                </div>
+
+                <!-- 4 Steps Columns / Descriptions based on Current Demonstration Step -->
+                <div class="bg-slate-50 border border-slate-200/60 rounded-xl p-4 mb-4">
+                    <div class="flex items-start gap-3">
+                        <div class="bg-brand-blue text-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-sm shrink-0" id="step-number-badge">1</div>
+                        <div>
+                            <h4 class="font-bold text-slate-800 text-base" id="step-title">步驟 1：從佇列讀進整批訂單</h4>
+                            <p class="text-sm text-slate-600 mt-1 font-semibold" id="step-desc">
+                                Worker 將佇列中的 8 筆操作一次讀進記憶體。
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 8 Interactive Queue Cards (Dynamic Simulation Canvas with C3 overload indicator!) -->
+                <div class="space-y-2 mb-4">
+                    <div class="flex justify-between items-center px-1">
+                        <span class="text-sm text-slate-600 font-bold">待批佇列 [C1..C8]（容量上限 100t）</span>
+                        <span class="text-sm text-rose-600 font-bold flex items-center gap-1"><i class="fa-solid fa-triangle-exclamation"></i> C3 (130t) 超載</span>
+                    </div>
+                    
+                    <div class="grid grid-cols-8 gap-2.5 items-stretch">
+                        <!-- C1 -->
+                        <div class="border-2 border-slate-200 rounded-xl p-3 bg-slate-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden" id="node-c1">
+                            <span class="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[10px] font-mono font-bold" id="badge-c1">QUEUEING</span>
+                            <div class="my-2">
+                                <span class="text-sm font-black font-mono text-slate-800 block">C1 [訂單一]</span>
+                                <span class="text-xs text-slate-600 font-bold block mt-1">需求: 30t</span>
+                            </div>
+                            <span class="text-xs text-slate-500 font-bold leading-tight mt-1.5" id="sub-c1">等待中</span>
+                        </div>
+                        <!-- C2 -->
+                        <div class="border-2 border-slate-200 rounded-xl p-3 bg-slate-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden" id="node-c2">
+                            <span class="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[10px] font-mono font-bold" id="badge-c2">QUEUEING</span>
+                            <div class="my-2">
+                                <span class="text-sm font-black font-mono text-slate-800 block">C2 [訂單二]</span>
+                                <span class="text-xs text-slate-600 font-bold block mt-1">需求: 40t</span>
+                            </div>
+                            <span class="text-xs text-slate-500 font-bold leading-tight mt-1.5" id="sub-c2">等待中</span>
+                        </div>
+                        <!-- C3 (Specific Overload Source Card!) -->
+                        <div class="border-2 border-red-200 rounded-xl p-3 bg-red-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden" id="node-c3">
+                            <span class="bg-rose-250 text-rose-800 px-2 py-0.5 rounded text-[10px] font-mono font-bold" id="badge-c3">OVERLOAD</span>
+                            <div class="my-2">
+                                <span class="text-sm font-bold text-rose-800 block">C3 (超載)</span>
+                                <span class="text-xs text-rose-600 font-black block mt-1">需求: 130t</span>
+                            </div>
+                            <span class="text-xs text-rose-700 font-black leading-tight mt-1.5" id="sub-c3">超出上限</span>
+                        </div>
+                        <!-- C4 -->
+                        <div class="border-2 border-slate-200 rounded-xl p-3 bg-slate-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden" id="node-c4">
+                            <span class="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[10px] font-mono font-bold" id="badge-c4">QUEUEING</span>
+                            <div class="my-2">
+                                <span class="text-sm font-black font-mono text-slate-800 block">C4 [訂單四]</span>
+                                <span class="text-xs text-slate-600 font-bold block mt-1">需求: 40t</span>
+                            </div>
+                            <span class="text-xs text-slate-500 font-bold leading-tight mt-1.5" id="sub-c4">等待中</span>
+                        </div>
+                        <!-- C5 -->
+                        <div class="border-2 border-slate-200 rounded-xl p-3 bg-slate-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden" id="node-c5">
+                            <span class="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[10px] font-mono font-bold" id="badge-c5">QUEUEING</span>
+                            <div class="my-2">
+                                <span class="text-sm font-black font-mono text-slate-800 block">C5 [訂單五]</span>
+                                <span class="text-xs text-slate-600 font-bold block mt-1">需求: 20t</span>
+                            </div>
+                            <span class="text-xs text-slate-500 font-bold leading-tight mt-1.5" id="sub-c5">等待中</span>
+                        </div>
+                        <!-- C6 -->
+                        <div class="border-2 border-slate-200 rounded-xl p-3 bg-slate-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden" id="node-c6">
+                            <span class="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[10px] font-mono font-bold" id="badge-c6">QUEUEING</span>
+                            <div class="my-2">
+                                <span class="text-sm font-black font-mono text-slate-800 block">C6 [訂單六]</span>
+                                <span class="text-xs text-slate-600 font-bold block mt-1">需求: 30t</span>
+                            </div>
+                            <span class="text-xs text-slate-500 font-bold leading-tight mt-1.5" id="sub-c6">等待中</span>
+                        </div>
+                        <!-- C7 -->
+                        <div class="border-2 border-slate-200 rounded-xl p-3 bg-slate-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden" id="node-c7">
+                            <span class="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[10px] font-mono font-bold" id="badge-c7">QUEUEING</span>
+                            <div class="my-2">
+                                <span class="text-sm font-black font-mono text-slate-800 block">C7 [訂單七]</span>
+                                <span class="text-xs text-slate-600 font-bold block mt-1">需求: 50t</span>
+                            </div>
+                            <span class="text-xs text-slate-500 font-bold leading-tight mt-1.5" id="sub-c7">等待中</span>
+                        </div>
+                        <!-- C8 -->
+                        <div class="border-2 border-slate-200 rounded-xl p-3 bg-slate-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden" id="node-c8">
+                            <span class="bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[10px] font-mono font-bold" id="badge-c8">QUEUEING</span>
+                            <div class="my-2">
+                                <span class="text-sm font-black font-mono text-slate-800 block">C8 [訂單八]</span>
+                                <span class="text-xs text-slate-600 font-bold block mt-1">需求: 40t</span>
+                            </div>
+                            <span class="text-xs text-slate-500 font-bold leading-tight mt-1.5" id="sub-c8">等待中</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Control Buttons for Manual Play / Next -->
+                <div class="flex justify-between items-center pt-2.5 border-t border-slate-100">
+                    <div class="text-sm text-slate-500 flex items-center gap-1.5">
+                        <span class="font-bold text-slate-700">當前搜尋區間：</span>
+                        <span class="font-mono bg-blue-50 text-brand-blue font-bold px-2 py-0.5 rounded-sm border border-blue-200/50" id="current-search-range">[1..8] 全區間</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="event.stopPropagation(); toggleAutoPlay()" class="flex items-center gap-1 text-xs font-bold border border-slate-300 text-slate-700 bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded-lg transition-all" id="play-pause-btn">
+                            <i class="fa-solid fa-pause"></i> <span>暫停</span>
+                        </button>
+                        <button onclick="event.stopPropagation(); resetSearchDemo()" class="flex items-center gap-1 text-xs font-bold ring-1 ring-slate-200 hover:ring-slate-300 text-slate-600 bg-white px-3 py-1.5 rounded-lg transition-all">
+                            <i class="fa-solid fa-rotate-left"></i> <span>重置</span>
+                        </button>
+                        <button onclick="event.stopPropagation(); stepNextDemo()" class="flex items-center gap-1 text-xs font-bold text-white bg-brand-blue hover:bg-brand-light px-4 py-1.5 rounded-lg shadow-md transition-all shrink-0" id="next-step-btn">
+                            <span>下一步</span> <i class="fa-solid fa-chevron-right"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">12</div>
+    
+    </div>
+    <!-- ===== page 10 :: cerosop 4 ===== -->
+    <div class="slide-container" id="slide-10" data-author="cerosop">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content mt-16">
+            <h2 class="slide-title">Fast / Slow 解耦與投機式平行 — 高響應與可擴展性</h2>
+            
+            <p class="text-lg text-brand-slateText font-medium mb-4 leading-loose">
+                兩個關鍵設計：<span class="text-brand-accent font-bold">Fast / Slow 路徑解耦</span>（記憶體判斷／背景寫 DB）＋ <span class="text-brand-accent font-bold">投機式平行二分搜</span>（多 Worker 同時試算）。
+            </p>
+
+            <div class="grid grid-cols-2 gap-6 flex-grow items-stretch select-text">
+                <!-- Fast vs Slow Path Highlight -->
+                <div class="highlight-box flex flex-col justify-between bg-white">
+                    <div>
+                        <div class="flex items-center gap-2 border-b-2 border-brand-blue pb-3 mb-3">
+                            <span class="p-1.5 bg-blue-100 rounded text-brand-blue flex items-center justify-center"><i class="fa-solid fa-bolt"></i></span>
+                            <h3 class="text-xl font-black text-slate-800">1. Fast / Slow 路徑解耦</h3>
+                        </div>
+                        <p class="text-base text-slate-600 mb-4 leading-relaxed font-semibold">
+                            算法判斷快、DB 寫入慢，因此將兩者拆開。
+                        </p>
+
+                        <div class="space-y-3">
+                            <div class="border border-slate-100 bg-[#f8fafc] p-3.5 rounded-xl">
+                                <span class="text-base font-bold text-emerald-600 flex items-center gap-1"><i class="fa-solid fa-bolt text-sm"></i> ⚡ 快速路徑 (Fast)</span>
+                                <p class="text-sm text-slate-600 leading-relaxed font-semibold mt-1">
+                                    在記憶體中<span class="text-emerald-700 font-bold">快速判斷批次可不可行</span>，確認後即刻回應使用者，不用等資料庫。
+                                </p>
+                            </div>
+
+                            <div class="border border-slate-100 bg-[#f8fafc] p-3.5 rounded-xl">
+                                <span class="text-base font-bold text-amber-600 flex items-center gap-1"><i class="fa-solid fa-hard-drive text-sm"></i> 🐌 慢速路徑 (Slow)</span>
+                                <p class="text-sm text-slate-600 leading-relaxed font-semibold mt-1">
+                                    <span class="text-amber-700 font-bold">背景執行寫入 DB</span>，並將多筆寫入合併以降低資料庫負擔。
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Speculative Parallel Search Timeline -->
+                <div class="highlight-box flex flex-col justify-between bg-white border-l-4 border-l-brand-accent">
+                    <div>
+                        <div class="flex items-center gap-2 border-b-2 border-brand-blue pb-3 mb-3">
+                            <span class="p-1.5 bg-orange-100 rounded text-brand-accent flex items-center justify-center"><i class="fa-solid fa-timeline"></i></span>
+                            <h3 class="text-xl font-black text-slate-800">2. 投機式平行二分搜</h3>
+                        </div>
+                        <p class="text-base text-slate-600 mb-4 leading-relaxed font-semibold">
+                            多個 Worker 同時試算不同的批次大小，把循序的 log N 輪壓成單輪並行。
+                        </p>
+
+                        <!-- Horizontal spec visualization -->
+                        <div class="bg-indigo-950 text-slate-200 p-4 rounded-xl font-mono text-sm space-y-3 mt-4 select-text border border-indigo-900">
+                            <div class="text-amber-400 font-bold border-b border-indigo-800 pb-2 text-xs tracking-wider">同時試算（不同批次大小）</div>
+                            <div class="space-y-2">
+                                <div class="flex justify-between">
+                                    <span class="text-indigo-300 font-bold bg-indigo-900/60 px-2 py-0.5 rounded">Worker A</span>
+                                    <span class="text-slate-300">試 N 筆 → ❌ 不可行</span>
+                                </div>
+                                <div class="flex justify-between">
+                                    <span class="text-indigo-300 font-bold bg-indigo-900/60 px-2 py-0.5 rounded">Worker B</span>
+                                    <span class="text-slate-300">試 N/2 筆 → ❌ 不可行</span>
+                                </div>
+                                <div class="flex justify-between text-emerald-400 font-bold">
+                                    <span class="bg-emerald-950/60 px-2 py-0.5 rounded">Worker C</span>
+                                    <span>試 N/4 筆 → ✅ 通過</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="bg-indigo-50 border border-indigo-100 p-3 rounded-xl text-center text-sm font-bold text-indigo-900 mt-4">
+                        🚀 增加 Worker 數量即可擴展，<span class="text-brand-accent">支援更高吞吐量</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">13</div>
+    
+    </div>
+    <!-- ===== page 11 :: cerosop 5 ===== -->
+    <div class="slide-container" id="slide-11" data-author="cerosop">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content mt-16">
+            <h2 class="slide-title">可靠性與可恢復性</h2>
+            
+            <p class="text-lg text-brand-slateText font-medium mb-4 leading-loose">
+                <span class="text-brand-accent font-bold">三道防線</span>防止 silent failure；<span class="text-brand-accent font-bold">rebuild</span> 機制應對 Redis 異常或演算法升版。
+            </p>
+
+            <div class="grid grid-cols-3 gap-5 flex-grow py-1">
+                <!-- Guard 1 -->
+                <div class="highlight-box bg-white flex flex-col justify-between">
+                    <div>
+                        <div class="flex items-center gap-2 mb-3 text-brand-blue">
+                            <span class="p-2 bg-blue-50 text-brand-blue rounded-lg text-base"><i class="fa-solid fa-circle-exclamation"></i></span>
+                            <h4 class="font-bold text-slate-800 text-lg">🛡️ 佇列訊息格式檢查</h4>
+                        </div>
+                        <p class="text-base text-slate-700 leading-relaxed">
+                            從佇列取出操作時，<span class="font-bold text-brand-blue">立即檢查欄位與格式</span>。發現異常立即<span class="font-bold text-brand-blue">留下紀錄並告警</span>，不會默默讓訂單卡死。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Guard 2 -->
+                <div class="highlight-box bg-white flex flex-col justify-between border-l-4 border-l-brand-accent">
+                    <div>
+                        <div class="flex items-center gap-2 mb-3 text-brand-accent">
+                            <span class="p-2 bg-orange-50 text-brand-accent rounded-lg text-base"><i class="fa-solid fa-shield-halved"></i></span>
+                            <h4 class="font-bold text-slate-800 text-lg">🛡️ 演算法內部狀態檢查</h4>
+                        </div>
+                        <p class="text-base text-slate-700 leading-relaxed">
+                            每次移除訂單後，驗證<span class="font-bold text-brand-accent">「樹中容量」與「實體訂單數量」是否一致</span>。對不上立即中斷錯誤，並<span class="font-bold text-brand-accent">將影響範圍限縮在該筆訂單</span>。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Guard 3 -->
+                <div class="highlight-box bg-[#fafbfe] flex flex-col justify-between border-t-4 border-t-purple-500 shadow-lg">
+                    <div>
+                        <div class="flex items-center gap-2 mb-3 text-purple-700">
+                            <span class="p-2 bg-purple-50 text-purple-600 rounded-lg text-base"><i class="fa-solid fa-arrows-spin"></i></span>
+                            <h4 class="font-bold text-purple-800 text-lg">🔄 災後重建 rebuild</h4>
+                        </div>
+                        <p class="text-base text-slate-700 leading-relaxed">
+                            當 Redis 被<span class="font-bold text-purple-700">清空、損毀或演算法升版</span>時，可直接<span class="font-bold text-purple-700">從 DB 重掃所有訂單</span>，重新計算並重建記憶體中的排程結構。
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">14</div>
+    
+    </div>
+    <!-- ===== page 12 :: cerosop 6 ===== -->
+    <div class="slide-container" id="slide-12" data-author="cerosop">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content mt-16">
+            <h2 class="slide-title">一致性保證</h2>
+            
+            <p class="text-lg text-brand-slateText font-medium mb-4 leading-loose">
+                <span class="text-brand-accent font-bold">Worker 唯一寫入者</span> + <span class="text-brand-accent font-bold">悲觀鎖 + 樂觀鎖</span>雙重防護，確保排程狀態與 DB 永遠一致。
+            </p>
+
+            <div class="grid grid-cols-2 gap-6 flex-grow items-stretch select-text">
+                <!-- Single Writer flow desc -->
+                <div class="highlight-box bg-white flex flex-col justify-between">
+                    <div>
+                        <h4 class="font-bold text-slate-800 text-lg mb-3 border-b border-slate-200 pb-2 flex items-center gap-1">
+                            <span class="p-1 bg-blue-100 rounded text-brand-blue text-sm"><i class="fa-solid fa-file-pen"></i></span>
+                            1. Worker 為唯一寫入者
+                        </h4>
+                        <p class="text-sm text-slate-600 mb-4 leading-relaxed font-semibold">
+                            只有 Worker 能寫入訂單欄位，Producer 端僅負責鎖定與排入佇列
+                        </p>
+
+                        <!-- Step-based flow (clean, monochrome blue) -->
+                        <div class="bg-slate-50 border border-slate-200 p-5 rounded-2xl mt-4 space-y-3">
+                            <!-- Step 1 -->
+                            <div class="flex items-start gap-3">
+                                <span class="bg-brand-blue text-white font-bold rounded-full w-8 h-8 flex items-center justify-center text-sm shrink-0">1</span>
+                                <div class="flex-1">
+                                    <div class="text-base font-bold text-slate-800">Producer 接收請求</div>
+                                    <div class="text-sm text-slate-600 mt-0.5 leading-relaxed">鎖定訂單、放入佇列。<span class="text-slate-800 font-bold">此時 DB 暫不更新欄位</span></div>
+                                </div>
+                            </div>
+                            <!-- Step 2 -->
+                            <div class="flex items-start gap-3">
+                                <span class="bg-brand-blue text-white font-bold rounded-full w-8 h-8 flex items-center justify-center text-sm shrink-0">2</span>
+                                <div class="flex-1">
+                                    <div class="text-base font-bold text-slate-800">Worker 進行批次准入</div>
+                                    <div class="text-sm text-slate-600 mt-0.5 leading-relaxed">從佇列取出整批操作，計算是否可接受</div>
+                                </div>
+                            </div>
+                            <!-- Step 3 -->
+                            <div class="flex items-start gap-3">
+                                <span class="bg-brand-blue text-white font-bold rounded-full w-8 h-8 flex items-center justify-center text-sm shrink-0">3</span>
+                                <div class="flex-1">
+                                    <div class="text-base font-bold text-slate-800">依結果寫入 DB</div>
+                                    <div class="text-sm text-slate-600 mt-0.5 leading-relaxed">
+                                        ✅ <span class="font-bold">接受</span>：更新訂單欄位與排程狀態 ／ ❌ <span class="font-bold">拒絕</span>：DB 不變更
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- Step 4 -->
+                            <div class="flex items-start gap-3">
+                                <span class="bg-brand-blue text-white font-bold rounded-full w-8 h-8 flex items-center justify-center text-sm shrink-0">4</span>
+                                <div class="flex-1">
+                                    <div class="text-base font-bold text-slate-800">解除訂單鎖定</div>
+                                    <div class="text-sm text-slate-600 mt-0.5 leading-relaxed">不論接受或拒絕都會清除鎖定標記</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Locks comparison blocks (Instead of crowded table) -->
+                <div class="highlight-box bg-white flex flex-col justify-between border-l-4 border-l-brand-accent">
+                    <div>
+                        <h4 class="font-bold text-slate-800 text-lg mb-3 border-b border-slate-200 pb-2 flex items-center gap-1">
+                            <span class="p-1 bg-orange-100 rounded text-brand-accent text-sm"><i class="fa-solid fa-lock"></i></span>
+                            2. 悲觀鎖與樂觀鎖雙重防護
+                        </h4>
+                        <p class="text-sm text-slate-600 mb-4 leading-relaxed font-semibold">
+                            悲觀鎖確保<span class="font-bold">一次只有一個請求能寫</span>；樂觀鎖確保<span class="font-bold">寫入時資料未被別人改過</span>。
+                        </p>
+
+                        <!-- Lock cards -->
+                        <div class="space-y-3">
+                            <div class="bg-[#fffbeb] border border-amber-100 p-3.5 rounded-xl">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-base font-bold text-amber-800 flex items-center gap-1">🔒 悲觀鎖 (SELECT FOR UPDATE)</span>
+                                </div>
+                                <p class="text-sm text-slate-600 leading-relaxed font-semibold mt-1">
+                                    <span class="font-bold text-amber-700">擋的是</span>：同筆訂單<span class="font-bold">同時間湧入</span>的多筆 UPDATE，強制排隊處理。
+                                </p>
+                            </div>
+
+                            <div class="bg-indigo-50 border border-indigo-100 p-3.5 rounded-xl">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-base font-bold text-indigo-800 flex items-center gap-1">🔓 樂觀鎖 (Version)</span>
+                                </div>
+                                <p class="text-sm text-slate-600 leading-relaxed font-semibold mt-1">
+                                    <span class="font-bold text-indigo-700">擋的是</span>：編輯頁開很久後存檔，造成<span class="font-bold">覆蓋掉別人改過的資料</span>。比對版號才允許寫入。
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="bg-amber-50 border border-dashed border-brand-accent p-3 rounded-xl text-sm font-bold mt-4 text-center text-slate-800">
+                        📊 大量 concurrent PATCH 壓測： 
+                        <span class="data-placeholder font-black text-emerald-600" id="state-db-consistency" onclick="openControlConsole()">100%</span> 一致
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">15</div>
+    
+    </div>
+    <!-- ===== page 13 :: cerosop 7 ===== -->
+    <div class="slide-container" id="slide-13" data-author="cerosop">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content mt-16">
+            <h2 class="slide-title">通知系統</h2>
+            
+            <p class="text-lg text-brand-slateText font-medium mb-4 leading-loose">
+                <span class="text-brand-accent font-bold">雙路徑通知</span>：WebSocket 即時推送（毫秒級反映）＋ Notifications 資料表（離線也不漏訊息）。
+            </p>
+
+            <div class="grid grid-cols-2 gap-6 flex-grow select-text">
+                <!-- Path 1: Real-time Push -->
+                <div class="bg-blue-50/70 border border-blue-200 p-6 rounded-2xl flex flex-col">
+                    <div>
+                        <span class="text-sm font-bold bg-blue-100 text-[#0033A0] px-2.5 py-1 rounded-full">⚡ 即時推送</span>
+                        <h3 class="font-extrabold text-[#0033A0] text-xl mt-3">WebSocket</h3>
+                        <p class="text-base text-slate-600 leading-relaxed font-semibold mt-3">
+                            Worker 完成排程後立即廣播，前端即時收到並更新畫面。
+                        </p>
+                    </div>
+
+                    <!-- Real-time pipeline layout -->
+                    <div class="bg-white border border-blue-100 p-3 rounded-xl mt-3 text-sm text-slate-700 space-y-1.5">
+                        <div class="flex items-center gap-1.5 font-bold">
+                            <span class="bg-[#0033A0] text-white px-3 py-1.5 rounded text-xs inline-flex items-center justify-center leading-none">Worker</span>
+                            <span>完成排程運算</span>
+                        </div>
+                        <div class="pl-4 text-slate-400 text-xs">↓ Redis Pub/Sub</div>
+                        <div class="flex items-center gap-1.5 font-bold">
+                            <span class="bg-[#0033A0] text-white px-3 py-1.5 rounded text-xs inline-flex items-center justify-center leading-none">FastAPI</span>
+                            <span>訂閱事件</span>
+                        </div>
+                        <div class="pl-4 text-slate-400 text-xs">↓ WebSocket</div>
+                        <div class="flex items-center gap-1.5 font-bold">
+                            <span class="bg-emerald-600 text-white px-3 py-1.5 rounded text-xs inline-flex items-center justify-center leading-none">前端</span>
+                            <span>即時更新介面</span>
+                        </div>
+                    </div>
+
+                    <div class="bg-white border border-blue-100 p-3 rounded-xl mt-3">
+                        <p class="text-sm text-slate-600 leading-relaxed font-semibold">
+                            ⚡ 讓使用者<span class="font-bold text-[#0033A0]">毫秒級看到</span>排程結果與容量變化。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Path 2: Persistent Storage -->
+                <div class="bg-indigo-50/70 border border-indigo-200 p-6 rounded-2xl flex flex-col">
+                    <div>
+                        <span class="text-sm font-bold bg-indigo-100 text-indigo-800 px-2.5 py-1 rounded-full">💾 持久化儲存</span>
+                        <h3 class="font-extrabold text-indigo-800 text-xl mt-3">Notifications 資料表</h3>
+                        <p class="text-base text-slate-600 leading-relaxed font-semibold mt-3">
+                            重要事件同步寫入資料庫，<span class="font-bold text-indigo-800">即使使用者離線也不會漏掉</span>。
+                        </p>
+                    </div>
+
+                    <!-- Notification list schema representation -->
+                    <div class="bg-white border border-indigo-100 p-3 rounded-xl mt-3 text-sm text-slate-700">
+                        <div class="text-indigo-800 font-bold border-b border-indigo-100 pb-1.5 mb-2 text-xs">資料表結構</div>
+                        <div class="grid grid-cols-2 gap-x-3 gap-y-1.5 text-sm">
+                            <div>🆔 <span class="font-bold">id</span></div>
+                            <div>🔔 <span class="font-bold">event_type</span></div>
+                            <div>📝 <span class="font-bold">message</span></div>
+                            <div>🕒 <span class="font-bold">created_at</span></div>
+                            <div>👀 <span class="font-bold">is_read</span></div>
+                            <div>👤 <span class="font-bold">user_id</span></div>
+                        </div>
+                    </div>
+
+                    <div class="bg-white border border-indigo-100 p-3 rounded-xl mt-3">
+                        <p class="text-sm text-slate-600 leading-relaxed font-semibold">
+                            💾 下次登入時<span class="font-bold text-indigo-800">仍可看到未讀通知</span>。
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">16</div>
+    
+    </div>
+    <!-- ===== page 14 :: cerosop 8 ===== -->
+    <div class="slide-container" id="slide-14" data-author="cerosop">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content mt-16">
+            <h2 class="slide-title">非功能性需求總表</h2>
+            
+            <p class="text-lg text-brand-slateText font-medium mb-5 leading-loose">
+                本模組在六項 NFR 上的實作摘要：
+            </p>
+
+            <div class="grid grid-cols-2 gap-5 flex-grow py-2 select-text">
+                <!-- NFR 1 -->
+                <div class="bg-white border border-slate-200 hover:border-brand-blue rounded-xl p-5 transition-all flex items-start gap-3">
+                    <span class="text-3xl mt-0.5">🚀</span>
+                    <div>
+                        <h4 class="font-bold text-slate-800 text-lg">可擴展性 (Scalability)</h4>
+                        <p class="text-sm text-slate-600 leading-relaxed mt-1.5 font-semibold">
+                            <span class="text-brand-accent font-bold">批次准入二分搜</span> + <span class="text-brand-accent font-bold">投機式平行</span>，可透過增加 Worker 擴展。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- NFR 2 -->
+                <div class="bg-white border border-slate-200 hover:border-brand-blue rounded-xl p-5 transition-all flex items-start gap-3">
+                    <span class="text-3xl mt-0.5">⚡</span>
+                    <div>
+                        <h4 class="font-bold text-slate-800 text-lg">高響應 (Responsiveness)</h4>
+                        <p class="text-sm text-slate-600 leading-relaxed mt-1.5 font-semibold">
+                            <span class="text-brand-accent font-bold">Fast / Slow 解耦</span>：在記憶體中快速判斷、背景非同步寫入 DB。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- NFR 3 -->
+                <div class="bg-white border border-slate-200 hover:border-brand-blue rounded-xl p-5 transition-all flex items-start gap-3">
+                    <span class="text-3xl mt-0.5">🛡️</span>
+                    <div>
+                        <h4 class="font-bold text-slate-800 text-lg">可靠性 (Reliability)</h4>
+                        <p class="text-sm text-slate-600 leading-relaxed mt-1.5 font-semibold">
+                            <span class="text-brand-accent font-bold">避免 silent failure</span>：佇列訊息格式檢查 + 演算法內部狀態檢查。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- NFR 4 -->
+                <div class="bg-white border border-slate-200 hover:border-brand-blue rounded-xl p-5 transition-all flex items-start gap-3">
+                    <span class="text-3xl mt-0.5">🔄</span>
+                    <div>
+                        <h4 class="font-bold text-slate-800 text-lg">可恢復性 (Recoverability)</h4>
+                        <p class="text-sm text-slate-600 leading-relaxed mt-1.5 font-semibold">
+                            提供 <span class="text-brand-accent font-bold">rebuild 功能</span>：可從 DB 重新計算並重建排程狀態。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- NFR 5 -->
+                <div class="bg-white border border-slate-200 hover:border-brand-blue rounded-xl p-5 transition-all flex items-start gap-3">
+                    <span class="text-3xl mt-0.5">⚖️</span>
+                    <div>
+                        <h4 class="font-bold text-slate-800 text-lg">一致性 (Consistency)</h4>
+                        <p class="text-sm text-slate-600 leading-relaxed mt-1.5 font-semibold">
+                            <span class="text-brand-accent font-bold">Worker 為唯一寫入者</span> + 悲觀鎖與樂觀鎖雙重防護。
+                        </p>
+                    </div>
+                </div>
+
+                <!-- NFR 6 -->
+                <div class="bg-white border border-slate-200 hover:border-brand-blue rounded-xl p-5 transition-all flex items-start gap-3">
+                    <span class="text-3xl mt-0.5">🛠️</span>
+                    <div>
+                        <h4 class="font-bold text-slate-800 text-lg">可維護性 (Maintainability)</h4>
+                        <p class="text-sm text-slate-600 leading-relaxed mt-1.5 font-semibold">
+                            排程演算法為<span class="text-brand-accent font-bold">純邏輯模組</span>，由 Worker、單元測試、災後重建共用。
+                        </p>
+                    </div>
+                </div>
+
+            </div> <!-- grid grid-cols-2 -->
+        </div> <!-- slide-content -->
+        <div class="page-number">17</div>
+    
+    </div>
+    <!-- ===== page 18 :: xixi 1 ===== -->
+    <div class="slide-container" id="slide-18" data-author="xixi">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">測試策略：三層防線</h2>
+            <div class="grid grid-cols-[1.15fr_0.85fr] gap-10 flex-grow items-center">
+                <div class="space-y-5">
+                    <div class="layer-card p-6">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <h3 class="text-2xl font-black text-brand-blue tech-font">Frontend Tests</h3>
+                                <p class="text-lg text-gray-500 font-bold mt-1">Component / Form / UI State</p>
+                            </div>
+                            <i class="fas fa-window-restore text-4xl text-brand-accent"></i>
+                        </div>
+                        <p class="text-xl text-gray-700 mt-4">表單驗證、modal、欄位狀態、錯誤訊息</p>
+                        <p class="text-lg text-gray-500 mt-2">快速回饋畫面邏輯錯誤，不啟動完整系統。</p>
+                    </div>
+                    <div class="layer-card p-6">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <h3 class="text-2xl font-black text-brand-blue tech-font">Backend Tests</h3>
+                                <p class="text-lg text-gray-500 font-bold mt-1">API / Service / Worker</p>
+                            </div>
+                            <i class="fas fa-server text-4xl text-brand-accent"></i>
+                        </div>
+                        <p class="text-xl text-gray-700 mt-4">權限、商業規則、排程任務、concurrency</p>
+                        <p class="text-lg text-gray-500 mt-2">使用真實 Postgres + Redis 覆蓋鎖與佇列行為。</p>
+                    </div>
+                    <div class="layer-card p-6">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <h3 class="text-2xl font-black text-brand-blue tech-font">E2E Tests</h3>
+                                <p class="text-lg text-gray-500 font-bold mt-1">Playwright</p>
+                            </div>
+                            <i class="fas fa-route text-4xl text-brand-accent"></i>
+                        </div>
+                        <p class="text-xl text-gray-700 mt-4">登入 / 訂單 / RBAC / 日曆 / 通知 / Audit Log</p>
+                        <p class="text-lg text-gray-500 mt-2">前後端都穩定後，再驗證完整使用者流程。</p>
+                    </div>
+                </div>
+                <div class="flex flex-col gap-6 min-h-0 justify-center">
+                    <div class="highlight-box bg-blue-50/60 border-brand-blue">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <p class="tech-font text-brand-blue text-xl font-black tracking-wide">LINE COVERAGE</p>
+                                <p class="text-gray-500 text-lg font-bold mt-2">Backend tests</p>
+                            </div>
+                            <i class="fas fa-chart-line text-4xl text-brand-blue"></i>
+                        </div>
+                        <div class="tech-font text-7xl font-black text-brand-blue mt-8">93.63%</div>
+                        <div class="text-2xl font-bold text-gray-600 mt-5">3585 / 3829 lines</div>
+                    </div>
+                    <div class="highlight-box bg-amber-50 border-amber-200">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <p class="tech-font text-brand-accent text-xl font-black tracking-wide">BRANCH COVERAGE</p>
+                                <p class="text-gray-500 text-lg font-bold mt-2">Decision paths</p>
+                            </div>
+                            <i class="fas fa-code-branch text-4xl text-brand-accent"></i>
+                        </div>
+                        <div class="tech-font text-7xl font-black text-brand-accent mt-8">87.27%</div>
+                        <div class="text-2xl font-bold text-gray-600 mt-5">665 / 762 branches</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">18</div>
+    
+    </div>
+    <!-- ===== page 19 :: xixi 2 ===== -->
+    <div class="slide-container" id="slide-19" data-author="xixi">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+
+        <div class="slide-content">
+            <h2 class="slide-title">排程正確性：比 Coverage 更有說服力</h2>
+            <div class="grid grid-cols-[0.95fr_1.05fr] gap-10 flex-grow items-center">
+                <div class="highlight-box bg-amber-50 border-amber-200">
+                    <div class="text-center border-b border-amber-200 pb-6 mb-6">
+                        <p class="tech-font text-brand-accent font-black text-xl">Scheduling Correctness Highlight</p>
+                        <h3 class="text-5xl font-black text-brand-dark mt-4">Batch apply</h3>
+                        <p class="text-4xl font-black text-brand-blue my-3">==</p>
+                        <h3 class="text-5xl font-black text-brand-dark">Per-op apply</h3>
+                    </div>
+                    <p class="text-xl text-gray-700 text-center font-bold">證明批次優化沒有破壞演算法正確性。</p>
+                </div>
+                <div class="space-y-5">
+                    <div class="bg-white border-l-8 border-brand-blue rounded-lg p-6 shadow-sm flex items-start gap-5">
+                        <span class="tech-font text-brand-blue bg-blue-100 font-black px-3 py-2 rounded">01</span>
+                        <div>
+                            <h3 class="text-2xl font-black text-brand-dark">同一批 operation</h3>
+                            <p class="text-lg text-gray-600 mt-2">準備相同輸入，避免測試只驗證單一路徑。</p>
+                        </div>
+                    </div>
+                    <div class="bg-white border-l-8 border-brand-blue rounded-lg p-6 shadow-sm flex items-start gap-5">
+                        <span class="tech-font text-brand-blue bg-blue-100 font-black px-3 py-2 rounded">02</span>
+                        <div>
+                            <h3 class="text-2xl font-black text-brand-dark">分別跑 batch 與 per-op 路徑</h3>
+                            <p class="text-lg text-gray-600 mt-2">一邊是效能優化，一邊是逐筆處理基準。</p>
+                        </div>
+                    </div>
+                    <div class="bg-white border-l-8 border-brand-blue rounded-lg p-6 shadow-sm flex items-start gap-5">
+                        <span class="tech-font text-brand-blue bg-blue-100 font-black px-3 py-2 rounded">03</span>
+                        <div>
+                            <h3 class="text-2xl font-black text-brand-dark">比對最後排程狀態完全一致</h3>
+                            <p class="text-lg text-gray-600 mt-2">不是只看有沒有跑完，而是確認結果沒有被優化改壞。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">19</div>
+    
+    </div>
+    <!-- ===== page 20 :: ctj 1 ===== -->
+    <div class="slide-container" id="slide-20" data-author="ctj">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+<section data-label="01 部署目標 · 五層架構">
+        <h2 class="slide-title">
+            部署目標 · 五層架構
+
+        </h2>
+
+        <div class="highlight-box flex-1 flex flex-col" style="margin-top: 24px; padding: 2rem 1.75rem;">
+            <div class="panel-header blue">
+                <h3>
+                    <i class="fas fa-layer-group text-brand-blue mr-4"></i>部署目標 · 五層架構
+                </h3>
+                <span class="meta">AWS Production</span>
+            </div>
+
+            <div class="flex-1 flex flex-col justify-start" style="gap: 8px;">
+                <div class="layer-row">
+                    <div class="layer-label">
+                        <span class="name">Presentation</span>
+                    </div>
+                    <div class="layer-content">
+                        <span class="layer-pill">React + TypeScript</span>
+                        <span class="layer-tag-right">Amazon CloudFront (CDN)</span>
+                    </div>
+                </div>
+
+                <div class="layer-row">
+                    <div class="layer-label">
+                        <span class="name">Routing</span>
+                    </div>
+                    <div class="layer-content">
+                        <span class="layer-pill">AWS ALB (Application Load Balancer) · Multi-AZ</span>
+                    </div>
+                </div>
+
+                <div class="layer-row">
+                    <div class="layer-label">
+                        <span class="name">Service</span>
+                    </div>
+                    <div class="layer-stack">
+                        <div class="layer-line">
+                            <span class="layer-pill">FastAPI</span>
+                            <span class="layer-pill dark">pod × 2</span>
+                            <span class="layer-tag-right" style="margin-left:auto;">Amazon EKS (Kubernetes) · Multi-AZ</span>
+                        </div>
+                        <div class="layer-line">
+                            <span class="layer-pill">Celery</span>
+                            <span class="layer-pill dark">pod × 1</span>
+                        </div>
+                        <div class="layer-line">
+                            <span class="layer-pill">Frontend</span>
+                            <span class="layer-pill dark">pod × 2</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="layer-row">
+                    <div class="layer-label">
+                        <span class="name">Persistence</span>
+                    </div>
+                    <div class="layer-content">
+                        <span class="layer-pill">SQLAlchemy ORM</span>
+                        <span class="layer-pill acc">Alembic Migration</span>
+                        <span class="layer-pill">Repository Pattern</span>
+                    </div>
+                </div>
+
+                <div class="layer-row">
+                    <div class="layer-label">
+                        <span class="name">Data</span>
+                    </div>
+                    <div class="layer-content">
+                        <span class="layer-pill">Amazon RDS (PostgreSQL) · Single-AZ</span>
+                        <span class="layer-pill">Amazon ElastiCache (Redis)</span>
+                        <span class="layer-tag-right">Amazon ECR (Docker Registry)</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+        <div class="page-number">20</div>
+    
+    </div>
+    <!-- ===== page 21 :: ctj 2 ===== -->
+    <div class="slide-container" id="slide-21" data-author="ctj">
+
+        <div class="info-box">
+            <div class="url"><i class="fas fa-link mr-1"></i>https://abcde12345.com</div>
+            <div class="creds">
+                <div>帳號 <span class="v">root0 ～ root9</span></div>
+                <div class="divider"></div>
+                <div>密碼 <span class="v">testpassword123</span> <span class="muted">（共 10 組共用）</span></div>
+            </div>
+        </div>
+<section data-label="02 Continuous Deployment Pipeline">
+        <h2 class="slide-title">
+            Continuous Deployment Pipeline
+            
+        </h2>
+
+        <div class="highlight-box panel-amber flex-1 flex flex-col" style="margin-top: 24px;">
+            <div class="panel-header">
+                <h3>
+                    <i class="fas fa-rocket text-brand-accent mr-4"></i>Continuous Deployment Pipeline
+                </h3>
+                <span class="meta">.github/workflows/deploy.yml</span>
+            </div>
+
+            <div class="trigger-bar">
+                <i class="fas fa-check-circle icon"></i>
+                <div>
+                    <div class="cmd">$ git push origin main</div>
+                    <div class="desc">Continuous Integration 通過後，main branch 才觸發 Continuous Deployment</div>
+                </div>
+                <span class="tag">trigger</span>
+            </div>
+
+            <div class="flex-1 flex flex-col justify-start" style="gap: 10px;">
+                <div class="cd-step">
+                    <span class="cd-num">1</span>
+                    <div>
+                        <div class="cd-title">GitHub OpenID Connect ⇄ AWS IAM (Identity and Access Management) Role</div>
+                        <div class="cd-sub">trust policy 鎖 repository，無長期金鑰外流風險</div>
+                    </div>
+                    <span class="cd-tag">Keyless</span>
+                </div>
+
+                <div class="cd-step">
+                    <span class="cd-num">2</span>
+                    <div>
+                        <div class="cd-title">Docker Buildx build → push Amazon ECR (Elastic Container Registry)</div>
+                        <div class="cd-sub">backend / frontend image，tag = commit SHA (Secure Hash Algorithm)</div>
+                    </div>
+                    <span class="cd-tag dark">Immutable</span>
+                </div>
+
+                <div class="cd-step">
+                    <span class="cd-num">3</span>
+                    <div>
+                        <div class="cd-title">取得 Amazon EKS (Elastic Kubernetes Service) cluster credentials</div>
+                        <div class="cd-sub mono">aws eks update-kubeconfig</div>
+                    </div>
+                    <span class="cd-tag gray">AWS</span>
+                </div>
+
+                <div class="cd-step gated">
+                    <span class="cd-num acc">4</span>
+                    <div>
+                        <div class="cd-title">Kubernetes (K8s) Job · <span class="mono">alembic upgrade head</span></div>
+                        <div class="cd-sub">migration 失敗就不更新 image，避免新程式跑在舊 schema 上</div>
+                    </div>
+                    <span class="cd-tag acc">★ GATE</span>
+                </div>
+
+                <div class="cd-step">
+                    <span class="cd-num">5</span>
+                    <div>
+                        <div class="cd-title">kubectl set image &amp; rollout status</div>
+                        <div class="cd-sub">等待 FastAPI / Frontend / Celery pod healthy</div>
+                    </div>
+                    <span class="cd-tag ok">Rollout</span>
+                </div>
+            </div>
+        </div>
+    </section>
+        <div class="page-number">21</div>
+
+    </div>
+
+    <script>
+    // === cerosop interactive demo (sanitized) ===
+var __cerosop_TotalSlides = 8;
+        var __cerosop_currentSlide = 0;
+        let showNotes = true;
+
+        // Speech notes based on exact oratorical guidelines in prompt
+        const speechDrafts = [
+            /* Slide 1 - WOMS Pipeline */
+            "「接下來要講的是訂單操作、排程演算法、通知這條 pipeline 的設計細節。整個流程大致是這樣：user 操作後，訂單會被 lock 起來，之後操作會被丟進 Redis 的 queue。worker 會在 queue 上做二分搜找到最大可被接受的訂單操作長度，整批一起更新排程 state、寫回資料庫、推 WebSocket 通知前端；每天凌晨還會自動把時間軸往後推一天。」",
+            
+            /* Slide 2 - Pure Algorithm Module */
+            "「為了實現可維護性，我們把演算法核心邏輯寫在單一檔案的 function，並剔除 DB、Redis、FastAPI 任何依賴，確保每個功能可以共用同一份逻辑。這份 pure python 邏輯同時在 Celery 運作、單元測試、以及資料庫 rebuild 三種情境通用。」",
+            
+            /* Slide 3 - Batch Admission */
+            "「在這之上，我們設計一次處理一整批訂單操作的機制。因為如果每筆都各自處理，N 筆訂單操作就是 N 次維護，總成本會疊到 O(N · D log D)。所以我們改成一次撈整個 queue，用二分搜找到最大可一起接受的訂單操作長度，確認可行之後只用一次維護把整批一起寫入，把成本壓到 O((N + D log D) log N)。[口語念出當下壓測對比數字]」",
+            
+            /* Slide 4 - Path Decoupling */
+            "「因為資料庫寫入較慢，為了確保回應時間與高吞吐量，我們把排程演算法跟資料庫操作解耦。快速管道在記憶體進行，做完 admission 就立刻 ACK；慢速管道背景非同步寫入 Postgres。最後，還可以讓多個 worker 平行猜測二分搜結果（投機式預判），把原本的庫存循序探測縮短為單一輪並行。」",
+            
+            /* Slide 5 - Reliability Protection */
+            "「可靠性的核心概念是避免 silent failure，也就是系統默默失敗、外部完全不開出。我們在兩處加了保護：第一，queue 訊息格式比對與死信佇列；第二，葉節點 remove 時檢測樹容量與實體 DB 一致性不變式，一遇出錯即進行 per-leaf 單點熔斷隔離。若遭遇災難重建，也可以直接重掃 Postgres DB 一鍵追補重建線段樹。」",
+            
+            /* Slide 6 - 一致性 */
+            "「一致性這塊要解決的核心問題是：DB 跟排程演算法的 state 必須永遠對得上。我們的做法是把 DB 更新權限嚴格收進 worker 裡面，即 worker 唯一的 single-writer。在 producer 端，我們同時混用 PostgreSQL 的悲觀鎖 (SELECT FOR UPDATE) 擋下同時間並發衝刺，以及版號樂觀鎖 (version_id) 護送跨時間的 stale 衝突，實現 100% 一致性對齊。」",
+            
+            /* Slide 7 - 即時與持久化通知系統 */
+            "「通知會透過 WebSocket 即時反映到 user 介面上。同時儲存在 db 中，避免 user 剛好斷線、關閉網頁而錯過重要通知，達到 100% 訊息傳遞可靠度，讓 user 下次登入時也能夠完好查看。」",
+            
+            /* Slide 8 - 非功能性需求總表 */
+            "「最後在非功能需求方面，我們對可擴展性、高響應、可靠度、可恢復性、一致度與可維護性等六大核心 NFRs 進行了極致的工程實踐。在 Batch admission、快慢解耦與多防線鎖的加持下：本模組完全落實了進階架構設計，以及金字塔強固測試、高運維可靠性的高標準目標！」"
+        ];
+
+        // Slide change driver
+        function changeSlide(index) {
+            if (index < 0 || index >= TotalSlides) return;
+            
+            // Remove active status from old slide and dot
+            document.querySelector(`.slide-container.active`)?.classList.remove('active');
+            document.querySelector(`.dot.bg-brand-blue`)?.classList.replace('bg-brand-blue', 'bg-slate-700');
+            document.querySelector(`.dot.border-brand-blue`)?.classList.replace('border-brand-blue', 'border-transparent');
+            
+            // Set new active
+            currentSlide = index;
+            document.getElementById(`slide-${currentSlide + 1}`).classList.add('active');
+            
+            const dot = document.getElementById(`dot-${currentSlide}`);
+            if (dot) {
+                dot.classList.replace('bg-slate-700', 'bg-brand-blue');
+                dot.classList.replace('border-transparent', 'border-brand-blue');
+            }
+
+            // Sync Header indicators
+            const topCounter = document.getElementById('top-counter');
+            if (topCounter) {
+                topCounter.textContent = `${currentSlide + 1} / ${TotalSlides}`;
+            }
+            
+            // Sync Speech Note
+            const speechDraftEl = document.getElementById('speech-draft');
+            if (speechDraftEl) {
+                speechDraftEl.textContent = speechDrafts[currentSlide];
+            }
+
+            // Play/Pause behaviors dynamically depending on whether we are on slide 3
+            if (currentSlide === 2) {
+                resetSearchDemo();
+                startAutoPlay();
+            } else {
+                stopAutoPlay();
+            }
+        }
+
+        // Initialize display note draft
+        /* removed initial speech draft init */
+
+        // Speaker notes panel toggle
+        function toggleSpeakerNotes() {
+            showNotes = !showNotes;
+            const panel = document.getElementById('notes-panel');
+            const btnText = document.getElementById('note-btn-text');
+            const btn = document.getElementById('note-toggle-btn');
+            
+            if (panel) {
+                if (showNotes) {
+                    panel.style.transform = "translateY(0)";
+                    panel.style.opacity = "1";
+                    if (btnText) btnText.textContent = "隱藏講稿提詞";
+                    if (btn) btn.classList.add('text-slate-200');
+                } else {
+                    panel.style.transform = "translateY(100%)";
+                    panel.style.opacity = "0";
+                    if (btnText) btnText.textContent = "顯示講稿提詞";
+                    if (btn) btn.classList.remove('text-slate-200');
+                }
+            }
+        }
+
+        // Keyboard slide triggers
+        /* removed keydown listener */
+
+        // Click slide triggers (Left 30% for previous, Right 70% for next)
+        /* removed click listener */
+
+        // Toggle Fullscreen method
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(err => {
+                    console.log(`全螢幕切換受限或失敗: ${err.message}`);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+
+        // ==========================================
+        // DYNAMIC STATISTICAL 2-WAY BIND CONTROL
+        // ==========================================
+        const targetIds = [
+            "p95-latency-before", "p95-latency-after",
+            "online-days", "dlq-hits", "inconsistency-events",
+            "state-db-consistency", "api-tests-num", "worker-tests-num",
+            "service-tests-num", "total-tests-num",
+            "branch-coverage-per", "ci-duration-tim"
+        ];
+
+        function toggleControlConsole() {
+            const panel = document.getElementById('data-control-panel');
+            if (panel) {
+                panel.classList.toggle('hidden');
+            }
+        }
+
+        function openControlConsole() {
+            const panel = document.getElementById('data-control-panel');
+            if (panel) {
+                panel.classList.remove('hidden');
+            }
+        }
+
+        // Wire 2 way variables
+        targetIds.forEach(id => {
+            const input = document.getElementById(`input-${id}`);
+            const textElement = document.getElementById(id);
+            
+            if (input && textElement) {
+                input.addEventListener('input', () => {
+                    textElement.textContent = input.value;
+                });
+            }
+        });
+
+        // Reset to default
+        function resetStatsToDefault() {
+            const defaults = {
+                "p95-latency-before": "185 ms",
+                "p95-latency-after": "1.8 ms",
+                "online-days": "60 天",
+                "dlq-hits": "4 件",
+                "inconsistency-events": "0 例",
+                "state-db-consistency": "100%",
+                "api-tests-num": "45",
+                "worker-tests-num": "95",
+                "service-tests-num": "80+",
+                "total-tests-num": "220",
+                "branch-coverage-per": "96.5%",
+                "ci-duration-tim": "1 分 45 秒"
+            };
+
+            Object.keys(defaults).forEach(id => {
+                const input = document.getElementById(`input-${id}`);
+                const textElement = document.getElementById(id);
+                if (input && textElement) {
+                    input.value = defaults[id];
+                    textElement.textContent = defaults[id];
+                }
+            });
+        }
+
+        // ==========================================
+        // BATCH ADMISSION INTERACTIVE PLAYER TIMELINE STATS (AUTOMATED PLAYBACK - LIKE GIF)
+        // ==========================================
+        let searchDemoStep = 1;
+        const totalSearchDemoSteps = 5;
+
+        const demoStepTitle = [
+            "步驟 1：從佇列讀進整批訂單",
+            "步驟 2：試算 8 筆全部接受",
+            "步驟 3：折半，試前 4 筆",
+            "步驟 4：再折半，試前 2 筆 ✅",
+            "步驟 5：一次更新狀態並出列"
+        ];
+
+        const demoStepDesc = [
+            "Worker 將佇列中的 8 筆操作一次讀進記憶體。",
+            "試著一次接受全部 8 筆。包含 C3 (130t)，超出容量上限 ❌",
+            "折半，試前 4 筆。仍含 C3，依然超出上限 ❌",
+            "再折半，試前 2 筆 (C1+C2=70t)，在容量內 ✅",
+            "對排程結構只做一次更新，並將 C1、C2 從佇列移除。"
+        ];
+
+        let autoPlayTimer = null;
+        let isAutoPlaying = false; 
+
+        function startAutoPlay() {
+            if (autoPlayTimer) clearInterval(autoPlayTimer);
+            autoPlayTimer = setInterval(() => {
+                if (searchDemoStep >= totalSearchDemoSteps) {
+                    searchDemoStep = 1;
+                } else {
+                    searchDemoStep++;
+                }
+                updateSearchDemoUI();
+            }, 3000); // 3 seconds per step
+            isAutoPlaying = true;
+            updatePlayPauseBtnUI();
+        }
+
+        function stopAutoPlay() {
+            if (autoPlayTimer) {
+                clearInterval(autoPlayTimer);
+                autoPlayTimer = null;
+            }
+            isAutoPlaying = false;
+            updatePlayPauseBtnUI();
+        }
+
+        function toggleAutoPlay() {
+            if (isAutoPlaying) {
+                stopAutoPlay();
+            } else {
+                startAutoPlay();
+            }
+        }
+
+        function updatePlayPauseBtnUI() {
+            const btn = document.getElementById('play-pause-btn');
+            const statusText = document.getElementById('auto-play-status');
+            if (btn) {
+                if (isAutoPlaying) {
+                    btn.innerHTML = `<i class="fa-solid fa-pause"></i> <span>暫停</span>`;
+                    btn.className = "flex items-center gap-1 text-xs font-bold border border-slate-300 text-slate-700 bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded-lg transition-all";
+                    if (statusText) statusText.textContent = "自動播放中";
+                } else {
+                    btn.innerHTML = `<i class="fa-solid fa-play"></i> <span>播放</span>`;
+                    btn.className = "flex items-center gap-1 text-xs font-bold border border-emerald-300 text-white bg-emerald-600 hover:bg-emerald-700 px-3 py-1.5 rounded-lg transition-all";
+                    if (statusText) statusText.textContent = "已暫停";
+                }
+            }
+        }
+
+        function stepNextDemo() {
+            stopAutoPlay(); // Pause autoplay when manual button is pressed
+            if (searchDemoStep >= totalSearchDemoSteps) {
+                searchDemoStep = 1;
+            } else {
+                searchDemoStep++;
+            }
+            updateSearchDemoUI();
+        }
+
+        function resetSearchDemo() {
+            searchDemoStep = 1;
+            updateSearchDemoUI();
+        }
+
+        function updateSearchDemoUI() {
+            // Update Title & Desc
+            const stepTitleEl = document.getElementById('step-title');
+            const stepDescEl = document.getElementById('step-desc');
+            const stepBadgeEl = document.getElementById('step-number-badge');
+            const searchRangeEl = document.getElementById('current-search-range');
+
+            if (stepTitleEl) stepTitleEl.textContent = demoStepTitle[searchDemoStep - 1];
+            if (stepDescEl) stepDescEl.textContent = demoStepDesc[searchDemoStep - 1];
+            if (stepBadgeEl) stepBadgeEl.textContent = searchDemoStep;
+
+            // Change Next button text and styles
+            const nextBtn = document.getElementById('next-step-btn');
+            if (nextBtn) {
+                if (searchDemoStep === totalSearchDemoSteps) {
+                    nextBtn.innerHTML = `<span>重新開始</span> <i class="fa-solid fa-rotate-left"></i>`;
+                    nextBtn.className = "flex items-center gap-1 text-xs font-bold text-white bg-indigo-500 hover:bg-indigo-600 px-4 py-1.5 rounded-lg shadow-md transition-all shrink-0";
+                } else {
+                    nextBtn.innerHTML = `<span>下一步</span> <i class="fa-solid fa-chevron-right"></i>`;
+                    nextBtn.className = "flex items-center gap-1 text-xs font-bold text-white bg-brand-blue hover:bg-brand-light px-4 py-1.5 rounded-lg shadow-md transition-all shrink-0";
+                }
+            }
+
+            // Define specific search range string for UI
+            const searchRanges = [
+                "[1..8] 全區間",
+                "試 [1..8]：380t > 100t ❌",
+                "試 [1..4]：240t > 100t ❌",
+                "試 [1..2]：70t ≤ 100t ✅",
+                "核准 [C1, C2]，從佇列移除"
+            ];
+            if (searchRangeEl) {
+                searchRangeEl.textContent = searchRanges[searchDemoStep - 1];
+            }
+
+            // Sync visual node classes for C1-C8
+            for (let i = 1; i <= 8; i++) {
+                const node = document.getElementById(`node-c${i}`);
+                const badgeEl = document.getElementById(`badge-c${i}`);
+                const sub = document.getElementById(`sub-c${i}`);
+
+                if (!node || !badgeEl || !sub) continue;
+
+                // Default Reset to base Queueing state
+                node.className = "border-2 border-slate-200 rounded-xl p-3 bg-slate-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden";
+                badgeEl.className = "bg-slate-200 text-slate-600 px-1.5 py-0.5 rounded text-[10px] font-bold";
+                badgeEl.textContent = "等待中";
+                sub.className = "text-xs text-slate-400 font-bold leading-tight mt-1";
+                sub.textContent = "";
+                node.style.opacity = "1";
+
+                if (i === 3) {
+                    // C3 is ALWAYS marked as the overload bottleneck
+                    node.className = "border-2 border-red-350 rounded-xl p-3 bg-red-50/50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden";
+                    badgeEl.className = "bg-red-200 text-red-800 px-1.5 py-0.5 rounded text-[10px] font-bold";
+                    badgeEl.textContent = "超載";
+                    sub.className = "text-xs text-red-500 font-bold leading-tight mt-1";
+                    sub.textContent = "130t";
+                }
+
+                if (searchDemoStep === 1) {
+                    if (i !== 3) {
+                        badgeEl.className = "bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded text-[10px] font-bold";
+                        badgeEl.textContent = "讀入";
+                        sub.textContent = "";
+                    }
+                }
+                else if (searchDemoStep === 2) {
+                    // Testing N=8 (entire batch)
+                    node.className += " border-amber-300 bg-amber-50/70";
+                    if (i === 3) {
+                        node.className = "border-2 border-red-500 rounded-xl p-3 bg-red-100 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden animate-pulse";
+                        badgeEl.className = "bg-red-600 text-white px-1.5 py-0.5 rounded text-[10px] font-bold";
+                        badgeEl.textContent = "超出上限";
+                        sub.textContent = "";
+                    } else {
+                        badgeEl.className = "bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded text-[10px] font-bold";
+                        badgeEl.textContent = "試算中";
+                        sub.textContent = "合計 380t";
+                    }
+                }
+                else if (searchDemoStep === 3) {
+                    // Testing N=4 (C1..C4)
+                    if (i <= 4) {
+                        node.className += " border-amber-300 bg-amber-50/70";
+                        if (i === 3) {
+                            node.className = "border-2 border-red-500 rounded-xl p-3 bg-red-100 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-sm relative overflow-hidden";
+                            badgeEl.className = "bg-red-600 text-white px-1.5 py-0.5 rounded text-[10px] font-bold";
+                            badgeEl.textContent = "超出上限";
+                            sub.textContent = "";
+                        } else {
+                            badgeEl.className = "bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded text-[10px] font-bold";
+                            badgeEl.textContent = "試算中";
+                            sub.textContent = "合計 240t";
+                        }
+                    } else {
+                        node.style.opacity = "0.25";
+                        sub.textContent = "";
+                    }
+                }
+                else if (searchDemoStep === 4) {
+                    // Qualified N=2 (C1..C2)
+                    if (i <= 2) {
+                        node.className = "border-2 border-emerald-400 bg-emerald-50 text-center flex flex-col justify-between items-center transition-all duration-300 shadow-md relative overflow-hidden";
+                        badgeEl.className = "bg-emerald-600 text-white px-1.5 py-0.5 rounded text-[10px] font-bold";
+                        badgeEl.textContent = "✅ 通過";
+                        sub.className = "text-xs text-emerald-700 font-bold mt-1";
+                        sub.textContent = "合計 70t";
+                    } else if (i <= 4) {
+                        if (i === 3) {
+                            node.style.opacity = "1";
+                            node.className = "border-2 border-red-400 bg-red-50 text-center flex flex-col justify-between items-center opacity-60";
+                            badgeEl.className = "bg-red-100 text-red-800 px-1.5 py-0.5 rounded text-[10px] font-bold";
+                            badgeEl.textContent = "已排除";
+                            sub.textContent = "";
+                        } else {
+                            node.style.opacity = "0.4";
+                            node.className = "border-2 border-rose-200 bg-rose-50 text-center flex flex-col justify-between items-center opacity-45";
+                            badgeEl.className = "bg-rose-100 text-rose-600 px-1.5 py-0.5 rounded text-[10px] font-bold";
+                            badgeEl.textContent = "未通過";
+                            sub.textContent = "";
+                        }
+                    } else {
+                        node.style.opacity = "0.25";
+                        sub.textContent = "";
+                    }
+                }
+                else if (searchDemoStep === 5) {
+                    // Committed N=2
+                    if (i <= 2) {
+                        node.className = "border-2 border-emerald-500 bg-emerald-600 text-white text-center flex flex-col justify-between items-center transition-all duration-300 shadow-lg scale-105 relative overflow-hidden";
+                        badgeEl.className = "bg-emerald-900 text-emerald-100 px-1.5 py-0.5 rounded text-[10px] font-bold border border-emerald-500";
+                        badgeEl.textContent = "已寫入 🚀";
+                        sub.className = "text-xs text-emerald-100 font-bold mt-1";
+                        sub.textContent = "";
+                    } else if (i <= 4) {
+                        node.style.opacity = "0.5";
+                        if (i === 3) {
+                            sub.textContent = "";
+                        } else {
+                            badgeEl.className = "bg-slate-200 text-slate-500 px-1.5 py-0.5 rounded text-[10px] font-bold";
+                            badgeEl.textContent = "待下輪";
+                            sub.textContent = "";
+                        }
+                    } else {
+                        node.style.opacity = "0.3";
+                        sub.textContent = "";
+                    }
+                }
+            }
+        }
+
+        // initial UI sync deferred to deck-nav onEnter hook for page 9
+    </script>
+
+    <script>
+        (function () {
+            const slides = document.querySelectorAll('.slide-container');
+            let deckIdx = 0;
+            slides.forEach((s, i) => s.classList.toggle('active', i === 0));
+
+            function onEnter(i) {
+                const page = i + 1;
+                if (page === 12) {
+                    // cerosop slide-3 batch admission demo
+                    if (typeof window.resetSearchDemo === 'function') {
+                        try { window.resetSearchDemo(); } catch (_) {}
+                    }
+                    if (typeof window.startAutoPlay === 'function') {
+                        try { window.startAutoPlay(); } catch (_) {}
+                    }
+                } else {
+                    if (typeof window.stopAutoPlay === 'function') {
+                        try { window.stopAutoPlay(); } catch (_) {}
+                    }
+                }
+            }
+
+            function goToSlide(n) {
+                slides[deckIdx].classList.remove('active');
+                deckIdx = (n + slides.length) % slides.length;
+                slides[deckIdx].classList.add('active');
+                onEnter(deckIdx);
+            }
+
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'Spacebar' || e.key === 'PageDown') {
+                    e.preventDefault();
+                    goToSlide(deckIdx + 1);
+                } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+                    e.preventDefault();
+                    goToSlide(deckIdx - 1);
+                }
+            });
+
+            // Expose for debugging.
+            window.deckGoTo = goToSlide;
+        })();
+    </script>
+
+</body>
+</html>
