@@ -127,6 +127,7 @@ addopts = [
     "--cov=app",
     "--cov-report=term-missing",
     "--cov-report=xml",
+    "--junit-xml=test-results/junit.xml",
 ]
 markers = [
     "integration: tests that require Docker / Testcontainers (slow)",
