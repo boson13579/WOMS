@@ -59,6 +59,23 @@ function clean<T extends string | undefined>(v: T): T | undefined {
 }
 
 /**
+ * Shared click-outside handler for combobox popovers. Returns a cleanup-
+ * compatible factory: pass the wrapper ref and the close callback, get
+ * back the `mousedown` listener used by the document-level effect.
+ */
+function makeOutsideMouseDownHandler(
+  wrapperRef: React.RefObject<HTMLDivElement>,
+  close: () => void,
+): (e: MouseEvent) => void {
+  return (e: MouseEvent) => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+    if (e.target instanceof Node && wrapper.contains(e.target)) return;
+    close();
+  };
+}
+
+/**
  * Typeahead-style combobox for picking an audit actor.
  *
  * `<Select>` doesn't scale once production has many users — scrolling
@@ -77,11 +94,11 @@ function ActorCombobox({
   value,
   onChange,
   users,
-}: {
+}: Readonly<{
   value: string | undefined;
   onChange: (id: string | undefined) => void;
   users: UserResponse[];
-}): JSX.Element {
+}>): JSX.Element {
   const selectedUser = useMemo(
     () => (value ? users.find((u) => u.id === value) : undefined),
     [users, value],
@@ -111,12 +128,9 @@ function ActorCombobox({
   // would briefly re-open it).
   useEffect(() => {
     if (!isOpen) return undefined;
-    function onMouseDown(e: MouseEvent): void {
-      const wrapper = wrapperRef.current;
-      if (!wrapper) return;
-      if (e.target instanceof Node && wrapper.contains(e.target)) return;
+    const onMouseDown = makeOutsideMouseDownHandler(wrapperRef, () => {
       setIsOpen(false);
-    }
+    });
     document.addEventListener('mousedown', onMouseDown);
     return () => {
       document.removeEventListener('mousedown', onMouseDown);
@@ -291,13 +305,13 @@ function ActionCombobox({
   actions,
   isLoading,
   isError,
-}: {
+}: Readonly<{
   value: string | undefined;
   onChange: (action: string | undefined) => void;
   actions: string[];
   isLoading: boolean;
   isError: boolean;
-}): JSX.Element {
+}>): JSX.Element {
   const [inputValue, setInputValue] = useState<string>(value ?? '');
   const [isOpen, setIsOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
@@ -315,12 +329,9 @@ function ActionCombobox({
   // before any focus event on another widget fires.
   useEffect(() => {
     if (!isOpen) return undefined;
-    function onMouseDown(e: MouseEvent): void {
-      const wrapper = wrapperRef.current;
-      if (!wrapper) return;
-      if (e.target instanceof Node && wrapper.contains(e.target)) return;
+    const onMouseDown = makeOutsideMouseDownHandler(wrapperRef, () => {
       setIsOpen(false);
-    }
+    });
     document.addEventListener('mousedown', onMouseDown);
     return () => {
       document.removeEventListener('mousedown', onMouseDown);
@@ -496,7 +507,11 @@ function renderActionListContent({
   });
 }
 
-export function AuditFilters({ value, onChange, onClear }: AuditFiltersProps): JSX.Element {
+export function AuditFilters({
+  value,
+  onChange,
+  onClear,
+}: Readonly<AuditFiltersProps>): JSX.Element {
   const role = useCurrentRole();
 
   const usersQuery = useQuery({
