@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -35,23 +36,23 @@ from app.services.audit import AuditEventsFilters
 
 router = APIRouter()
 
-_root_only = Depends(require_roles(UserRole.root))
+_root_only = require_roles(UserRole.root)
 
 
-@router.get("/events", response_model=AuditLogListResponse)
+@router.get("/events")
 def list_audit_events(
-    db: Session = Depends(get_db),
-    current_user: User = _root_only,
-    actor_id: uuid.UUID | None = Query(default=None),
-    action: str | None = Query(default=None),
-    resource_type: str | None = Query(default=None),
-    resource_id: uuid.UUID | None = Query(default=None),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_root_only)],
+    actor_id: Annotated[uuid.UUID | None, Query()] = None,
+    action: Annotated[str | None, Query()] = None,
+    resource_type: Annotated[str | None, Query()] = None,
+    resource_id: Annotated[uuid.UUID | None, Query()] = None,
     # ``from`` is a Python reserved word — bind via alias so the public
     # query name stays ``?from=...&to=...`` per the spec.
-    from_: datetime | None = Query(default=None, alias="from"),
-    to: datetime | None = Query(default=None),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
+    from_: Annotated[datetime | None, Query(alias="from")] = None,
+    to: Annotated[datetime | None, Query()] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> AuditLogListResponse:
     """Return a paginated, filtered slice of the global audit-log feed.
 
@@ -96,10 +97,10 @@ def list_audit_events(
     return audit_service.get_events(db, filters)
 
 
-@router.get("/actions", response_model=AuditActionsResponse)
+@router.get("/actions")
 def list_audit_actions(
-    db: Session = Depends(get_db),
-    current_user: User = _root_only,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_root_only)],
 ) -> AuditActionsResponse:
     """Return the sorted, distinct set of audit ``action`` values in the DB.
 

@@ -97,8 +97,8 @@ export const orderKeys = {
 export interface ListOrdersParams {
   status?: string | null;
   search?: string | null;
-  assignedTo?: string[];
-  createdBy?: string[];
+  assignedTo?: string[] | undefined;
+  createdBy?: string[] | undefined;
   page?: number;
   page_size?: number;
   sortBy?: string;
@@ -163,8 +163,8 @@ export function useCreateOrder(): ReturnType<typeof useMutation<Order, Error, Or
         (d) => orderSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
     },
   });
 }
@@ -187,8 +187,8 @@ export function useUpdateOrder(): ReturnType<
         (d) => orderSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
     },
   });
 }
@@ -204,8 +204,8 @@ export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error
         () => undefined,
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
     },
   });
 }
@@ -219,8 +219,8 @@ export function useCancelOrder(): ReturnType<typeof useMutation<Order, Error, st
         orderSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
     },
   });
 }
@@ -240,7 +240,7 @@ export function useTriggerSchedule(): ReturnType<typeof useMutation<ScheduleTrig
 }
 
 /**
- * TODO(future PR): wire into a multi-select bulk-update toolbar on the
+ * Deferred (future PR): wire into a multi-select bulk-update toolbar on the
  * Orders table (SUMMARY-zh feature #7 — "useBatchUpdateOrders 接 UI").
  * Intended consumer: a "Bulk reassign / status change" action surfaced
  * once row selection ships in the orders feature (rough scope: add a
@@ -267,13 +267,13 @@ export function useBatchUpdateOrders(): ReturnType<
         (d) => batchUpdateResponseSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
     },
   });
 }
 
 /**
- * TODO(future PR): wire into an order-history drawer / dialog on
+ * Deferred (future PR): wire into an order-history drawer / dialog on
  * `OrderTable` (and eventually `OrderDetail`). Intended consumer:
  * a chronological audit-trail view that renders each entry with the
  * action, the actor's username (resolved via `useUsernames`), the

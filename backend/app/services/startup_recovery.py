@@ -312,23 +312,26 @@ def _clear_orphan_locks(rds: Redis) -> None:
     deferred trigger. Both are more complex than the failure mode
     warrants for a startup-only sweep.
     """
-    # Lazy import for the rest (model + audit are stable to import top-level
-    # too but keeping the lazy pattern matches the celery-task imports above
-    # — recovery module's defensible contract is "minimal module-load surface
-    # area; pull in heavy deps only when actually running recovery"). The
-    # ``SessionLocal`` import is at module top so tests can patch it.
+    in_flight = _collect_in_flight_order_ids(rds)
+    if in_flight is None:
+        return
+    _sweep_orphan_locks(in_flight)
+
+
+def _collect_in_flight_order_ids(rds: Redis) -> set[str] | None:
+    """Return the set of order IDs referenced by in-flight pending compounds.
+
+    Returns ``None`` when the underlying ZRANGE call fails (caller should
+    abort the sweep entirely rather than risk clearing live locks based on
+    a partial view).
+    """
     import json  # noqa: PLC0415
-
-    from sqlalchemy import select  # noqa: PLC0415
-
-    from app.core.audit import record_audit  # noqa: PLC0415
-    from app.models.order import Order  # noqa: PLC0415
 
     try:
         members = cast("list[str]", rds.zrange(PENDING_OPS_KEY, 0, -1))
     except Exception:
         logger.exception("schedule.startup_recovery.orphan_locks.zrange_failed")
-        return
+        return None
 
     in_flight_order_ids: set[str] = set()
     for raw in members:
@@ -341,6 +344,15 @@ def _clear_orphan_locks(rds: Redis) -> None:
             oid = op.get("order_id")
             if isinstance(oid, str):
                 in_flight_order_ids.add(oid)
+    return in_flight_order_ids
+
+
+def _sweep_orphan_locks(in_flight_order_ids: set[str]) -> None:
+    """Clear ``is_processing_locked`` rows not present in *in_flight_order_ids*."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.core.audit import record_audit  # noqa: PLC0415
+    from app.models.order import Order  # noqa: PLC0415
 
     db = SessionLocal()
     try:

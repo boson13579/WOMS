@@ -24,7 +24,7 @@ interface AuthOnlyRouteProps {
   children: ReactNode;
 }
 
-export function AuthOnlyRoute({ children }: AuthOnlyRouteProps): JSX.Element {
+export function AuthOnlyRoute({ children }: Readonly<AuthOnlyRouteProps>): JSX.Element {
   const user = useAuthStore((state) => state.user);
   const expiresAt = useAuthStore((state) => state.expiresAt);
   const location = useLocation();

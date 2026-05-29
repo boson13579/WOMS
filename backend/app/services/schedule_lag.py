@@ -132,7 +132,7 @@ def compute_window(window_seconds: int) -> ScheduleLagStats:
         try:
             doc = json.loads(raw)
             lags.append(int(doc["lag"]))
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except (KeyError, ValueError):
             continue
 
     if not lags:

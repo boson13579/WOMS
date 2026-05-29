@@ -149,7 +149,7 @@ const COLOR_PALETTE = [
 
 function hashOrderId(orderId: string): number {
   const hash = Array.from(orderId).reduce(
-    (acc, ch) => (acc * 33 + ch.charCodeAt(0)) % Number.MAX_SAFE_INTEGER,
+    (acc, ch) => (acc * 33 + (ch.codePointAt(0) ?? 0)) % Number.MAX_SAFE_INTEGER,
     5381,
   );
   return hash % COLOR_PALETTE.length;
@@ -339,6 +339,69 @@ function dragOrdersFromEvent(event: DragEvent): DraggableOrder[] {
   }
 }
 
+function renderUnscheduledBody({
+  isPending,
+  isError,
+  children,
+}: Readonly<{
+  isPending: boolean;
+  isError: boolean;
+  children: JSX.Element;
+}>): JSX.Element {
+  if (isPending) {
+    return (
+      <div className="flex items-center py-6 text-sm text-muted-foreground">
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+        載入中...
+      </div>
+    );
+  }
+  if (isError) {
+    return (
+      <div className="rounded-md border border-destructive/40 p-3 text-sm text-destructive">
+        無法載入未排程訂單。
+      </div>
+    );
+  }
+  return children;
+}
+
+function renderCalendarBody({
+  canReadSchedule,
+  isPending,
+  isError,
+  children,
+}: Readonly<{
+  canReadSchedule: boolean;
+  isPending: boolean;
+  isError: boolean;
+  children: JSX.Element;
+}>): JSX.Element {
+  if (canReadSchedule) {
+    if (isPending) {
+      return (
+        <div className="flex h-96 items-center justify-center text-muted-foreground">
+          <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+          載入日曆中...
+        </div>
+      );
+    }
+    if (isError) {
+      return (
+        <div className="flex h-96 items-center justify-center rounded-md border text-sm text-destructive">
+          無法載入排程日曆，請確認帳號權限或稍後再試。
+        </div>
+      );
+    }
+    return children;
+  }
+  return (
+    <div className="flex h-96 items-center justify-center rounded-md border text-sm text-destructive">
+      無法載入排程日曆，請確認帳號權限或稍後再試。
+    </div>
+  );
+}
+
 function scheduleFailureMessage(raw: unknown): string {
   if (typeof raw !== 'object' || raw === null) {
     return '後端無法執行這次排程操作。';
@@ -357,7 +420,7 @@ function OrderLine({
   selected,
   onSelectedChange,
   pinAction,
-}: {
+}: Readonly<{
   order: ProductionCalendarItem;
   dragOrder?: DraggableOrder;
   canDrag: boolean;
@@ -365,7 +428,7 @@ function OrderLine({
   selected: boolean;
   onSelectedChange: (orderId: string, selected: boolean) => void;
   pinAction?: PinAction | null;
-}): JSX.Element {
+}>): JSX.Element {
   return (
     <div
       draggable={canDrag && Boolean(dragOrder)}
@@ -448,13 +511,13 @@ function UnscheduledOrderLine({
   onDragStart,
   selected,
   onSelectedChange,
-}: {
+}: Readonly<{
   order: Order;
   canDrag: boolean;
   onDragStart: (event: DragEvent, order: DraggableOrder) => void;
   selected: boolean;
   onSelectedChange: (orderId: string, selected: boolean) => void;
-}): JSX.Element {
+}>): JSX.Element {
   return (
     <div
       data-testid="orders-calendar-unscheduled-order"
@@ -509,7 +572,7 @@ function UnscheduledOrderLine({
 export function OrdersCalendarDialog({
   open,
   onOpenChange,
-}: OrdersCalendarDialogProps): JSX.Element {
+}: Readonly<OrdersCalendarDialogProps>): JSX.Element {
   const [visibleMonth, setVisibleMonth] = useState(() => startOfMonth(new Date()));
   const [selectedDate, setSelectedDate] = useState(() => dateKey(new Date()));
   const [pendingMoves, setPendingMoves] = useState<PendingMove[]>([]);
@@ -749,8 +812,8 @@ export function OrdersCalendarDialog({
   useEffect(() => {
     if (!activeOperation) return undefined;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/api/v1/ws`);
+    const protocol = globalThis.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${protocol}//${globalThis.location.host}/api/v1/ws`);
 
     ws.onmessage = (event: MessageEvent<string>) => {
       let payload: unknown;
@@ -907,135 +970,130 @@ export function OrdersCalendarDialog({
               </div>
             </div>
 
-            {!canReadSchedule ? (
-              <div className="flex h-96 items-center justify-center rounded-md border text-sm text-destructive">
-                無法載入排程日曆，請確認帳號權限或稍後再試。
-              </div>
-            ) : scheduleResult.isPending || scheduleCapacity.isPending ? (
-              <div className="flex h-96 items-center justify-center text-muted-foreground">
-                <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                載入日曆中...
-              </div>
-            ) : scheduleResult.isError || scheduleCapacity.isError ? (
-              <div className="flex h-96 items-center justify-center rounded-md border text-sm text-destructive">
-                無法載入排程日曆，請確認帳號權限或稍後再試。
-              </div>
-            ) : (
-              <>
-                <div className="grid grid-cols-7 border-l border-t text-center text-xs font-medium text-muted-foreground">
-                  {WEEKDAYS.map((day) => (
-                    <div key={day} className="border-b border-r py-2">
-                      {day}
-                    </div>
-                  ))}
-                </div>
-                <div className="grid grid-cols-7 border-l" data-testid="orders-calendar-grid">
-                  {days.map((day) => {
-                    const key = dateKey(day);
-                    const items = filteredGrouped[key] ?? [];
-                    const capacity = dailyCapacityByDate.get(key);
-                    const isCurrentMonth = day.getMonth() === visibleMonth.getMonth();
-                    const isSelected = key === selectedDate;
-                    const isToday = key === dateKey(new Date());
-                    return (
-                      <button
-                        key={key}
-                        type="button"
-                        aria-label={`${key}${items.length > 0 ? `, ${items.length} orders` : ''}`}
-                        className={cn(
-                          'min-h-28 border-b border-r p-2 text-left align-top transition-colors hover:bg-muted/60',
-                          !isCurrentMonth && 'bg-muted/30 text-muted-foreground',
-                          isToday &&
+            {renderCalendarBody({
+              canReadSchedule,
+              isPending: scheduleResult.isPending || scheduleCapacity.isPending,
+              isError: scheduleResult.isError || scheduleCapacity.isError,
+              children: (
+                <>
+                  <div className="grid grid-cols-7 border-l border-t text-center text-xs font-medium text-muted-foreground">
+                    {WEEKDAYS.map((day) => (
+                      <div key={day} className="border-b border-r py-2">
+                        {day}
+                      </div>
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-7 border-l" data-testid="orders-calendar-grid">
+                    {days.map((day) => {
+                      const key = dateKey(day);
+                      const items = filteredGrouped[key] ?? [];
+                      const capacity = dailyCapacityByDate.get(key);
+                      const isCurrentMonth = day.getMonth() === visibleMonth.getMonth();
+                      const isSelected = key === selectedDate;
+                      const isToday = key === dateKey(new Date());
+                      const orderSuffix = items.length > 0 ? `, ${items.length} orders` : '';
+                      const ariaLabel = `${key}${orderSuffix}`;
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          aria-label={ariaLabel}
+                          className={cn(
+                            'min-h-28 border-b border-r p-2 text-left align-top transition-colors hover:bg-muted/60',
+                            !isCurrentMonth && 'bg-muted/30 text-muted-foreground',
+                            isToday &&
+                              isSelected &&
+                              'bg-amber-50 ring-2 ring-inset ring-sky-500 dark:bg-amber-950/30',
+                            isToday &&
+                              !isSelected &&
+                              'bg-amber-50 ring-2 ring-inset ring-amber-400 dark:bg-amber-950/30',
                             isSelected &&
-                            'bg-amber-50 ring-2 ring-inset ring-sky-500 dark:bg-amber-950/30',
-                          isToday &&
-                            !isSelected &&
-                            'bg-amber-50 ring-2 ring-inset ring-amber-400 dark:bg-amber-950/30',
-                          isSelected &&
-                            !isToday &&
-                            'bg-sky-50 ring-2 ring-inset ring-sky-500 dark:bg-sky-950/40',
-                        )}
-                        onClick={() => {
-                          setSelectedDate(key);
-                        }}
-                        onDragOver={(event) => {
-                          if (!canManageSchedule) return;
-                          event.preventDefault();
-                        }}
-                        onDrop={(event) => {
-                          handleDropOnDate(event, key);
-                        }}
-                      >
-                        <div className="mb-1 flex items-center justify-between">
-                          <span
-                            className={cn(
-                              'text-xs font-semibold',
-                              isToday && 'text-amber-700 dark:text-amber-300',
-                            )}
-                          >
-                            {day.getDate()}
-                          </span>
-                          <span className="flex items-center gap-1">
-                            {capacity && (
-                              <span
-                                className={cn(
-                                  'inline-flex items-center gap-0.5 text-[10px] font-medium',
-                                  capacityTone(capacity.remaining, capacity.dailyCapacity),
-                                )}
-                                title="當日剩餘產能"
-                              >
-                                <Zap className="h-3 w-3" />
-                                {capacity.remaining.toLocaleString()}
-                              </span>
-                            )}
-                            {items.length > 0 && (
-                              <span className="rounded-full bg-sky-600 px-1.5 py-0.5 text-[10px] text-white">
-                                {items.length}
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                        <div className="space-y-1">
-                          {items.slice(0, MAX_ITEMS_PER_DAY).map((order) => {
-                            const draggableOrder = scheduledOrderById.get(order.id);
-                            const isDraggable = canDragScheduledOrder(
-                              order,
-                              draggableOrder,
-                              canManageSchedule,
-                            );
-                            return (
-                              <div
-                                key={order.id}
-                                draggable={isDraggable}
-                                onDragStart={(event) => {
-                                  if (draggableOrder) handleDragStart(event, draggableOrder);
-                                }}
-                                className={cn(
-                                  'rounded px-1.5 py-1 text-[11px] flex items-center gap-1',
-                                  getOrderColor(order.id),
-                                  getOrderTextColor(order.id),
-                                  isDraggable && 'cursor-grab active:cursor-grabbing',
-                                )}
-                              >
-                                {order.is_pinned && <Lock className="h-3 w-3 shrink-0" />}
-                                <span className="truncate">
-                                  {order.order_number} · {order.productionQuantity.toLocaleString()}
-                                </span>
-                              </div>
-                            );
-                          })}
-                          {items.length > MAX_ITEMS_PER_DAY && (
-                            <div className="text-[11px] text-muted-foreground">
-                              +{items.length - MAX_ITEMS_PER_DAY} 筆
-                            </div>
+                              !isToday &&
+                              'bg-sky-50 ring-2 ring-inset ring-sky-500 dark:bg-sky-950/40',
                           )}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </>
-            )}
+                          onClick={() => {
+                            setSelectedDate(key);
+                          }}
+                          onDragOver={(event) => {
+                            if (!canManageSchedule) return;
+                            event.preventDefault();
+                          }}
+                          onDrop={(event) => {
+                            handleDropOnDate(event, key);
+                          }}
+                        >
+                          <div className="mb-1 flex items-center justify-between">
+                            <span
+                              className={cn(
+                                'text-xs font-semibold',
+                                isToday && 'text-amber-700 dark:text-amber-300',
+                              )}
+                            >
+                              {day.getDate()}
+                            </span>
+                            <span className="flex items-center gap-1">
+                              {capacity && (
+                                <span
+                                  className={cn(
+                                    'inline-flex items-center gap-0.5 text-[10px] font-medium',
+                                    capacityTone(capacity.remaining, capacity.dailyCapacity),
+                                  )}
+                                  title="當日剩餘產能"
+                                >
+                                  <Zap className="h-3 w-3" />
+                                  {capacity.remaining.toLocaleString()}
+                                </span>
+                              )}
+                              {items.length > 0 && (
+                                <span className="rounded-full bg-sky-600 px-1.5 py-0.5 text-[10px] text-white">
+                                  {items.length}
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                          <div className="space-y-1">
+                            {items.slice(0, MAX_ITEMS_PER_DAY).map((order) => {
+                              const draggableOrder = scheduledOrderById.get(order.id);
+                              const isDraggable = canDragScheduledOrder(
+                                order,
+                                draggableOrder,
+                                canManageSchedule,
+                              );
+                              return (
+                                <div
+                                  key={order.id}
+                                  draggable={isDraggable}
+                                  onDragStart={(event) => {
+                                    if (draggableOrder) handleDragStart(event, draggableOrder);
+                                  }}
+                                  className={cn(
+                                    'rounded px-1.5 py-1 text-[11px] flex items-center gap-1',
+                                    getOrderColor(order.id),
+                                    getOrderTextColor(order.id),
+                                    isDraggable && 'cursor-grab active:cursor-grabbing',
+                                  )}
+                                >
+                                  {order.is_pinned && <Lock className="h-3 w-3 shrink-0" />}
+                                  <span className="truncate">
+                                    {order.order_number} ·{' '}
+                                    {order.productionQuantity.toLocaleString()}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                            {items.length > MAX_ITEMS_PER_DAY && (
+                              <div className="text-[11px] text-muted-foreground">
+                                +{items.length - MAX_ITEMS_PER_DAY} 筆
+                              </div>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </>
+              ),
+            })}
           </section>
 
           <aside className="border-t bg-muted/20 p-4 lg:border-l lg:border-t-0">
@@ -1253,38 +1311,33 @@ export function OrdersCalendarDialog({
                 <PackageOpen className="h-4 w-4 text-muted-foreground" />
                 <h3 className="text-sm font-semibold">未排程訂單</h3>
               </div>
-              {pendingOrders.isPending ? (
-                <div className="flex items-center py-6 text-sm text-muted-foreground">
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  載入中...
-                </div>
-              ) : pendingOrders.isError ? (
-                <div className="rounded-md border border-destructive/40 p-3 text-sm text-destructive">
-                  無法載入未排程訂單。
-                </div>
-              ) : (
-                <div
-                  className="max-h-80 space-y-2 overflow-y-auto pr-1"
-                  data-testid="orders-calendar-unscheduled-list"
-                >
-                  {filteredUnscheduled.length > 0 ? (
-                    filteredUnscheduled.map((order) => (
-                      <UnscheduledOrderLine
-                        key={order.id}
-                        order={order}
-                        canDrag={canManageSchedule}
-                        onDragStart={handleDragStart}
-                        selected={selectedOrderIds.includes(order.id)}
-                        onSelectedChange={updateSelectedOrder}
-                      />
-                    ))
-                  ) : (
-                    <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-                      目前沒有未排程訂單。
-                    </div>
-                  )}
-                </div>
-              )}
+              {renderUnscheduledBody({
+                isPending: pendingOrders.isPending,
+                isError: pendingOrders.isError,
+                children: (
+                  <div
+                    className="max-h-80 space-y-2 overflow-y-auto pr-1"
+                    data-testid="orders-calendar-unscheduled-list"
+                  >
+                    {filteredUnscheduled.length > 0 ? (
+                      filteredUnscheduled.map((order) => (
+                        <UnscheduledOrderLine
+                          key={order.id}
+                          order={order}
+                          canDrag={canManageSchedule}
+                          onDragStart={handleDragStart}
+                          selected={selectedOrderIds.includes(order.id)}
+                          onSelectedChange={updateSelectedOrder}
+                        />
+                      ))
+                    ) : (
+                      <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+                        目前沒有未排程訂單。
+                      </div>
+                    )}
+                  </div>
+                ),
+              })}
 
               <div className="mt-4 rounded-md bg-background p-3 text-xs text-muted-foreground">
                 {canManageSchedule

@@ -81,7 +81,7 @@ export function useMarkNotificationRead(): ReturnType<
         (d) => notificationResponseSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: notificationKeys.all });
+      qc.invalidateQueries({ queryKey: notificationKeys.all }).catch(() => {});
     },
   });
 }
@@ -103,7 +103,7 @@ export function useMarkAllNotificationsRead(): ReturnType<
         (d) => z.object({ updated: z.number().int() }).parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: notificationKeys.all });
+      qc.invalidateQueries({ queryKey: notificationKeys.all }).catch(() => {});
     },
   });
 }

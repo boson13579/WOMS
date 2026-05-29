@@ -59,6 +59,66 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 
+async function doFetch(
+  url: string,
+  init: RequestInit,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
+}
+
+function notifyUnauthorized(): void {
+  if (!unauthorizedHandler) return;
+  try {
+    unauthorizedHandler();
+  } catch {
+    // Swallow — see comment in apiFetch.
+  }
+}
+
+async function throwApiError(res: Response): Promise<never> {
+  // Capture the server-issued correlation id once. The header is set
+  // by the A4 request-id middleware; on 401 the user is being logged
+  // out so we don't display it, but populating the field is free and
+  // lets non-toast consumers (logging, devtools) still correlate.
+  const requestId = res.headers.get('X-Request-Id') ?? undefined;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
+  const body = await res.json().catch((): any => ({}));
+  const msg: string =
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    (body?.error?.message as string | undefined) ??
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    (body?.detail as string | undefined) ??
+    res.statusText;
+  if (res.status === 401) {
+    notifyUnauthorized();
+  }
+  throw new ApiError(res.status, msg, requestId);
+}
+
+async function parseBody<T>(
+  res: Response,
+  parse: (raw: unknown) => T,
+  timeoutMs: number,
+): Promise<T> {
+  try {
+    return parse(await res.json());
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
+}
+
 export async function apiFetch<T>(
   url: string,
   init: RequestInit,
@@ -70,50 +130,12 @@ export async function apiFetch<T>(
     controller.abort();
   }, timeoutMs);
   try {
-    let res: Response;
-    try {
-      res = await fetch(url, { ...init, signal: controller.signal });
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw new Error(`Request timed out after ${timeoutMs}ms`);
-      }
-      throw err;
-    }
+    const res = await doFetch(url, init, controller.signal, timeoutMs);
     if (!res.ok) {
-      // Capture the server-issued correlation id once. The header is set
-      // by the A4 request-id middleware; on 401 the user is being logged
-      // out so we don't display it, but populating the field is free and
-      // lets non-toast consumers (logging, devtools) still correlate.
-      const requestId = res.headers.get('X-Request-Id') ?? undefined;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
-      const body = await res.json().catch((): any => ({}));
-      const msg: string =
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-        (body?.error?.message as string | undefined) ??
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-        (body?.detail as string | undefined) ??
-        res.statusText;
-      if (res.status === 401 && unauthorizedHandler) {
-        // Wrap in try/catch so a misbehaving handler (e.g. throwing from
-        // a stale closure) can never replace the API error with a
-        // generic ``Error`` — callers still observe ``ApiError(401)``.
-        try {
-          unauthorizedHandler();
-        } catch {
-          // Swallow — see comment above.
-        }
-      }
-      throw new ApiError(res.status, msg, requestId);
+      await throwApiError(res);
     }
     if (res.status === 204) return undefined as T;
-    try {
-      return parse(await res.json());
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw new Error(`Request timed out after ${timeoutMs}ms`);
-      }
-      throw err;
-    }
+    return await parseBody(res, parse, timeoutMs);
   } finally {
     clearTimeout(timer);
   }

@@ -157,6 +157,8 @@ PENDING_OPS_KEY = "schedule:pending_ops"
 PENDING_OPS_SEQ_KEY = "schedule:pending_ops:seq"
 """Redis monotonic counter (INCR) for the ``seq`` field embedded in op scores."""
 
+_REBUILD_SKIP_EVENT = "schedule.rebuild.skip"
+
 REBUILD_IN_FLIGHT_KEY = "schedule:rebuild_in_flight"
 """Redis SET-NX-EX flag: a rebuild has been requested and not yet finished.
 
@@ -1414,7 +1416,18 @@ def compute_schedule(state: SchedulerState) -> list[ScheduledResult]:
     daily_remaining = [DAILY_CAPACITY] * (HORIZON_DAYS + 1)  # 1-indexed
     results: list[ScheduledResult] = []
 
-    # Phase 1: pinned orders consume their reserved day.
+    _fill_pinned_orders(state, daily_remaining, results)
+    _fill_pq_orders(state, daily_remaining, results)
+
+    return results
+
+
+def _fill_pinned_orders(
+    state: SchedulerState,
+    daily_remaining: list[int],
+    results: list[ScheduledResult],
+) -> None:
+    """Phase 1 of :func:`compute_schedule`: pinned orders consume their reserved day."""
     for pinned in state.pinned_orders.values():
         fake_rel = abs_to_rel(pinned.fake_deadline, state.base_date)
         if fake_rel is None:
@@ -1449,15 +1462,13 @@ def compute_schedule(state: SchedulerState) -> list[ScheduledResult]:
             )
             daily_remaining[fake_rel] -= assigned
 
-    # Phase 2: forward-fill pq orders against the post-pin remaining.
-    # ``_iter_pq_edf_sorted`` does a bucket sort (by deadline_rel) +
-    # within-bucket sort (by qty desc, order_number asc) at iteration time
-    # — cheaper than maintaining a SortedKeyList at every mutation,
-    # because compute_schedule is the only ordered-iteration consumer.
-    #
-    # Tree day 1 = ``base_date + 1`` (tomorrow), so forward-fill starts at
-    # rel=1 unconditionally — there's no "today" in the tree to skip.
-    # Today's in-production orders are tracked in DB (status), not in pq.
+
+def _fill_pq_orders(
+    state: SchedulerState,
+    daily_remaining: list[int],
+    results: list[ScheduledResult],
+) -> None:
+    """Phase 2 of :func:`compute_schedule`: forward-fill pq orders against post-pin remaining."""
     for order in _iter_pq_edf_sorted(state):
         deadline_rel = abs_to_rel(order.deadline, state.base_date)
         if deadline_rel is None:
@@ -1479,8 +1490,6 @@ def compute_schedule(state: SchedulerState) -> list[ScheduledResult]:
             )
             daily_remaining[d] -= assigned
             remaining -= assigned
-
-    return results
 
 
 def capacity_prefix_sums(state: SchedulerState) -> list[tuple[date, int]]:
@@ -1504,6 +1513,28 @@ def capacity_prefix_sums(state: SchedulerState) -> list[tuple[date, int]]:
 # ---------------------------------------------------------------------------
 # advance_day
 # ---------------------------------------------------------------------------
+
+
+def _partition_pinned_for_advance(
+    state: SchedulerState,
+) -> tuple[list[PinnedOrder], dict[uuid.UUID, PinnedOrder], int]:
+    """Split pinned orders into today-due vs. carried-forward groups for :func:`advance_day`.
+
+    Returns ``(pinned_today, pinned_remaining, pinned_today_total)`` where
+    ``pinned_today_total`` is the wafer-quantity sum of orders whose
+    ``fake_deadline`` maps to rel == 1.
+    """
+    pinned_today: list[PinnedOrder] = []
+    pinned_remaining: dict[uuid.UUID, PinnedOrder] = {}
+    pinned_today_total = 0
+    for pinned in state.pinned_orders.values():
+        fake_rel = abs_to_rel(pinned.fake_deadline, state.base_date)
+        if fake_rel == 1:
+            pinned_today.append(pinned)
+            pinned_today_total += pinned.wafer_quantity
+        else:
+            pinned_remaining[pinned.order_id] = pinned
+    return pinned_today, pinned_remaining, pinned_today_total
 
 
 def advance_day(state: SchedulerState) -> SchedulerState:
@@ -1555,16 +1586,7 @@ def advance_day(state: SchedulerState) -> SchedulerState:
     )
 
     # ----- Step 0: pinned-today (fake_deadline == today) ------------------
-    pinned_today: list[PinnedOrder] = []
-    pinned_remaining: dict[uuid.UUID, PinnedOrder] = {}
-    pinned_today_total = 0
-    for pinned in state.pinned_orders.values():
-        fake_rel = abs_to_rel(pinned.fake_deadline, state.base_date)
-        if fake_rel == 1:
-            pinned_today.append(pinned)
-            pinned_today_total += pinned.wafer_quantity
-        else:
-            pinned_remaining[pinned.order_id] = pinned
+    pinned_today, pinned_remaining, pinned_today_total = _partition_pinned_for_advance(state)
 
     # Drop pinned-today from trees (they're done today).
     for pinned in pinned_today:
@@ -1725,7 +1747,7 @@ def rebuild_state(
                 )
             )
             logger.warning(
-                "schedule.rebuild.skip",
+                _REBUILD_SKIP_EVENT,
                 order_id=str(order.order_id),
                 order_number=order.order_number,
                 reason=add_result.status,
@@ -1747,7 +1769,7 @@ def rebuild_state(
             )
         )
         logger.warning(
-            "schedule.rebuild.skip",
+            _REBUILD_SKIP_EVENT,
             order_id=str(order.order_id),
             order_number=order.order_number,
             reason=pin_result.status,
@@ -1767,7 +1789,7 @@ def rebuild_state(
             )
         )
         logger.warning(
-            "schedule.rebuild.skip",
+            _REBUILD_SKIP_EVENT,
             order_id=str(order.order_id),
             order_number=order.order_number,
             reason=result.status,

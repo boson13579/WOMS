@@ -70,7 +70,7 @@ function SortableHead({
   className,
   testId,
   children,
-}: SortableHeadProps): JSX.Element {
+}: Readonly<SortableHeadProps>): JSX.Element {
   const active = sortBy === field;
   const ActiveIcon = sortOrder === 'asc' ? ArrowUp : ArrowDown;
   const Icon = active ? ActiveIcon : ArrowUpDown;
@@ -98,7 +98,7 @@ interface OrderTableProps {
   onEdit: (order: Order) => void;
 }
 
-export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
+export function OrderTable({ onEdit }: Readonly<OrderTableProps>): JSX.Element {
   const { status, search, assignedTo, createdBy, page, sortBy, sortOrder, setPage, setSort } =
     useOrderStore();
   const PAGE_SIZE = 20;
@@ -145,7 +145,7 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
 
   function handleDelete(order: Order): void {
     // eslint-disable-next-line no-alert
-    if (!window.confirm(`確定要刪除訂單 ${order.order_number}？`)) return;
+    if (!globalThis.confirm(`確定要刪除訂單 ${order.order_number}？`)) return;
     // Backend DELETE is async for non-cancelled orders: it locks the row and
     // enqueues a worker compound that performs the soft-delete on accept. The
     // row only leaves the list once the worker finishes, so the toast must not
@@ -164,7 +164,7 @@ export function OrderTable({ onEdit }: OrderTableProps): JSX.Element {
 
   function handleCancel(order: Order): void {
     // eslint-disable-next-line no-alert
-    if (!window.confirm(`確定要取消訂單 ${order.order_number}？`)) return;
+    if (!globalThis.confirm(`確定要取消訂單 ${order.order_number}？`)) return;
     // Backend POST /cancel only locks the row and enqueues a worker compound;
     // the status flips to cancelled when the worker accepts, not on this
     // response. Word the toast as a queued request, not a completed change.

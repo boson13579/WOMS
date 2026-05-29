@@ -38,7 +38,10 @@ const SECONDARY_NAV: readonly NavItem[] = [
   { to: '/notifications', label: 'Notifications', icon: Bell },
 ];
 
-function NavRow({ item, onNavigate }: { item: NavItem; onNavigate: () => void }): JSX.Element {
+function NavRow({
+  item,
+  onNavigate,
+}: Readonly<{ item: NavItem; onNavigate: () => void }>): JSX.Element {
   const { to, label, icon: Icon, disabled, badgeCount } = item;
 
   if (disabled) {

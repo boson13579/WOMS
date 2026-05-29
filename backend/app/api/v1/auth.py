@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.orm import Session
 
@@ -15,9 +17,9 @@ from app.services import auth as auth_service
 router = APIRouter()
 
 
-@router.post("/login", response_model=LoginResponse)
+@router.post("/login")
 def login(
-    request: LoginRequest, response: Response, db: Session = Depends(get_db)
+    request: LoginRequest, response: Response, db: Annotated[Session, Depends(get_db)]
 ) -> LoginResponse:
     """Authenticate with username/password and return a JWT bearer token.
 
@@ -47,12 +49,11 @@ def logout(response: Response) -> dict[str, str]:
 
 @router.post(
     "/register",
-    response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
 )
 def register(
     request: RegisterRequest,
-    db: Session = Depends(get_db),
+    db: Annotated[Session, Depends(get_db)],
 ) -> UserResponse:
     """Create a new user account and return the created user profile.
 
@@ -65,8 +66,8 @@ def register(
     return auth_service.register(db, request)
 
 
-@router.get("/me", response_model=UserResponse)
-def me(current_user: User = Depends(get_current_user)) -> UserResponse:
+@router.get("/me")
+def me(current_user: Annotated[User, Depends(get_current_user)]) -> UserResponse:
     """Return the profile of the currently authenticated user.
 
     Permission: any authenticated user — valid bearer token required.

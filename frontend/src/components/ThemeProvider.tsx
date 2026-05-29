@@ -29,7 +29,7 @@ export function ThemeProvider({ children }: ThemeProviderProps): React.ReactNode
     // user choice should win and OS flips are irrelevant.
     if (theme !== 'system') return undefined;
 
-    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const mq = globalThis.matchMedia('(prefers-color-scheme: dark)');
     mq.addEventListener('change', apply);
     return () => {
       mq.removeEventListener('change', apply);

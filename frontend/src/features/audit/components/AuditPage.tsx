@@ -130,7 +130,7 @@ export function AuditPage(): JSX.Element {
   );
 
   const handleRefresh = useCallback((): void => {
-    void eventsQuery.refetch();
+    eventsQuery.refetch().catch(() => {});
   }, [eventsQuery]);
 
   if (role !== 'root') {

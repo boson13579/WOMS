@@ -72,7 +72,7 @@ export function RedKpiCard({
   footnote,
   sparklineData,
   sparklineLabel,
-}: RedKpiCardProps): JSX.Element {
+}: Readonly<RedKpiCardProps>): JSX.Element {
   return (
     <Card className={cn(CARD_TONE_CLASS[tone])}>
       <CardHeader className="pb-1">

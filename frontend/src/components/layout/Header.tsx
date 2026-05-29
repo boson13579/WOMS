@@ -30,7 +30,7 @@ export function Header({
   lastUpdatedLabel,
   onRefresh,
   refreshing = false,
-}: HeaderProps): JSX.Element {
+}: Readonly<HeaderProps>): JSX.Element {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const logout = useAuthStore((state) => state.logout);
@@ -49,9 +49,11 @@ export function Header({
     // per-user data visible while the redirect is in flight. The auth
     // store also clears its own local hint inside logout().
     queryClient.clear();
-    void logout().finally(() => {
-      navigate('/login', { replace: true });
-    });
+    logout()
+      .finally(() => {
+        navigate('/login', { replace: true });
+      })
+      .catch(() => {});
   };
 
   return (

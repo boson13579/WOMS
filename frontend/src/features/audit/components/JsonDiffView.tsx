@@ -33,7 +33,7 @@ function renderValue(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2);
   } catch {
-    return String(value);
+    return '(unserialisable value)';
   }
 }
 
@@ -43,7 +43,7 @@ interface JsonObjectPanelProps {
   tone: 'before' | 'after';
 }
 
-function JsonObjectPanel({ label, data, tone }: JsonObjectPanelProps): JSX.Element {
+function JsonObjectPanel({ label, data, tone }: Readonly<JsonObjectPanelProps>): JSX.Element {
   const toneClass =
     tone === 'before'
       ? 'bg-rose-50 dark:bg-rose-950/30 border-rose-200/60 dark:border-rose-900/40'
@@ -95,7 +95,7 @@ function JsonObjectPanel({ label, data, tone }: JsonObjectPanelProps): JSX.Eleme
   );
 }
 
-export function JsonDiffView({ oldValue, newValue }: JsonDiffViewProps): JSX.Element {
+export function JsonDiffView({ oldValue, newValue }: Readonly<JsonDiffViewProps>): JSX.Element {
   if (oldValue === null && newValue === null) {
     return (
       <p className="italic text-muted-foreground" data-testid="json-diff-empty">

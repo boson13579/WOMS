@@ -73,7 +73,7 @@ export function ProtectedRoute(): JSX.Element {
               type="button"
               size="sm"
               onClick={() => {
-                void query.refetch();
+                query.refetch().catch(() => {});
               }}
             >
               Retry
@@ -83,7 +83,7 @@ export function ProtectedRoute(): JSX.Element {
               variant="outline"
               size="sm"
               onClick={() => {
-                void logout();
+                logout().catch(() => {});
               }}
             >
               Sign out

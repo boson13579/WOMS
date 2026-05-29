@@ -27,7 +27,6 @@ class HealthResponse(BaseModel):
 
 @router.get(
     "/health",
-    response_model=HealthResponse,
     summary="Liveness probe",
     response_description="Service is up and accepting requests.",
 )

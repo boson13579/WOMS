@@ -72,7 +72,7 @@ export function deriveScheduleDisplay(
     return { label: 'Idle', variant: 'success', Icon: CheckCircle2 };
   }
   // idle + queue>0 → between-task gap or stalled.
-  const finishedMs = data.finished_at ? Date.parse(data.finished_at) : NaN;
+  const finishedMs = data.finished_at ? Date.parse(data.finished_at) : Number.NaN;
   const secondsSinceFinish = Number.isFinite(finishedMs) ? (now - finishedMs) / 1000 : Infinity;
   if (secondsSinceFinish < STALL_THRESHOLD_SECONDS) {
     return {
@@ -90,31 +90,64 @@ export function deriveScheduleDisplay(
   };
 }
 
+function renderLoadingCard(): JSX.Element {
+  return (
+    <Card>
+      <CardContent className="p-5">
+        <Skeleton data-testid="schedule-status-skeleton" className="h-20 w-full" />
+      </CardContent>
+    </Card>
+  );
+}
+
+function renderErrorCard(): JSX.Element {
+  return (
+    <Card className="border-destructive/40">
+      <CardContent className="flex items-start gap-3 p-5">
+        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-600 dark:text-red-400" />
+        <p className="text-sm">Failed to load scheduler status.</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+function renderDetailsList(data: ScheduleStatusResponse): JSX.Element {
+  return (
+    <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+      {data.task_id ? (
+        <>
+          <dt className="text-muted-foreground">Task ID</dt>
+          <dd className="font-mono tabular-nums">{data.task_id}</dd>
+        </>
+      ) : null}
+      {data.started_at ? (
+        <>
+          <dt className="text-muted-foreground">Started</dt>
+          <dd className="tabular-nums">{formatTimestamp(data.started_at)}</dd>
+        </>
+      ) : null}
+      {data.finished_at ? (
+        <>
+          <dt className="text-muted-foreground">Finished</dt>
+          <dd className="tabular-nums">{formatTimestamp(data.finished_at)}</dd>
+        </>
+      ) : null}
+    </dl>
+  );
+}
+
 export function ScheduleStatusCard({
   data,
   isLoading,
   isError,
   queueDepth,
-}: ScheduleStatusCardProps): JSX.Element {
+}: Readonly<ScheduleStatusCardProps>): JSX.Element {
   if (isLoading) {
-    return (
-      <Card>
-        <CardContent className="p-5">
-          <Skeleton data-testid="schedule-status-skeleton" className="h-20 w-full" />
-        </CardContent>
-      </Card>
-    );
+    return renderLoadingCard();
   }
 
   if (isError || !data) {
-    return (
-      <Card className="border-destructive/40">
-        <CardContent className="flex items-start gap-3 p-5">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-600 dark:text-red-400" />
-          <p className="text-sm">Failed to load scheduler status.</p>
-        </CardContent>
-      </Card>
-    );
+    return renderErrorCard();
   }
 
   const display = deriveScheduleDisplay(data, queueDepth);
@@ -152,26 +185,7 @@ export function ScheduleStatusCard({
         {data.message ? (
           <p className="text-xs text-muted-foreground">{data.message}</p>
         ) : (
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-            {data.task_id ? (
-              <>
-                <dt className="text-muted-foreground">Task ID</dt>
-                <dd className="font-mono tabular-nums">{data.task_id}</dd>
-              </>
-            ) : null}
-            {data.started_at ? (
-              <>
-                <dt className="text-muted-foreground">Started</dt>
-                <dd className="tabular-nums">{formatTimestamp(data.started_at)}</dd>
-              </>
-            ) : null}
-            {data.finished_at ? (
-              <>
-                <dt className="text-muted-foreground">Finished</dt>
-                <dd className="tabular-nums">{formatTimestamp(data.finished_at)}</dd>
-              </>
-            ) : null}
-          </dl>
+          renderDetailsList(data)
         )}
 
         {data.error ? (

@@ -16,7 +16,7 @@ interface RegisterFormProps {
   onSuccess?: () => void;
 }
 
-export function RegisterForm({ onSuccess }: RegisterFormProps): JSX.Element {
+export function RegisterForm({ onSuccess }: Readonly<RegisterFormProps>): JSX.Element {
   const {
     register,
     handleSubmit,
@@ -39,7 +39,7 @@ export function RegisterForm({ onSuccess }: RegisterFormProps): JSX.Element {
   return (
     <form
       onSubmit={(event) => {
-        void onSubmit(event);
+        onSubmit(event).catch(() => {});
       }}
       className="space-y-5"
       noValidate
