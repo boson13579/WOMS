@@ -41,11 +41,11 @@ VALID_SORT_FIELDS = frozenset(
 )
 
 
-@router.post("", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED)
 def create_order(
     request: CreateOrderRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_WRITE_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_WRITE_ROLES)],
 ) -> OrderResponse:
     """Create a new wafer order.
 
@@ -59,18 +59,18 @@ def create_order(
     return order_service.create_order(db, request, current_user)
 
 
-@router.get("", response_model=OrderListResponse)
+@router.get("")
 def list_orders(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_READ_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_READ_ROLES)],
     status_filter: Annotated[list[OrderStatus] | None, Query(alias="status")] = None,
     assigned_to: Annotated[list[uuid.UUID] | None, Query()] = None,
     created_by: uuid.UUID | None = None,
-    search: str | None = Query(default=None, max_length=200),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    sort_by: str | None = Query(default=None),
-    sort_order: Literal["asc", "desc"] | None = Query(default=None),
+    search: Annotated[str | None, Query(max_length=200)] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    sort_by: Annotated[str | None, Query()] = None,
+    sort_order: Annotated[Literal["asc", "desc"] | None, Query()] = None,
 ) -> OrderListResponse:
     """List active orders with optional filtering, sorting, and pagination.
 
@@ -96,11 +96,11 @@ def list_orders(
 
 # IMPORTANT: /batch-update must be registered BEFORE /{order_id} to prevent
 # FastAPI from matching the literal string "batch-update" as a UUID path param.
-@router.patch("/batch-update", response_model=BatchUpdateResponse)
+@router.patch("/batch-update")
 def batch_update_orders(
     request: BatchUpdateRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_WRITE_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_WRITE_ROLES)],
 ) -> BatchUpdateResponse:
     """Bulk-update the requested_delivery_date for multiple orders.
 
@@ -112,11 +112,11 @@ def batch_update_orders(
     return order_service.batch_update_orders(db, request, current_user)
 
 
-@router.get("/{order_id}", response_model=OrderResponse)
+@router.get("/{order_id}")
 def get_order(
     order_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_READ_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_READ_ROLES)],
 ) -> OrderResponse:
     """Fetch a single order by ID.
 
@@ -128,12 +128,12 @@ def get_order(
     return order_service.get_order(db, order_id)
 
 
-@router.patch("/{order_id}", response_model=OrderResponse)
+@router.patch("/{order_id}")
 def update_order(
     order_id: uuid.UUID,
     request: UpdateOrderRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_WRITE_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_WRITE_ROLES)],
 ) -> OrderResponse:
     """Partially update an order (pending or scheduled only).
 
@@ -153,8 +153,8 @@ def update_order(
 @router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_order(
     order_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_WRITE_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_WRITE_ROLES)],
 ) -> None:
     """Soft-delete an order: sets is_deleted=True and status=cancelled.
 
@@ -166,11 +166,11 @@ def delete_order(
     order_service.delete_order(db, order_id, current_user)
 
 
-@router.post("/{order_id}/cancel", response_model=OrderResponse)
+@router.post("/{order_id}/cancel")
 def cancel_order(
     order_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_WRITE_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_WRITE_ROLES)],
 ) -> OrderResponse:
     """Cancel a scheduled order: sets status=cancelled but is_deleted stays False.
 
@@ -192,11 +192,11 @@ def cancel_order(
     return order_service.cancel_order(db, order_id, current_user)
 
 
-@router.get("/{order_id}/audit-log", response_model=list[AuditLogResponse])
+@router.get("/{order_id}/audit-log")
 def get_audit_log(
     order_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_READ_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_READ_ROLES)],
 ) -> list[AuditLogResponse]:
     """Return all audit-log entries for a given order, oldest first.
 

@@ -49,7 +49,7 @@ def _envelope(
     }
 
 
-async def http_exception_handler(
+def http_exception_handler(
     _request: Request,
     exc: StarletteHTTPException,
 ) -> JSONResponse:
@@ -68,7 +68,7 @@ async def http_exception_handler(
     )
 
 
-async def validation_exception_handler(
+def validation_exception_handler(
     _request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
@@ -94,7 +94,7 @@ async def validation_exception_handler(
     )
 
 
-async def unhandled_exception_handler(
+def unhandled_exception_handler(
     request: Request,
     exc: Exception,
 ) -> JSONResponse:

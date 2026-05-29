@@ -30,7 +30,7 @@ import json
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
-from typing import Any, cast
+from typing import Annotated, Any, TypeAlias, cast
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -85,6 +85,8 @@ logger = structlog.get_logger(__name__)
 _READ_ROLES = require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
 _WRITE_ROLES = require_roles(UserRole.scheduler, UserRole.root)
 
+_StrOrNone: TypeAlias = str | None
+
 
 # ---------------------------------------------------------------------------
 # Lazy Redis client
@@ -98,7 +100,7 @@ def _redis() -> Redis:
 
 
 def _read_status() -> dict[str, Any] | None:
-    raw = cast("str | None", _redis().get(STATUS_KEY))
+    raw = cast(_StrOrNone, _redis().get(STATUS_KEY))
     if raw is None:
         return None
     return cast("dict[str, Any]", json.loads(raw))
@@ -111,11 +113,10 @@ def _read_status() -> dict[str, Any] | None:
 
 @router.post(
     "/trigger",
-    response_model=ScheduleTriggerResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
 def trigger_scheduling(
-    current_user: User = Depends(_WRITE_ROLES),
+    current_user: Annotated[User, Depends(_WRITE_ROLES)],
 ) -> ScheduleTriggerResponse:
     """Manually dispatch a scheduling run.
 
@@ -171,11 +172,10 @@ def trigger_scheduling(
 
 @router.delete(
     "/operations/{compound_id}",
-    response_model=ScheduleCompoundResponse,
 )
 def cancel_compound_endpoint(
     compound_id: uuid.UUID,
-    current_user: User = Depends(_WRITE_ROLES),
+    current_user: Annotated[User, Depends(_WRITE_ROLES)],
 ) -> ScheduleCompoundResponse:
     """Cancel a still-queued scheduler compound.
 
@@ -242,10 +242,9 @@ def cancel_compound_endpoint(
 
 @router.get(
     "/status",
-    response_model=ScheduleStatusResponse,
 )
 def get_schedule_status(
-    current_user: User = Depends(_READ_ROLES),
+    current_user: Annotated[User, Depends(_READ_ROLES)],
 ) -> ScheduleStatusResponse:
     """Current scheduler lifecycle state, mirrored from Redis.
 
@@ -267,28 +266,31 @@ def get_schedule_status(
 
 @router.get(
     "/result",
-    response_model=list[ScheduleResultResponse],
 )
 def get_schedule_result(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_READ_ROLES),
-    include_completed: bool = Query(
-        default=False,
-        description=(
-            "Include ``completed`` orders alongside ``scheduled`` / "
-            "``in_production``. The default is False to preserve legacy "
-            "behavior; the calendar view passes True."
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_READ_ROLES)],
+    include_completed: Annotated[
+        bool,
+        Query(
+            description=(
+                "Include ``completed`` orders alongside ``scheduled`` / "
+                "``in_production``. The default is False to preserve legacy "
+                "behavior; the calendar view passes True."
+            ),
         ),
-    ),
-    completed_since: date | None = Query(
-        default=None,
-        description=(
-            "Lower-bound (inclusive) on ``scheduled_production_date`` for "
-            "completed orders. Ignored when ``include_completed`` is False. "
-            "When ``include_completed`` is True and this is omitted, defaults "
-            "to today - ``SCHEDULER_HORIZON_DAYS`` days."
+    ] = False,
+    completed_since: Annotated[
+        date | None,
+        Query(
+            description=(
+                "Lower-bound (inclusive) on ``scheduled_production_date`` for "
+                "completed orders. Ignored when ``include_completed`` is False. "
+                "When ``include_completed`` is True and this is omitted, defaults "
+                "to today - ``SCHEDULER_HORIZON_DAYS`` days."
+            ),
         ),
-    ),
+    ] = None,
 ) -> list[ScheduleResultResponse]:
     """Return every order on the production timeline, with per-day breakdown.
 
@@ -328,10 +330,9 @@ def get_schedule_result(
 
 @router.get(
     "/pending-ops",
-    response_model=list[PendingOpsEntry],
 )
 def get_pending_ops(
-    current_user: User = Depends(_READ_ROLES),
+    current_user: Annotated[User, Depends(_READ_ROLES)],
 ) -> list[PendingOpsEntry]:
     """Snapshot the worker's pending-compound queue with drain ranks.
 
@@ -362,10 +363,9 @@ def get_pending_ops(
 
 @router.get(
     "/capacity",
-    response_model=ScheduleCapacityResponse,
 )
 def get_schedule_capacity(
-    current_user: User = Depends(_READ_ROLES),
+    current_user: Annotated[User, Depends(_READ_ROLES)],
 ) -> ScheduleCapacityResponse:
     """Per-day prefix sum of remaining wafer capacity across the 30-day horizon.
 
@@ -386,7 +386,7 @@ def get_schedule_capacity(
 
     Permission: order_manager+.
     """
-    raw = cast("str | None", _redis().get(STATE_KEY))
+    raw = cast(_StrOrNone, _redis().get(STATE_KEY))
     if raw is None:
         state = SchedulerState.initial(datetime.now(tz=UTC).date())
     else:
@@ -410,11 +410,10 @@ def get_schedule_capacity(
 
 @router.get(
     "/capacity-usage",
-    response_model=ScheduleCapacityUsageResponse,
 )
 def get_schedule_capacity_usage(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_READ_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_READ_ROLES)],
 ) -> ScheduleCapacityUsageResponse:
     """Per-day used / remaining capacity across the upcoming 30-day horizon.
 
@@ -440,7 +439,7 @@ def get_schedule_capacity_usage(
 
     Permission: order_manager+.
     """
-    raw = cast("str | None", _redis().get(STATE_KEY))
+    raw = cast(_StrOrNone, _redis().get(STATE_KEY))
     if raw is None:
         base_date = datetime.now(tz=UTC).date()
     else:
@@ -466,11 +465,10 @@ def get_schedule_capacity_usage(
 
 @router.post(
     "/rebuild",
-    response_model=ScheduleRebuildResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
 def rebuild_schedule(
-    current_user: User = Depends(_WRITE_ROLES),
+    current_user: Annotated[User, Depends(_WRITE_ROLES)],
 ) -> ScheduleRebuildResponse:
     """Queue a scheduler state rebuild from DB scheduled orders.
 
