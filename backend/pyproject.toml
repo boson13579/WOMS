@@ -127,6 +127,7 @@ addopts = [
     "--cov=app",
     "--cov-report=term-missing",
     "--cov-report=xml",
+    "--cov-branch",
     "--junit-xml=test-results/junit.xml",
 ]
 markers = [
