@@ -196,7 +196,7 @@ def cancel_order(
 def get_audit_log(
     order_id: uuid.UUID,
     db: Annotated[Session, Depends(get_db)],
-    current_user: Annotated[User, Depends(_READ_ROLES)],
+    _current_user: Annotated[User, Depends(_READ_ROLES)],
 ) -> list[AuditLogResponse]:
     """Return all audit-log entries for a given order, oldest first.
 
@@ -205,4 +205,4 @@ def get_audit_log(
     Errors:
         404: order not found.
     """
-    return order_service.get_audit_log(db, order_id, current_user)
+    return order_service.get_audit_log(db, order_id)

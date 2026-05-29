@@ -83,13 +83,13 @@ function isExpired(expiresAt: number): boolean {
 }
 
 function clearPersistedAuth(): void {
-  if (typeof globalThis.localStorage !== 'undefined') {
+  if ('localStorage' in globalThis) {
     globalThis.localStorage.removeItem(STORAGE_KEY);
   }
 }
 
 function loadPersistedAuth(): PersistedAuthState | null {
-  if (typeof globalThis.localStorage === 'undefined') {
+  if (!('localStorage' in globalThis)) {
     return null;
   }
 
@@ -121,7 +121,7 @@ function loadPersistedAuth(): PersistedAuthState | null {
 }
 
 function persistAuth(state: PersistedAuthState | null): void {
-  if (typeof globalThis.localStorage === 'undefined') {
+  if (!('localStorage' in globalThis)) {
     return;
   }
 
@@ -180,10 +180,9 @@ export function installUnauthorizedHandler(
       .getState()
       .logout()
       .catch(() => {});
-    const next =
-      typeof globalThis.location === 'undefined'
-        ? '/'
-        : `${globalThis.location.pathname}${globalThis.location.search}`;
+    const next = !('location' in globalThis)
+      ? '/'
+      : `${globalThis.location.pathname}${globalThis.location.search}`;
     navigate(`/login?next=${encodeURIComponent(next)}`, { replace: true });
   });
 }

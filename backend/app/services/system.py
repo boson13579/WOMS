@@ -28,7 +28,7 @@ import uuid as uuid_module
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeAlias, cast
 from urllib.parse import urlparse
 
 import structlog
@@ -65,6 +65,9 @@ from app.workers.celery_app import celery_app
 
 ServiceId = Literal["api", "postgres", "redis", "celery"]
 HealthStatus = Literal["healthy", "warning", "error"]
+
+# Cast target for redis/json payloads decoded as untyped mappings.
+_DictStrAny: TypeAlias = dict[str, Any]
 
 logger = structlog.get_logger(__name__)
 
@@ -340,7 +343,7 @@ def _parse_status_doc(status_raw: str | None) -> dict[str, Any] | None:
     if not status_raw:
         return None
     try:
-        return cast("dict[str, Any]", json.loads(status_raw))
+        return cast(_DictStrAny, json.loads(status_raw))
     except json.JSONDecodeError:
         logger.warning("system.health.celery.bad_status_doc", raw=status_raw)
         return None
@@ -543,9 +546,9 @@ def _get_redis_stats() -> RedisStats | None:
         # cover the async client too — we use the sync client, so cast to the
         # plain ``dict`` shape we know we get. Mirrors the existing pattern
         # in ``_probe_celery``.
-        info_mem = cast("dict[str, Any]", rds.info("memory"))
-        info_clients = cast("dict[str, Any]", rds.info("clients"))
-        info_stats = cast("dict[str, Any]", rds.info("stats"))
+        info_mem = cast(_DictStrAny, rds.info("memory"))
+        info_clients = cast(_DictStrAny, rds.info("clients"))
+        info_stats = cast(_DictStrAny, rds.info("stats"))
     except Exception as exc:
         logger.warning("system.resources.redis.probe_failed", error=str(exc))
         return None

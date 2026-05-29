@@ -1,4 +1,4 @@
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
 import { toast } from 'sonner';
 import { z } from 'zod';
@@ -32,6 +32,15 @@ const wsEnvelopeSchema = z
 function buildWsUrl(): string {
   const protocol = globalThis.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${protocol}//${globalThis.location.host}${WS_PATH}`;
+}
+
+/**
+ * Fire-and-forget refresh of the notification queries. Hoisted to module
+ * scope so its ``.catch`` doesn't add a nested function level at the call
+ * sites inside the effect's socket handlers.
+ */
+function invalidateNotifications(qc: QueryClient): void {
+  qc.invalidateQueries({ queryKey: notificationKeys.all }).catch(() => {});
 }
 
 export function useNotificationsWs(): void {
@@ -88,7 +97,7 @@ export function useNotificationsWs(): void {
       }
 
       if (env.type === 'notification.created' && env.data) {
-        qc.invalidateQueries({ queryKey: notificationKeys.all }).catch(() => {});
+        invalidateNotifications(qc);
         queueNotificationToast(env.data.message);
       }
     }
@@ -100,7 +109,7 @@ export function useNotificationsWs(): void {
       ws.onopen = () => {
         backoffMs = RECONNECT_INITIAL_MS;
         if (!isFirstOpen) {
-          qc.invalidateQueries({ queryKey: notificationKeys.all }).catch(() => {});
+          invalidateNotifications(qc);
         }
         isFirstOpen = false;
       };

@@ -652,6 +652,31 @@ def _check_update_preconditions(order: Order, req: UpdateOrderRequest, actor: Us
         )
 
 
+def _resolve_pin_day(
+    order: Order,
+    req: UpdateOrderRequest,
+    new_deadline: date,
+) -> tuple[bool, date | None, bool]:
+    """Resolve the production-pin change and validate it against the deadline.
+
+    Returns ``(pin_day_set, new_pin_day, pin_changed_explicitly)``.
+    """
+    pin_day_set = "pinned_production_date" in req.model_fields_set
+    new_pin_day = req.pinned_production_date if pin_day_set else order.pinned_production_date
+    if pin_day_set and new_pin_day is not None and new_pin_day > new_deadline:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Pin date cannot be after the order's delivery deadline.",
+        )
+    if pin_day_set and new_pin_day is not None:
+        _validate_deadline_or_422(new_pin_day)
+    pin_changed_explicitly = pin_day_set and (
+        (new_pin_day is None) != (not order.is_pinned)
+        or (new_pin_day is not None and new_pin_day != order.pinned_production_date)
+    )
+    return pin_day_set, new_pin_day, pin_changed_explicitly
+
+
 def _resolve_update_payload(
     db: Session,
     order: Order,
@@ -677,23 +702,11 @@ def _resolve_update_payload(
     if assigned_to_set:
         _validate_assigned_to_user(db, new_assigned_to)
 
-    pin_day_set = "pinned_production_date" in req.model_fields_set
-    new_pin_day = req.pinned_production_date if pin_day_set else order.pinned_production_date
-    if pin_day_set and new_pin_day is not None and new_pin_day > new_deadline:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Pin date cannot be after the order's delivery deadline.",
-        )
-
     if req.requested_delivery_date is not None:
         _validate_deadline_or_422(new_deadline)
-    if pin_day_set and new_pin_day is not None:
-        _validate_deadline_or_422(new_pin_day)
 
-    pin_changed_explicitly = pin_day_set and (
-        (new_pin_day is None) != (not order.is_pinned)
-        or (new_pin_day is not None and new_pin_day != order.pinned_production_date)
-    )
+    pin_day_set, new_pin_day, pin_changed_explicitly = _resolve_pin_day(order, req, new_deadline)
+
     scheduling_changed = (
         new_qty != order.wafer_quantity
         or new_deadline != order.requested_delivery_date
@@ -1168,7 +1181,6 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
 def get_audit_log(
     db: Session,
     order_id: uuid.UUID,
-    current_user: User,
 ) -> list[AuditLogResponse]:
     """Return all audit-log entries for an order; raise 404 if not found.
 

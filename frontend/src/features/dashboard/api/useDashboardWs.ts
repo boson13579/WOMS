@@ -21,7 +21,7 @@
  * auth (PR #18) and closes with code 4401 when the cookie is missing or
  * the token is invalid.
  */
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
 
 import { useCurrentRole } from '@/lib/auth';
@@ -85,6 +85,31 @@ function buildWsUrl(): string {
   return `${protocol}//${globalThis.location.host}${WS_PATH}`;
 }
 
+/**
+ * Translate one raw WebSocket frame into query invalidations. Hoisted to
+ * module scope (taking ``queryClient`` as a parameter) so the per-key
+ * ``forEach`` doesn't sit four function levels deep inside the effect.
+ */
+function dispatchEvent(queryClient: QueryClient, rawData: unknown): void {
+  if (typeof rawData !== 'string') return;
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(rawData);
+  } catch {
+    // Malformed JSON — drop the message silently rather than throw,
+    // so one bad frame doesn't break subsequent events.
+    return;
+  }
+  if (typeof envelope !== 'object' || envelope === null) return;
+  const { type } = envelope as { type?: unknown };
+  if (typeof type !== 'string') return;
+  const keys = EVENT_INVALIDATIONS[type];
+  if (!keys) return;
+  keys.forEach((queryKey) => {
+    queryClient.invalidateQueries({ queryKey }).catch(() => {});
+  });
+}
+
 export function useDashboardWs(): void {
   const queryClient = useQueryClient();
   // Gate on role, not the whole user object: viewers never get
@@ -106,26 +131,6 @@ export function useDashboardWs(): void {
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    function dispatchEvent(rawData: unknown): void {
-      if (typeof rawData !== 'string') return;
-      let envelope: unknown;
-      try {
-        envelope = JSON.parse(rawData);
-      } catch {
-        // Malformed JSON — drop the message silently rather than throw,
-        // so one bad frame doesn't break subsequent events.
-        return;
-      }
-      if (typeof envelope !== 'object' || envelope === null) return;
-      const { type } = envelope as { type?: unknown };
-      if (typeof type !== 'string') return;
-      const keys = EVENT_INVALIDATIONS[type];
-      if (!keys) return;
-      keys.forEach((queryKey) => {
-        queryClient.invalidateQueries({ queryKey }).catch(() => {});
-      });
-    }
-
     function connect(): void {
       if (stopped) return;
       ws = new WebSocket(buildWsUrl());
@@ -137,7 +142,7 @@ export function useDashboardWs(): void {
       };
 
       ws.onmessage = (e: MessageEvent) => {
-        dispatchEvent(e.data);
+        dispatchEvent(queryClient, e.data);
       };
 
       ws.onclose = (e: CloseEvent) => {
