@@ -180,9 +180,10 @@ export function installUnauthorizedHandler(
       .getState()
       .logout()
       .catch(() => {});
-    const next = !('location' in globalThis)
-      ? '/'
-      : `${globalThis.location.pathname}${globalThis.location.search}`;
+    const next =
+      'location' in globalThis
+        ? `${globalThis.location.pathname}${globalThis.location.search}`
+        : '/';
     navigate(`/login?next=${encodeURIComponent(next)}`, { replace: true });
   });
 }
