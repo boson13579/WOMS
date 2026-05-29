@@ -89,8 +89,21 @@ jobs:
         # invisible — pytest never prints them by default.
         run: uv run pytest --durations=20
 
-      - name: Coverage Summary
+      - name: Test and Coverage Summary
+        if: always()
         run: |
+          echo "## Backend Test Results" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c "
+          import xml.etree.ElementTree as ET
+          try:
+            s = ET.parse('test-results/junit.xml').getroot()
+            if s.tag != 'testsuite': s = s.find('testsuite')
+            t,f,e,k = int(s.get('tests',0)),int(s.get('failures',0)),int(s.get('errors',0)),int(s.get('skipped',0))
+            icon = '✅' if f+e == 0 else '❌'
+            print(icon+' '+str(t-f-e-k)+' passed, '+str(f+e)+' failed, '+str(k)+' skipped')
+          except Exception as ex: print('⚠️ '+str(ex))
+          " >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Coverage Report" >> "$GITHUB_STEP_SUMMARY"
           uv run coverage report --format=markdown | grep -E "^\| Name |^\|[-]|TOTAL" >> "$GITHUB_STEP_SUMMARY"
 
