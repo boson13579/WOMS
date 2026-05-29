@@ -1,0 +1,56 @@
+# Deploy the slide deck (asset/ppt/all.html) to GitHub Pages.
+#
+# The combined deck `all.html` plus its sibling assets (images, the other
+# per-section decks) are published verbatim; `all.html` is also copied to
+# `index.html` so the Pages root URL opens the combined presentation directly.
+#
+# Triggers on pushes to `main` that touch the deck (or this workflow), and can
+# be run on demand from any branch via the Actions tab ("Run workflow").
+
+name: Deploy PPT to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "asset/ppt/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Least-privilege token plus the OIDC id-token Pages needs to deploy.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize deployments; a newer run supersedes an in-flight one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble site (all.html -> index.html)
+        run: |
+          mkdir -p _site
+          cp -r asset/ppt/. _site/
+          cp asset/ppt/all.html _site/index.html
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
