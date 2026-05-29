@@ -122,3 +122,9 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
+# local SonarQube analysis token
+.sonar_token
+.scannerwork/
+frontend/coverage/
+backend/coverage.xml
