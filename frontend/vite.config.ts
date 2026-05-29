@@ -47,5 +47,9 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     css: false,
     exclude: ['e2e/**', ...configDefaults.exclude],
+    reporters: process.env.CI ? ['default', 'junit'] : ['default'],
+    outputFile: {
+      junit: './test-results/junit.xml',
+    },
   },
 });

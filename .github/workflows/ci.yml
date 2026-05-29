@@ -22,6 +22,9 @@ jobs:
   backend:
     name: backend (lint + test)
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
     defaults:
       run:
         working-directory: backend
@@ -86,6 +89,15 @@ jobs:
         # invisible — pytest never prints them by default.
         run: uv run pytest --durations=20
 
+      - name: Backend Test Report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Backend Test Results
+          path: backend/test-results/junit.xml
+          reporter: java-junit
+          fail-on-error: false
+
       - name: Upload coverage
         uses: actions/upload-artifact@v4
         if: always()
@@ -100,6 +112,9 @@ jobs:
   frontend:
     name: frontend (lint + test)
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
     defaults:
       run:
         working-directory: frontend
@@ -133,6 +148,15 @@ jobs:
 
       - name: Vitest
         run: pnpm test
+
+      - name: Frontend Test Report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Frontend Test Results
+          path: frontend/test-results/junit.xml
+          reporter: java-junit
+          fail-on-error: false
 
 # ---------------------------------------------------------------------------
 # Local "review pipeline" snippet (NOT executed by Actions — kept here as a
