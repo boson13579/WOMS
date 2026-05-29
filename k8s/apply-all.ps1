@@ -54,6 +54,7 @@ kubectl wait --for=condition=complete --timeout=60s job/woms-seed-admin -n woms
 # 4. App workloads.
 Apply-Templated "k8s/30-backend-deployment.yaml"
 Apply-Templated "k8s/40-worker-deployment.yaml"
+Apply-Templated "k8s/41-beat-deployment.yaml"
 Apply-Templated "k8s/50-frontend-deployment.yaml"
 
 # 5. Ingress (provisions the ALB on the AWS side — takes 3–5 min).

@@ -16,8 +16,9 @@ Three tasks live here:
 
 - ``run_scheduling_task`` — drain pending ops, mutate state, persist, notify,
   and re-fire itself if more ops queued during the run.
-- ``advance_day_task`` — daily 00:00 UTC tick; waits for any in-flight run,
-  rolls the horizon forward by a day, then re-triggers scheduling.
+- ``advance_day_task`` — daily 00:00 ``Asia/Taipei`` tick (see
+  ``celery_app.py`` for the timezone + crontab); waits for any in-flight
+  run, rolls the horizon forward by a day, then re-triggers scheduling.
 - ``rebuild_schedule_task`` — fired by ``POST /schedule/rebuild``; waits for
   any in-flight run, rebuilds state from DB, notifies skipped orders'
   creators, then re-triggers scheduling.
@@ -29,7 +30,7 @@ import json
 import math
 import time
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from typing import Any, cast
 
@@ -53,6 +54,7 @@ from app.services.scheduling import (
     MATERIALIZE_NOTIFY_PROCESSING_KEY,
     MATERIALIZE_RUNNING_KEY,
     PENDING_OPS_KEY,
+    REBUILD_IN_FLIGHT_KEY,
     STATE_KEY,
     STATUS_KEY,
     BatchOp,
@@ -995,7 +997,13 @@ def _finalize_run(state: SchedulerState) -> int:
 
     db: Session = SessionLocal()
     try:
-        order_service.apply_schedule(db, scheduled, pinned_map)
+        # ``preserve_capacity_for=base_date``: rebuild's compute_schedule
+        # never produces work on base_date (the "tree day 1 = base_date
+        # + 1" rule), so today's snapshot row written earlier by
+        # ``advance_day_task`` must survive this materialize.
+        order_service.apply_schedule(
+            db, scheduled, pinned_map, preserve_capacity_for=state.base_date
+        )
     finally:
         db.close()
 
@@ -1332,7 +1340,17 @@ def materialize_schedule_task() -> None:
                 pinned_map = {p.order_id: p.fake_deadline for p in state.pinned_orders.values()}
                 db: Session = SessionLocal()
                 try:
-                    order_service.apply_schedule(db, scheduled_results, pinned_map)
+                    # ``preserve_capacity_for=base_date``: materializer
+                    # only sees future-day work (compute_schedule fills
+                    # from base_date + 1), so today's snapshot row
+                    # written by ``advance_day_task`` (today's
+                    # in_production wafer量) must NOT be wiped.
+                    order_service.apply_schedule(
+                        db,
+                        scheduled_results,
+                        pinned_map,
+                        preserve_capacity_for=state.base_date,
+                    )
                 finally:
                     db.close()
 
@@ -1421,8 +1439,17 @@ def _wait_for_idle_run(*, log_event: str) -> None:
     retry_backoff_max=600,
     retry_jitter=True,
 )
-def advance_day_task() -> None:
-    """Roll the scheduler horizon forward one day at 00:00 UTC.
+def advance_day_task() -> None:  # noqa: PLR0915 — orchestrates many DB steps in one txn
+    """Roll the scheduler horizon forward one day at the Taiwan-calendar boundary.
+
+    Triggered by Celery Beat at 00:00 ``Asia/Taipei`` (see
+    ``celery_app.py::beat_schedule['advance-day']``). Earlier revisions
+    were anchored to UTC midnight, which on a Taipei-localised fab gave
+    an 8-hour window every night where the browser-local calendar
+    showed a new day but ``base_date`` had not yet advanced. The
+    business day is the Taiwan calendar day; the Beat firing time is
+    what defines that boundary (``advance_day`` itself just does
+    ``base_date += 1`` and never reads a wall clock).
 
     Polls ``schedule:status`` for up to 5 minutes waiting for any in-flight
     ``run_scheduling_task`` to finish. After the wait window we proceed
@@ -1491,15 +1518,50 @@ def advance_day_task() -> None:
         try:
             state = _load_state()
 
-            # Snapshot "today's locked-in" set BEFORE advance_day shifts
-            # state. compute_schedule(state) gives us every order with any
-            # work on day-1 of the OLD state (= today by definition of the
-            # 00:00 UTC fire). Filter by scheduled_date == state.base_date
-            # to be explicit.
-            today = state.base_date
+            # Compute the OLD state's full schedule ONCE. We need it for
+            # two things:
+            #
+            # 1. **today_locked_in_ids**: orders advance_day is about to
+            #    "produce today". Under the "tree day 1 = base_date + 1"
+            #    structural design, ``compute_schedule`` never places work
+            #    on ``base_date`` itself — earliest is ``base_date + 1``.
+            #    advance_day consumes exactly that rel==1 day, so the
+            #    orders to flip to ``in_production`` are those scheduled
+            #    on ``base_date + 1`` in the OLD state.
+            #
+            # 2. **today_portion**: each locked-in order's planned
+            #    production_day entries from the OLD compute_schedule.
+            #    For a fully-consumed order this is one entry carrying its
+            #    full wafer_quantity; for a boundary order this is one
+            #    entry carrying just today's partial production (the
+            #    remaining portion is in ``compute_schedule(new_state)``
+            #    below). We feed these into ``apply_schedule`` so it
+            #    writes the locked-in orders' ``scheduled_production_date``
+            #    and ``daily_breakdown``, and so the per-day
+            #    ``schedule_daily_capacity`` snapshot includes today's
+            #    in_production wafers. Without this, advance_day removes
+            #    the orders from the new state, ``apply_schedule``'s
+            #    rewrite loop never sees them (they're not in the new
+            #    state's compute_schedule) and ``clear_scheduled_dates``
+            #    leaves them with NULL date+breakdown → the frontend
+            #    calendar (which places items by ``daily_breakdown``)
+            #    silently drops them after the day rolls over.
+            #
+            # Regression history: a previous "tree day 1 = tomorrow"
+            # refactor moved compute_schedule's fill-start from base_date
+            # to base_date+1 but left the locked-in filter on
+            # ``== state.base_date``, so mark_in_production silently
+            # flipped nothing. Then once the filter was corrected to
+            # ``base_date + 1`` the locked-in orders flipped status but
+            # still ended up with NULL date+breakdown for the reason
+            # above. Adding today_portion to apply_schedule's input
+            # closes the second half of the gap.
+            production_day = state.base_date + timedelta(days=1)
+            old_schedule = compute_schedule(state)
             today_locked_in_ids: set[uuid.UUID] = {
-                sr.order_id for sr in compute_schedule(state) if sr.scheduled_date == today
+                sr.order_id for sr in old_schedule if sr.scheduled_date == production_day
             }
+            today_portion = [sr for sr in old_schedule if sr.scheduled_date == production_day]
 
             new_state = advance_day(state)
 
@@ -1513,19 +1575,45 @@ def advance_day_task() -> None:
             # Combined DB workflow: apply_schedule + status flips. We bypass
             # ``_finalize_run`` here so we can serialize the three DB writes
             # in one session before ``_save_state`` + broadcast.
-            scheduled_results = compute_schedule(new_state)
+            #
+            # ``apply_schedule`` is fed the UNION of (1) the today_portion
+            # entries from the OLD compute_schedule (= today's production
+            # for locked-in orders) and (2) the new state's future
+            # schedule. These two sets are disjoint by construction: today
+            # _portion is on ``production_day`` (= old base_date + 1) and
+            # the new state's earliest scheduled day is new base_date + 1
+            # = production_day + 1. Boundary orders appear in both — the
+            # today_portion entry carries their today-partial quantity and
+            # the new schedule carries their remaining quantity on the
+            # next day — and apply_schedule's per-order grouping rolls the
+            # two entries into a single ``daily_breakdown`` covering both
+            # days. ``daily_totals`` (= the daily_capacity snapshot) sums
+            # quantities across the union, so today's in_production
+            # wafers show up under production_day.
+            future_schedule = compute_schedule(new_state)
+            scheduled_results = today_portion + future_schedule
             pinned_map = {p.order_id: p.fake_deadline for p in new_state.pinned_orders.values()}
             db: Session = SessionLocal()
             try:
-                # 1. Set scheduled_production_date / dates / pin columns
-                #    for orders still in state (status=scheduled).
+                # 1. Write scheduled_production_date / daily_breakdown /
+                #    pin columns / daily_capacity snapshot for everything:
+                #    today's locked-in (their today portion) + future
+                #    schedule. At this point the locked-in orders are
+                #    still status='scheduled' in DB so
+                #    ``clear_scheduled_dates`` wipes them and the rewrite
+                #    loop immediately puts them back with the right
+                #    values. The status flip to ``in_production`` happens
+                #    in step 3 below; it overrides apply_schedule's
+                #    ``scheduled`` write without touching the date /
+                #    breakdown that step 1 just wrote.
                 order_service.apply_schedule(db, scheduled_results, pinned_map)
                 # 2. Yesterday's in_production orders that have no remaining
                 #    work in state → completed.
                 completed_count = order_repo.mark_completed_outside_set(db, new_alive_ids)
-                # 3. Today's-locked-in (advance_day moved them out of state)
-                #    → in_production. Overrides apply_schedule's
-                #    ``scheduled`` for any boundary order present here.
+                # 3. Today's-locked-in → ``in_production``. Only flips the
+                #    status column; date / daily_breakdown were already
+                #    written by step 1 (this depends on step 1 receiving
+                #    today_portion — see the block comment above).
                 in_prod_count = order_repo.mark_in_production(db, today_locked_in_ids)
                 db.commit()
             finally:
@@ -1711,6 +1799,11 @@ def rebuild_schedule_task() -> None:
         if lock_acquired:
             _release_state_lock(lock_holder_id)
         _clear_waiter_flag()
+        # Release the single-flight rebuild guard claimed by
+        # ``POST /schedule/rebuild`` so the next rebuild request is
+        # accepted. Best-effort: the key also has a TTL safety net in
+        # case this task crashed before reaching ``finally``.
+        _get_redis().delete(REBUILD_IN_FLIGHT_KEY)
         # Same as advance_day_task: refresh materialized DB columns
         # to overwrite any racing materializer that read the pre-
         # rebuild state. See ``materialize_schedule_task`` body for

@@ -454,6 +454,134 @@ def test_result_excludes_soft_deleted_orders(
     assert res.json() == []
 
 
+def test_result_excludes_completed_by_default(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """Legacy contract: ``GET /schedule/result`` without query params returns
+    ``scheduled`` + ``in_production`` only. Completed orders MUST NOT appear
+    when ``include_completed`` is omitted (default = False) — otherwise
+    callers that opt out would silently start seeing history rows.
+    """
+    _patch_delay(monkeypatch)
+    user = _make_user(db_session, username="mgr_result_default", role=UserRole.order_manager)
+    token = _login(client, "mgr_result_default")
+
+    _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=date(2026, 5, 20),
+        expected_delivery_date=date(2026, 5, 22),
+    )
+    _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=date(2026, 5, 18),
+        expected_delivery_date=date(2026, 5, 19),
+    )
+
+    res = client.get("/api/v1/schedule/result", headers=_auth(token))
+
+    assert res.status_code == 200
+    statuses = {item["status"] for item in res.json()}
+    assert statuses == {"scheduled"}, (
+        "completed rows leaked into the default response — legacy callers "
+        "(e.g. pre-calendar-update consumers) would see them unexpectedly"
+    )
+
+
+def test_result_include_completed_returns_recent_completed_within_horizon_window(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """``include_completed=true`` (no explicit ``completed_since``) returns
+    completed rows from the last ``SCHEDULER_HORIZON_DAYS`` days. Rows
+    older than the window MUST be excluded so the calendar payload stays
+    bounded as the archive grows.
+
+    The lookback window mirrors the forward scheduling horizon — same
+    setting drives both directions so the calendar shows symmetric
+    past/future windows by default.
+
+    Setup: today - (horizon/2) days (in window) + today - (horizon + 30)
+    days (outside) + an active scheduled row that always shows. We pick
+    relative offsets instead of literal day counts so the test stays
+    valid if the operator widens / narrows ``SCHEDULER_HORIZON_DAYS``.
+    """
+    from app.core.config import get_settings
+
+    horizon = get_settings().SCHEDULER_HORIZON_DAYS
+    in_window_offset = max(1, horizon // 2)
+    outside_window_offset = horizon + 30
+
+    _patch_delay(monkeypatch)
+    user = _make_user(db_session, username="mgr_result_include", role=UserRole.order_manager)
+    token = _login(client, "mgr_result_include")
+
+    today = date.today()
+    recent_completed = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=today - timedelta(days=in_window_offset),
+        expected_delivery_date=today - timedelta(days=in_window_offset - 1),
+    )
+    _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=today - timedelta(days=outside_window_offset),
+        expected_delivery_date=today - timedelta(days=outside_window_offset - 1),
+    )
+    active = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.scheduled,
+        scheduled_production_date=today + timedelta(days=5),
+        expected_delivery_date=today + timedelta(days=6),
+    )
+
+    res = client.get("/api/v1/schedule/result?include_completed=true", headers=_auth(token))
+
+    assert res.status_code == 200
+    ids = {item["id"] for item in res.json()}
+    # Recent completed in, ancient completed out, scheduled always in.
+    assert ids == {str(recent_completed.id), str(active.id)}
+
+
+def test_result_include_completed_honors_explicit_completed_since(
+    client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    """When the caller passes both ``include_completed=true`` and
+    ``completed_since``, the explicit date wins over the 30-day default.
+    Lets callers either narrow the window (debugging) or widen it
+    (admin/history view) without a code change.
+    """
+    _patch_delay(monkeypatch)
+    user = _make_user(db_session, username="mgr_result_since", role=UserRole.order_manager)
+    token = _login(client, "mgr_result_since")
+
+    today = date.today()
+    far_past = _make_order(
+        db_session,
+        created_by=user.id,
+        status=OrderStatus.completed,
+        scheduled_production_date=today - timedelta(days=100),
+        expected_delivery_date=today - timedelta(days=99),
+    )
+
+    # Widen the window to 200 days: the 100d-old row should now appear.
+    since = (today - timedelta(days=200)).isoformat()
+    res = client.get(
+        f"/api/v1/schedule/result?include_completed=true&completed_since={since}",
+        headers=_auth(token),
+    )
+
+    assert res.status_code == 200
+    ids = {item["id"] for item in res.json()}
+    assert str(far_past.id) in ids
+
+
 def test_result_by_viewer_returns_403(client: TestClient, db_session: Session, monkeypatch) -> None:
     _patch_delay(monkeypatch)
     _make_user(db_session, username="viewer_result", role=UserRole.viewer)
@@ -959,6 +1087,86 @@ def test_rebuild_dispatches_even_when_run_scheduling_is_running(
 
     assert res.status_code == 202
     rebuild_delay_mock.assert_called_once()
+
+
+def test_rebuild_second_request_returns_409_when_rebuild_in_flight(
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
+) -> None:
+    """Single-flight guard: while a rebuild is in flight (REBUILD_IN_FLIGHT_KEY
+    held), a second rebuild request is rejected with 409 instead of piling
+    another ``rebuild_schedule_task`` onto the queue. Spamming the button
+    is the bug this guards — N queued rebuilds each wait + run serially and
+    blow past the frontend's request timeout.
+    """
+    from app.services.scheduling import REBUILD_IN_FLIGHT_KEY
+
+    _patch_delay(monkeypatch)
+    rebuild_delay_mock = _patch_rebuild_delay(monkeypatch)
+
+    _make_user(db_session, username="sched_rebuild_dup", role=UserRole.scheduler)
+    token = _login(client, "sched_rebuild_dup")
+
+    # First request claims the flag and dispatches.
+    res1 = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+    assert res1.status_code == 202
+    rebuild_delay_mock.assert_called_once()
+    assert redis_client.get(REBUILD_IN_FLIGHT_KEY) is not None
+
+    # Second request while the flag is still held → 409, no extra dispatch.
+    res2 = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+    assert res2.status_code == 409
+    assert res2.json()["error"]["code"] == 409
+    rebuild_delay_mock.assert_called_once()  # still only the first dispatch
+
+
+def test_rebuild_accepts_again_after_flag_cleared(
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
+) -> None:
+    """Once the in-flight flag is gone (task finished + cleared it, or TTL
+    expired), a fresh rebuild is accepted again. Simulate the task's
+    ``finally`` cleanup by deleting the key between the two requests.
+    """
+    from app.services.scheduling import REBUILD_IN_FLIGHT_KEY
+
+    _patch_delay(monkeypatch)
+    rebuild_delay_mock = _patch_rebuild_delay(monkeypatch)
+
+    _make_user(db_session, username="sched_rebuild_again", role=UserRole.scheduler)
+    token = _login(client, "sched_rebuild_again")
+
+    res1 = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+    assert res1.status_code == 202
+
+    # Task finished → flag cleared (mirrors rebuild_schedule_task's finally).
+    redis_client.delete(REBUILD_IN_FLIGHT_KEY)
+
+    res2 = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+    assert res2.status_code == 202
+    assert rebuild_delay_mock.call_count == 2
+
+
+def test_rebuild_releases_flag_when_dispatch_fails(
+    client: TestClient, db_session: Session, monkeypatch, redis_client: Redis
+) -> None:
+    """If ``rebuild_schedule_task.delay()`` raises (broker down), the
+    endpoint must release the flag it just claimed — otherwise the task
+    never runs to clear it and every later rebuild is wrongly 409'd until
+    the TTL expires.
+    """
+    from app.services.scheduling import REBUILD_IN_FLIGHT_KEY
+
+    _patch_delay(monkeypatch)
+    boom = MagicMock(side_effect=RuntimeError("broker unreachable"))
+    monkeypatch.setattr("app.api.v1.schedule.rebuild_schedule_task.delay", boom)
+
+    _make_user(db_session, username="sched_rebuild_boom", role=UserRole.scheduler)
+    token = _login(client, "sched_rebuild_boom")
+
+    res = client.post("/api/v1/schedule/rebuild", headers=_auth(token))
+
+    assert res.status_code == 503
+    # Flag released so the next request isn't wrongly blocked.
+    assert redis_client.get(REBUILD_IN_FLIGHT_KEY) is None
 
 
 def test_rebuild_by_viewer_returns_403(

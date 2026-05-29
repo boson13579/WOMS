@@ -52,7 +52,7 @@ const TILES: readonly Tile[] = [
     Icon: Factory,
     iconBg: 'bg-violet-50 dark:bg-violet-500/15',
     iconText: 'text-violet-600 dark:text-violet-400',
-    hint: 'Orders whose production day has arrived (flipped daily by advance_day at 00:00 UTC).',
+    hint: 'Orders whose production day has arrived (flipped daily by advance_day at the day boundary, currently 00:00 Asia/Taipei).',
   },
   {
     key: 'completed',

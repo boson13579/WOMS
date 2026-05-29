@@ -37,6 +37,7 @@ __all__ = [
     "MATERIALIZE_RUNNING_KEY",
     "PENDING_OPS_KEY",
     "PENDING_OPS_SEQ_KEY",
+    "REBUILD_IN_FLIGHT_KEY",
     "STATE_KEY",
     "STATUS_KEY",
     "BatchOp",
@@ -156,6 +157,19 @@ PENDING_OPS_KEY = "schedule:pending_ops"
 PENDING_OPS_SEQ_KEY = "schedule:pending_ops:seq"
 """Redis monotonic counter (INCR) for the ``seq`` field embedded in op scores."""
 
+REBUILD_IN_FLIGHT_KEY = "schedule:rebuild_in_flight"
+"""Redis SET-NX-EX flag: a rebuild has been requested and not yet finished.
+
+Set by ``POST /schedule/rebuild`` BEFORE dispatching ``rebuild_schedule_task``
+(so the guard covers the dispatch → task-start gap), cleared by the task's
+``finally`` block. A second rebuild request while the flag is held gets a
+409 instead of piling another ``rebuild_schedule_task`` onto the queue —
+unlike a regular scheduling run, a rebuild can sit waiting up to the run-wait
+timeout for an in-flight run to drain, so naive spam of the rebuild button
+queues N tasks that each wait + run serially and blow past the frontend's
+request timeout. The TTL is a crash safety net only (worker died before the
+``finally`` cleared it); the happy path always DELs explicitly."""
+
 # ---------------------------------------------------------------------------
 # Materializer-side coordination keys (Phase 4 fast/slow split)
 # ---------------------------------------------------------------------------
@@ -260,7 +274,8 @@ class DeadlineOutOfRangeError(ValueError):
     the "POST 200 then WS compound_failed" two-step. Worker's
     ``abs_to_rel``-based rejection inside ``add_order`` / ``pin_order``
     remains as defense in depth — if a producer accepts a deadline but
-    the scheduler's ``base_date`` has just advanced (00:00 UTC race),
+    the scheduler's ``base_date`` has just advanced (Beat-tick race at
+    the day boundary, currently 00:00 ``Asia/Taipei``),
     the worker still rejects safely.
 
     Attributes mirror what an HTTP response would need:
@@ -1497,8 +1512,10 @@ def advance_day(state: SchedulerState) -> SchedulerState:
     **Timing note**: this function operates on the **pre-increment** state.
     ``state.base_date`` is still today's calendar date and tree day 1 (= rel
     == 1) is therefore ``base_date + 1`` = tomorrow from the caller's
-    perspective. But this function is called at the 00:00 UTC boundary
-    when "tomorrow" is about to become "today" — so the orders we
+    perspective. But this function is called at the calendar-day
+    boundary (currently 00:00 ``Asia/Taipei`` per
+    ``celery_app.py::beat_schedule``) when "tomorrow" is about to
+    become "today" — so the orders we
     process on rel == 1 are the orders that, after Step 5 below, will
     be **the new today**. The "pinned-today" / "fully done today"
     terminology in the steps below refers to that post-increment view

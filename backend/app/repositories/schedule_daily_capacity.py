@@ -39,7 +39,12 @@ def get_all_ordered(db: Session) -> list[ScheduleDailyCapacity]:
     return list(db.scalars(stmt).all())
 
 
-def replace_all(db: Session, *, entries: dict[date_type, int]) -> int:
+def replace_all(
+    db: Session,
+    *,
+    entries: dict[date_type, int],
+    preserve_date: date_type | None = None,
+) -> int:
     """Atomic truncate-and-insert: wipe every snapshot row, then insert ``entries``.
 
     Why truncate-and-insert instead of upsert: the snapshot is a complete
@@ -54,15 +59,35 @@ def replace_all(db: Session, *, entries: dict[date_type, int]) -> int:
     cleared to nothing" call also clears the snapshot. ``flush()`` (not
     ``commit()``) — caller decides the transaction boundary.
 
-    Returns the number of rows inserted.
+    **``preserve_date``** (typically the scheduler's current
+    ``base_date`` = "today"): when set, the existing snapshot row for
+    that date is **NOT** wiped, and any ``entries`` key matching that
+    date is **NOT** inserted (which would overwrite the preserved row).
+    Use case: ``materialize_schedule_task`` / ``rebuild_schedule_task``
+    only see future-day work in their ``compute_schedule`` output —
+    ``base_date`` itself is empty under the "tree day 1 = base_date +
+    1" rule. The today snapshot row is written by
+    ``advance_day_task``'s ``apply_schedule`` (which gets the
+    ``today_portion`` entries) and must survive subsequent materializer
+    passes, otherwise "today's in_production wafer usage" disappears
+    from ``GET /schedule/capacity-usage`` after the next materialize.
+    ``advance_day_task`` passes ``preserve_date=None`` so its own
+    today-row write goes through normally.
+
+    Returns the number of rows inserted (excluding any preserved row).
     """
-    db.execute(delete(ScheduleDailyCapacity))
+    if preserve_date is not None:
+        db.execute(delete(ScheduleDailyCapacity).where(ScheduleDailyCapacity.date != preserve_date))
+    else:
+        db.execute(delete(ScheduleDailyCapacity))
     if not entries:
         db.flush()
         return 0
 
     rows = [
-        ScheduleDailyCapacity(date=d, used_quantity=q) for d, q in sorted(entries.items()) if q > 0
+        ScheduleDailyCapacity(date=d, used_quantity=q)
+        for d, q in sorted(entries.items())
+        if q > 0 and d != preserve_date
     ]
     db.add_all(rows)
     db.flush()

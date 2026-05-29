@@ -25,21 +25,42 @@ const scheduleResultSchema = z.object({
 
 const scheduleResultResponseSchema = z.array(scheduleResultSchema);
 
+interface ScheduleResultParams {
+  // When true, the response also includes ``completed`` orders within the
+  // server-side rolling window (today − 30 days by default; the backend
+  // owns the actual lower bound). When false / omitted, only
+  // ``scheduled`` + ``in_production`` are returned — matches the legacy
+  // contract that pre-completed-on-calendar callers rely on.
+  includeCompleted?: boolean;
+}
+
 export const scheduleResultKeys = {
+  // 'all' targets every variant of this query — invalidating it (e.g.
+  // after a PATCH/cancel/delete commits) refreshes both the
+  // include_completed=true and include_completed=false versions if both
+  // happen to be cached. The variant-specific key is appended for the
+  // actual fetch so React Query caches them separately.
   all: ['schedule', 'result'] as const,
+  variant: (params: ScheduleResultParams) =>
+    ['schedule', 'result', { includeCompleted: params.includeCompleted ?? false }] as const,
 };
 
-export function useScheduleResult(): UseQueryResult<ScheduleResult[]> {
+export function useScheduleResult(
+  params: ScheduleResultParams = {},
+): UseQueryResult<ScheduleResult[]> {
   const user = useCurrentUser();
   const role = useCurrentRole();
   const allowed = Boolean(user) && role !== 'viewer';
+  const includeCompleted = params.includeCompleted ?? false;
+
+  const url = includeCompleted
+    ? '/api/v1/schedule/result?include_completed=true'
+    : '/api/v1/schedule/result';
 
   return useQuery<ScheduleResult[]>({
-    queryKey: scheduleResultKeys.all,
+    queryKey: scheduleResultKeys.variant({ includeCompleted }),
     queryFn: () =>
-      apiFetch('/api/v1/schedule/result', { credentials: 'include' }, (d) =>
-        scheduleResultResponseSchema.parse(d),
-      ),
+      apiFetch(url, { credentials: 'include' }, (d) => scheduleResultResponseSchema.parse(d)),
     enabled: allowed,
     staleTime: 5_000,
   });

@@ -157,6 +157,33 @@ const inProductionOrderDetail: Order = {
   scheduled_production_date: inProductionOrder.scheduled_production_date,
   expected_delivery_date: inProductionOrder.expected_delivery_date,
   status: 'in_production',
+  is_pinned: true,
+};
+
+const scheduledOrderDetail: Order = {
+  ...pendingOrder,
+  id: '55555555-5555-4555-8555-555555555555',
+  order_number: 'ORD-20260504-0005',
+  customer_name: 'Nanya',
+  wafer_quantity: 800,
+  requested_delivery_date: '2026-05-12',
+  scheduled_production_date: '2026-05-09',
+  expected_delivery_date: '2026-05-10',
+  status: 'scheduled',
+  pinned_production_date: null,
+  is_pinned: false,
+};
+
+const scheduledOrderResult: ScheduleResult = {
+  id: scheduledOrderDetail.id,
+  order_number: scheduledOrderDetail.order_number,
+  customer_name: scheduledOrderDetail.customer_name,
+  wafer_quantity: scheduledOrderDetail.wafer_quantity,
+  requested_delivery_date: scheduledOrderDetail.requested_delivery_date,
+  scheduled_production_date: scheduledOrderDetail.scheduled_production_date,
+  expected_delivery_date: scheduledOrderDetail.expected_delivery_date,
+  status: 'scheduled',
+  daily_breakdown: [{ date: '2026-05-09', quantity: 800 }],
 };
 
 const splitInProductionOrder: ScheduleResult = {
@@ -225,9 +252,60 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText('2026-05-09 生產訂單')).toBeInTheDocument();
     expect(screen.getAllByText('ORD-20260504-0001').length).toBeGreaterThan(0);
     expect(screen.getByText(/TSMC/)).toBeInTheDocument();
+    expect(screen.getAllByText('需求日 2026-06-01').length).toBeGreaterThan(0);
     expect(screen.getByText(/今日 500/)).toBeInTheDocument();
     expect(screen.getByText('生產中')).toBeInTheDocument();
     expect(screen.getByText('剩餘 1,500')).toBeInTheDocument();
+  });
+
+  it('pins a scheduled order from the right panel', async () => {
+    const user = userEvent.setup();
+    mockScheduleResult.data = [scheduledOrderResult];
+    mockScheduledOrders.data = {
+      items: [scheduledOrderDetail],
+      total: 1,
+      page: 1,
+      page_size: 100,
+    };
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
+    await user.click(screen.getByRole('button', { name: '固定到此日' }));
+
+    const [payload] = mockPinMutate.mock.calls[0] as [
+      { targets: { order: { id: string }; targetDate: string | null }[] },
+      unknown,
+    ];
+    expect(payload.targets[0].order.id).toBe(scheduledOrderDetail.id);
+    expect(payload.targets[0].targetDate).toBe('2026-05-09');
+  });
+
+  it('unpins a scheduled order from the right panel', async () => {
+    const user = userEvent.setup();
+    mockScheduleResult.data = [scheduledOrderResult];
+    mockScheduledOrders.data = {
+      items: [
+        {
+          ...scheduledOrderDetail,
+          is_pinned: true,
+          pinned_production_date: '2026-05-09',
+        },
+      ],
+      total: 1,
+      page: 1,
+      page_size: 100,
+    };
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
+    await user.click(screen.getByRole('button', { name: '取消固定' }));
+
+    const [payload] = mockPinMutate.mock.calls[0] as [
+      { targets: { order: { id: string }; targetDate: string | null }[] },
+      unknown,
+    ];
+    expect(payload.targets[0].order.id).toBe(scheduledOrderDetail.id);
+    expect(payload.targets[0].targetDate).toBeNull();
   });
 
   it('renders pending orders without expected delivery date in the unscheduled panel', () => {
@@ -263,13 +341,18 @@ describe('OrdersCalendarDialog', () => {
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
     expect(screen.getByText(/今日 1,500/)).toBeInTheDocument();
     expect(screen.getByText(/累計 2,500 \/ 2,500/)).toBeInTheDocument();
-    expect(screen.getByText('已排程')).toBeInTheDocument();
+    expect(screen.getByText('生產中')).toBeInTheDocument();
     expect(screen.getByText('剩餘 0')).toBeInTheDocument();
   });
 
-  it('shows split production as completed when base_date is past the final production date', async () => {
+  it('shows split production as completed when status is completed', async () => {
     const user = userEvent.setup();
-    mockScheduleResult.data = [splitInProductionOrder];
+    mockScheduleResult.data = [
+      {
+        ...splitInProductionOrder,
+        status: 'completed',
+      },
+    ];
     setServerBaseDate('2026-05-12');
     renderDialog();
 
@@ -277,7 +360,7 @@ describe('OrdersCalendarDialog', () => {
     expect(screen.getByText('已完成')).toBeInTheDocument();
   });
 
-  it('uses server base_date instead of the client clock for production state', async () => {
+  it('uses order status instead of the client clock for production state', async () => {
     const user = userEvent.setup();
     vi.setSystemTime(new Date('2026-05-12T00:00:00Z'));
     setServerBaseDate('2026-05-10');
@@ -286,7 +369,7 @@ describe('OrdersCalendarDialog', () => {
 
     await user.click(screen.getByRole('button', { name: /2026-05-11/ }));
 
-    expect(screen.getByText('已排程')).toBeInTheDocument();
+    expect(screen.getByText('生產中')).toBeInTheDocument();
   });
 
   it('displays a padlock icon for production-active or pinned orders', async () => {
@@ -294,7 +377,7 @@ describe('OrdersCalendarDialog', () => {
     renderDialog();
 
     await user.click(screen.getByRole('button', { name: /2026-05-09/ }));
-    expect(screen.getAllByLabelText('處理鎖定中').length).toBeGreaterThan(0);
+    expect(screen.getAllByLabelText('已鎖定').length).toBeGreaterThan(0);
   });
 
   it('does not drag a scheduled calendar item when the canonical order record is not loaded', () => {
@@ -449,5 +532,51 @@ describe('OrdersCalendarDialog', () => {
       '2026-05-10',
       '2026-05-11',
     ]);
+  });
+
+  it("highlights today's date with amber styling when not selected", async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    // Get today's date and a different date
+    const today = new Date();
+    const todayDateString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+
+    // Get tomorrow's date to click on
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowDateString = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`;
+
+    // Click tomorrow to deselect today
+    const tomorrowButton = screen.getByRole('button', {
+      name: new RegExp(`^${tomorrowDateString}`),
+    });
+    await user.click(tomorrowButton);
+
+    // Find today's button
+    const todayButton = screen.getByRole('button', { name: new RegExp(`^${todayDateString}`) });
+
+    // When today is not selected, it should have amber styling
+    expect(todayButton).toHaveClass('bg-amber-50');
+    expect(todayButton).toHaveClass('ring-amber-400');
+    expect(todayButton).toHaveClass('dark:bg-amber-950/30');
+  });
+
+  it("highlights today's date with blue ring when selected", async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    // Get today's date
+    const today = new Date();
+    const todayDateString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+
+    // Find and click today's date to ensure it's selected
+    const todayButton = screen.getByRole('button', { name: new RegExp(`^${todayDateString}`) });
+    await user.click(todayButton);
+
+    // When today is selected, it should have amber background with blue ring
+    expect(todayButton).toHaveClass('bg-amber-50');
+    expect(todayButton).toHaveClass('ring-sky-500');
+    expect(todayButton).toHaveClass('dark:bg-amber-950/30');
   });
 });

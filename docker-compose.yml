@@ -107,6 +107,32 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
+  # Celery Beat — periodic-task scheduler. MUST be a singleton: it's the
+  # only thing that fires `scheduling.advance_day` at 00:00 Asia/Taipei
+  # (roll the horizon, mark today's orders in_production, flip finished
+  # runs to completed) and `audit.cleanup_old_logs` at 02:00 Asia/Taipei.
+  # Times are owned by `backend/app/workers/celery_app.py` — the
+  # ``timezone`` + ``beat_schedule`` settings; change them there, this
+  # comment will rot. Kept as its own service — separate from `worker` —
+  # so the worker can be scaled without running multiple Beats (two
+  # Beats would fire advance_day twice and over-advance base_date).
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    command: [ "celery", "-A", "app.workers.celery_app", "beat", "--loglevel=INFO" ]
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-smart_order}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
   frontend:
     build:
       context: ./frontend

@@ -21,7 +21,7 @@
                                              ▼
                                   ┌──────────────────────┐         ┌──────────────────┐
                                   │ Redis                │         │ Celery Beat      │
-                                  │  schedule:pending_ops│         │  每天 00:00 UTC  │
+                                  │  schedule:pending_ops│         │  每天 00:00 TPE  │
                                   │   (sorted set)       │         └────────┬─────────┘
                                   │  schedule:pending_ops│                  │
                                   │   :seq (INCR)        │                  │
@@ -68,7 +68,7 @@
 - **pending_ops queue**：所有 compound（想排 / 想取消 / 想 pin 等的事件包成一組）先進這個 Redis sorted set，score 編碼 shrink-優先 + 組內 FIFO。worker 用 batch admission 一次處理 — `ZRANGE` 讀全部、二分搜尋找最大可行 prefix `[1..k]`、整 batch tree 一次更新後 `ZREM` 那 k 個 member。可行性 check 在 tree 變動前就做，所以不需要 snapshot rollback。詳見 §4.2。
 - **scheduler state**：序列化在 Redis 的線段樹 + pq + `pinned_orders` + `base_date`，跨次持久保存。
 - **schedule status**：`idle` / `running` / `failed`，由 worker 維護，API 跟 advance\_day 拿來判斷有沒有任務在跑。
-- **訂單生命週期 status**（DB 上的 `Order.status` 欄位，跟上面的 schedule status 是不同的東西）：`pending` → `scheduled` → `in_production` → `completed`。`pending` 是剛建立 / 剛 PATCH 的；scheduler 把它排進排程後變 `scheduled`；advance_day 在生產日當天 00:00 UTC 把它變 `in_production`、生產完那天 00:00 UTC 變 `completed`。`cancelled` 是「訂單沒能成功進入排程 / 被人工取消」的旁路（user 主動取消、user 刪除、worker reject 三種來源）。
+- **訂單生命週期 status**（DB 上的 `Order.status` 欄位，跟上面的 schedule status 是不同的東西）：`pending` → `scheduled` → `in_production` → `completed`。`pending` 是剛建立 / 剛 PATCH 的；scheduler 把它排進排程後變 `scheduled`；advance_day 在生產日當天的日界（目前為 00:00 `Asia/Taipei`，見 `celery_app.py::beat_schedule`）把它變 `in_production`、生產完那天的日界變 `completed`。`cancelled` 是「訂單沒能成功進入排程 / 被人工取消」的旁路（user 主動取消、user 刪除、worker reject 三種來源）。
 - **`cancelled` 跟 `is_deleted` 的區分**（兩個欄位獨立，組合決定可見性）：
     - **使用者 `DELETE /orders/{id}`**（「刪除訂單」按鈕，僅適用 `scheduled` 訂單）：`status='cancelled'` + `is_deleted=True` + audit `order.deleted`。訂單從 list view 消失（`is_deleted=False` filter），但 audit log 還查得到（`/orders/{id}/audit` 不過 soft-delete filter）。
     - **使用者 `POST /orders/{id}/cancel`**（「取消訂單」按鈕，僅適用 `scheduled` 訂單）：`status='cancelled'` + `is_deleted=False` + audit `order.cancelled`。訂單**保留在 list view**，跟「刪除」的差別只在 `is_deleted` 這一欄。compound shape 跟 delete 相同（`[remove]` / `[unpin, remove]`），只是 `db_action.kind="cancel"`。語意：「客戶反悔，把這張單從產線拉掉但保留紀錄」。
@@ -104,7 +104,7 @@ endpoint 一覽（細節見下方各節）：
 | `GET`  | `/capacity-usage` | order_manager+ | 未來 30 天每日 used / remaining（DB snapshot 的 realized 視角） |
 | `GET`  | `/pending-ops` | order_manager+ | 排隊中 compound 的順位快照 |
 | `DELETE` | `/operations/{compound_id}` | scheduler+ | 取消尚未被 worker 處理的 compound |
-| `POST` | `/rebuild` | scheduler+ | 從 DB 重建線段樹與 pq（async；任務自己等 in-flight 結束） |
+| `POST` | `/rebuild` | scheduler+ | 從 DB 重建線段樹與 pq（async；任務自己等 in-flight 結束）。單一飛行守衛：已有 rebuild 進行中 → 409 |
 
 > **`POST /schedule/operations` 已於 P1-2 移除**。原本給「raw 推 compound 進佇列」用的對外 endpoint 沒有了 — pin / unpin 折進 PATCH 的 `pinned_production_date` 欄位、其他 compound 都由 Order CRUD service 內部 `enqueue_compound`。動機：raw endpoint 沒走 row lock / `db_action` / business validation，跟 PATCH/DELETE 比起來是「結構上較弱保護」的併排入口；折掉它讓 producer surface 收斂到單一條，所有 race 都用同一道 row lock 防守。詳見 §3.3。
 
@@ -443,9 +443,11 @@ Schema-level validation：
 
 ---
 
-#### `POST /schedule/rebuild` — 從 DB 重建排程狀態（async）
+#### `POST /schedule/rebuild` — 從 DB 重建排程狀態（async，單一飛行）
 
-**功能**：dispatch `rebuild_schedule_task` 並立刻回 202。**rebuild 本身是 async**，endpoint 不會 block 等待結果，跟 `advance_day_task` 同一個 pattern。
+**功能**：搶單一飛行守衛 → dispatch `rebuild_schedule_task` → 立刻回 202。**rebuild 本身是 async**，endpoint 不會 block 等待結果，跟 `advance_day_task` 同一個 pattern。
+
+**單一飛行守衛（spam 防護）**：endpoint dispatch 前先 `SET NX EX schedule:rebuild_in_flight`。搶不到（已有 rebuild 進行中）→ **409 `A schedule rebuild is already in progress`**。task 在 `finally` 區塊 `DEL` 這把 flag。為什麼需要：rebuild task 進 body 前會 poll 等 in-flight `run_scheduling_task` drain（最多 5 分鐘），這段期間 endpoint 早就回 202 了。沒守衛的話狂點 rebuild 按鈕會把 N 個 `rebuild_schedule_task` 全塞進 queue，每個都等 + 跑序列化，堆積到爆掉前端 request timeout（畫面顯示 fail to load）。守衛在 **producer 端（endpoint）** 搶而非 task 內搶 — task 是非同步啟動的，在 task 裡搶會讓一連串請求在第一個 task 跑起來前全部 dispatch 出去，守衛就破功。Flag 的 TTL（複用 `SCHEDULER_WAITER_FLAG_TTL_SECONDS`）純粹是 worker 崩潰沒走到 `finally` 的安全網。
 
 **task 的執行流程**：
 1. **Poll `schedule:status` 等 in-flight `run_scheduling_task` 結束**（最多 5 分鐘，2 秒 polling 一次；超時就 log warning 後繼續）。這一步用 `_wait_for_idle_run` 完成，跟 `advance_day_task` 共用同一個 helper。
@@ -455,9 +457,13 @@ Schema-level validation：
 5. **針對每筆被 skip 的訂單，依 `created_by` 透過 WebSocket 推 `schedule.rebuild_skipped` 訊息給原 requester**，讓他們知道這筆訂單需要人工調整。
 6. 觸發一次 `run_scheduling_task.delay()` — 在重建後的 state 上消化「等待期間累積的 pending\_ops」並廣播 WebSocket `schedule.updated`。
 
-**為什麼設計成 async（不再 409）**：rebuild 跟 in-flight `run_scheduling_task` 衝突的本質是「兩個都要寫 `schedule:state`」。原本 409 設計把責任丟給呼叫方（叫他「等一下再試」），但實務上呼叫者沒辦法精確知道 in-flight 任務什麼時候結束，會變成 polling retry loop。改 async 之後：
-- 呼叫者只要 POST 一次，rebuild 一定會被執行
-- 任務自己 serialize（poll status 直到 idle），不會跟 in-flight 任務搶寫
+**兩種 409 要分清楚**：
+
+- **「rebuild vs in-flight `run_scheduling_task`」不 409** — 這個衝突的本質是「兩個都要寫 `schedule:state`」。rebuild task 自己 serialize（poll status 直到 idle 再寫），呼叫方不需要知道 in-flight 任務何時結束、不需要 retry loop。POST 一次 rebuild 一定會被執行。
+- **「rebuild vs 另一個 rebuild」會 409** — 這是上面講的單一飛行守衛。同時間只允許一個 rebuild 在排隊 / 執行，第二個直接被駁回（叫呼叫方「等正在跑的 rebuild 完成」）。
+
+兩者不矛盾：前者是「rebuild 願意等其他種類的 task」，後者是「同種類的 rebuild 不重複排隊」。改成 async 帶來的好處仍然成立：
+- 任務自己等 in-flight run，不會跟它搶寫 state
 - rebuild 完還會自動再觸發 `run_scheduling_task` 把等待期間進來的 pending\_ops 消化掉，**rebuild 後的 state + 新 ops** 一起在新基礎上重算
 - 流程跟 `advance_day_task` 完全一致，模型統一好維護
 
@@ -485,7 +491,7 @@ Schema-level validation：
 - **懷疑 state 損壞**：`capacity_tree` 或 `deadline_tree` 的前綴和跟 pq 不一致時（例如 mid-run crash）。
 
 > 這條 endpoint 會讓重建後的結果**覆蓋** `schedule:state`，但寫入時機是 task 執行到 step 4 時才發生，不是 endpoint 回 202 那一刻。等待期間打的 CRUD 會 push 進 `pending_ops`，rebuild 完後 step 6 觸發的 `run_scheduling_task` 會把它們消化掉。  
-> 多次連按 rebuild 不會出錯：第二個 task 會等第一個 task 結束的 `run_scheduling_task` 跑完才 rebuild，結果一樣 — 從 DB 重建是 idempotent 的。
+> 多次連按 rebuild：第一下 202，後續在它跑完前一律 409（單一飛行守衛）。前端據此顯示「正在觸發 rebuild，請稍候」。即使守衛失效讓兩個 task 都跑起來，結果仍正確 — 從 DB 重建是 idempotent 的，第二個 task 會等第一個結束的 `run_scheduling_task` 跑完才 rebuild。守衛是防 queue 堆積 / request timeout，不是防正確性。
 
 ---
 
@@ -574,6 +580,7 @@ ws.addEventListener("close", (e) => {
 | `schedule:status` | String (JSON) | `{state, started_at, finished_at, task_id, error}` | worker 寫；API / 監控讀 |
 | `schedule:waiter_pending` | String (`"1"`，TTL 10 分鐘) | 一支 advance\_day / rebuild waiter 進入 `_wait_for_idle_run` 之前 SET，task body 結束時在 `finally` 裡 DELETE。`run_scheduling_task` 在結尾 retrigger 之前先 `GET` 這把 key — 有就**讓位**（不 retrigger），由 waiter 結尾自己呼 `.delay()`。TTL 是 crash-safety：如果 waiter 在 finally 之前死掉，10 分鐘後 flag 自動消失，系統不會永遠卡在「讓位」狀態。 | waiter 寫 / 清；run_scheduling_task 讀 |
 | `schedule:state_writer_lock` | String (task_id，TTL 5 分鐘) | **P0-2/P0-3 並行保護**：任何要寫 `schedule:state` 的 task（run/advance_day/rebuild）進入 body 前 SETNX 自己的 task_id；finally 用 Lua CAS-delete（只刪自己持有的）。`run_scheduling_task` 拿不到就直接 return（持有人 retrigger 時會接手）；`advance_day_task` / `rebuild_schedule_task` 退而 polling，最多等 5 分鐘（仍拿不到 → status=failed）。TTL 跟 lock-hold 時間是同一個 5 分鐘安全窗口。 | 三支 state-writer task 寫 / 清 |
+| `schedule:rebuild_in_flight` | String (`"1"`，TTL = `SCHEDULER_WAITER_FLAG_TTL_SECONDS`) | **rebuild 單一飛行守衛**：`POST /schedule/rebuild` dispatch 前 `SET NX EX`；搶不到回 409。`rebuild_schedule_task` 在 `finally` DEL。在 endpoint（producer）端搶而非 task 內搶 — task 非同步啟動，task 內搶會讓一連串請求在第一個 task 跑起來前全部 dispatch 掉。TTL 是 worker 崩潰沒走到 finally 的安全網。 | rebuild-endpoint 寫；rebuild_schedule_task 清 |
 | `schedule:pending_ops:by_compound_id` | **Hash** | secondary index: `compound_id → sorted-set member 字串`，給 `DELETE /schedule/operations/{compound_id}` O(1) 查到該 compound 的 member 後 ZREM。enqueue 時用 pipeline 跟 ZADD 一起 atomic 寫；worker 在 ZPOPMIN 後 best-effort HDEL 清掉 stale entry。 | producer 寫；cancel-endpoint 讀；worker 清 |
 | `schedule:pending_ops:dlq` | **List** | **P1-5 dead-letter queue**：`_pop_next_compound` 從 sorted set 拿到的 member 若 JSON 解析失敗，RPUSH 進這條 list + ERROR log；不再 silently 丟掉。ops 看到這條 list 有東西就要去人工處理（撈出原始 bytes、找到被卡住的 order_id、unlock）。 | worker 寫；ops / 監控讀 |
 | `schedule:materialize_running` | String (`"1"`，TTL 5 分鐘) | self-coalescing flag：materializer 進 body 前 SETNX，沒拿到就 return（已有 materializer 在跑）；finally 在最後 DEL。讓 N 個 fast-path 成功只觸發 1 次 DB 重寫。 | materializer 寫 / 清 |
@@ -637,7 +644,7 @@ stale 也是有界的 — `advance_day_task` / `rebuild_schedule_task` finally �
 | `SCHEDULER_HORIZON_DAYS` | `30` | 線段樹的天數；超過這個天數的 deadline → `add_order` 回 `deadline_too_far` | `app/services/scheduling.py::HORIZON_DAYS` |
 | `SCHEDULER_RUN_WAIT_TIMEOUT_SECONDS` | `300` | `advance_day_task` / `rebuild_schedule_task` 的 `_wait_for_idle_run` 上限 | `app/workers/scheduling.py::_RUN_WAIT_TIMEOUT_SECONDS` |
 | `SCHEDULER_RUN_WAIT_POLL_INTERVAL_SECONDS` | `2` | `_wait_for_idle_run` 每次 poll 之間的 `time.sleep` 秒數 | `app/workers/scheduling.py::_RUN_WAIT_POLL_INTERVAL_SECONDS` |
-| `SCHEDULER_WAITER_FLAG_TTL_SECONDS` | `600` | `schedule:waiter_pending` 的 TTL — crashed waiter 自我復原用 | `app/workers/scheduling.py::_WAITER_FLAG_TTL_SECONDS` |
+| `SCHEDULER_WAITER_FLAG_TTL_SECONDS` | `600` | `schedule:waiter_pending` 的 TTL（crashed waiter 自我復原用）；同時也是 `schedule:rebuild_in_flight` 單一飛行守衛的 TTL（crashed rebuild worker 安全網） | `app/workers/scheduling.py::_WAITER_FLAG_TTL_SECONDS` |
 
 > **不放進 env 的常數**：`GROUP_OFFSET = 10**12` 是 sorted-set score 的編碼內部常數，跟線段樹的 float64 精度綁在一起改了會直接破壞 ZPOPMIN 的排序行為，沒有合理的 deployment 會想動它。留在 code 裡。
 
@@ -666,7 +673,7 @@ celery_app.conf.update(
 celery_app.conf.beat_schedule = {
     "scheduling.advance_day": {
         "task": "scheduling.advance_day",
-        "schedule": crontab(hour=0, minute=0),  # 每天 00:00 UTC
+        "schedule": crontab(hour=0, minute=0),  # 每天 00:00 Asia/Taipei（依 celery_app.py 的 timezone 設定）
     },
 }
 ```
@@ -804,7 +811,7 @@ enqueue_compound(compound)   # ← 同 process Redis call；條件式 .delay() �
 
 **Tree 結構：day 1 = 明天**（不是「今天但被 lock」）
 
-業務規則：今天的生產線在前一晚 00:00 UTC 就已經由 `advance_day_task::mark_in_production` 把當天訂單升級成 `in_production` 確認下來。當天 user 新增訂單 / PATCH / pin 一律不能落在今天，只能 day 2（明天）以後。
+業務規則：今天的生產線在前一晚的日界（目前是 00:00 `Asia/Taipei`，由 `celery_app.py::beat_schedule['advance-day']` 控制）就已經由 `advance_day_task::mark_in_production` 把當天訂單升級成 `in_production` 確認下來。當天 user 新增訂單 / PATCH / pin 一律不能落在今天，只能 day 2（明天）以後。
 
 實作層面採用**結構性設計**：兩棵 segment tree 只覆蓋「可放」的天，今天根本不在 tree 裡。`abs_to_rel(today, base_date)` 直接回 `None`，跟「超出 horizon」走同一條 reject 分支。
 
@@ -1104,7 +1111,7 @@ waiter flag + status claim 兩層解決了「同類型 task 串接 race」（adv
 
 選 SETNX + CAS-delete 而不是 Redlock：單一 Redis 實例的場景用單一 SETNX 就夠，Redlock 是給多 Redis 副本的、會引入不必要複雜度。也不選「靠 Celery `--concurrency=1` 約束」把正確性壓在 ops 紀律上太脆，文件講過很容易忘記。`status` + `waiter_pending` 仍然保留，因為它們提供 observability（`GET /schedule/status`）跟 cooperative retrigger（讓 waiter 知道誰要接手 delay）— lock 補的是正確性層的洞，這兩層是 UX / ergonomics 層、互補不互斥。
 
-#### `advance_day_task`（每天 00:00 UTC，由 Beat 觸發）
+#### `advance_day_task`（每天日界，目前為 00:00 `Asia/Taipei`，由 Beat 觸發）
 
 整個 task body 包在 `try / finally` 裡 — 進入時 `_set_waiter_flag()`，離開時 `_clear_waiter_flag()`。等 in-flight run 結束之後，再用一層 inner `try / except` claim `schedule:status`：成功走完寫 `idle`，body 任何一步 raise 寫 `failed` 並 re-raise。
 
@@ -1144,7 +1151,7 @@ waiter flag + status claim 兩層解決了「同類型 task 串接 race」（adv
 9. 只有 `ZCARD pending_ops > 0` 才 `run_scheduling_task.delay()` 消化等待期間累積的 ops
 10. **success：`_set_status("idle")`**
 11. **except：`_set_status("failed", error=str(exc))` 然後 re-raise**
-12. **outer `finally: _clear_waiter_flag()`**
+12. **outer `finally`：`_clear_waiter_flag()` + `DEL schedule:rebuild_in_flight`**（釋放 §2.1 的單一飛行守衛，讓下一個 rebuild 請求能被接受；best-effort，flag 另有 TTL 安全網）+ 派 materializer 覆寫可能的 stale DB 欄位
 
 例外路徑統一行為：三支 task（`run_scheduling_task` / `advance_day_task` / `rebuild_schedule_task`）body 任何步驟 raise 時，worker 把 status 標 `failed`、寫進 `error` 欄位、re-raise，Celery 也會記錄 traceback。`failed` 在 `/trigger` 的 409 邏輯下不會卡住下一輪 — 只有 `running` 才會 409，`failed` 視同 idle 可以再 dispatch；下次成功的 task 會把 status 蓋回 `idle`，不必人工介入 Redis。
 
@@ -1366,7 +1373,7 @@ broadcast({...})  ──PUBLISH──▶ schedule:ws:events ──SUBSCRIBE─�
 
 排程模組有四個 runtime 自己補不回來的缺口，全部都跟「server 重啟時 Redis state / DB 跟現實對不齊」有關：
 
-1. **`schedule:state.base_date` 過時**：Celery Beat 每天 00:00 UTC 觸發 `advance_day_task`。Stack 完整關閉跨過 N 個午夜的話，Beat 那 N 次 tick 就漏掉，`base_date` 卡在舊日期 — segment tree 的 day 1 不再是「今天」，後續所有 `add_order` / `compute_schedule` 都用錯誤日曆算。
+1. **`schedule:state.base_date` 過時**：Celery Beat 每天 00:00 `Asia/Taipei`（見 `celery_app.py::beat_schedule`）觸發 `advance_day_task`。Stack 完整關閉跨過 N 個午夜的話，Beat 那 N 次 tick 就漏掉，`base_date` 卡在舊日期 — segment tree 的 day 1 不再是「今天」，後續所有 `add_order` / `compute_schedule` 都用錯誤日曆算。
 2. **`schedule:state` 不見**：Redis 被 flush、首次部署、state schema 升版。worker 會 fallback 到 `SchedulerState.initial(today)` 空狀態，**靜默忘記**現有 scheduled 訂單佔的容量。
 3. **`pending_ops` 卡住 compound**：worker 在 drain 中途 crash，queue 還有 entries 但 `schedule:status` 可能卡在 `running`（死掉的 worker 沒寫 `idle`）。producer 端的 `enqueue_compound` 看到 `running` 就不會 `.delay()`，於是這些 compound 永遠不會被處理。
 4. **`is_processing_locked=True` 的 orphan row**：producer commit 完 `lock=True` → 還沒 enqueue compound 或 enqueue 完還沒被 worker accept 前 process crash → lock 留在 row 上。Materializer 不再順手清 lock（見 §4.4 lock ownership），這些 orphan lock 會永遠卡住該 row 的後續 PATCH / DELETE / cancel。
@@ -2114,7 +2121,7 @@ uv run pytest tests/services tests/workers tests/api      # 全部
 
 ## 8. 已知限制 / 後續工作
 
-- `celery_app.py` 已照 §3.1 顯式加 `imports=("app.workers.scheduling",)`，但 Beat schedule（換天 task 每天 00:00 UTC 觸發）仍需要部署環境另外註冊 `beat_schedule=`，沒寫的話 advance_day 不會自動跑。
+- `celery_app.py` 已照 §3.1 顯式加 `imports=("app.workers.scheduling",)`，但 Beat schedule（換天 task 每天 00:00 `Asia/Taipei` 觸發）仍需要部署環境另外註冊 `beat_schedule=`，沒寫的話 advance_day 不會自動跑。
 - WebSocket 是 in-memory `ConnectionManager`：每個 FastAPI worker 進程各自持有自己的連線，靠 Redis pub/sub fan-out 同步事件。橫向擴展（uvicorn `--workers N` 或多台機器）時是 fan-out 模式（每個 worker 都收訊息但只送給自己手上的連線），不需要 sticky session；要把 `ConnectionManager` 的 metrics 暴露給 Prometheus 之類的監控時要 per-process aggregate。
 - WebSocket 是 best-effort：worker `publish` 失敗會被 `services/websocket.py` 內部 catch 起來只 log warning，不會擋住 caller 的 transaction。如果 Redis pub/sub 中斷時段較長要保證訊息不漏，請另外加持久化（例如 Redis Streams + consumer group），目前的 `pub/sub` 不重送。
 - `apply_schedule` 用 ORM session 更新每筆訂單，會 bump `version_id` 但不檢查它，理論上會跟同時的人工 PATCH 撞到 — 演算法有最終決定權，前端讀到時請以 server 值為準。

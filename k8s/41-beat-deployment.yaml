@@ -1,0 +1,62 @@
+# Celery Beat — periodic-task scheduler. Same image as the backend /
+# worker, different command.
+#
+# MUST stay a singleton (replicas: 1, never scaled). Beat is the only
+# thing that fires `scheduling.advance_day` at the configured day
+# boundary (currently 00:00 ``Asia/Taipei`` — see
+# ``backend/app/workers/celery_app.py::beat_schedule['advance-day']``) —
+# the daily horizon roll that advances base_date, marks today's orders
+# in_production, and flips finished runs to completed. Two Beat replicas
+# would each fire advance_day and over-advance base_date by a day. The
+# worker deployment can scale freely; Beat cannot.
+#
+# No Service needed — Beat only pushes jobs into Redis, no inbound traffic.
+#
+# Recovery note: if Beat is down across a midnight, the missed advance_day
+# is caught up by `startup_recovery.run_startup_recovery()` the next time
+# the backend pod restarts with a stale base_date (it dispatches
+# advance_day_task.delay() once per missed day, capped at the horizon).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beat
+  namespace: woms
+  labels:
+    app: beat
+spec:
+  replicas: 1
+  # Recreate (not RollingUpdate) so a redeploy never momentarily runs two
+  # Beat pods — overlapping Beats would double-fire the schedule.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: beat
+  template:
+    metadata:
+      labels:
+        app: beat
+    spec:
+      containers:
+        - name: beat
+          image: ${ECR_URI}/woms-backend:${IMAGE_TAG}
+          imagePullPolicy: IfNotPresent
+          command:
+            - celery
+            - -A
+            - app.workers.celery_app
+            - beat
+            - --loglevel=INFO
+          envFrom:
+            - configMapRef:
+                name: woms-config
+            - secretRef:
+                name: woms-secrets
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"

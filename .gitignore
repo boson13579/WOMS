@@ -28,6 +28,15 @@ htmlcov/
 .nox/
 dist/
 build/
+
+# Celery Beat's local PersistentScheduler cache. Written by
+# ``celery -A app.workers.celery_app beat`` next to the launch CWD on
+# every run; it stores "when was each scheduled task last fired" so a
+# beat restart doesn't refire missed slots. Never source-controlled —
+# it's per-deployment runtime state. dbm on different OSes writes
+# different file shapes (``.dat`` / ``.dir`` / ``.bak`` on Windows;
+# a single file on Unix), hence the glob.
+backend/celerybeat-schedule*
 .eggs/
 
 # uv (lockfile `uv.lock` IS committed; only ignore caches)

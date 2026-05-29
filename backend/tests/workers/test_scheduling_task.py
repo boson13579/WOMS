@@ -1090,15 +1090,21 @@ def test_advance_day_marks_today_orders_in_production(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
-    """Phase 3 case 17: advance_day flips ``today's d0`` orders to
-    ``in_production`` and ``previously-in_production-now-out-of-state``
+    """Phase 3 case 17: advance_day flips the orders it produces "today"
+    to ``in_production`` and ``previously-in_production-now-out-of-state``
     orders to ``completed``.
 
     Setup: OLD state's compute_schedule returns one ScheduledResult on
-    today's date (``order_X``); new state's pq contains a different
-    ``order_Y`` (still being scheduled for the future). Assert the
-    mark_in_production call gets ``{order_X}`` and mark_completed_outside_set
-    gets ``{order_Y}`` (the only alive id).
+    ``base_date + 1`` (``order_X``) — that's the earliest production day
+    under the "tree day 1 = base_date + 1" rule and exactly the day
+    advance_day consumes. new state's pq contains a different ``order_Y``
+    (still being scheduled for the future). Assert the mark_in_production
+    call gets ``{order_X}`` and mark_completed_outside_set gets ``{order_Y}``.
+
+    Regression guard: the old mock put ``order_X`` on ``today`` (==
+    base_date), which never happens with the real compute_schedule, so it
+    masked the off-by-one where ``today_locked_in_ids`` filtered on
+    ``base_date`` and matched nothing.
     """
     monkeypatch.setattr(
         "app.workers.scheduling._get_status",
@@ -1130,12 +1136,21 @@ def test_advance_day_marks_today_orders_in_production(
     )
 
     # compute_schedule called twice:
-    #   1) on old_state for today_locked_in detection → ScheduledResult on today.
-    #   2) on new_state for apply_schedule → ScheduledResult on tomorrow.
+    #   1) on old_state for today_locked_in detection → ScheduledResult on
+    #      ``base_date + 1`` (= tomorrow of the OLD state), the earliest
+    #      production day and exactly what advance_day consumes.
+    #   2) on new_state for apply_schedule → ScheduledResult on the new
+    #      state's first production day.
     compute_side_effects = iter(
         [
-            [ScheduledResult(order_id=order_x, scheduled_date=today, quantity=1000)],
-            [ScheduledResult(order_id=order_y, scheduled_date=tomorrow, quantity=1000)],
+            [ScheduledResult(order_id=order_x, scheduled_date=tomorrow, quantity=1000)],
+            [
+                ScheduledResult(
+                    order_id=order_y,
+                    scheduled_date=tomorrow + timedelta(days=1),
+                    quantity=1000,
+                )
+            ],
         ]
     )
     monkeypatch.setattr(
@@ -1144,9 +1159,10 @@ def test_advance_day_marks_today_orders_in_production(
     )
 
     monkeypatch.setattr("app.workers.scheduling.SessionLocal", lambda: MagicMock())
+    apply_mock = MagicMock(return_value=0)
     monkeypatch.setattr(
         "app.workers.scheduling.order_service.apply_schedule",
-        MagicMock(return_value=0),
+        apply_mock,
     )
 
     mark_completed_mock = MagicMock(return_value=0)
@@ -1172,6 +1188,18 @@ def test_advance_day_marks_today_orders_in_production(
     # completed-outside-set called with new state's alive ids = {order_y}.
     completed_args = mark_completed_mock.call_args.args
     assert completed_args[1] == {order_y}
+
+    # apply_schedule was fed the UNION of today_portion (from the OLD
+    # compute_schedule, filtered to production_day) and future_schedule
+    # (from the new state). Without this union, the locked-in orders'
+    # ``scheduled_production_date`` / ``daily_breakdown`` would never be
+    # written and they'd vanish from the calendar after the day rolls.
+    # The two entries are disjoint by date: order_x on ``tomorrow``
+    # (= production_day), order_y on ``tomorrow + 1`` (= new state's
+    # earliest day).
+    apply_scheduled_arg = apply_mock.call_args.args[1]
+    apply_dates = {sr.order_id: sr.scheduled_date for sr in apply_scheduled_arg}
+    assert apply_dates == {order_x: tomorrow, order_y: tomorrow + timedelta(days=1)}
 
 
 # ---------------------------------------------------------------------------
@@ -1211,8 +1239,13 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
     No skipped orders in this path — the next test covers that branch.
     """
 
+    from app.services.scheduling import REBUILD_IN_FLIGHT_KEY
+
     base = date(2026, 5, 5)
     redis_client.set(STATE_KEY, SchedulerState.initial(base).to_json())
+    # Simulate the endpoint having claimed the single-flight guard before
+    # dispatch; the task's finally must clear it.
+    redis_client.set(REBUILD_IN_FLIGHT_KEY, "1")
     # One pending op so the conditional retrigger fires after rebuild.
     _enqueue(redis_client, _make_op(order_number="POST-REBUILD"))
 
@@ -1279,6 +1312,9 @@ def test_rebuild_task_waits_for_running_then_rebuilds_and_retriggers(
     notify_mock.assert_not_called()
     # run_scheduling_task was kicked off because POST-REBUILD is pending.
     assert delay_mock.called
+    # Single-flight guard released in the task's finally so the next
+    # rebuild request is accepted.
+    assert redis_client.get(REBUILD_IN_FLIGHT_KEY) is None
 
 
 def test_rebuild_task_notifies_each_skipped_orders_creator(

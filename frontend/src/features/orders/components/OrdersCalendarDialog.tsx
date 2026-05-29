@@ -7,6 +7,8 @@ import {
   GripVertical,
   Loader2,
   Lock,
+  Pin,
+  PinOff,
   PackageOpen,
   Search,
   X,
@@ -80,9 +82,18 @@ interface ProductionCalendarItem extends ScheduleResult {
   productionQuantity: number;
   cumulativeQuantity: number;
   productionState: ProductionState;
+  is_pinned?: boolean;
 }
 
 type ProductionState = 'in_progress' | 'complete' | 'scheduled';
+
+interface PinAction {
+  label: string;
+  title: string;
+  disabled: boolean;
+  onClick: () => void;
+  icon: JSX.Element;
+}
 
 function getProductionStateLabel(state: ProductionState): string {
   if (state === 'complete') return '已完成';
@@ -103,6 +114,86 @@ function dateKey(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+const COLOR_PALETTE = [
+  'bg-red-100 dark:bg-red-900',
+  'bg-red-50 dark:bg-red-950',
+  'bg-orange-100 dark:bg-orange-900',
+  'bg-orange-50 dark:bg-orange-950',
+  'bg-amber-100 dark:bg-amber-900',
+  'bg-amber-50 dark:bg-amber-950',
+  'bg-yellow-100 dark:bg-yellow-900',
+  'bg-yellow-50 dark:bg-yellow-950',
+  'bg-lime-100 dark:bg-lime-900',
+  'bg-lime-50 dark:bg-lime-950',
+  'bg-green-100 dark:bg-green-900',
+  'bg-green-50 dark:bg-green-950',
+  'bg-emerald-100 dark:bg-emerald-900',
+  'bg-emerald-50 dark:bg-emerald-950',
+  'bg-teal-100 dark:bg-teal-900',
+  'bg-teal-50 dark:bg-teal-950',
+  'bg-cyan-100 dark:bg-cyan-900',
+  'bg-cyan-50 dark:bg-cyan-950',
+  'bg-blue-100 dark:bg-blue-900',
+  'bg-blue-50 dark:bg-blue-950',
+  'bg-indigo-100 dark:bg-indigo-900',
+  'bg-indigo-50 dark:bg-indigo-950',
+  'bg-purple-100 dark:bg-purple-900',
+  'bg-purple-50 dark:bg-purple-950',
+  'bg-pink-100 dark:bg-pink-900',
+  'bg-pink-50 dark:bg-pink-950',
+  'bg-rose-100 dark:bg-rose-900',
+  'bg-rose-50 dark:bg-rose-950',
+];
+
+function hashOrderId(orderId: string): number {
+  const hash = Array.from(orderId).reduce(
+    (acc, ch) => (acc * 33 + ch.charCodeAt(0)) % Number.MAX_SAFE_INTEGER,
+    5381,
+  );
+  return hash % COLOR_PALETTE.length;
+}
+
+function getOrderColor(orderId: string): string {
+  return COLOR_PALETTE[hashOrderId(orderId)];
+}
+
+function getOrderTextColor(orderId: string): string {
+  const index = hashOrderId(orderId);
+
+  const textColors = [
+    'text-red-950 dark:text-red-50',
+    'text-red-950 dark:text-red-50',
+    'text-orange-950 dark:text-orange-50',
+    'text-orange-950 dark:text-orange-50',
+    'text-amber-950 dark:text-amber-50',
+    'text-amber-950 dark:text-amber-50',
+    'text-yellow-950 dark:text-yellow-50',
+    'text-yellow-950 dark:text-yellow-50',
+    'text-lime-950 dark:text-lime-50',
+    'text-lime-950 dark:text-lime-50',
+    'text-green-950 dark:text-green-50',
+    'text-green-950 dark:text-green-50',
+    'text-emerald-950 dark:text-emerald-50',
+    'text-emerald-950 dark:text-emerald-50',
+    'text-teal-950 dark:text-teal-50',
+    'text-teal-950 dark:text-teal-50',
+    'text-cyan-950 dark:text-cyan-50',
+    'text-cyan-950 dark:text-cyan-50',
+    'text-blue-950 dark:text-blue-50',
+    'text-blue-950 dark:text-blue-50',
+    'text-indigo-950 dark:text-indigo-50',
+    'text-indigo-950 dark:text-indigo-50',
+    'text-purple-950 dark:text-purple-50',
+    'text-purple-950 dark:text-purple-50',
+    'text-pink-950 dark:text-pink-50',
+    'text-pink-950 dark:text-pink-50',
+    'text-rose-950 dark:text-rose-50',
+    'text-rose-950 dark:text-rose-50',
+  ];
+
+  return textColors[index];
 }
 
 function startOfMonth(date: Date): Date {
@@ -135,52 +226,53 @@ function cumulativeQuantityUntil(assignments: DailyAssignment[], date: string): 
     .reduce((total, assignment) => total + assignment.quantity, 0);
 }
 
-// `baseDate` is the server's production "today" anchor. When it is undefined
-// (capacity query still loading / errored), every row collapses to `scheduled`
-// so the UI never quietly falls back to the client clock — that fallback
-// would re-introduce the timezone bug this view was rewritten to avoid.
+// Each order's ``daily_breakdown`` is fanned out into one calendar item
+// per day. The badge for each day is derived purely from the order's
+// DB ``status`` (see the if/else below) — the caller doesn't need to
+// thread ``base_date`` through anymore. Older versions of this view
+// compared each ``assignment.date`` against ``base_date`` to refine
+// the badge per-day; that produced inconsistent badges across an
+// order's multi-day breakdown and flipped a day's badge whenever
+// ``advance_day_task`` rolled the calendar.
 function groupByProductionDate(
   items: ScheduleResult[],
-  baseDate: string | undefined,
+  orderMap?: Map<string, { is_pinned?: boolean }>,
 ): Record<string, ProductionCalendarItem[]> {
-  return items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
+  const result = items.reduce<Record<string, ProductionCalendarItem[]>>((acc, item) => {
     item.daily_breakdown.forEach((assignment) => {
       const cumulativeQuantity = cumulativeQuantityUntil(item.daily_breakdown, assignment.date);
 
-      // ``productionState`` is driven by the order's DB ``status`` first,
-      // with a date-based refinement only for the multi-day in-flight case.
-      // The earlier version computed state purely from ``assignment.date``
-      // vs ``baseDate`` — which gave the wrong answer in the window between
-      // an order being scheduled and ``advance_day_task`` actually flipping
-      // its status to ``in_production`` at midnight: the calendar showed
-      // "生產中" while the table view still showed "已排程" and the order
-      // was still editable. Sourcing the status from the same field both
-      // views read keeps them in lockstep.
+      // ``productionState`` is driven entirely by the order's DB
+      // ``status``. Each day of a multi-day order carries the SAME badge
+      // so the calendar reads consistently — if the order is still
+      // ``in_production`` on any of its days, EVERY day in its
+      // ``daily_breakdown`` shows "生產中" (including future portions
+      // not yet started and past portions whose wafers were already
+      // produced).
       //
-      // Date refinement for ``in_production`` multi-day orders only:
-      // - future days of an in-flight order: still "scheduled" visually
-      //   (those days haven't started)
-      // - past days where the order completed: "complete"
-      // - the current production day and any unfinished past day: "in_progress"
+      // Rationale for skipping per-day date refinement: an earlier
+      // version split a boundary order's badges by comparing each
+      // ``assignment.date`` to ``baseDate`` (future→已排程, past→已完成,
+      // today→生產中). That refinement made the SAME order render
+      // differently on adjacent days, and worse, made the same day's
+      // badge flip across an ``advance_day`` tick — confusing for ops
+      // who treat the daily badge as "what is this order doing right
+      // now". Order-level status is the single source of truth; let
+      // ``status='completed'`` (set by ``advance_day_task`` when the
+      // last portion finishes) be the signal that "this order is now
+      // done across all its days".
+      //
+      // Sourcing badge from ``status`` (not from date math vs baseDate)
+      // also keeps the calendar in lockstep with the table view,
+      // which reads the same ``status`` column.
       let productionState: ProductionState;
-      if (baseDate === undefined) {
-        productionState = 'scheduled';
-      } else if (item.status === 'completed') {
+      if (item.status === 'completed') {
         productionState = 'complete';
       } else if (item.status === 'in_production') {
-        if (assignment.date > baseDate) {
-          productionState = 'scheduled';
-        } else if (assignment.date < baseDate && cumulativeQuantity >= item.wafer_quantity) {
-          productionState = 'complete';
-        } else {
-          productionState = 'in_progress';
-        }
+        productionState = 'in_progress';
       } else {
         // ``scheduled`` / ``pending`` — never show in_progress until the
-        // backend flips status. Under the "no scheduling for today" rule,
-        // ``status='scheduled'`` orders should not have any
-        // daily_breakdown rows on ``baseDate`` (today) at all, so this
-        // branch only ever produces "scheduled" badges in steady state.
+        // backend flips status.
         productionState = 'scheduled';
       }
 
@@ -190,11 +282,25 @@ function groupByProductionDate(
         productionQuantity: assignment.quantity,
         cumulativeQuantity,
         productionState,
+        is_pinned: orderMap?.get(item.id)?.is_pinned ?? false,
       };
       acc[assignment.date] = [...(acc[assignment.date] ?? []), productionItem];
     });
     return acc;
   }, {});
+
+  // Pinned orders float to the top of each day so they're immediately
+  // visible in both the calendar grid (which truncates to MAX_ITEMS_PER_DAY)
+  // and the right-panel detail list.
+  Object.values(result).forEach((dayItems) => {
+    dayItems.sort((a, b) => {
+      const aPinned = a.is_pinned ? 1 : 0;
+      const bPinned = b.is_pinned ? 1 : 0;
+      return bPinned - aPinned;
+    });
+  });
+
+  return result;
 }
 
 function capacityTone(remaining: number, dailyCapacity: number): string {
@@ -250,6 +356,7 @@ function OrderLine({
   onDragStart,
   selected,
   onSelectedChange,
+  pinAction,
 }: {
   order: ProductionCalendarItem;
   dragOrder?: DraggableOrder;
@@ -257,6 +364,7 @@ function OrderLine({
   onDragStart: (event: DragEvent, order: DraggableOrder) => void;
   selected: boolean;
   onSelectedChange: (orderId: string, selected: boolean) => void;
+  pinAction?: PinAction | null;
 }): JSX.Element {
   return (
     <div
@@ -265,12 +373,18 @@ function OrderLine({
         if (dragOrder) onDragStart(event, dragOrder);
       }}
       className={cn(
-        'rounded-md border border-border/70 bg-background px-2 py-1.5 text-xs',
+        'rounded-md border border-border/70 px-2 py-1.5 text-xs',
+        getOrderColor(order.id),
         canDrag && dragOrder && 'cursor-grab active:cursor-grabbing',
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="flex min-w-0 items-center gap-1 truncate font-medium">
+        <span
+          className={cn(
+            'flex min-w-0 items-center gap-1 truncate font-medium',
+            getOrderTextColor(order.id),
+          )}
+        >
           {canDrag && dragOrder && (
             <input
               type="checkbox"
@@ -287,20 +401,42 @@ function OrderLine({
           )}
           {canDrag && dragOrder && <GripVertical className="h-3.5 w-3.5 shrink-0" />}
           <span className="truncate">{order.order_number}</span>
-          {(order.productionState === 'in_progress' || dragOrder?.is_processing_locked) && (
+          {order.is_pinned && (
             <Lock
-              aria-label="處理鎖定中"
+              aria-label="已鎖定"
               className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0"
             />
           )}
         </span>
-        <Badge variant={getProductionStateVariant(order.productionState)} className="shrink-0">
-          {getProductionStateLabel(order.productionState)}
-        </Badge>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <Badge variant={getProductionStateVariant(order.productionState)} className="shrink-0">
+            {getProductionStateLabel(order.productionState)}
+          </Badge>
+          {pinAction && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={pinAction.onClick}
+              disabled={pinAction.disabled}
+              title={pinAction.title}
+              className="h-6 px-2 text-[10px]"
+            >
+              {pinAction.icon}
+              <span className="ml-1">{pinAction.label}</span>
+            </Button>
+          )}
+        </div>
       </div>
-      <div className="mt-1 truncate text-muted-foreground">
-        {order.customer_name} · 今日 {order.productionQuantity.toLocaleString()} / 累計{' '}
-        {order.cumulativeQuantity.toLocaleString()} / {order.wafer_quantity.toLocaleString()}
+      <div className="mt-1 space-y-0.5 text-muted-foreground">
+        <div className="flex min-w-0 items-center justify-between gap-2 text-[11px]">
+          <span className="truncate">{order.customer_name}</span>
+          <span className="shrink-0">需求日 {order.requested_delivery_date}</span>
+        </div>
+        <div className="text-[11px]">
+          今日 {order.productionQuantity.toLocaleString()} / 累計{' '}
+          {order.cumulativeQuantity.toLocaleString()} / {order.wafer_quantity.toLocaleString()}
+        </div>
       </div>
     </div>
   );
@@ -328,12 +464,18 @@ function UnscheduledOrderLine({
       }}
       className={cn(
         'rounded-md border border-dashed px-3 py-2 text-sm',
+        getOrderColor(order.id),
         canDrag && !order.is_processing_locked && 'cursor-grab active:cursor-grabbing',
         order.is_processing_locked && 'opacity-60',
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="flex min-w-0 items-center gap-1 truncate font-medium">
+        <span
+          className={cn(
+            'flex min-w-0 items-center gap-1 truncate font-medium',
+            getOrderTextColor(order.id),
+          )}
+        >
           {canDrag && !order.is_processing_locked && (
             <input
               type="checkbox"
@@ -378,7 +520,12 @@ export function OrdersCalendarDialog({
   const [searchQuery, setSearchQuery] = useState('');
   const role = useCurrentRole();
 
-  const scheduleResult = useScheduleResult();
+  // Calendar shows ``completed`` orders alongside scheduled / in-production
+  // so the user can see the production history in context. The backend
+  // restricts completed rows to the last ~30 days (see
+  // ``_COMPLETED_LOOKBACK_DAYS`` in schedule.py) so the payload stays
+  // bounded as archive size grows.
+  const scheduleResult = useScheduleResult({ includeCompleted: true });
   const scheduleCapacity = useScheduleCapacity();
   const pinSchedule = usePinScheduleOperation();
   const pendingOrders = useOrders({
@@ -401,11 +548,10 @@ export function OrdersCalendarDialog({
   const canReadSchedule = role !== 'viewer';
   const canManageSchedule = role === 'root' || role === 'scheduler';
   const days = useMemo(() => calendarDays(visibleMonth), [visibleMonth]);
-  const baseDate = scheduleCapacity.data?.base_date;
-  const grouped = useMemo(
-    () => groupByProductionDate(scheduleResult.data ?? [], baseDate),
-    [scheduleResult.data, baseDate],
-  );
+  const grouped = useMemo(() => {
+    const orderMap = new Map((scheduledOrders.data?.items ?? []).map((order) => [order.id, order]));
+    return groupByProductionDate(scheduleResult.data ?? [], orderMap);
+  }, [scheduleResult.data, scheduledOrders.data]);
   const filteredGrouped = useMemo(() => {
     if (!searchQuery) return grouped;
     const query = searchQuery.toLowerCase();
@@ -511,6 +657,39 @@ export function OrdersCalendarDialog({
       });
     },
     [canManageSchedule],
+  );
+
+  const handlePinAction = useCallback(
+    (order: DraggableOrder, targetDate: string | null) => {
+      if (!canManageSchedule) return;
+      if (order.is_processing_locked) {
+        toast.error('這筆訂單仍在排程處理中，請稍後再試。');
+        return;
+      }
+      if (targetDate && isTargetAfterDeadline(order, targetDate)) {
+        toast.error('目標日期不能晚於客戶要求交期。');
+        return;
+      }
+      const compoundId = crypto.randomUUID();
+      const actionLabel = targetDate ? `固定至 ${targetDate}` : '解除固定';
+      pinSchedule.mutate(
+        {
+          compoundId,
+          targets: [{ order, targetDate }],
+        },
+        {
+          onSuccess: () => {
+            toast.success(`已送出${actionLabel}`, {
+              description: `訂單 ${order.order_number}`,
+            });
+          },
+          onError: (error) => {
+            toast.error('無法送出排程操作', { description: error.message });
+          },
+        },
+      );
+    },
+    [canManageSchedule, pinSchedule],
   );
 
   const removePendingMove = useCallback((orderId: string) => {
@@ -757,6 +936,7 @@ export function OrdersCalendarDialog({
                     const capacity = dailyCapacityByDate.get(key);
                     const isCurrentMonth = day.getMonth() === visibleMonth.getMonth();
                     const isSelected = key === selectedDate;
+                    const isToday = key === dateKey(new Date());
                     return (
                       <button
                         key={key}
@@ -765,7 +945,14 @@ export function OrdersCalendarDialog({
                         className={cn(
                           'min-h-28 border-b border-r p-2 text-left align-top transition-colors hover:bg-muted/60',
                           !isCurrentMonth && 'bg-muted/30 text-muted-foreground',
+                          isToday &&
+                            isSelected &&
+                            'bg-amber-50 ring-2 ring-inset ring-sky-500 dark:bg-amber-950/30',
+                          isToday &&
+                            !isSelected &&
+                            'bg-amber-50 ring-2 ring-inset ring-amber-400 dark:bg-amber-950/30',
                           isSelected &&
+                            !isToday &&
                             'bg-sky-50 ring-2 ring-inset ring-sky-500 dark:bg-sky-950/40',
                         )}
                         onClick={() => {
@@ -780,7 +967,14 @@ export function OrdersCalendarDialog({
                         }}
                       >
                         <div className="mb-1 flex items-center justify-between">
-                          <span className="text-xs font-semibold">{day.getDate()}</span>
+                          <span
+                            className={cn(
+                              'text-xs font-semibold',
+                              isToday && 'text-amber-700 dark:text-amber-300',
+                            )}
+                          >
+                            {day.getDate()}
+                          </span>
                           <span className="flex items-center gap-1">
                             {capacity && (
                               <span
@@ -817,11 +1011,16 @@ export function OrdersCalendarDialog({
                                   if (draggableOrder) handleDragStart(event, draggableOrder);
                                 }}
                                 className={cn(
-                                  'truncate rounded bg-sky-100 px-1.5 py-1 text-[11px] text-sky-950 dark:bg-sky-900 dark:text-sky-50',
+                                  'rounded px-1.5 py-1 text-[11px] flex items-center gap-1',
+                                  getOrderColor(order.id),
+                                  getOrderTextColor(order.id),
                                   isDraggable && 'cursor-grab active:cursor-grabbing',
                                 )}
                               >
-                                {order.order_number} · {order.productionQuantity.toLocaleString()}
+                                {order.is_pinned && <Lock className="h-3 w-3 shrink-0" />}
+                                <span className="truncate">
+                                  {order.order_number} · {order.productionQuantity.toLocaleString()}
+                                </span>
                               </div>
                             );
                           })}
@@ -993,6 +1192,41 @@ export function OrdersCalendarDialog({
                   selectedItems.map((order) => {
                     const dragOrder = scheduledOrderById.get(order.id);
                     const canDrag = canDragScheduledOrder(order, dragOrder, canManageSchedule);
+                    const pinAction = (() => {
+                      if (!canManageSchedule || !dragOrder) return null;
+                      const isPinnedToSelected =
+                        dragOrder.is_pinned && dragOrder.pinned_production_date === selectedDate;
+                      const targetDate = isPinnedToSelected ? null : selectedDate;
+                      const isImmutable =
+                        dragOrder.status !== 'scheduled' && dragOrder.status !== 'pending';
+                      const exceedsDeadline =
+                        targetDate !== null && isTargetAfterDeadline(dragOrder, targetDate);
+                      let title = isPinnedToSelected ? '取消固定' : '固定到此日';
+                      if (dragOrder.is_processing_locked) {
+                        title = '排程處理中，請稍候';
+                      } else if (isImmutable) {
+                        title = '訂單狀態無法固定';
+                      } else if (exceedsDeadline) {
+                        title = '目標日期不能晚於客戶要求交期';
+                      }
+                      return {
+                        label: isPinnedToSelected ? '取消固定' : '固定到此日',
+                        title,
+                        disabled:
+                          pinSchedule.isPending ||
+                          dragOrder.is_processing_locked ||
+                          isImmutable ||
+                          exceedsDeadline,
+                        onClick: () => {
+                          handlePinAction(dragOrder, targetDate);
+                        },
+                        icon: isPinnedToSelected ? (
+                          <PinOff className="h-3 w-3" />
+                        ) : (
+                          <Pin className="h-3 w-3" />
+                        ),
+                      };
+                    })();
                     return (
                       <OrderLine
                         key={order.id}
@@ -1002,6 +1236,7 @@ export function OrdersCalendarDialog({
                         onDragStart={handleDragStart}
                         selected={selectedOrderIds.includes(order.id)}
                         onSelectedChange={updateSelectedOrder}
+                        pinAction={pinAction}
                       />
                     );
                   })

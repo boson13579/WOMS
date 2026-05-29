@@ -28,12 +28,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from typing import Any, cast
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from redis import Redis
 from sqlalchemy.orm import Session
 
@@ -61,6 +61,7 @@ from app.services.schedule_queue import (
 from app.services.scheduling import (
     DAILY_CAPACITY,
     HORIZON_DAYS,
+    REBUILD_IN_FLIGHT_KEY,
     STATE_KEY,
     STATUS_KEY,
     SchedulerState,
@@ -271,8 +272,25 @@ def get_schedule_status(
 def get_schedule_result(
     db: Session = Depends(get_db),
     current_user: User = Depends(_READ_ROLES),
+    include_completed: bool = Query(
+        default=False,
+        description=(
+            "Include ``completed`` orders alongside ``scheduled`` / "
+            "``in_production``. The default is False to preserve legacy "
+            "behavior; the calendar view passes True."
+        ),
+    ),
+    completed_since: date | None = Query(
+        default=None,
+        description=(
+            "Lower-bound (inclusive) on ``scheduled_production_date`` for "
+            "completed orders. Ignored when ``include_completed`` is False. "
+            "When ``include_completed`` is True and this is omitted, defaults "
+            "to today - ``SCHEDULER_HORIZON_DAYS`` days."
+        ),
+    ),
 ) -> list[ScheduleResultResponse]:
-    """Return every order currently in ``scheduled`` status, with per-day breakdown.
+    """Return every order on the production timeline, with per-day breakdown.
 
     Sorted by ``scheduled_production_date`` ascending so the timeline is
     natural for the UI. Both the summary dates and the ``daily_breakdown``
@@ -285,9 +303,22 @@ def get_schedule_result(
     Empty when no scheduler run has happened yet (column NULL → empty
     list).
 
+    ``include_completed=true`` adds completed orders to the response,
+    restricted to ``scheduled_production_date >= completed_since``.
+    When ``completed_since`` is omitted the window defaults to
+    ``today - SCHEDULER_HORIZON_DAYS`` so the visible history mirrors
+    the forward planning horizon — same number of days in each
+    direction keeps the calendar symmetric and bounds the response.
+
     Permission: order_manager+.
     """
-    return order_service.list_scheduled_orders(db)
+    effective_since: date | None = None
+    if include_completed:
+        lookback_days = get_settings().SCHEDULER_HORIZON_DAYS
+        effective_since = completed_since or (
+            datetime.now(tz=UTC).date() - timedelta(days=lookback_days)
+        )
+    return order_service.list_scheduled_orders(db, completed_since=effective_since)
 
 
 # ---------------------------------------------------------------------------
@@ -454,13 +485,50 @@ def rebuild_schedule(
     4. Re-triggers ``run_scheduling_task`` so any pending ops queued during
        the wait are drained on top of the fresh state.
 
-    No 409 is raised even when a run is in progress — the task self-serializes
-    by polling status. This endpoint never blocks; results / skipped orders
-    are surfaced via WebSocket events the caller subscribes to.
+    **Single-flight guard**: a rebuild can sit waiting up to the run-wait
+    timeout (5 min) for an in-flight run to drain before it even starts its
+    own work. Without a guard, spamming the rebuild button queues N
+    ``rebuild_schedule_task`` instances that each wait + run serially —
+    the pile-up blows past the frontend's request timeout and surfaces as
+    "fail to load". So we claim ``REBUILD_IN_FLIGHT_KEY`` with ``SET NX EX``
+    BEFORE dispatch (covers the dispatch → task-start gap) and reject a
+    second concurrent rebuild with 409. The task clears the flag in its
+    ``finally`` block; the TTL is a crash safety net only.
+
+    The flag is set here (producer side) rather than inside the task
+    because the task starts asynchronously — if we set it in the task,
+    a burst of requests would all dispatch before the first task ran and
+    claimed the flag, defeating the guard.
+
+    Errors:
+        409: a rebuild is already in progress (queued or running).
 
     Permission: scheduler+.
     """
-    async_result = rebuild_schedule_task.delay()
+    # TTL covers the worst-case rebuild lifetime (wait-for-idle + lock
+    # acquire + rebuild) so a crashed worker that never reaches the
+    # task's ``finally`` can't suppress rebuilds forever. Reuse the
+    # waiter-flag TTL — same "crashed waiter" semantics.
+    ttl = get_settings().SCHEDULER_WAITER_FLAG_TTL_SECONDS
+    claimed = _redis().set(REBUILD_IN_FLIGHT_KEY, "1", nx=True, ex=ttl)
+    if not claimed:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A schedule rebuild is already in progress; please wait for it to finish.",
+        )
+
+    try:
+        async_result = rebuild_schedule_task.delay()
+    except Exception as exc:
+        # Dispatch failed (broker down etc.) — release the flag so the
+        # next request isn't wrongly rejected. The task never ran, so
+        # nothing else will clear it (only the TTL would, eventually).
+        _redis().delete(REBUILD_IN_FLIGHT_KEY)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not queue rebuild task (scheduler broker unavailable); please retry.",
+        ) from exc
+
     return ScheduleRebuildResponse(
         task_id=str(async_result.id),
         message="Rebuild queued; will run after any in-flight scheduling completes.",
