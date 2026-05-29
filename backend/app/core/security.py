@@ -23,6 +23,8 @@ from app.models.user import User, UserRole
 from app.repositories import user as user_repo
 from app.schemas.user import TokenPayload
 
+_INVALID_CREDENTIALS_MSG = "Could not validate credentials."
+
 # auto_error=False so we can raise 401 (HTTPBearer default is 403 on missing token).
 http_bearer = HTTPBearer(auto_error=False)
 
@@ -79,14 +81,14 @@ def decode_access_token(token: str) -> TokenPayload:
     except jwt.PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials.",
+            detail=_INVALID_CREDENTIALS_MSG,
         ) from exc
     try:
         return TokenPayload(sub=raw["sub"], role=raw["role"], exp=raw["exp"])
     except (KeyError, TypeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials.",
+            detail=_INVALID_CREDENTIALS_MSG,
         ) from exc
 
 
@@ -97,7 +99,7 @@ def decode_access_token(token: str) -> TokenPayload:
 
 _UNAUTHORIZED = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED,
-    detail="Could not validate credentials.",
+    detail=_INVALID_CREDENTIALS_MSG,
 )
 
 
