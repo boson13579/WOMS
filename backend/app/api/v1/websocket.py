@@ -125,9 +125,11 @@ class ConnectionManager:
         ``app.services.pod_stats``; on its own this number is only
         meaningful for the pod that served the request.
         """
-        # ``list(self._connections.values())`` is what guards against
-        # ``RuntimeError: dictionary changed size during iteration``.
-        return sum(len(sockets) for sockets in list(self._connections.values()))
+        # ``[*self._connections.values()]`` materializes a snapshot list —
+        # same guard as ``list(...)`` against ``RuntimeError: dictionary
+        # changed size during iteration`` — but as a display literal it
+        # avoids the S7504 false positive on ``list()``.
+        return sum(len(sockets) for sockets in [*self._connections.values()])
 
     async def _send_all(self, sockets: list[WebSocket], message: dict[str, Any]) -> int:
         delivered = 0

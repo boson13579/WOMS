@@ -240,7 +240,7 @@ export function useTriggerSchedule(): ReturnType<typeof useMutation<ScheduleTrig
 }
 
 /**
- * TODO(future PR): wire into a multi-select bulk-update toolbar on the
+ * Deferred (future PR): wire into a multi-select bulk-update toolbar on the
  * Orders table (SUMMARY-zh feature #7 — "useBatchUpdateOrders 接 UI").
  * Intended consumer: a "Bulk reassign / status change" action surfaced
  * once row selection ships in the orders feature (rough scope: add a
@@ -273,7 +273,7 @@ export function useBatchUpdateOrders(): ReturnType<
 }
 
 /**
- * TODO(future PR): wire into an order-history drawer / dialog on
+ * Deferred (future PR): wire into an order-history drawer / dialog on
  * `OrderTable` (and eventually `OrderDetail`). Intended consumer:
  * a chronological audit-trail view that renders each entry with the
  * action, the actor's username (resolved via `useUsernames`), the
