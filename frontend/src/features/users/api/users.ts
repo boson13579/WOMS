@@ -15,7 +15,8 @@ export async function listUsers(search?: string): Promise<UserListResponse> {
     params.set('search', search.trim());
   }
 
-  const url = `/api/v1/users${params.size ? `?${params.toString()}` : ''}`;
+  const query = params.size ? `?${params.toString()}` : '';
+  const url = `/api/v1/users${query}`;
   return apiFetch(url, { headers: jsonHeaders(), credentials: 'include' }, (raw) =>
     userListResponseSchema.parse(raw),
   );

@@ -49,6 +49,46 @@ interface UseResourceCardProps {
 
 const UNREACHABLE_DEFAULT = 'Probe unreachable.';
 
+function renderUtilizationBar(
+  label: string,
+  clampedRatio: number | null,
+  widthPct: number,
+  isUnreachable: boolean,
+  isHot: boolean,
+): JSX.Element {
+  return (
+    <div
+      className="h-2 w-full overflow-hidden rounded-full bg-secondary"
+      role="progressbar"
+      aria-valuenow={isUnreachable ? undefined : widthPct}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-label={`${label} utilization`}
+    >
+      {clampedRatio === null ? (
+        <div
+          data-testid="util-bar-dashed"
+          className="h-full w-full bg-muted-foreground/20 [background-image:repeating-linear-gradient(45deg,transparent,transparent_4px,hsl(var(--border))_4px,hsl(var(--border))_8px)]"
+        />
+      ) : (
+        <div
+          data-testid="util-bar-fill"
+          className={cn('h-full transition-all', isHot ? 'bg-destructive' : 'bg-primary')}
+          style={{ width: `${widthPct}%` }}
+        />
+      )}
+    </div>
+  );
+}
+
+function renderCaptionLines(captionLines: readonly (string | undefined)[]): JSX.Element[] {
+  return captionLines.map((line) => (
+    <p key={line} className="text-xs text-muted-foreground">
+      {line}
+    </p>
+  ));
+}
+
 export function UseResourceCard({
   label,
   value,
@@ -58,12 +98,13 @@ export function UseResourceCard({
   expandable,
   unreachableMessage = UNREACHABLE_DEFAULT,
   hideBar = false,
-}: UseResourceCardProps): JSX.Element {
+}: Readonly<UseResourceCardProps>): JSX.Element {
   const isUnreachable = value === null;
   // Clamp ratio so a borked backend value can't paint a 200%-wide bar.
   const clampedRatio = typeof ratio === 'number' ? Math.max(0, Math.min(1, ratio)) : null;
   const widthPct = clampedRatio === null ? 0 : Math.round(clampedRatio * 100);
   const isHot = clampedRatio !== null && clampedRatio > 0.8;
+  const captionLines = Array.isArray(caption) ? caption : [caption];
 
   return (
     <Card>
@@ -83,44 +124,12 @@ export function UseResourceCard({
           {detail ? <span className="text-xs text-muted-foreground">{detail}</span> : null}
         </div>
 
-        {hideBar ? null : (
-          <div
-            className="h-2 w-full overflow-hidden rounded-full bg-secondary"
-            role="progressbar"
-            aria-valuenow={isUnreachable ? undefined : widthPct}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-label={`${label} utilization`}
-          >
-            {clampedRatio === null ? (
-              <div
-                data-testid="util-bar-dashed"
-                className="h-full w-full bg-muted-foreground/20 [background-image:repeating-linear-gradient(45deg,transparent,transparent_4px,hsl(var(--border))_4px,hsl(var(--border))_8px)]"
-              />
-            ) : (
-              <div
-                data-testid="util-bar-fill"
-                className={cn('h-full transition-all', isHot ? 'bg-destructive' : 'bg-primary')}
-                style={{ width: `${widthPct}%` }}
-              />
-            )}
-          </div>
-        )}
+        {hideBar ? null : renderUtilizationBar(label, clampedRatio, widthPct, isUnreachable, isHot)}
 
         {isUnreachable ? (
           <p className="text-xs text-muted-foreground">{unreachableMessage}</p>
         ) : null}
-        {!isUnreachable && caption
-          ? (Array.isArray(caption) ? caption : [caption]).map((line) => (
-              // Caption lines are derived from stable sources that
-              // already embed the per-replica pod_id slice, so each
-              // line string is unique within a render and works as a
-              // stable React key.
-              <p key={line} className="text-xs text-muted-foreground">
-                {line}
-              </p>
-            ))
-          : null}
+        {!isUnreachable && caption ? renderCaptionLines(captionLines) : null}
 
         {expandable ? <div className="pt-1">{expandable}</div> : null}
       </CardContent>

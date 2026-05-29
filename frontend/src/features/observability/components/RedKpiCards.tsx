@@ -60,7 +60,7 @@ function lagTone(p95Ms: number): KpiTone {
   return 'positive';
 }
 
-function ErrorState({ message }: { message: string }): JSX.Element {
+function ErrorState({ message }: Readonly<{ message: string }>): JSX.Element {
   return (
     <Card className="border-destructive/40">
       <CardContent className="flex items-start gap-3 p-5">
@@ -89,7 +89,7 @@ export function RedKpiCards({
   lag,
   lagLoading,
   lagError,
-}: RedKpiCardsProps): JSX.Element {
+}: Readonly<RedKpiCardsProps>): JSX.Element {
   const rateHistory = useRedHistoryStore((s) => s.series.rate);
   const errorPctHistory = useRedHistoryStore((s) => s.series.errorPct);
   const p95History = useRedHistoryStore((s) => s.series.p95);
@@ -148,12 +148,12 @@ function LagCardSlot({
   loading,
   error,
   history,
-}: {
+}: Readonly<{
   lag: ScheduleLag | undefined;
   loading: boolean;
   error: boolean;
   history: number[];
-}): JSX.Element {
+}>): JSX.Element {
   if (loading && !lag) {
     return <Skeleton data-testid="red-kpi-skeleton" className="h-32 w-full" />;
   }

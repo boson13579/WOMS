@@ -17,7 +17,7 @@ interface LoginFormProps {
   onSuccess?: () => void;
 }
 
-export function LoginForm({ onSuccess }: LoginFormProps): JSX.Element {
+export function LoginForm({ onSuccess }: Readonly<LoginFormProps>): JSX.Element {
   const setSession = useAuthStore((s) => s.setSession);
 
   const {
@@ -43,7 +43,7 @@ export function LoginForm({ onSuccess }: LoginFormProps): JSX.Element {
   return (
     <form
       onSubmit={(event) => {
-        void onSubmit(event);
+        onSubmit(event).catch(() => {});
       }}
       className="space-y-5"
       noValidate

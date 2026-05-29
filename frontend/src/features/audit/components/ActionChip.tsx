@@ -32,7 +32,7 @@ function chipClass(action: string): string {
   return 'bg-muted text-muted-foreground';
 }
 
-export function ActionChip({ action, className }: ActionChipProps): JSX.Element {
+export function ActionChip({ action, className }: Readonly<ActionChipProps>): JSX.Element {
   return (
     <span
       className={cn(

@@ -24,7 +24,7 @@ interface SparklineProps {
   ariaLabel?: string | undefined;
 }
 
-export function Sparkline({ values, ariaLabel }: SparklineProps): JSX.Element | null {
+export function Sparkline({ values, ariaLabel }: Readonly<SparklineProps>): JSX.Element | null {
   const gradientId = useId();
 
   // Warming-up guard: rendering an AreaChart with 0 / 1 / 2 points draws

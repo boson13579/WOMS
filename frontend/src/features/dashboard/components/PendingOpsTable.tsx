@@ -43,7 +43,7 @@ export function PendingOpsTable({
   isLoading,
   isError,
   topN = DEFAULT_TOP_N,
-}: PendingOpsTableProps): JSX.Element {
+}: Readonly<PendingOpsTableProps>): JSX.Element {
   // Resolve the requester UUIDs to usernames in bulk. ``useUsernames``
   // short-circuits on an empty list so this is safe even before data
   // loads — the hook returns ``{}`` and the table renders the raw UUID
@@ -82,6 +82,11 @@ export function PendingOpsTable({
 
   const total = data.length;
   const rows = data.slice(0, topN);
+  const opsWord = total === 1 ? 'operation' : 'operations';
+  const queueDescription =
+    total === 0
+      ? 'scheduler queue is empty'
+      : `${total.toLocaleString()} ${opsWord} queued (one per CRUD action)`;
 
   return (
     <Card>
@@ -94,11 +99,7 @@ export function PendingOpsTable({
             <Layers className="h-4 w-4 text-muted-foreground" aria-hidden />
             Pending operations
           </CardTitle>
-          <CardDescription>
-            {total === 0
-              ? 'scheduler queue is empty'
-              : `${total.toLocaleString()} operation${total === 1 ? '' : 's'} queued (one per CRUD action)`}
-          </CardDescription>
+          <CardDescription>{queueDescription}</CardDescription>
         </div>
       </CardHeader>
       <CardContent>

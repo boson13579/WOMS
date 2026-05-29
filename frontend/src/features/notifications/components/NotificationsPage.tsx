@@ -168,9 +168,9 @@ export function NotificationsPage(): JSX.Element {
         {listItems.map((item: NotificationResponse) => {
           const cardClass = cn(
             'group flex items-start gap-4 p-4 transition-all duration-200 hover:shadow-md hover:shadow-muted/20',
-            !item.is_read
-              ? 'border-l-4 border-l-primary bg-primary/[0.01] dark:bg-primary/[0.005]'
-              : 'bg-card/60 opacity-80 hover:opacity-100',
+            item.is_read
+              ? 'bg-card/60 opacity-80 hover:opacity-100'
+              : 'border-l-4 border-l-primary bg-primary/[0.01] dark:bg-primary/[0.005]',
           );
           const textClass = cn(
             'text-sm leading-relaxed text-foreground/90 break-words',

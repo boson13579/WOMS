@@ -81,8 +81,8 @@ const EVENT_INVALIDATIONS: Readonly<Partial<Record<string, readonly (readonly un
 };
 
 function buildWsUrl(): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}${WS_PATH}`;
+  const protocol = globalThis.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${globalThis.location.host}${WS_PATH}`;
 }
 
 export function useDashboardWs(): void {
@@ -122,7 +122,7 @@ export function useDashboardWs(): void {
       const keys = EVENT_INVALIDATIONS[type];
       if (!keys) return;
       keys.forEach((queryKey) => {
-        void queryClient.invalidateQueries({ queryKey });
+        queryClient.invalidateQueries({ queryKey }).catch(() => {});
       });
     }
 

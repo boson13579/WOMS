@@ -33,7 +33,7 @@ const STATUS_CONFIG = {
   },
 } as const;
 
-export function StatusCard({ service }: { service: ServiceHealthEntry }): JSX.Element {
+export function StatusCard({ service }: Readonly<{ service: ServiceHealthEntry }>): JSX.Element {
   const cfg = STATUS_CONFIG[service.status];
   const StatusIcon = cfg.icon;
 

@@ -42,9 +42,9 @@ export function MobileNav(): JSX.Element | null {
     function onKey(e: KeyboardEvent): void {
       if (e.key === 'Escape') setOpen(false);
     }
-    window.addEventListener('keydown', onKey);
+    globalThis.addEventListener('keydown', onKey);
     return () => {
-      window.removeEventListener('keydown', onKey);
+      globalThis.removeEventListener('keydown', onKey);
     };
   }, [open, setOpen]);
 
@@ -73,7 +73,7 @@ export function MobileNav(): JSX.Element | null {
     );
     if (focusables.length === 0) return undefined;
     const first = focusables[0];
-    const last = focusables[focusables.length - 1];
+    const last = focusables.at(-1) ?? first;
     first.focus();
 
     function onKey(e: KeyboardEvent): void {

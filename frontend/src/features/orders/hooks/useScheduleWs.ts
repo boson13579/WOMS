@@ -40,9 +40,9 @@ export function useScheduleWs(): void {
   useEffect(() => {
     if (!user) return undefined;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const protocol = globalThis.location.protocol === 'https:' ? 'wss:' : 'ws:';
     // Cookie is sent automatically by the browser for same-origin WS connections.
-    const url = `${protocol}//${window.location.host}/api/v1/ws`;
+    const url = `${protocol}//${globalThis.location.host}/api/v1/ws`;
     const ws = new WebSocket(url);
 
     ws.onmessage = (evt: MessageEvent<string>) => {
@@ -53,9 +53,9 @@ export function useScheduleWs(): void {
         return;
       }
       if (env.type.startsWith('schedule.')) {
-        void qc.invalidateQueries({ queryKey: orderKeys.all });
-        void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
-        void qc.invalidateQueries({ queryKey: scheduleResultKeys.all });
+        qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+        qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
+        qc.invalidateQueries({ queryKey: scheduleResultKeys.all }).catch(() => {});
       }
 
       if (env.type === 'schedule.compound_failed') {

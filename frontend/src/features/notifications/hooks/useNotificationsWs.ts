@@ -30,8 +30,8 @@ const wsEnvelopeSchema = z
   .passthrough();
 
 function buildWsUrl(): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}${WS_PATH}`;
+  const protocol = globalThis.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${globalThis.location.host}${WS_PATH}`;
 }
 
 export function useNotificationsWs(): void {
@@ -88,7 +88,7 @@ export function useNotificationsWs(): void {
       }
 
       if (env.type === 'notification.created' && env.data) {
-        void qc.invalidateQueries({ queryKey: notificationKeys.all });
+        qc.invalidateQueries({ queryKey: notificationKeys.all }).catch(() => {});
         queueNotificationToast(env.data.message);
       }
     }
@@ -100,7 +100,7 @@ export function useNotificationsWs(): void {
       ws.onopen = () => {
         backoffMs = RECONNECT_INITIAL_MS;
         if (!isFirstOpen) {
-          void qc.invalidateQueries({ queryKey: notificationKeys.all });
+          qc.invalidateQueries({ queryKey: notificationKeys.all }).catch(() => {});
         }
         isFirstOpen = false;
       };

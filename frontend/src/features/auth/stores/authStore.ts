@@ -54,7 +54,7 @@ function decodeJwtPayload(token: string): { sub?: string; role?: string; exp?: n
     return {};
   }
 
-  const normalizedPayload = payloadSegment.replace(/-/g, '+').replace(/_/g, '/');
+  const normalizedPayload = payloadSegment.replaceAll('-', '+').replaceAll('_', '/');
   const paddedPayload = normalizedPayload.padEnd(
     normalizedPayload.length + ((4 - (normalizedPayload.length % 4)) % 4),
     '=',
@@ -83,17 +83,17 @@ function isExpired(expiresAt: number): boolean {
 }
 
 function clearPersistedAuth(): void {
-  if (typeof window !== 'undefined') {
-    window.localStorage.removeItem(STORAGE_KEY);
+  if (typeof globalThis.localStorage !== 'undefined') {
+    globalThis.localStorage.removeItem(STORAGE_KEY);
   }
 }
 
 function loadPersistedAuth(): PersistedAuthState | null {
-  if (typeof window === 'undefined') {
+  if (typeof globalThis.localStorage === 'undefined') {
     return null;
   }
 
-  const raw = window.localStorage.getItem(STORAGE_KEY);
+  const raw = globalThis.localStorage.getItem(STORAGE_KEY);
   if (!raw) {
     return null;
   }
@@ -121,16 +121,16 @@ function loadPersistedAuth(): PersistedAuthState | null {
 }
 
 function persistAuth(state: PersistedAuthState | null): void {
-  if (typeof window === 'undefined') {
+  if (typeof globalThis.localStorage === 'undefined') {
     return;
   }
 
   if (state === null) {
-    window.localStorage.removeItem(STORAGE_KEY);
+    globalThis.localStorage.removeItem(STORAGE_KEY);
     return;
   }
 
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  globalThis.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
 const persisted = loadPersistedAuth();
@@ -176,9 +176,14 @@ export function installUnauthorizedHandler(
     // Run logout async — the user's local state is already torn down by
     // the time the handler returns; the HTTP POST to /auth/logout is
     // best-effort and doesn't block the navigation.
-    void useAuthStore.getState().logout();
+    useAuthStore
+      .getState()
+      .logout()
+      .catch(() => {});
     const next =
-      typeof window === 'undefined' ? '/' : `${window.location.pathname}${window.location.search}`;
+      typeof globalThis.location === 'undefined'
+        ? '/'
+        : `${globalThis.location.pathname}${globalThis.location.search}`;
     navigate(`/login?next=${encodeURIComponent(next)}`, { replace: true });
   });
 }

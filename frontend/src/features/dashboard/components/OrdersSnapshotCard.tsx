@@ -74,7 +74,7 @@ export function OrdersSnapshotCard({
   data,
   isLoading,
   isError,
-}: OrdersSnapshotCardProps): JSX.Element {
+}: Readonly<OrdersSnapshotCardProps>): JSX.Element {
   if (isLoading) {
     return (
       <Card>

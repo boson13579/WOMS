@@ -97,8 +97,8 @@ export const orderKeys = {
 export interface ListOrdersParams {
   status?: string | null;
   search?: string | null;
-  assignedTo?: string[];
-  createdBy?: string[];
+  assignedTo?: string[] | undefined;
+  createdBy?: string[] | undefined;
   page?: number;
   page_size?: number;
   sortBy?: string;
@@ -163,8 +163,8 @@ export function useCreateOrder(): ReturnType<typeof useMutation<Order, Error, Or
         (d) => orderSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
     },
   });
 }
@@ -187,8 +187,8 @@ export function useUpdateOrder(): ReturnType<
         (d) => orderSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
     },
   });
 }
@@ -204,8 +204,8 @@ export function useDeleteOrder(): ReturnType<typeof useMutation<undefined, Error
         () => undefined,
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
     },
   });
 }
@@ -219,8 +219,8 @@ export function useCancelOrder(): ReturnType<typeof useMutation<Order, Error, st
         orderSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
     },
   });
 }
@@ -267,7 +267,7 @@ export function useBatchUpdateOrders(): ReturnType<
         (d) => batchUpdateResponseSchema.parse(d),
       ),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
     },
   });
 }

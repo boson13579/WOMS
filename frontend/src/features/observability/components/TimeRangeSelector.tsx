@@ -25,9 +25,13 @@ const LABELS: Record<RedWindowSeconds, string> = {
   3600: '1h',
 };
 
-export function TimeRangeSelector({ value, onChange }: TimeRangeSelectorProps): JSX.Element {
+export function TimeRangeSelector({
+  value,
+  onChange,
+}: Readonly<TimeRangeSelectorProps>): JSX.Element {
   return (
-    <div role="group" aria-label="Select time range" className="inline-flex items-center gap-1">
+    <fieldset className="inline-flex items-center gap-1 border-0 p-0 m-0">
+      <legend className="sr-only">Select time range</legend>
       {RED_WINDOW_OPTIONS.map((opt) => {
         const isActive = opt === value;
         return (
@@ -46,6 +50,6 @@ export function TimeRangeSelector({ value, onChange }: TimeRangeSelectorProps): 
           </Button>
         );
       })}
-    </div>
+    </fieldset>
   );
 }

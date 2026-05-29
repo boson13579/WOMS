@@ -14,7 +14,7 @@ interface DialogProps {
   className?: string;
 }
 
-function Dialog({ open, onOpenChange, children, className }: DialogProps): JSX.Element {
+function Dialog({ open, onOpenChange, children, className }: Readonly<DialogProps>): JSX.Element {
   const ref = React.useRef<HTMLDialogElement>(null);
 
   React.useEffect(() => {

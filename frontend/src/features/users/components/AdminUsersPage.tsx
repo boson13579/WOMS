@@ -71,14 +71,14 @@ export function AdminUsersPage(): JSX.Element {
       }),
     onSuccess: () => {
       setEdit(null);
-      void queryClient.invalidateQueries({ queryKey: [ADMIN_USERS_QUERY_KEY] });
+      queryClient.invalidateQueries({ queryKey: [ADMIN_USERS_QUERY_KEY] }).catch(() => {});
     },
   });
 
   const deactivateMutation = useMutation({
     mutationFn: deactivateUser,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: [ADMIN_USERS_QUERY_KEY] });
+      queryClient.invalidateQueries({ queryKey: [ADMIN_USERS_QUERY_KEY] }).catch(() => {});
     },
   });
 

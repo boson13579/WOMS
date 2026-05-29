@@ -23,7 +23,7 @@ interface AuthPageProps {
   onLoginSuccess?: () => void;
 }
 
-export function AuthPage({ onLoginSuccess }: AuthPageProps): JSX.Element {
+export function AuthPage({ onLoginSuccess }: Readonly<AuthPageProps>): JSX.Element {
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -98,12 +98,9 @@ export function AuthPage({ onLoginSuccess }: AuthPageProps): JSX.Element {
           <CardContent>
             {/* Success banner after registration */}
             {registered && mode === 'login' ? (
-              <div
-                role="status"
-                className="mb-4 rounded-md border border-green-500/30 bg-green-500/10 px-4 py-3 text-sm text-green-600 dark:text-green-400"
-              >
+              <output className="mb-4 block rounded-md border border-green-500/30 bg-green-500/10 px-4 py-3 text-sm text-green-600 dark:text-green-400">
                 Account created! Please sign in.
-              </div>
+              </output>
             ) : null}
 
             {/* Animated form swap */}
