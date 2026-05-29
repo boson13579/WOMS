@@ -125,7 +125,7 @@ services:
     depends_on:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
-    command: [ "celery", "-A", "app.workers.celery_app", "beat", "--loglevel=INFO" ]
+    command: [ "celery", "-A", "app.workers.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule" ]
     environment:
       APP_ENV: ${APP_ENV:-dev}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-smart_order}

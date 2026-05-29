@@ -1525,7 +1525,7 @@ def test_run_scheduling_drains_op_count_mismatch_to_dlq(
     assert failed == []
 
 
-def test_run_scheduling_pin_failure_logs_but_continues_batch(
+def test_run_scheduling_pin_failure_rejects_compound_and_continues_batch(
     monkeypatch: pytest.MonkeyPatch,
     redis_client: Redis,
 ) -> None:
@@ -1577,18 +1577,17 @@ def test_run_scheduling_pin_failure_logs_but_continues_batch(
         for c in mocks["notify_user"].call_args_list
         if c.kwargs["message"]["type"] == "schedule.compound_accepted"
     ]
-    # Both compounds in the batch fired compound_accepted (pin failure is
-    # defensive-only, does NOT cancel the compound).
-    assert len(accepted) == 2
+    # Only the follow-up add fires compound_accepted; the failed pin is rejected.
+    assert len(accepted) == 1
 
-    # No compound_failed for the pin (different contract from the old
-    # saga design which would have raised this).
     failed = [
         c
         for c in mocks["notify_user"].call_args_list
         if c.kwargs["message"]["type"] == "schedule.compound_failed"
     ]
-    assert failed == []
+    assert len(failed) == 1
+    assert failed[0].kwargs["user_id"] == pin_user
+    assert failed[0].kwargs["message"]["order_number"] == "PIN-FAIL"
 
 
 def test_run_scheduling_dispatches_unpin_op(
@@ -2216,6 +2215,10 @@ def _stub_compound_with_db_action(
     new_requested_delivery_date: str | None = None,
     new_notes_set: bool = False,
     new_notes: str | None = None,
+    new_pinned_production_date_set: bool = False,
+    new_pinned_production_date: str | None = None,
+    old_pinned_production_date: str | None = None,
+    old_is_pinned: bool = False,
 ) -> dict[str, Any]:
     """Build a compound dict that mimics what ``schedule_queue.enqueue_compound``
     stores in Redis — only the fields ``_perform_compound_db_action`` reads."""
@@ -2242,10 +2245,14 @@ def _stub_compound_with_db_action(
             "new_notes": new_notes,
             "new_assigned_to_set": False,
             "new_assigned_to": None,
+            "new_pinned_production_date_set": new_pinned_production_date_set,
+            "new_pinned_production_date": new_pinned_production_date,
             "old_wafer_quantity": None,
             "old_requested_delivery_date": None,
             "old_notes": None,
             "old_assigned_to": None,
+            "old_pinned_production_date": old_pinned_production_date,
+            "old_is_pinned": old_is_pinned,
         },
     }
 
@@ -2420,6 +2427,76 @@ def test_perform_db_action_reject_update_clears_lock_only(
     # Lock cleared; status restored to scheduled (had a scheduled date).
     assert order.is_processing_locked is False
     assert order.status == OrderStatus.scheduled
+
+
+def test_perform_db_action_reject_update_restores_old_pin_columns(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected calendar pin must leave the order at its original pin date."""
+    from app.models.notification import Notification
+    from app.models.order import Order, OrderStatus
+    from app.models.user import User, UserRole
+    from app.workers.scheduling import _perform_compound_db_action
+
+    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
+
+    import bcrypt
+
+    actor = User(
+        username="worker-dbaction-reject-pin",
+        email="worker-dbaction-reject-pin@test.internal",
+        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
+        role=UserRole.scheduler,
+        is_active=True,
+    )
+    db_session.add(actor)
+    db_session.commit()
+
+    original_pin_day = date(2026, 7, 15)
+    order = Order(
+        order_number="ORD-DBACTION-REJ-PIN",
+        customer_name="ACME",
+        wafer_quantity=100,
+        requested_delivery_date=date(2026, 8, 1),
+        created_by=actor.id,
+        status=OrderStatus.pending,
+        scheduled_production_date=original_pin_day,
+        is_pinned=True,
+        pinned_production_date=original_pin_day,
+        is_processing_locked=True,
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    compound = _stub_compound_with_db_action(
+        kind="update",
+        order_id=order.id,
+        actor_id=actor.id,
+        new_pinned_production_date_set=True,
+        new_pinned_production_date="2026-07-16",
+        old_pinned_production_date=original_pin_day.isoformat(),
+        old_is_pinned=True,
+    )
+
+    _perform_compound_db_action(compound, accepted=False)
+
+    db_session.expire_all()
+    db_session.refresh(order)
+    assert order.status == OrderStatus.scheduled
+    assert order.is_processing_locked is False
+    assert order.is_pinned is True
+    assert order.pinned_production_date == original_pin_day
+
+    from sqlalchemy import select as _sa_select
+
+    notification = db_session.scalar(
+        _sa_select(Notification).where(Notification.order_id == order.id)
+    )
+    assert notification is not None
+    assert notification.user_id == actor.id
+    assert notification.type == "order_schedule_rejected"
+    assert "ORD-DBACTION-REJ-PIN" in notification.message
 
 
 def test_perform_db_action_accept_delete_soft_deletes_and_audits(

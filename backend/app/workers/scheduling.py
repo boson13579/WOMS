@@ -741,6 +741,10 @@ def _apply_compound_leaf_structural(
                 status=result.status,
                 message=result.message,
             )
+            raise SegmentTreeInvariantError(
+                f"pin_order rejected order {leaf.get('order_id')}: "
+                f"{result.status} ({result.message or 'no detail'})"
+            )
         return
     if kind == "unpin":
         result = unpin_order(state, uuid.UUID(leaf["order_id"]))
@@ -750,6 +754,10 @@ def _apply_compound_leaf_structural(
                 order_id=leaf.get("order_id"),
                 status=result.status,
                 message=result.message,
+            )
+            raise SegmentTreeInvariantError(
+                f"unpin_order rejected order {leaf.get('order_id')}: "
+                f"{result.status} ({result.message or 'no detail'})"
             )
         return
     logger.warning("schedule.batch.unknown_op", op=kind)
@@ -868,10 +876,12 @@ def _commit_accepted_batch(
     succeeded: list[tuple[str, dict[str, Any]]] = []
     failed: list[tuple[str, dict[str, Any]]] = []
     for member, compound in accepted:
+        state_before_compound = state.to_json()
         try:
             for leaf in compound.get("ops", []):
                 _apply_compound_leaf_structural(state, leaf)
         except SegmentTreeInvariantError as exc:
+            state = SchedulerState.from_json(state_before_compound)
             logger.error(
                 "schedule.batch.invariant_break_skipping_compound",
                 compound_id=compound.get("compound_id"),

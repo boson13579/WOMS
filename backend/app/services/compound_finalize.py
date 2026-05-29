@@ -151,7 +151,7 @@ def perform_compound_db_action(
         if accepted:
             _apply_db_action_accept(db, order, kind, db_action_raw, actor_id)
         else:
-            _apply_db_action_reject(db, order, kind, actor_id)
+            _apply_db_action_reject(db, order, kind, db_action_raw, actor_id)
 
         db.commit()
 
@@ -183,6 +183,29 @@ def perform_compound_db_action(
                     order_id=_oid,
                     type="order_cancelled",
                     message=f"訂單 {_order_number} 已被取消",
+                )
+            except Exception:
+                logger.warning(
+                    "notification.create_failed",
+                    order_id=str(_oid),
+                    user_id=str(_created_by),
+                    exc_info=True,
+                )
+        _is_rejected_pin_update = (
+            kind == "update"
+            and not accepted
+            and bool(db_action_raw.get("new_pinned_production_date_set"))
+        )
+        if _is_rejected_pin_update:
+            try:
+                target_date = db_action_raw.get("new_pinned_production_date")
+                detail = f"目標日期 {target_date}" if target_date else "解除固定"
+                notification_service.create_notification(
+                    db,
+                    user_id=_created_by,
+                    order_id=_oid,
+                    type="order_schedule_rejected",
+                    message=f"訂單 {_order_number} 排程調整失敗, {detail} 未套用.",
                 )
             except Exception:
                 logger.warning(
@@ -332,6 +355,7 @@ def _apply_db_action_reject(
     db: Session,
     order: Order,
     kind: str,
+    db_action: dict[str, Any],
     actor_id: uuid.UUID | None,
 ) -> None:
     """Compensate for a rejected compound: clear lock; for create, orphan-cleanup.
@@ -416,6 +440,27 @@ def _apply_db_action_reject(
     # compound that failed.
     if order.status == OrderStatus.cancelled or order.is_deleted:
         return
+    if kind == "update":
+        if "old_wafer_quantity" in db_action and db_action.get("old_wafer_quantity") is not None:
+            order.wafer_quantity = int(db_action["old_wafer_quantity"])
+        if (
+            "old_requested_delivery_date" in db_action
+            and db_action.get("old_requested_delivery_date") is not None
+        ):
+            order.requested_delivery_date = date.fromisoformat(
+                str(db_action["old_requested_delivery_date"])
+            )
+        if db_action.get("new_notes_set"):
+            order.notes = db_action.get("old_notes")
+        if db_action.get("new_assigned_to_set"):
+            raw_assignee = db_action.get("old_assigned_to")
+            order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
+        if db_action.get("new_pinned_production_date_set"):
+            raw_old_pin_day = db_action.get("old_pinned_production_date")
+            order.is_pinned = bool(db_action.get("old_is_pinned"))
+            order.pinned_production_date = (
+                date.fromisoformat(str(raw_old_pin_day)) if raw_old_pin_day else None
+            )
     if order.scheduled_production_date is not None:
         order.status = OrderStatus.scheduled
     else:
