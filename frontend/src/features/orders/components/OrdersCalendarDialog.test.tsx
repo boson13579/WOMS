@@ -441,6 +441,24 @@ describe('OrdersCalendarDialog', () => {
     expect(payload.targets.map((target) => target.targetDate)).toEqual(['2026-05-10']);
   });
 
+  it('does not queue a drag when the target date has insufficient capacity', () => {
+    renderDialog();
+
+    const dragData = new Map<string, string>();
+    const dataTransfer = {
+      effectAllowed: '',
+      dropEffect: '',
+      setData: vi.fn((type: string, value: string) => dragData.set(type, value)),
+      getData: vi.fn((type: string) => dragData.get(type) ?? ''),
+    } as unknown as DataTransfer;
+
+    fireEvent.dragStart(screen.getByText('ORD-20260504-0002'), { dataTransfer });
+    fireEvent.drop(screen.getByRole('button', { name: /2026-05-11/ }), { dataTransfer });
+
+    expect(screen.getByText(/產能不足/)).toBeInTheDocument();
+    expect(mockPinMutate).not.toHaveBeenCalled();
+  });
+
   it('keeps selected order order when queueing a multi-order pin attempt', async () => {
     const user = userEvent.setup();
     mockOrders.data = {
@@ -482,6 +500,15 @@ describe('OrdersCalendarDialog', () => {
 
   it('queues separately dropped orders with different target dates in one compound', async () => {
     const user = userEvent.setup();
+    mockScheduleCapacity.data = {
+      base_date: '2026-05-09',
+      daily_capacity: 2500,
+      entries: [
+        { date: '2026-05-09', used: 1000, remaining: 1500 },
+        { date: '2026-05-10', used: 1500, remaining: 1000 },
+        { date: '2026-05-11', used: 1500, remaining: 1000 },
+      ],
+    };
     mockOrders.data = {
       items: [pendingOrder, secondPendingOrder],
       total: 2,

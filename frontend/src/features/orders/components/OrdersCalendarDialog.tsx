@@ -1,4 +1,5 @@
 /* eslint-disable no-nested-ternary */
+import { useQueryClient } from '@tanstack/react-query';
 import {
   AlertCircle,
   CalendarDays,
@@ -24,10 +25,14 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { useCurrentRole } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 
-import { useOrders } from '../api/orders';
-import { toDailyCapacity, useScheduleCapacity } from '../api/scheduleCapacity';
+import { orderKeys, useOrders } from '../api/orders';
+import {
+  scheduleCapacityKeys,
+  toDailyCapacity,
+  useScheduleCapacity,
+} from '../api/scheduleCapacity';
 import { usePinScheduleOperation } from '../api/scheduleOperations';
-import { useScheduleResult } from '../api/scheduleResult';
+import { scheduleResultKeys, useScheduleResult } from '../api/scheduleResult';
 import type { DailyAssignment, Order, OrderStatus, ScheduleResult } from '../types';
 
 interface OrdersCalendarDialogProps {
@@ -339,6 +344,11 @@ function dragOrdersFromEvent(event: DragEvent): DraggableOrder[] {
   }
 }
 
+function capacityShortfallMessage(orders: DraggableOrder[], targetDate: string): string {
+  const quantity = orders.reduce((total, order) => total + order.wafer_quantity, 0);
+  return `目標日期 ${targetDate} 產能不足，需要 ${quantity.toLocaleString()} 片晶圓。`;
+}
+
 function renderUnscheduledBody({
   isPending,
   isError,
@@ -573,6 +583,7 @@ export function OrdersCalendarDialog({
   open,
   onOpenChange,
 }: Readonly<OrdersCalendarDialogProps>): JSX.Element {
+  const queryClient = useQueryClient();
   const [visibleMonth, setVisibleMonth] = useState(() => startOfMonth(new Date()));
   const [selectedDate, setSelectedDate] = useState(() => dateKey(new Date()));
   const [pendingMoves, setPendingMoves] = useState<PendingMove[]>([]);
@@ -709,6 +720,15 @@ export function OrdersCalendarDialog({
         return;
       }
 
+      const capacity = dailyCapacityByDate.get(targetDate);
+      const requestedQuantity = orders.reduce((total, order) => total + order.wafer_quantity, 0);
+      if (capacity && requestedQuantity > capacity.remaining) {
+        const message = capacityShortfallMessage(orders, targetDate);
+        setOperationError(message);
+        toast.error('目標日期產能不足', { description: message });
+        return;
+      }
+
       setSelectedDate(targetDate);
       setOperationError(null);
       setPendingMoves((current) => {
@@ -719,7 +739,7 @@ export function OrdersCalendarDialog({
         ];
       });
     },
-    [canManageSchedule],
+    [canManageSchedule, dailyCapacityByDate],
   );
 
   const handlePinAction = useCallback(
@@ -731,6 +751,13 @@ export function OrdersCalendarDialog({
       }
       if (targetDate && isTargetAfterDeadline(order, targetDate)) {
         toast.error('目標日期不能晚於客戶要求交期。');
+        return;
+      }
+      const capacity = targetDate ? dailyCapacityByDate.get(targetDate) : undefined;
+      if (targetDate !== null && capacity && order.wafer_quantity > capacity.remaining) {
+        const message = capacityShortfallMessage([order], targetDate);
+        setOperationError(message);
+        toast.error('目標日期產能不足', { description: message });
         return;
       }
       const compoundId = crypto.randomUUID();
@@ -752,7 +779,7 @@ export function OrdersCalendarDialog({
         },
       );
     },
-    [canManageSchedule, pinSchedule],
+    [canManageSchedule, dailyCapacityByDate, pinSchedule],
   );
 
   const removePendingMove = useCallback((orderId: string) => {
@@ -824,15 +851,19 @@ export function OrdersCalendarDialog({
       }
 
       if (typeof payload !== 'object' || payload === null) return;
-      const scheduleEvent = payload as { type?: string; compound_id?: string };
+      const scheduleEvent = payload as { type?: string; compound_id?: string; order_id?: string };
 
       if (
         scheduleEvent.type === 'schedule.compound_failed' &&
-        scheduleEvent.compound_id === activeOperation.compoundId
+        (scheduleEvent.compound_id === activeOperation.compoundId ||
+          activeOperation.targets.some((target) => target.orderId === scheduleEvent.order_id))
       ) {
         const message = scheduleFailureMessage(scheduleEvent);
         setOperationError(message);
         setActiveOperation(null);
+        queryClient.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+        queryClient.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
+        queryClient.invalidateQueries({ queryKey: scheduleResultKeys.all }).catch(() => {});
         toast.error('無法執行此排程操作', { description: message });
       }
 
@@ -852,7 +883,7 @@ export function OrdersCalendarDialog({
     return () => {
       ws.close();
     };
-  }, [activeOperation]);
+  }, [activeOperation, queryClient]);
 
   useEffect(() => {
     if (!activeOperation?.readyToVerify || scheduledOrders.isFetching) return;
@@ -916,8 +947,8 @@ export function OrdersCalendarDialog({
   ]);
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange} className="max-w-6xl">
-      <DialogContent className="p-0" data-testid="orders-calendar-dialog">
+    <Dialog open={open} onOpenChange={onOpenChange} className="max-w-[92vw]">
+      <DialogContent className="h-[90vh] max-w-[92vw] p-0" data-testid="orders-calendar-dialog">
         <DialogHeader className="border-b px-6 py-4">
           <DialogTitle className="flex items-center gap-2">
             <CalendarDays className="h-5 w-5" />
@@ -925,8 +956,8 @@ export function OrdersCalendarDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <div className="grid gap-0 lg:grid-cols-[minmax(0,1fr)_320px]">
-          <section className="min-w-0 p-4 sm:p-6">
+        <div className="grid h-[calc(90vh-65px)] gap-0 overflow-hidden lg:grid-cols-[minmax(0,1fr)_380px]">
+          <section className="min-w-0 overflow-y-auto p-4 sm:p-6">
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h3 className="text-base font-semibold">{monthLabel(visibleMonth)}</h3>
@@ -999,7 +1030,7 @@ export function OrdersCalendarDialog({
                           type="button"
                           aria-label={ariaLabel}
                           className={cn(
-                            'min-h-28 border-b border-r p-2 text-left align-top transition-colors hover:bg-muted/60',
+                            'min-h-36 border-b border-r p-2 text-left align-top transition-colors hover:bg-muted/60',
                             !isCurrentMonth && 'bg-muted/30 text-muted-foreground',
                             isToday &&
                               isSelected &&
@@ -1096,7 +1127,7 @@ export function OrdersCalendarDialog({
             })}
           </section>
 
-          <aside className="border-t bg-muted/20 p-4 lg:border-l lg:border-t-0">
+          <aside className="overflow-y-auto border-t bg-muted/20 p-4 lg:border-l lg:border-t-0">
             {pendingMoves.length > 0 && (
               <div className="mb-5 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/30">
                 <div className="font-medium">待送出的排程變更</div>
