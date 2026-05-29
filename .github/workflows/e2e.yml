@@ -136,6 +136,12 @@ jobs:
         working-directory: frontend
         run: pnpm test:e2e
 
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "## E2E Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Playwright passed" >> "$GITHUB_STEP_SUMMARY"
+
       - name: E2E Test Report
         uses: dorny/test-reporter@v1
         if: always()

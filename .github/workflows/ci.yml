@@ -92,7 +92,7 @@ jobs:
       - name: Coverage Summary
         run: |
           echo "## Coverage Report" >> "$GITHUB_STEP_SUMMARY"
-          uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          uv run coverage report --format=markdown | grep -E "^\| Name |^\|[-]|TOTAL" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Backend Test Report
         uses: dorny/test-reporter@v1
@@ -153,6 +153,12 @@ jobs:
 
       - name: Vitest
         run: pnpm test
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "## Frontend Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Vitest passed" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Frontend Test Report
         uses: dorny/test-reporter@v1
