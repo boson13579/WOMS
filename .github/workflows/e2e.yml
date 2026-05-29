@@ -140,7 +140,19 @@ jobs:
         if: always()
         run: |
           echo "## E2E Test Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "✅ Playwright passed" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c "
+          import xml.etree.ElementTree as ET
+          try:
+            root = ET.parse('frontend/test-results/junit.xml').getroot()
+            suites = root.findall('testsuite') if root.tag == 'testsuites' else [root]
+            t = sum(int(s.get('tests',0)) for s in suites)
+            f = sum(int(s.get('failures',0)) for s in suites)
+            e = sum(int(s.get('errors',0)) for s in suites)
+            k = sum(int(s.get('skipped',0)) for s in suites)
+            icon = '✅' if f+e == 0 else '❌'
+            print(icon+' '+str(t-f-e-k)+' passed, '+str(f+e)+' failed, '+str(k)+' skipped')
+          except Exception as ex: print('⚠️ '+str(ex))
+          " >> "$GITHUB_STEP_SUMMARY"
 
       - name: E2E Test Report
         uses: dorny/test-reporter@v1
