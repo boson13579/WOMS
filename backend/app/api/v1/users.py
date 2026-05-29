@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -22,15 +23,15 @@ from app.services import user as user_service
 
 router = APIRouter()
 
-_root_only = Depends(require_roles(UserRole.root))
-_any_auth = Depends(get_current_user)
+_RootOnly = Annotated[User, Depends(require_roles(UserRole.root))]
+_AnyAuth = Annotated[User, Depends(get_current_user)]
 
 
-@router.get("", response_model=UserListResponse)
+@router.get("")
 def list_users(
+    db: Annotated[Session, Depends(get_db)],
+    current_user: _RootOnly,
     search: str | None = None,
-    db: Session = Depends(get_db),
-    current_user: User = _root_only,
 ) -> UserListResponse:
     """List all users, optionally filtered by ?search= (username or email).
 
@@ -43,12 +44,13 @@ def list_users(
     return user_service.list_users(db, search=search)
 
 
-@router.get("/assignable", response_model=list[AssignableUserResponse])
+@router.get("/assignable")
 def get_assignable_users(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(
-        require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)
-    ),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[
+        User,
+        Depends(require_roles(UserRole.order_manager, UserRole.scheduler, UserRole.root)),
+    ],
 ) -> list[AssignableUserResponse]:
     """Return the list of users that can be assigned as order owners.
 
@@ -62,11 +64,11 @@ def get_assignable_users(
     return user_service.get_assignable_users(db, current_user)
 
 
-@router.get("/{user_id}", response_model=UserResponse)
+@router.get("/{user_id}")
 def get_user(
     user_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User = _root_only,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: _RootOnly,
 ) -> UserResponse:
     """Return a single user by id.
 
@@ -80,13 +82,13 @@ def get_user(
     return user_service.get_user(db, user_id)
 
 
-@router.get("/{user_id}/audit", response_model=UserAuditLogListResponse)
+@router.get("/{user_id}/audit")
 def get_user_audit_log(
     user_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User = _root_only,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: _RootOnly,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> UserAuditLogListResponse:
     """Return the paginated audit-log history for a single user, newest first.
 
@@ -113,11 +115,11 @@ def get_user_audit_log(
     )
 
 
-@router.patch("/me", response_model=UserResponse)
+@router.patch("/me")
 def update_self(
     request: UserSelfUpdateRequest,
-    db: Session = Depends(get_db),
-    current_user: User = _any_auth,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: _AnyAuth,
 ) -> UserResponse:
     """Update the calling user's own username or email.
 
@@ -133,12 +135,12 @@ def update_self(
     return user_service.update_self(db, current_user, request)
 
 
-@router.patch("/{user_id}", response_model=UserResponse)
+@router.patch("/{user_id}")
 def update_user(
     user_id: uuid.UUID,
     request: UserUpdateRequest,
-    db: Session = Depends(get_db),
-    current_user: User = _root_only,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: _RootOnly,
 ) -> UserResponse:
     """Partially update a user (username, email, role, is_active).
 
@@ -156,11 +158,11 @@ def update_user(
     return user_service.update_user(db, user_id, request, current_user)
 
 
-@router.delete("/{user_id}", response_model=UserResponse)
+@router.delete("/{user_id}")
 def deactivate_user(
     user_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User = _root_only,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: _RootOnly,
 ) -> UserResponse:
     """Deactivate a user (sets is_active=False). Row is retained in DB.
 

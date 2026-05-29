@@ -33,7 +33,7 @@ export function AuditPagination({
   onPageChange,
   onPageSizeChange,
   disabled = false,
-}: AuditPaginationProps): JSX.Element {
+}: Readonly<AuditPaginationProps>): JSX.Element {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const isFirstPage = page <= 1;
   const isLastPage = page >= totalPages;

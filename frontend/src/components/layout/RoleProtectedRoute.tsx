@@ -22,7 +22,9 @@ interface RoleProtectedRouteProps {
   allowedRoles: UserRole[];
 }
 
-export function RoleProtectedRoute({ allowedRoles }: RoleProtectedRouteProps): JSX.Element {
+export function RoleProtectedRoute({
+  allowedRoles,
+}: Readonly<RoleProtectedRouteProps>): JSX.Element {
   const role = useCurrentRole();
 
   if (role === null || !allowedRoles.includes(role)) {

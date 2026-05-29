@@ -44,6 +44,6 @@ export const useThemeStore = create<ThemeStore>()(
 /** Resolve `system` against the OS preference. SSR-safe (returns 'light'). */
 export function resolveTheme(theme: Theme): 'light' | 'dark' {
   if (theme !== 'system') return theme;
-  if (typeof window === 'undefined') return 'light';
-  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  if (typeof globalThis.matchMedia !== 'function') return 'light';
+  return globalThis.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }

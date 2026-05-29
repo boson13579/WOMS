@@ -203,7 +203,7 @@ export function OrderFilters(): JSX.Element {
           value={status ?? ''}
           onChange={(e) => {
             const val = e.target.value as OrderStatus | '';
-            setStatus(val !== '' ? val : null);
+            setStatus(val === '' ? null : val);
           }}
         >
           {STATUS_OPTIONS.map((o) => (

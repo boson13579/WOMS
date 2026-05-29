@@ -128,7 +128,8 @@ describe('AuditFilters', () => {
       wrapper: makeWrapper(),
     });
     // Wait for the fallback to appear (after query settles)
-    await screen.findByLabelText(/Actor filter \(text\)/i);
+    const fallback = await screen.findByLabelText(/Actor filter \(text\)/i);
+    expect(fallback).toBeInTheDocument();
   });
 
   it('calls onChange with the updated resourceType when the Select changes', async () => {

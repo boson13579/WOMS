@@ -7,6 +7,7 @@ so FastAPI does not interpret the literal string "read-all" as a UUID.
 from __future__ import annotations
 
 import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -27,11 +28,11 @@ _AUTH_ROLES = require_roles(
 )
 
 
-@router.get("", response_model=NotificationListResponse)
+@router.get("")
 def list_notifications(
-    all: bool = Query(default=False, alias="all"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_AUTH_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_AUTH_ROLES)],
+    all: Annotated[bool, Query(alias="all")] = False,
 ) -> NotificationListResponse:
     """Return notifications for the authenticated user.
 
@@ -41,21 +42,21 @@ def list_notifications(
     return notification_service.list_notifications(db, current_user.id, all_notifications=all)
 
 
-@router.patch("/read-all", response_model=dict)
+@router.patch("/read-all")
 def mark_all_read(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_AUTH_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_AUTH_ROLES)],
 ) -> dict[str, int]:
     """Mark all unread notifications as read for the authenticated user."""
     count = notification_service.mark_all_read(db, current_user.id)
     return {"updated": count}
 
 
-@router.patch("/{notification_id}/read", response_model=NotificationResponse)
+@router.patch("/{notification_id}/read")
 def mark_notification_read(
     notification_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(_AUTH_ROLES),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(_AUTH_ROLES)],
 ) -> NotificationResponse:
     """Mark a single notification as read.
 

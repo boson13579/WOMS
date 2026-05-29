@@ -22,7 +22,7 @@ const usernamesResponseSchema = z.object({
 export type UsernamesMap = Record<string, string | null>;
 
 export const usernamesQueryKey = (ids: readonly string[]) =>
-  ['system', 'usernames', [...ids].sort()] as const;
+  ['system', 'usernames', [...ids].sort((a, b) => a.localeCompare(b))] as const;
 
 // 1 minute stale time — usernames change rarely
 const STALE_TIME_MS = 60_000;

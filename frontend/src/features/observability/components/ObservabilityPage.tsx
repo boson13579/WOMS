@@ -39,7 +39,7 @@ const INVALIDATE_PREFIXES = [
   ['system', 'health'],
 ];
 
-function SectionLabel({ children }: { children: React.ReactNode }): JSX.Element {
+function SectionLabel({ children }: Readonly<{ children: React.ReactNode }>): JSX.Element {
   return (
     <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
       {children}
@@ -78,7 +78,7 @@ export function ObservabilityPage(): JSX.Element {
 
   const onRefresh = (): void => {
     INVALIDATE_PREFIXES.forEach((queryKey) => {
-      void queryClient.invalidateQueries({ queryKey });
+      queryClient.invalidateQueries({ queryKey }).catch(() => {});
     });
   };
 
@@ -125,14 +125,13 @@ export function ObservabilityPage(): JSX.Element {
              * "metrics data is unavailable" generically.
              */}
             {(red.data?.data_status === 'degraded' || lag.data?.data_status === 'degraded') && (
-              <div
-                role="status"
+              <output
                 data-testid="metrics-degraded-banner"
-                className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-200"
+                className="mb-3 block rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-200"
               >
                 Metrics data is currently unavailable (Redis unreachable). Numbers shown may not
                 reflect live state.
-              </div>
+              </output>
             )}
             <RedKpiCards
               red={red.data}

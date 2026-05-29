@@ -92,7 +92,7 @@ async function patchPinForOrder(
     (d): PatchOrderResponse => {
       const obj = d as { id?: string; version_id?: number };
       if (typeof obj.id !== 'string' || typeof obj.version_id !== 'number') {
-        throw new Error('Malformed PATCH response from /orders/{id}');
+        throw new TypeError('Malformed PATCH response from /orders/{id}');
       }
       return { id: obj.id, version_id: obj.version_id };
     },
@@ -124,9 +124,9 @@ export function usePinScheduleOperation(): ReturnType<
       };
     },
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: orderKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all });
-      void qc.invalidateQueries({ queryKey: scheduleResultKeys.all });
+      qc.invalidateQueries({ queryKey: orderKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleCapacityKeys.all }).catch(() => {});
+      qc.invalidateQueries({ queryKey: scheduleResultKeys.all }).catch(() => {});
     },
   });
 }

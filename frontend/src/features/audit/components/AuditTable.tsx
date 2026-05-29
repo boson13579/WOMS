@@ -47,7 +47,7 @@ interface AuditTableProps {
 const HEAD_COLUMN_COUNT = 5; // chevron + time + actor + action + resource
 const SKELETON_KEYS = ['skel-a', 'skel-b', 'skel-c', 'skel-d', 'skel-e'] as const;
 
-function SkeletonRow({ keyId }: { keyId: string }): JSX.Element {
+function SkeletonRow({ keyId }: Readonly<{ keyId: string }>): JSX.Element {
   return (
     <TableRow data-testid="audit-skeleton-row">
       <TableCell key={`${keyId}-chevron`} className="w-6">
@@ -80,7 +80,7 @@ export function AuditTable({
   onPageSizeChange,
   onRetry,
   onClearFilters,
-}: AuditTableProps): JSX.Element {
+}: Readonly<AuditTableProps>): JSX.Element {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
   const actorIds = useMemo(() => {

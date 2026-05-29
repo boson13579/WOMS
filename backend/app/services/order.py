@@ -71,6 +71,11 @@ __all__ = [
     "update_order",
 ]
 
+_ORDER_NOT_FOUND_MSG = "Order not found."
+_ORDER_ONLY_OWNER_CAN_MODIFY_MSG = "You can only modify orders you created."
+_ORDER_STALE_VERSION_MSG = "Order was modified by another user. Refresh and try again."
+_NOTIFICATION_CREATE_FAILED_EVENT = "notification.create_failed"
+
 _IMMUTABLE_STATUS_ERROR = HTTPException(
     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
     detail="Order cannot be modified in its current status.",
@@ -282,6 +287,110 @@ def _build_cancel_compound(order: Order, actor_id: uuid.UUID) -> ScheduleCompoun
     )
 
 
+def _decide_target_pin_day(
+    *,
+    order: Order,
+    new_qty: int,
+    new_deadline: date,
+    pin_day_set: bool,
+    new_pin_day: date | None,
+    needs_remove_add: bool,
+) -> date | None:
+    """Decide the final pin day from the patch inputs and existing pin state."""
+    is_pinned_before = order.is_pinned
+    old_pin_day = order.pinned_production_date
+    if pin_day_set:
+        return new_pin_day
+    if is_pinned_before and old_pin_day is not None and needs_remove_add:
+        can_repin = new_deadline >= old_pin_day and new_qty <= order.wafer_quantity
+        return old_pin_day if can_repin else None
+    return old_pin_day if is_pinned_before else None
+
+
+def _classify_patch_group(
+    *,
+    order: Order,
+    new_qty: int,
+    new_deadline: date,
+    target_pin_day: date | None,
+) -> Literal["shrink", "grow"]:
+    """Classify a patch compound as shrink (capacity release) or grow."""
+    old_qty = order.wafer_quantity
+    old_deadline = order.requested_delivery_date
+    is_pinned_before = order.is_pinned
+    old_pin_day = order.pinned_production_date
+    final_is_pinned = target_pin_day is not None
+
+    qty_non_growing = new_qty <= old_qty
+    deadline_non_earlier = new_deadline >= old_deadline
+    pin_non_earlier = True
+    if final_is_pinned and is_pinned_before:
+        pin_non_earlier = target_pin_day >= old_pin_day  # type: ignore[operator]
+    elif final_is_pinned and not is_pinned_before:
+        pin_non_earlier = False
+    return "shrink" if (qty_non_growing and deadline_non_earlier and pin_non_earlier) else "grow"
+
+
+def _build_patch_ops(
+    *,
+    order: Order,
+    new_qty: int,
+    new_deadline: date,
+    needs_unpin: bool,
+    needs_remove_add: bool,
+    needs_pin_op: bool,
+    target_pin_day: date | None,
+) -> list[ScheduleOpInCompound]:
+    """Build the ordered op list for a patch compound."""
+    old_qty = order.wafer_quantity
+    old_deadline = order.requested_delivery_date
+    op_qty = new_qty if needs_remove_add else old_qty
+    op_deadline = new_deadline if needs_remove_add else old_deadline
+
+    ops: list[ScheduleOpInCompound] = []
+    if needs_unpin:
+        ops.append(
+            ScheduleOpInCompound(
+                op="unpin",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=old_qty,
+                deadline=old_deadline,
+            )
+        )
+    if needs_remove_add:
+        ops.append(
+            ScheduleOpInCompound(
+                op="remove",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=old_qty,
+                deadline=old_deadline,
+            )
+        )
+        ops.append(
+            ScheduleOpInCompound(
+                op="add",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=new_qty,
+                deadline=new_deadline,
+            )
+        )
+    if needs_pin_op:
+        ops.append(
+            ScheduleOpInCompound(
+                op="pin",
+                order_id=order.id,
+                order_number=order.order_number,
+                wafer_quantity=op_qty,
+                deadline=op_deadline,
+                fake_deadline=target_pin_day,
+            )
+        )
+    return ops
+
+
 def _build_patch_compound(
     *,
     order: Order,
@@ -342,20 +451,14 @@ def _build_patch_compound(
     deadline_changed = new_deadline != old_deadline
     needs_remove_add = qty_changed or deadline_changed
 
-    # Decide the final pin state. Two paths:
-    # (a) Client explicitly set ``pinned_production_date`` — honor verbatim
-    # (b) Client didn't touch pin — fall back to case-14 auto-re-pin /
-    #     silent-drop based on qty/deadline change compatibility.
-    if pin_day_set:
-        target_pin_day = new_pin_day  # may be None = "unpin"
-    elif is_pinned_before and old_pin_day is not None and needs_remove_add:
-        # Implicit transition: was pinned + something changed → try auto-re-pin.
-        # Same conditions as the original case-14 gate.
-        can_repin = new_deadline >= old_pin_day and new_qty <= old_qty
-        target_pin_day = old_pin_day if can_repin else None
-    else:
-        # Pin state untouched.
-        target_pin_day = old_pin_day if is_pinned_before else None
+    target_pin_day = _decide_target_pin_day(
+        order=order,
+        new_qty=new_qty,
+        new_deadline=new_deadline,
+        pin_day_set=pin_day_set,
+        new_pin_day=new_pin_day,
+        needs_remove_add=needs_remove_add,
+    )
 
     final_is_pinned = target_pin_day is not None
     pin_state_changed = (final_is_pinned != is_pinned_before) or (target_pin_day != old_pin_day)
@@ -367,68 +470,22 @@ def _build_patch_compound(
     needs_unpin = is_pinned_before
     needs_pin_op = final_is_pinned
 
-    # Group classification: shrink only when all axes are non-additive.
-    qty_non_growing = new_qty <= old_qty
-    deadline_non_earlier = new_deadline >= old_deadline
-    # Pin moving to an earlier day shifts demand forward → grow.
-    pin_non_earlier = True
-    if final_is_pinned and is_pinned_before:
-        pin_non_earlier = target_pin_day >= old_pin_day  # type: ignore[operator]
-    elif final_is_pinned and not is_pinned_before:
-        # Newly pinning to ANY day pulls demand off the natural EDF
-        # distribution onto that one day → treat as grow.
-        pin_non_earlier = False
-    group: Literal["shrink", "grow"] = (
-        "shrink" if (qty_non_growing and deadline_non_earlier and pin_non_earlier) else "grow"
+    group = _classify_patch_group(
+        order=order,
+        new_qty=new_qty,
+        new_deadline=new_deadline,
+        target_pin_day=target_pin_day,
     )
 
-    # Op qty/deadline for the post-remove-add segment use new values when
-    # remove+add fires; if only pin changed (no qty/deadline change), the
-    # add/pin reference the unchanged values.
-    op_qty = new_qty if needs_remove_add else old_qty
-    op_deadline = new_deadline if needs_remove_add else old_deadline
-
-    ops: list[ScheduleOpInCompound] = []
-    if needs_unpin:
-        ops.append(
-            ScheduleOpInCompound(
-                op="unpin",
-                order_id=order.id,
-                order_number=order.order_number,
-                wafer_quantity=old_qty,
-                deadline=old_deadline,
-            )
-        )
-    if needs_remove_add:
-        ops.append(
-            ScheduleOpInCompound(
-                op="remove",
-                order_id=order.id,
-                order_number=order.order_number,
-                wafer_quantity=old_qty,
-                deadline=old_deadline,
-            )
-        )
-        ops.append(
-            ScheduleOpInCompound(
-                op="add",
-                order_id=order.id,
-                order_number=order.order_number,
-                wafer_quantity=new_qty,
-                deadline=new_deadline,
-            )
-        )
-    if needs_pin_op:
-        ops.append(
-            ScheduleOpInCompound(
-                op="pin",
-                order_id=order.id,
-                order_number=order.order_number,
-                wafer_quantity=op_qty,
-                deadline=op_deadline,
-                fake_deadline=target_pin_day,
-            )
-        )
+    ops = _build_patch_ops(
+        order=order,
+        new_qty=new_qty,
+        new_deadline=new_deadline,
+        needs_unpin=needs_unpin,
+        needs_remove_add=needs_remove_add,
+        needs_pin_op=needs_pin_op,
+        target_pin_day=target_pin_day,
+    )
 
     # Worker writes the pin columns iff state actually changed. Otherwise
     # skip the column write so the audit log doesn't show a no-op flip.
@@ -570,11 +627,166 @@ def get_order(db: Session, order_id: uuid.UUID) -> OrderResponse:
     """Fetch a single order by ID; raise 404 if not found."""
     order = order_repo.get_by_id(db, order_id)
     if order is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_ORDER_NOT_FOUND_MSG)
     return OrderResponse.model_validate(order)
 
 
-def update_order(  # noqa: PLR0912, PLR0915
+def _check_update_preconditions(order: Order, req: UpdateOrderRequest, actor: User) -> None:
+    """Auth, status, lock, and version-id checks for ``update_order``."""
+    if actor.role == UserRole.order_manager and order.created_by != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=_ORDER_ONLY_OWNER_CAN_MODIFY_MSG,
+        )
+
+    if order.status not in MUTABLE_STATUSES:
+        raise _IMMUTABLE_STATUS_ERROR
+
+    if order.is_processing_locked:
+        raise _LOCKED_ORDER_ERROR
+
+    if req.version_id != order.version_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_ORDER_STALE_VERSION_MSG,
+        )
+
+
+def _resolve_pin_day(
+    order: Order,
+    req: UpdateOrderRequest,
+    new_deadline: date,
+) -> tuple[bool, date | None, bool]:
+    """Resolve the production-pin change and validate it against the deadline.
+
+    Returns ``(pin_day_set, new_pin_day, pin_changed_explicitly)``.
+    """
+    pin_day_set = "pinned_production_date" in req.model_fields_set
+    new_pin_day = req.pinned_production_date if pin_day_set else order.pinned_production_date
+    if pin_day_set and new_pin_day is not None and new_pin_day > new_deadline:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Pin date cannot be after the order's delivery deadline.",
+        )
+    if pin_day_set and new_pin_day is not None:
+        _validate_deadline_or_422(new_pin_day)
+    pin_changed_explicitly = pin_day_set and (
+        (new_pin_day is None) != (not order.is_pinned)
+        or (new_pin_day is not None and new_pin_day != order.pinned_production_date)
+    )
+    return pin_day_set, new_pin_day, pin_changed_explicitly
+
+
+def _resolve_update_payload(
+    db: Session,
+    order: Order,
+    req: UpdateOrderRequest,
+    actor: User,
+) -> dict[str, Any]:
+    """Build the merged new-values payload for ``update_order``."""
+    new_qty = req.wafer_quantity if req.wafer_quantity is not None else order.wafer_quantity
+    new_deadline = (
+        req.requested_delivery_date
+        if req.requested_delivery_date is not None
+        else order.requested_delivery_date
+    )
+    notes_set = "notes" in req.model_fields_set
+    new_notes = req.notes if notes_set else order.notes
+    assigned_to_set = "assigned_to" in req.model_fields_set
+    if assigned_to_set and actor.role not in (UserRole.scheduler, UserRole.root):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only scheduler and root can reassign orders.",
+        )
+    new_assigned_to = req.assigned_to if assigned_to_set else order.assigned_to
+    if assigned_to_set:
+        _validate_assigned_to_user(db, new_assigned_to)
+
+    if req.requested_delivery_date is not None:
+        _validate_deadline_or_422(new_deadline)
+
+    pin_day_set, new_pin_day, pin_changed_explicitly = _resolve_pin_day(order, req, new_deadline)
+
+    scheduling_changed = (
+        new_qty != order.wafer_quantity
+        or new_deadline != order.requested_delivery_date
+        or pin_changed_explicitly
+    )
+    return {
+        "new_qty": new_qty,
+        "new_deadline": new_deadline,
+        "notes_set": notes_set,
+        "new_notes": new_notes,
+        "assigned_to_set": assigned_to_set,
+        "new_assigned_to": new_assigned_to,
+        "pin_day_set": pin_day_set,
+        "new_pin_day": new_pin_day,
+        "scheduling_changed": scheduling_changed,
+    }
+
+
+def _apply_non_scheduling_patch(
+    db: Session,
+    order: Order,
+    req: UpdateOrderRequest,
+    actor: User,
+    payload: dict[str, Any],
+) -> OrderResponse:
+    """Direct write path for PATCHes that don't touch scheduling fields."""
+    notes_set = payload["notes_set"]
+    assigned_to_set = payload["assigned_to_set"]
+    old_val: dict[str, Any] = {
+        "notes": order.notes,
+        "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+    }
+    if notes_set:
+        order.notes = req.notes
+    if assigned_to_set:
+        order.assigned_to = req.assigned_to
+    new_val_simple: dict[str, Any] = {
+        "notes": order.notes,
+        "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+    }
+    _write_audit(
+        db,
+        action="order.updated",
+        actor=actor,
+        order=order,
+        old_value=old_val,
+        new_value=new_val_simple,
+    )
+    try:
+        db.commit()
+    except StaleDataError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_ORDER_STALE_VERSION_MSG,
+        ) from exc
+    db.refresh(order)
+    return OrderResponse.model_validate(order)
+
+
+def _send_locked_notification(db: Session, order: Order) -> None:
+    """Best-effort ``order_locked`` notification — swallow failures."""
+    try:
+        notification_service.create_notification(
+            db,
+            user_id=order.created_by,
+            order_id=order.id,
+            type="order_locked",
+            message=f"訂單 {order.order_number} 已被鎖定處理中",
+        )
+    except Exception:
+        logger.warning(
+            _NOTIFICATION_CREATE_FAILED_EVENT,
+            order_id=str(order.id),
+            user_id=str(order.created_by),
+            exc_info=True,
+        )
+
+
+def update_order(
     db: Session, order_id: uuid.UUID, req: UpdateOrderRequest, actor: User
 ) -> OrderResponse:
     """Update a mutable order with optimistic-lock and status guard.
@@ -604,143 +816,30 @@ def update_order(  # noqa: PLR0912, PLR0915
     """
     order = order_repo.get_by_id_for_update(db, order_id)
     if order is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_ORDER_NOT_FOUND_MSG)
 
-    if actor.role == UserRole.order_manager and order.created_by != actor.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only modify orders you created.",
-        )
+    _check_update_preconditions(order, req, actor)
 
-    if order.status not in MUTABLE_STATUSES:
-        raise _IMMUTABLE_STATUS_ERROR
+    payload = _resolve_update_payload(db, order, req, actor)
 
-    # N-3 round-2 guard: if a previous compound is still in flight, refuse
-    # to stack another one on top. See ``_LOCKED_ORDER_ERROR`` docstring.
-    if order.is_processing_locked:
-        raise _LOCKED_ORDER_ERROR
+    if not payload["scheduling_changed"]:
+        return _apply_non_scheduling_patch(db, order, req, actor, payload)
 
-    # Application-level optimistic lock: reject stale client versions before
-    # making any changes. SQLAlchemy's DB-level check fires on flush(), but this
-    # early guard gives a clearer error and avoids unnecessary DB work.
-    if req.version_id != order.version_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Order was modified by another user. Refresh and try again.",
-        )
-
-    # Decide payload first — what fields did the user actually touch?
-    new_qty = req.wafer_quantity if req.wafer_quantity is not None else order.wafer_quantity
-    new_deadline = (
-        req.requested_delivery_date
-        if req.requested_delivery_date is not None
-        else order.requested_delivery_date
-    )
-    notes_set = "notes" in req.model_fields_set
-    new_notes = req.notes if notes_set else order.notes
-    assigned_to_set = "assigned_to" in req.model_fields_set
-    if assigned_to_set and actor.role not in (UserRole.scheduler, UserRole.root):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only scheduler and root can reassign orders.",
-        )
-    new_assigned_to = req.assigned_to if assigned_to_set else order.assigned_to
-    if assigned_to_set:
-        _validate_assigned_to_user(db, new_assigned_to)
-
-    # Pin field uses the same "set" sentinel pattern — ``None`` is a legal
-    # client input (= "unpin"), distinct from "missing" (= "keep current").
-    pin_day_set = "pinned_production_date" in req.model_fields_set
-    new_pin_day = req.pinned_production_date if pin_day_set else order.pinned_production_date
-    # Surface "pinning to a day after the deadline" as a 422 here so users get
-    # synchronous feedback instead of a delayed WS ``compound_failed``. Pinning
-    # to None (unpin) is always fine.
-    if pin_day_set and new_pin_day is not None and new_pin_day > new_deadline:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Pin date cannot be after the order's delivery deadline.",
-        )
-
-    # Producer-side range check (B + C of the deadline-validation design):
-    # mirrors ``add_order`` / ``pin_order``'s ``abs_to_rel`` rejection so
-    # the user gets a synchronous 422 instead of "PATCH 200 → WS
-    # compound_failed → order auto-cancelled". Only fire when the user
-    # actually touched the deadline (otherwise an unchanged deadline
-    # that's now overtaken by ``base_date`` advancing would falsely
-    # reject a notes-only PATCH).
-    if req.requested_delivery_date is not None:
-        _validate_deadline_or_422(new_deadline)
-    if pin_day_set and new_pin_day is not None:
-        _validate_deadline_or_422(new_pin_day)
-
-    pin_changed_explicitly = pin_day_set and (
-        (new_pin_day is None) != (not order.is_pinned)
-        or (new_pin_day is not None and new_pin_day != order.pinned_production_date)
-    )
-    scheduling_changed = (
-        new_qty != order.wafer_quantity
-        or new_deadline != order.requested_delivery_date
-        or pin_changed_explicitly
-    )
-
-    if not scheduling_changed:
-        # Non-scheduling PATCH (notes / assigned_to) — no worker round-trip needed.
-        # Write directly and audit here; the producer remains the single
-        # writer because no compound is ever enqueued.
-        old_val: dict[str, Any] = {
-            "notes": order.notes,
-            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
-        }
-        if notes_set:
-            order.notes = req.notes
-        if assigned_to_set:
-            order.assigned_to = req.assigned_to
-        new_val_simple: dict[str, Any] = {
-            "notes": order.notes,
-            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
-        }
-        _write_audit(
-            db,
-            action="order.updated",
-            actor=actor,
-            order=order,
-            old_value=old_val,
-            new_value=new_val_simple,
-        )
-        try:
-            db.commit()
-        except StaleDataError as exc:
-            db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Order was modified by another user. Refresh and try again.",
-            ) from exc
-        db.refresh(order)
-        return OrderResponse.model_validate(order)
-
-    # Scheduling change — pre-build the compound on the *pre-PATCH* order
-    # snapshot so its ``db_action`` carries the right new/old values.
     compound = _build_patch_compound(
         order=order,
-        new_qty=new_qty,
-        new_deadline=new_deadline,
+        new_qty=payload["new_qty"],
+        new_deadline=payload["new_deadline"],
         actor_id=actor.id,
-        notes_set=notes_set,
-        new_notes=new_notes,
-        assigned_to_set=assigned_to_set,
-        new_assigned_to=new_assigned_to,
-        pin_day_set=pin_day_set,
-        new_pin_day=new_pin_day,
+        notes_set=payload["notes_set"],
+        new_notes=payload["new_notes"],
+        assigned_to_set=payload["assigned_to_set"],
+        new_assigned_to=payload["new_assigned_to"],
+        pin_day_set=payload["pin_day_set"],
+        new_pin_day=payload["new_pin_day"],
     )
-    # ``_build_patch_compound`` returns ``None`` only when no qty/deadline
-    # change was detected; we already guarded above (``scheduling_changed``
-    # short-circuit), so this branch is unreachable. Narrow the type for
-    # mypy without using an ``assert`` (banned by ruff S101).
     if compound is None:  # pragma: no cover — defensive
         raise RuntimeError("compound builder returned None for a scheduling-changed PATCH")
 
-    # Producer-side write: only the in-flight lock. DO NOT mutate the
-    # business columns — worker writes those on accept.
     order.status = OrderStatus.pending
     order.is_processing_locked = True
 
@@ -750,26 +849,12 @@ def update_order(  # noqa: PLR0912, PLR0915
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Order was modified by another user. Refresh and try again.",
+            detail=_ORDER_STALE_VERSION_MSG,
         ) from exc
     db.refresh(order)
 
     enqueue_compound(compound)
-    try:
-        notification_service.create_notification(
-            db,
-            user_id=order.created_by,
-            order_id=order.id,
-            type="order_locked",
-            message=f"訂單 {order.order_number} 已被鎖定處理中",
-        )
-    except Exception:
-        logger.warning(
-            "notification.create_failed",
-            order_id=str(order.id),
-            user_id=str(order.created_by),
-            exc_info=True,
-        )
+    _send_locked_notification(db, order)
     return OrderResponse.model_validate(order)
 
 
@@ -792,12 +877,12 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     """
     order = order_repo.get_by_id_for_update(db, order_id)
     if order is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_ORDER_NOT_FOUND_MSG)
 
     if actor.role == UserRole.order_manager and order.created_by != actor.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only modify orders you created.",
+            detail=_ORDER_ONLY_OWNER_CAN_MODIFY_MSG,
         )
 
     # N-3 round-2 guard: refuse to stack another compound on top of an
@@ -850,7 +935,7 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
             db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Order was modified by another user. Refresh and try again.",
+                detail=_ORDER_STALE_VERSION_MSG,
             ) from exc
         db.refresh(order)
 
@@ -870,7 +955,7 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
             )
         except Exception:
             logger.warning(
-                "notification.create_failed",
+                _NOTIFICATION_CREATE_FAILED_EVENT,
                 order_id=str(order.id),
                 user_id=str(order.created_by),
                 exc_info=True,
@@ -897,7 +982,7 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Order was modified by another user. Refresh and try again.",
+            detail=_ORDER_STALE_VERSION_MSG,
         ) from exc
     db.refresh(order)
 
@@ -912,7 +997,7 @@ def delete_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
         )
     except Exception:
         logger.warning(
-            "notification.create_failed",
+            _NOTIFICATION_CREATE_FAILED_EVENT,
             order_id=str(order.id),
             user_id=str(order.created_by),
             exc_info=True,
@@ -942,12 +1027,12 @@ def cancel_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
     """
     order = order_repo.get_by_id_for_update(db, order_id)
     if order is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_ORDER_NOT_FOUND_MSG)
 
     if actor.role == UserRole.order_manager and order.created_by != actor.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only modify orders you created.",
+            detail=_ORDER_ONLY_OWNER_CAN_MODIFY_MSG,
         )
 
     if order.status != OrderStatus.scheduled:
@@ -973,7 +1058,7 @@ def cancel_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Order was modified by another user. Refresh and try again.",
+            detail=_ORDER_STALE_VERSION_MSG,
         ) from exc
     db.refresh(order)
 
@@ -988,7 +1073,7 @@ def cancel_order(db: Session, order_id: uuid.UUID, actor: User) -> OrderResponse
         )
     except Exception:
         logger.warning(
-            "notification.create_failed",
+            _NOTIFICATION_CREATE_FAILED_EVENT,
             order_id=str(order.id),
             user_id=str(order.created_by),
             exc_info=True,
@@ -1093,7 +1178,10 @@ def batch_update_orders(db: Session, req: BatchUpdateRequest, actor: User) -> Ba
     )
 
 
-def get_audit_log(db: Session, order_id: uuid.UUID, current_user: User) -> list[AuditLogResponse]:
+def get_audit_log(
+    db: Session,
+    order_id: uuid.UUID,
+) -> list[AuditLogResponse]:
     """Return all audit-log entries for an order; raise 404 if not found.
 
     Uses get_by_id_including_deleted so cancelled orders remain queryable —
@@ -1101,7 +1189,7 @@ def get_audit_log(db: Session, order_id: uuid.UUID, current_user: User) -> list[
     """
     order = order_repo.get_by_id_including_deleted(db, order_id)
     if order is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_ORDER_NOT_FOUND_MSG)
 
     logs = audit_log_repo.get_by_resource_id(db, order_id)
     return [AuditLogResponse.model_validate(log) for log in logs]
@@ -1260,6 +1348,99 @@ def list_for_scheduler(
     return orders, creators
 
 
+def _persist_order_schedule(
+    db: Session,
+    *,
+    order_id: uuid.UUID,
+    results: list[ScheduledResult],
+    pinned_map: dict[uuid.UUID, date],
+    prior_scheduled_dates: dict[uuid.UUID, date],
+    notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, date | None, date]],
+) -> bool:
+    """Write a single order's schedule via SAVEPOINT; enqueue notifications.
+
+    Returns ``True`` when the order was applied, ``False`` when it was
+    skipped (missing row or concurrent stale-data conflict).
+    """
+    results.sort(key=lambda x: x.scheduled_date)
+    earliest = results[0].scheduled_date
+    latest = results[-1].scheduled_date
+    daily_breakdown_payload: list[dict[str, str | int]] = [
+        {"date": sr.scheduled_date.isoformat(), "quantity": int(sr.quantity)} for sr in results
+    ]
+    is_pinned = order_id in pinned_map
+
+    try:
+        with db.begin_nested():
+            order = order_repo.set_schedule_dates(
+                db,
+                order_id=order_id,
+                scheduled_production_date=earliest,
+                expected_delivery_date=latest,
+                daily_breakdown=daily_breakdown_payload,
+                is_pinned=is_pinned,
+                pinned_production_date=pinned_map.get(order_id),
+            )
+            if order is None:
+                logger.warning(
+                    "order.schedule.apply_missing",
+                    order_id=str(order_id),
+                )
+                return False
+            old_scheduled_date = prior_scheduled_dates.get(order_id)
+            if old_scheduled_date != earliest:
+                recipients: list[uuid.UUID] = [order.created_by]
+                if order.assigned_to is not None and order.assigned_to != order.created_by:
+                    recipients.append(order.assigned_to)
+                for recipient_id in recipients:
+                    notif_queue.append(
+                        (
+                            recipient_id,
+                            order.id,
+                            order.order_number,
+                            old_scheduled_date,
+                            earliest,
+                        )
+                    )
+            return True
+    except StaleDataError:
+        logger.warning(
+            "order.schedule.apply_stale_skipped",
+            order_id=str(order_id),
+        )
+        return False
+
+
+def _flush_schedule_notifications(
+    db: Session,
+    notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, date | None, date]],
+) -> None:
+    """Send queued schedule-change notifications; swallow per-row failures."""
+    for notif_user_id, notif_order_id, order_number, old_date, new_date in notif_queue:
+        if old_date is None:
+            message = f"訂單 {order_number} 已排定生產日期 {new_date.isoformat()}"
+        else:
+            message = (
+                f"訂單 {order_number} 生產日期已從 "
+                f"{old_date.isoformat()} 變更為 {new_date.isoformat()}"
+            )
+        try:
+            notification_service.create_notification(
+                db,
+                user_id=notif_user_id,
+                order_id=notif_order_id,
+                type="order_status_changed",
+                message=message,
+            )
+        except Exception:
+            logger.warning(
+                _NOTIFICATION_CREATE_FAILED_EVENT,
+                order_id=str(notif_order_id),
+                user_id=str(notif_user_id),
+                exc_info=True,
+            )
+
+
 def apply_schedule(
     db: Session,
     scheduled: list[ScheduledResult],
@@ -1322,117 +1503,23 @@ def apply_schedule(
         per_order.setdefault(sr.order_id, []).append(sr)
 
     applied = 0
-    # Per-day capacity-usage accumulator. Same single pass as per-order
-    # daily_breakdown writes — for each ScheduledResult we already iterate
-    # we also bump the matching date's running total. Written via
-    # ``daily_cap_repo.replace_all`` after the loop so the snapshot is
-    # always a single atomic projection of the just-applied schedule
-    # rather than incremental upserts (see repo docstring for why).
     daily_totals: dict[date, int] = {}
-    # Collect data for notifications before commit; attributes expire after
-    # commit. Tuple shape: (recipient_user_id, order_id, order_number,
-    # old_date, new_date) — old_date is None for first-time-scheduled orders.
     _notif_queue: list[tuple[uuid.UUID, uuid.UUID, str, date | None, date]] = []
     for order_id, results in per_order.items():
-        results.sort(key=lambda x: x.scheduled_date)
-        earliest = results[0].scheduled_date
-        latest = results[-1].scheduled_date
-        daily_breakdown_payload: list[dict[str, str | int]] = [
-            {"date": sr.scheduled_date.isoformat(), "quantity": int(sr.quantity)} for sr in results
-        ]
-        # Accumulate per-day totals for the snapshot. We do this BEFORE
-        # the SAVEPOINT below so the accumulator reflects what
-        # ``compute_schedule()`` planned, not what actually committed —
-        # if a row gets skipped due to ``StaleDataError`` (concurrent
-        # PATCH), the next materialization re-runs with the post-PATCH
-        # state anyway, so this snapshot is "best-known plan", which is
-        # what the capacity-usage dashboard wants.
         for sr in results:
             daily_totals[sr.scheduled_date] = daily_totals.get(sr.scheduled_date, 0) + int(
                 sr.quantity
             )
-        is_pinned = order_id in pinned_map
+        if _persist_order_schedule(
+            db,
+            order_id=order_id,
+            results=results,
+            pinned_map=pinned_map,
+            prior_scheduled_dates=prior_scheduled_dates,
+            notif_queue=_notif_queue,
+        ):
+            applied += 1
 
-        # SAVEPOINT-isolate each per-order write so a single ``StaleDataError``
-        # (= ``version_id`` mismatch because a concurrent PATCH bumped the row
-        # between our SELECT and our flush) only rolls back THAT order's
-        # update, not the whole outer transaction. Without this nested guard
-        # the first stale row crashes the session into
-        # ``PendingRollbackError`` and every subsequent order in the loop
-        # follows, turning rebuild / advance_day into an unrecoverable
-        # task abort.
-        #
-        # Skipping is functionally safe: the concurrent PATCH enqueued a
-        # compound that ``run_scheduling_task`` will process next, which
-        # triggers a fresh ``materialize_schedule_task`` that rewrites the
-        # skipped order's ``scheduled_production_date`` / ``daily_breakdown``
-        # — so the only thing we "lose" by skipping is a redundant DB write.
-        try:
-            with db.begin_nested():
-                order = order_repo.set_schedule_dates(
-                    db,
-                    order_id=order_id,
-                    scheduled_production_date=earliest,
-                    expected_delivery_date=latest,
-                    daily_breakdown=daily_breakdown_payload,
-                    is_pinned=is_pinned,
-                    pinned_production_date=pinned_map.get(order_id),
-                )
-                if order is None:
-                    logger.warning(
-                        "order.schedule.apply_missing",
-                        order_id=str(order_id),
-                    )
-                    continue
-                applied += 1
-                # Only notify when the user-visible production date actually
-                # moves. Re-materialize-with-same-dates (the common case after
-                # every accepted compound, due to fast/slow split) must not
-                # flood the user's notification center.
-                #
-                # ``None`` in ``prior`` means the order wasn't in
-                # ``status='scheduled'`` before this materialize — either a
-                # fresh promotion from ``pending`` or a return from
-                # ``cancelled``. Both count as "first-time scheduled" and
-                # always notify.
-                old_scheduled_date = prior_scheduled_dates.get(order_id)
-                if old_scheduled_date != earliest:
-                    # Recipients: order.created_by always; order.assigned_to
-                    # also when set and different from creator (de-dup so a
-                    # creator who self-assigned doesn't get the same
-                    # notification twice).
-                    recipients: list[uuid.UUID] = [order.created_by]
-                    if order.assigned_to is not None and order.assigned_to != order.created_by:
-                        recipients.append(order.assigned_to)
-                    for recipient_id in recipients:
-                        _notif_queue.append(
-                            (
-                                recipient_id,
-                                order.id,
-                                order.order_number,
-                                old_scheduled_date,
-                                earliest,
-                            )
-                        )
-        except StaleDataError:
-            # Concurrent PATCH on this row landed between our SELECT and
-            # our flush. The SAVEPOINT is already rolled back; outer
-            # transaction still usable. Log + skip.
-            logger.warning(
-                "order.schedule.apply_stale_skipped",
-                order_id=str(order_id),
-            )
-            continue
-
-    # Write the per-day capacity-usage snapshot in the same transaction
-    # as the per-order daily_breakdown rows. Atomic with respect to the
-    # outer commit — readers either see the previous snapshot or the new
-    # one, never a half-applied mix. Snapshot may include dates where
-    # the corresponding order's row write got SAVEPOINT-skipped above;
-    # that's a tolerable transient (the next materialize will re-write
-    # the snapshot with fresh data) and the alternative — recomputing
-    # daily_totals from only successfully-written rows — adds bookkeeping
-    # complexity for no real user-visible win.
     daily_cap_repo.replace_all(db, entries=daily_totals, preserve_date=preserve_capacity_for)
 
     db.commit()
@@ -1442,32 +1529,6 @@ def apply_schedule(
         snapshot_days=len(daily_totals),
     )
 
-    for notif_user_id, notif_order_id, order_number, old_date, new_date in _notif_queue:
-        # Two message templates so the user-facing wording stays natural in
-        # both "first-time scheduled" and "rescheduled" cases. Both include
-        # the order number + the new date so the notification center entry
-        # is self-contained without clicking through.
-        if old_date is None:
-            message = f"訂單 {order_number} 已排定生產日期 {new_date.isoformat()}"
-        else:
-            message = (
-                f"訂單 {order_number} 生產日期已從 "
-                f"{old_date.isoformat()} 變更為 {new_date.isoformat()}"
-            )
-        try:
-            notification_service.create_notification(
-                db,
-                user_id=notif_user_id,
-                order_id=notif_order_id,
-                type="order_status_changed",
-                message=message,
-            )
-        except Exception:
-            logger.warning(
-                "notification.create_failed",
-                order_id=str(notif_order_id),
-                user_id=str(notif_user_id),
-                exc_info=True,
-            )
+    _flush_schedule_notifications(db, _notif_queue)
 
     return applied

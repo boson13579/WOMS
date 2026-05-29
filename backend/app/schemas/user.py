@@ -82,7 +82,8 @@ class LoginResponse(BaseModel):
     """Returned on successful login."""
 
     access_token: str
-    token_type: str = "bearer"  # noqa: S105 — OAuth2 token_type, not a password
+    # OAuth2 token_type, not a password.
+    token_type: str = "bearer"  # noqa: S105
 
 
 class UserResponse(BaseModel):

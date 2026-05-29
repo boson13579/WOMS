@@ -56,94 +56,132 @@ function shortPodId(id: string): string {
   return id.length <= 6 ? id : id.slice(-6);
 }
 
-export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsProps): JSX.Element {
+interface DbPoolView {
+  value: string | null;
+  detail: string | undefined;
+  ratio: number | null;
+  caption: string | undefined;
+}
+
+function buildDbPoolView(db: UseResources['db_pool']): DbPoolView {
+  return {
+    value: db ? `${db.checked_out} / ${db.size + db.max_overflow}` : null,
+    detail: db ? `(${db.utilization_pct.toFixed(1)}% used)` : undefined,
+    ratio: db ? db.utilization_pct / 100 : null,
+    caption:
+      db && db.replicas.length > 1
+        ? db.replicas
+            .map((r) => `${shortPodId(r.pod_id)}: ${r.checked_out} / ${r.size + r.max_overflow}`)
+            .join(' · ')
+        : undefined,
+  };
+}
+
+function buildRedisClientsLine(redis: NonNullable<UseResources['redis']>): string {
+  const clientsSuffix = redis.connected_clients === 1 ? '' : 's';
+  const evictedSuffix = redis.evicted_keys > 0 ? ` · ${redis.evicted_keys} evicted` : '';
+  return `${redis.connected_clients} client${clientsSuffix}${evictedSuffix}`;
+}
+
+function buildRedisCaption(
+  redis: UseResources['redis'],
+  clientsLine: string | undefined,
+): string | string[] | undefined {
+  if (!redis) {
+    return undefined;
+  }
+  if (redis.max_memory_bytes > 0) {
+    return `cap ${formatBytes(redis.max_memory_bytes)} · ${clientsLine ?? ''}`;
+  }
+  return ['no cap', clientsLine ?? ''];
+}
+
+interface RedisView {
+  value: string | null;
+  ratio: number | null;
+  caption: string | string[] | undefined;
+}
+
+function buildRedisView(redis: UseResources['redis']): RedisView {
+  const clientsLine = redis ? buildRedisClientsLine(redis) : undefined;
+  return {
+    value: redis ? formatBytes(redis.used_memory_bytes) : null,
+    ratio:
+      redis && redis.max_memory_bytes > 0 ? redis.used_memory_bytes / redis.max_memory_bytes : null,
+    caption: buildRedisCaption(redis, clientsLine),
+  };
+}
+
+interface WsView {
+  value: string | null;
+  caption: string[] | undefined;
+}
+
+function buildWsView(ws: UseResources['ws_connections']): WsView {
+  return {
+    value: ws ? `${ws.total}` : null,
+    caption:
+      ws && ws.replicas.length > 1
+        ? ws.replicas.map((r) => `${shortPodId(r.pod_id)}: ${r.count}`)
+        : undefined,
+  };
+}
+
+function renderLoadingGrid(): JSX.Element {
+  return (
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+      {Array.from({ length: 3 }, (_, i) => (
+        // eslint-disable-next-line react/no-array-index-key
+        <Skeleton key={i} data-testid="use-resource-skeleton" className="h-40 w-full" />
+      ))}
+    </div>
+  );
+}
+
+function renderErrorCard(): JSX.Element {
+  return (
+    <Card className="border-destructive/40">
+      <CardContent className="flex items-start gap-3 p-5">
+        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
+        <p className="text-sm">Failed to load resources.</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function UseResourceCards({
+  data,
+  isLoading,
+  isError,
+}: Readonly<UseResourceCardsProps>): JSX.Element {
   if (isLoading && !data) {
-    return (
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-        {Array.from({ length: 3 }, (_, i) => (
-          // eslint-disable-next-line react/no-array-index-key
-          <Skeleton key={i} data-testid="use-resource-skeleton" className="h-40 w-full" />
-        ))}
-      </div>
-    );
+    return renderLoadingGrid();
   }
 
   if (isError || !data) {
-    return (
-      <Card className="border-destructive/40">
-        <CardContent className="flex items-start gap-3 p-5">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
-          <p className="text-sm">Failed to load resources.</p>
-        </CardContent>
-      </Card>
-    );
+    return renderErrorCard();
   }
 
-  // ---- DB pool ----------------------------------------------------------
-  // Layout:
-  //   "16 / 50"  [detail: "(32.0% used)"]
-  //   bar
-  //   backend-1: 9/25
-  //   backend-2: 7/25
-  const db = data.db_pool;
-  const dbValue = db ? `${db.checked_out} / ${db.size + db.max_overflow}` : null;
-  const dbDetail = db ? `(${db.utilization_pct.toFixed(1)}% used)` : undefined;
-  const dbRatio = db ? db.utilization_pct / 100 : null;
-  const dbCaption: string | undefined =
-    db && db.replicas.length > 1
-      ? db.replicas
-          .map((r) => `${shortPodId(r.pod_id)}: ${r.checked_out} / ${r.size + r.max_overflow}`)
-          .join(' · ')
-      : undefined;
-
-  // ---- Redis ------------------------------------------------------------
-  // Two layout modes depending on whether a maxmemory cap is configured:
-  // - Capped (AWS ElastiCache): one-line caption + saturation bar
-  // - Uncapped (docker default): caption split into two lines so the
-  //   "no cap" status is visually distinct from the client count
+  const dbView = buildDbPoolView(data.db_pool);
+  const redisView = buildRedisView(data.redis);
+  const wsView = buildWsView(data.ws_connections);
   const { redis } = data;
-  const redisValue = redis ? formatBytes(redis.used_memory_bytes) : null;
-  const redisRatio =
-    redis && redis.max_memory_bytes > 0 ? redis.used_memory_bytes / redis.max_memory_bytes : null;
-  const clientsLine = redis
-    ? `${redis.connected_clients} client${redis.connected_clients === 1 ? '' : 's'}${
-        redis.evicted_keys > 0 ? ` · ${redis.evicted_keys} evicted` : ''
-      }`
-    : undefined;
-  let redisCaption: string | string[] | undefined;
-  if (!redis) {
-    redisCaption = undefined;
-  } else if (redis.max_memory_bytes > 0) {
-    redisCaption = `cap ${formatBytes(redis.max_memory_bytes)} · ${clientsLine ?? ''}`;
-  } else {
-    redisCaption = ['no cap', clientsLine ?? ''];
-  }
-
-  // ---- Live WebSocket connections (replaces Workers card) ----------------
-  // Layout: just the number + per-pod breakdown on separate lines, no
-  // "session"/"sessions" suffix (number on its own is unambiguous).
-  const ws = data.ws_connections;
-  const wsValue = ws ? `${ws.total}` : null;
-  const wsCaption: string[] | undefined =
-    ws && ws.replicas.length > 1
-      ? ws.replicas.map((r) => `${shortPodId(r.pod_id)}: ${r.count}`)
-      : undefined;
 
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
       <UseResourceCard
         label="DB connections"
-        value={dbValue}
-        detail={dbDetail}
-        ratio={dbRatio}
-        caption={dbCaption}
+        value={dbView.value}
+        detail={dbView.detail}
+        ratio={dbView.ratio}
+        caption={dbView.caption}
         unreachableMessage="Pool stats unavailable."
       />
       <UseResourceCard
         label="Redis memory"
-        value={redisValue}
-        ratio={redisRatio}
-        caption={redisCaption}
+        value={redisView.value}
+        ratio={redisView.ratio}
+        caption={redisView.caption}
         // No ``maxmemory`` configured (local docker default) → no
         // meaningful denominator, hide the bar slot entirely instead
         // of showing a dashed "no signal" placeholder that the eye
@@ -153,8 +191,8 @@ export function UseResourceCards({ data, isLoading, isError }: UseResourceCardsP
       />
       <UseResourceCard
         label="Live connections"
-        value={wsValue}
-        caption={wsCaption}
+        value={wsView.value}
+        caption={wsView.caption}
         // No natural saturation denominator — see ``hideBar`` docs.
         hideBar
         unreachableMessage="WebSocket stats unavailable."

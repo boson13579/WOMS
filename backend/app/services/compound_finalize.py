@@ -195,6 +195,117 @@ def perform_compound_db_action(
         db.close()
 
 
+def _accept_create(order: Order) -> None:
+    order.is_processing_locked = False
+
+
+def _accept_update(
+    db: Session,
+    order: Order,
+    db_action: dict[str, Any],
+    actor_id: uuid.UUID | None,
+) -> None:
+    old_value: dict[str, Any] = {
+        "wafer_quantity": order.wafer_quantity,
+        "requested_delivery_date": str(order.requested_delivery_date),
+        "notes": order.notes,
+        "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        "is_pinned": order.is_pinned,
+        "pinned_production_date": (
+            str(order.pinned_production_date) if order.pinned_production_date is not None else None
+        ),
+    }
+    new_qty = db_action.get("new_wafer_quantity")
+    if new_qty is not None:
+        order.wafer_quantity = int(new_qty)
+    new_dl = db_action.get("new_requested_delivery_date")
+    if new_dl is not None:
+        order.requested_delivery_date = date.fromisoformat(str(new_dl))
+    if db_action.get("new_notes_set"):
+        order.notes = db_action.get("new_notes")
+    if db_action.get("new_assigned_to_set"):
+        raw_assignee = db_action.get("new_assigned_to")
+        order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
+    if db_action.get("new_pinned_production_date_set"):
+        raw_pin_day = db_action.get("new_pinned_production_date")
+        if raw_pin_day is None:
+            order.is_pinned = False
+            order.pinned_production_date = None
+        else:
+            order.is_pinned = True
+            order.pinned_production_date = date.fromisoformat(str(raw_pin_day))
+    order.is_processing_locked = False
+    new_value: dict[str, Any] = {
+        "wafer_quantity": order.wafer_quantity,
+        "requested_delivery_date": str(order.requested_delivery_date),
+        "notes": order.notes,
+        "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
+        "is_pinned": order.is_pinned,
+        "pinned_production_date": (
+            str(order.pinned_production_date) if order.pinned_production_date is not None else None
+        ),
+    }
+    _worker_audit(
+        db,
+        action="order.updated",
+        actor_id=actor_id,
+        order_id=order.id,
+        old_value=old_value,
+        new_value=new_value,
+    )
+
+
+def _accept_delete(
+    db: Session,
+    order: Order,
+    db_action: dict[str, Any],
+    actor_id: uuid.UUID | None,
+) -> None:
+    old_value: dict[str, Any] = {
+        "status": order.status.value,
+        "is_deleted": False,
+        "wafer_quantity": db_action.get("old_wafer_quantity"),
+        "requested_delivery_date": db_action.get("old_requested_delivery_date"),
+        "notes": db_action.get("old_notes"),
+        "assigned_to": db_action.get("old_assigned_to"),
+    }
+    order.is_deleted = True
+    order.status = OrderStatus.cancelled
+    order.is_processing_locked = False
+    _worker_audit(
+        db,
+        action="order.deleted",
+        actor_id=actor_id,
+        order_id=order.id,
+        old_value=old_value,
+    )
+
+
+def _accept_cancel(
+    db: Session,
+    order: Order,
+    db_action: dict[str, Any],
+    actor_id: uuid.UUID | None,
+) -> None:
+    old_value: dict[str, Any] = {
+        "status": order.status.value,
+        "is_deleted": False,
+        "wafer_quantity": db_action.get("old_wafer_quantity"),
+        "requested_delivery_date": db_action.get("old_requested_delivery_date"),
+        "notes": db_action.get("old_notes"),
+        "assigned_to": db_action.get("old_assigned_to"),
+    }
+    order.status = OrderStatus.cancelled
+    order.is_processing_locked = False
+    _worker_audit(
+        db,
+        action="order.cancelled",
+        actor_id=actor_id,
+        order_id=order.id,
+        old_value=old_value,
+    )
+
+
 def _apply_db_action_accept(
     db: Session,
     order: Order,
@@ -208,138 +319,13 @@ def _apply_db_action_accept(
     timestamp reflects when the change was actually committed.
     """
     if kind == "create":
-        # Producer already inserted the row + wrote the ``order.created``
-        # audit. Worker only clears the in-flight lock so the row becomes
-        # editable again; the materializer's apply_schedule will set
-        # ``status=scheduled`` and fill the scheduling columns.
-        order.is_processing_locked = False
-        return
-
-    if kind == "update":
-        old_value: dict[str, Any] = {
-            "wafer_quantity": order.wafer_quantity,
-            "requested_delivery_date": str(order.requested_delivery_date),
-            "notes": order.notes,
-            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
-            "is_pinned": order.is_pinned,
-            "pinned_production_date": (
-                str(order.pinned_production_date)
-                if order.pinned_production_date is not None
-                else None
-            ),
-        }
-        new_qty = db_action.get("new_wafer_quantity")
-        if new_qty is not None:
-            order.wafer_quantity = int(new_qty)
-        new_dl = db_action.get("new_requested_delivery_date")
-        if new_dl is not None:
-            order.requested_delivery_date = date.fromisoformat(str(new_dl))
-        if db_action.get("new_notes_set"):
-            order.notes = db_action.get("new_notes")
-        if db_action.get("new_assigned_to_set"):
-            raw_assignee = db_action.get("new_assigned_to")
-            order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
-        # Pin columns: only touch when producer asked us to. ``_set=False``
-        # means "client didn't change pin status" — leave is_pinned /
-        # pinned_production_date alone so the auto-re-pin / silent-drop
-        # logic in the algorithm's pin_order / unpin_order calls stays
-        # authoritative on the in-memory side (DB matches whatever
-        # apply_schedule writes next).
-        if db_action.get("new_pinned_production_date_set"):
-            raw_pin_day = db_action.get("new_pinned_production_date")
-            if raw_pin_day is None:
-                order.is_pinned = False
-                order.pinned_production_date = None
-            else:
-                order.is_pinned = True
-                order.pinned_production_date = date.fromisoformat(str(raw_pin_day))
-        order.is_processing_locked = False
-        new_value: dict[str, Any] = {
-            "wafer_quantity": order.wafer_quantity,
-            "requested_delivery_date": str(order.requested_delivery_date),
-            "notes": order.notes,
-            "assigned_to": str(order.assigned_to) if order.assigned_to is not None else None,
-            "is_pinned": order.is_pinned,
-            "pinned_production_date": (
-                str(order.pinned_production_date)
-                if order.pinned_production_date is not None
-                else None
-            ),
-        }
-        _worker_audit(
-            db,
-            action="order.updated",
-            actor_id=actor_id,
-            order_id=order.id,
-            old_value=old_value,
-            new_value=new_value,
-        )
-        return
-
-    if kind == "delete":
-        # N-5: capture the full pre-delete view in the audit row.
-        # ``_build_delete_compound`` already snapshotted these into
-        # ``db_action.old_*`` at producer time; before round-2 the worker
-        # didn't read them and just logged ``status`` + ``is_deleted``,
-        # making it impossible to answer "what was the qty / deadline /
-        # notes when this order got cancelled?" without consulting the
-        # full row history. Pulling the snapshot into the audit row makes
-        # the history self-contained.
-        old_value = {
-            "status": order.status.value,
-            "is_deleted": False,
-            "wafer_quantity": db_action.get("old_wafer_quantity"),
-            "requested_delivery_date": db_action.get("old_requested_delivery_date"),
-            "notes": db_action.get("old_notes"),
-            "assigned_to": db_action.get("old_assigned_to"),
-        }
-        order.is_deleted = True
-        order.status = OrderStatus.cancelled
-        order.is_processing_locked = False
-        _worker_audit(
-            db,
-            action="order.deleted",
-            actor_id=actor_id,
-            order_id=order.id,
-            old_value=old_value,
-        )
-        return
-
-    if kind == "cancel":
-        # User-initiated cancel of a ``scheduled`` order. Same scheduler-side
-        # compound shape as ``delete`` ([remove] / [unpin, remove]) but the
-        # DB outcome differs in one column: ``is_deleted`` stays ``False``
-        # so the row remains visible in ``GET /orders``. Compared to the
-        # three existing cancel-shaped paths:
-        #
-        # - ``delete`` accept: ``is_deleted=True``, removed from list.
-        # - ``create`` reject (worker auto / user retract): ``is_deleted=False``,
-        #   row was never scheduled to begin with.
-        # - ``cancel`` accept (this branch): ``is_deleted=False``,
-        #   row WAS scheduled and the user is intentionally pulling it back.
-        #
-        # Audit action ``order.cancelled`` (matches the create-reject path);
-        # ``delete`` was retitled to ``order.deleted`` so the two
-        # are distinguishable in the audit trail.
-        old_value = {
-            "status": order.status.value,
-            "is_deleted": False,
-            "wafer_quantity": db_action.get("old_wafer_quantity"),
-            "requested_delivery_date": db_action.get("old_requested_delivery_date"),
-            "notes": db_action.get("old_notes"),
-            "assigned_to": db_action.get("old_assigned_to"),
-        }
-        order.status = OrderStatus.cancelled
-        order.is_processing_locked = False
-        # Intentionally NOT setting is_deleted=True — that's the delete path.
-        _worker_audit(
-            db,
-            action="order.cancelled",
-            actor_id=actor_id,
-            order_id=order.id,
-            old_value=old_value,
-        )
-        return
+        _accept_create(order)
+    elif kind == "update":
+        _accept_update(db, order, db_action, actor_id)
+    elif kind == "delete":
+        _accept_delete(db, order, db_action, actor_id)
+    elif kind == "cancel":
+        _accept_cancel(db, order, db_action, actor_id)
 
 
 def _apply_db_action_reject(

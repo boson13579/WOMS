@@ -71,7 +71,7 @@ export function DashboardPage(): JSX.Element {
   // so the Header's spinner state updates without a frame delay.
   const onRefresh = (): void => {
     DASHBOARD_INVALIDATE_PREFIXES.forEach((queryKey) => {
-      void queryClient.invalidateQueries({ queryKey });
+      queryClient.invalidateQueries({ queryKey }).catch(() => {});
     });
   };
 
@@ -164,7 +164,7 @@ export function DashboardPage(): JSX.Element {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function SectionLabel({ children }: { children: React.ReactNode }): JSX.Element {
+function SectionLabel({ children }: Readonly<{ children: React.ReactNode }>): JSX.Element {
   return (
     <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
       {children}

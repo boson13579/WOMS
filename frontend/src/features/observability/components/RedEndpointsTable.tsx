@@ -66,7 +66,7 @@ export function RedEndpointsTable({
   isLoading,
   isError,
   windowSeconds,
-}: RedEndpointsTableProps): JSX.Element {
+}: Readonly<RedEndpointsTableProps>): JSX.Element {
   if (isLoading) {
     return (
       <Card>

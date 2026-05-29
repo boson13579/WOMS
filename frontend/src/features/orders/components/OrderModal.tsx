@@ -82,7 +82,7 @@ interface OrderModalProps {
   order?: Order | undefined;
 }
 
-export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Element {
+export function OrderModal({ open, onClose, order }: Readonly<OrderModalProps>): JSX.Element {
   const isEdit = order !== undefined;
   const createMutation = useCreateOrder();
   const updateMutation = useUpdateOrder();
@@ -187,7 +187,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
   const onSubmit = handleSubmit((values) => {
     const matchedUser = users.find((u) => u.email === values.assigned_to_email);
     const assignedTo = matchedUser?.id ?? null;
-    const notes = values.notes !== '' ? (values.notes ?? null) : null;
+    const notes = values.notes === '' ? null : (values.notes ?? null);
 
     if (order) {
       updateMutation.mutate(
@@ -253,7 +253,7 @@ export function OrderModal({ open, onClose, order }: OrderModalProps): JSX.Eleme
         <form
           id="order-form"
           onSubmit={(e) => {
-            void onSubmit(e);
+            onSubmit(e).catch(() => {});
           }}
           className="space-y-4"
           noValidate

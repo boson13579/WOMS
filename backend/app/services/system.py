@@ -28,7 +28,7 @@ import uuid as uuid_module
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeAlias, cast
 from urllib.parse import urlparse
 
 import structlog
@@ -66,6 +66,9 @@ from app.workers.celery_app import celery_app
 ServiceId = Literal["api", "postgres", "redis", "celery"]
 HealthStatus = Literal["healthy", "warning", "error"]
 
+# Cast target for redis/json payloads decoded as untyped mappings.
+_DictStrAny: TypeAlias = dict[str, Any]
+
 logger = structlog.get_logger(__name__)
 
 __all__ = ["gather_resources", "gather_system_health", "lookup_usernames"]
@@ -83,6 +86,8 @@ _MAX_WORKER_BREAKDOWN = 50
 # what ``app.workers.celery_app`` does today). Queue depth is read via
 # ``LLEN`` because the Redis broker stores tasks as a plain list.
 _CELERY_DEFAULT_QUEUE = "celery"
+
+_CELERY_WORKER_NAME = "Celery Worker"
 
 # Inspect timeout: Celery's default 1.0s blocks the resources endpoint when
 # no worker registers (which is the production posture during a restart).
@@ -288,7 +293,7 @@ def _probe_celery() -> ServiceHealthEntry:
     if not _redis_port_open():
         return ServiceHealthEntry(
             id="celery",
-            name="Celery Worker",
+            name=_CELERY_WORKER_NAME,
             status="error",
             summary="Unable to read scheduler state from Redis (port not reachable)",
             details=[ServiceHealthDetail(label="Error", value="Redis port not reachable")],
@@ -301,7 +306,7 @@ def _probe_celery() -> ServiceHealthEntry:
         logger.warning("system.health.celery.probe_failed", error=str(exc))
         return ServiceHealthEntry(
             id="celery",
-            name="Celery Worker",
+            name=_CELERY_WORKER_NAME,
             status="error",
             summary="Unable to read scheduler state from Redis",
             details=[
@@ -309,52 +314,21 @@ def _probe_celery() -> ServiceHealthEntry:
             ],
         )
 
-    status_doc: dict[str, Any] | None = None
-    if status_raw:
-        try:
-            status_doc = json.loads(status_raw)
-        except json.JSONDecodeError:
-            logger.warning("system.health.celery.bad_status_doc", raw=status_raw)
-
+    status_doc = _parse_status_doc(status_raw)
     worker_state = (status_doc or {}).get("state", "idle")
     finished_at_raw = (status_doc or {}).get("finished_at")
     seconds_since_finish = _seconds_since(finished_at_raw)
 
-    status: HealthStatus
-    if worker_state == "failed" and queue_depth > 0:
-        # Actively broken: a task just failed AND there's queued work
-        # that won't drain until something intervenes.
-        status = "error"
-        summary = (
-            f"Last run failed — {queue_depth} compound{'s' if queue_depth != 1 else ''} "
-            f"still pending"
-        )
-    elif worker_state == "failed":
-        # Past incident: a task failed, but nothing's queued so the
-        # next caller may succeed. Surface the timestamp so operators
-        # know if it's recent (urgent) or old (stale signal).
-        status = "warning"
-        if finished_at_raw:
-            summary = f"Last run failed at {finished_at_raw} — no new tasks since"
-        else:
-            summary = "Last run failed — no new tasks since"
-    elif (
-        worker_state == "idle"
-        and queue_depth > 0
-        and seconds_since_finish >= _CELERY_STALL_THRESHOLD_SECONDS
-    ):
-        status = "warning"
-        summary = (
-            f"Queue has {queue_depth} pending but no task in "
-            f"{int(seconds_since_finish)}s — worker may be stuck"
-        )
-    else:
-        status = "healthy"
-        summary = f"Scheduler state={worker_state}"
+    status, summary = _interpret_celery_state(
+        worker_state=worker_state,
+        queue_depth=queue_depth,
+        finished_at_raw=finished_at_raw,
+        seconds_since_finish=seconds_since_finish,
+    )
 
     return ServiceHealthEntry(
         id="celery",
-        name="Celery Worker",
+        name=_CELERY_WORKER_NAME,
         status=status,
         summary=summary,
         details=[
@@ -362,6 +336,50 @@ def _probe_celery() -> ServiceHealthEntry:
             ServiceHealthDetail(label="Queue depth", value=str(queue_depth)),
         ],
     )
+
+
+def _parse_status_doc(status_raw: str | None) -> dict[str, Any] | None:
+    """Parse the ``schedule:status`` JSON blob; return ``None`` on absence / bad JSON."""
+    if not status_raw:
+        return None
+    try:
+        return cast(_DictStrAny, json.loads(status_raw))
+    except json.JSONDecodeError:
+        logger.warning("system.health.celery.bad_status_doc", raw=status_raw)
+        return None
+
+
+def _interpret_celery_state(
+    *,
+    worker_state: str,
+    queue_depth: int,
+    finished_at_raw: str | None,
+    seconds_since_finish: float,
+) -> tuple[HealthStatus, str]:
+    """Map the worker state + queue snapshot to a (status, summary) pair."""
+    if worker_state == "failed" and queue_depth > 0:
+        summary = (
+            f"Last run failed — {queue_depth} compound{'s' if queue_depth != 1 else ''} "
+            f"still pending"
+        )
+        return "error", summary
+    if worker_state == "failed":
+        if finished_at_raw:
+            summary = f"Last run failed at {finished_at_raw} — no new tasks since"
+        else:
+            summary = "Last run failed — no new tasks since"
+        return "warning", summary
+    if (
+        worker_state == "idle"
+        and queue_depth > 0
+        and seconds_since_finish >= _CELERY_STALL_THRESHOLD_SECONDS
+    ):
+        summary = (
+            f"Queue has {queue_depth} pending but no task in "
+            f"{int(seconds_since_finish)}s — worker may be stuck"
+        )
+        return "warning", summary
+    return "healthy", f"Scheduler state={worker_state}"
 
 
 def _seconds_since(iso_timestamp: str | None) -> float:
@@ -427,7 +445,7 @@ def gather_system_health(db: Session) -> SystemHealthResponse:
         _safe("api", "API", _probe_api),
         _safe("postgres", "PostgreSQL", lambda: _probe_postgres(db)),
         _safe("redis", "Redis", _probe_redis),
-        _safe("celery", "Celery Worker", _probe_celery),
+        _safe("celery", _CELERY_WORKER_NAME, _probe_celery),
     ]
     return SystemHealthResponse(services=services)
 
@@ -528,9 +546,9 @@ def _get_redis_stats() -> RedisStats | None:
         # cover the async client too — we use the sync client, so cast to the
         # plain ``dict`` shape we know we get. Mirrors the existing pattern
         # in ``_probe_celery``.
-        info_mem = cast("dict[str, Any]", rds.info("memory"))
-        info_clients = cast("dict[str, Any]", rds.info("clients"))
-        info_stats = cast("dict[str, Any]", rds.info("stats"))
+        info_mem = cast(_DictStrAny, rds.info("memory"))
+        info_clients = cast(_DictStrAny, rds.info("clients"))
+        info_stats = cast(_DictStrAny, rds.info("stats"))
     except Exception as exc:
         logger.warning("system.resources.redis.probe_failed", error=str(exc))
         return None
@@ -587,30 +605,14 @@ def _get_celery_stats() -> CeleryStats | None:
         logger.warning("system.resources.celery.inspect_failed", error=str(exc))
         return None
 
-    # ``ping()`` returns a list of single-key dicts: [{"celery@h1": {"ok":"pong"}}, ...].
-    # Some Celery versions return a dict keyed by hostname; handle both.
-    ping_hostnames: set[str] = set()
-    if isinstance(ping, list):
-        for entry in ping:
-            if isinstance(entry, dict):
-                ping_hostnames.update(entry.keys())
-    elif isinstance(ping, dict):
-        ping_hostnames.update(ping.keys())
+    ping_hostnames = _extract_ping_hostnames(ping)
 
     # Union of every hostname we have any signal for.
     hostnames: set[str] = set()
     hostnames.update(active.keys())
     hostnames.update(ping_hostnames)
 
-    workers: list[WorkerBreakdown] = []
-    for hostname in sorted(hostnames):
-        tasks = active.get(hostname) or []
-        task_count = len(tasks) if isinstance(tasks, list) else 0
-        # ``"active"`` when the worker has in-flight tasks. ``"idle"`` when
-        # it's reachable (ping or active map presence) but has no tasks.
-        # We never emit ``"dead"`` — dead workers drop out of both maps.
-        status: WorkerStatus = "active" if task_count > 0 else "idle"
-        workers.append(WorkerBreakdown(hostname=hostname, active_tasks=task_count, status=status))
+    workers = _build_worker_breakdown(active, hostnames)
 
     # Aggregate ``active_tasks`` from the source ``active`` map BEFORE
     # truncation so the headline number is honest even when we truncate
@@ -621,15 +623,7 @@ def _get_celery_stats() -> CeleryStats | None:
     if truncated:
         workers = workers[:_MAX_WORKER_BREAKDOWN]
 
-    # Queue depth: best-effort. Failing here only zeros out queue_depth, the
-    # rest of the celery section is still useful.
-    queue_depth = 0
-    try:
-        rds = _get_redis_client()
-        raw_depth = cast("int", rds.llen(_CELERY_DEFAULT_QUEUE))
-        queue_depth = int(raw_depth) if raw_depth is not None else 0
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("system.resources.celery.queue_depth_failed", error=str(exc))
+    queue_depth = _read_celery_queue_depth()
 
     return CeleryStats(
         active_tasks=total_active,
@@ -638,6 +632,40 @@ def _get_celery_stats() -> CeleryStats | None:
         workers=workers,
         truncated=truncated,
     )
+
+
+def _extract_ping_hostnames(ping: Any) -> set[str]:
+    """Normalise Celery ``inspect().ping()`` output into a set of hostnames."""
+    ping_hostnames: set[str] = set()
+    if isinstance(ping, list):
+        for entry in ping:
+            if isinstance(entry, dict):
+                ping_hostnames.update(entry.keys())
+    elif isinstance(ping, dict):
+        ping_hostnames.update(ping.keys())
+    return ping_hostnames
+
+
+def _build_worker_breakdown(active: dict[str, Any], hostnames: set[str]) -> list[WorkerBreakdown]:
+    """Sort hostnames and build the per-worker breakdown rows."""
+    workers: list[WorkerBreakdown] = []
+    for hostname in sorted(hostnames):
+        tasks = active.get(hostname) or []
+        task_count = len(tasks) if isinstance(tasks, list) else 0
+        status: WorkerStatus = "active" if task_count > 0 else "idle"
+        workers.append(WorkerBreakdown(hostname=hostname, active_tasks=task_count, status=status))
+    return workers
+
+
+def _read_celery_queue_depth() -> int:
+    """Best-effort LLEN against the Celery default queue."""
+    try:
+        rds = _get_redis_client()
+        raw_depth = cast("int", rds.llen(_CELERY_DEFAULT_QUEUE))
+        return int(raw_depth) if raw_depth is not None else 0
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("system.resources.celery.queue_depth_failed", error=str(exc))
+        return 0
 
 
 def _get_ws_connection_stats() -> WsConnectionStats | None:

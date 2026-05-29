@@ -30,7 +30,11 @@ interface CapacityChartProps {
   isError: boolean;
 }
 
-export function CapacityChart({ data, isLoading, isError }: CapacityChartProps): JSX.Element {
+export function CapacityChart({
+  data,
+  isLoading,
+  isError,
+}: Readonly<CapacityChartProps>): JSX.Element {
   if (isLoading) {
     return (
       <Card>

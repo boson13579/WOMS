@@ -65,7 +65,7 @@ export function AuditRow({
   expanded,
   onToggle,
   colSpan,
-}: AuditRowProps): JSX.Element {
+}: Readonly<AuditRowProps>): JSX.Element {
   const resourceType = inferResourceType(event.action);
 
   return (

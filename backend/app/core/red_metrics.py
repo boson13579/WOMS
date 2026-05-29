@@ -86,6 +86,8 @@ SKIP_PREFIXES: tuple[str, ...] = ("/static", "/favicon")
 # they're mounted (``/api/v1/openapi.json``, ``/openapi.json``).
 SKIP_SUFFIXES: tuple[str, ...] = ("/openapi.json", "/docs", "/redoc")
 
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
 
 @lru_cache(maxsize=1)
 def _get_metrics_redis() -> Redis:
@@ -226,7 +228,7 @@ async def red_metrics_middleware(
         # exception so an unawaited-task warning is impossible — and the
         # response can flush without waiting for Redis.
         try:
-            asyncio.create_task(  # noqa: RUF006 — fire-and-forget by design
+            task = asyncio.create_task(
                 _record_sample(
                     path=_route_template(request),
                     method=request.method,
@@ -235,6 +237,8 @@ async def red_metrics_middleware(
                     ts_ms=int(time.time() * 1000),
                 )
             )
+            _BACKGROUND_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_TASKS.discard)
         except RuntimeError as exc:
             # No running event loop (e.g. inside ``TestClient`` finalize).
             # Swallow + log — middleware MUST NOT raise.

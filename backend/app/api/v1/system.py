@@ -17,6 +17,7 @@ fine to surface to viewers since they don't include secrets.
 from __future__ import annotations
 
 import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -46,12 +47,11 @@ _MAX_USERNAME_LOOKUPS_PER_REQUEST = 100
 
 @router.get(
     "/health",
-    response_model=SystemHealthResponse,
     summary="Aggregated service health for the dashboard.",
 )
 def get_system_health(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
 ) -> SystemHealthResponse:
     """Return a 4-entry list of (api, postgres, redis, celery) health snapshots.
 
@@ -67,11 +67,10 @@ def get_system_health(
 
 @router.get(
     "/resources",
-    response_model=SystemResourcesResponse,
     summary="USE (utilization / saturation / errors) snapshot of DB, Redis, Celery.",
 )
 def get_system_resources(
-    current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),
+    current_user: Annotated[User, Depends(require_roles(UserRole.scheduler, UserRole.root))],
 ) -> SystemResourcesResponse:
     """Operator-grade resource snapshot for the observability page.
 
@@ -86,20 +85,21 @@ def get_system_resources(
 
 @router.get(
     "/red",
-    response_model=RedMetricsResponse,
     summary="RED (rate / errors / duration) metrics over a trailing window.",
 )
 def get_red_metrics(
-    window_seconds: int = Query(
-        default=60,
-        ge=1,
-        description=(
-            "Trailing window in seconds. The underlying ZSET is trimmed to "
-            "the last 5 minutes, so windows wider than 300s return only the "
-            "samples that are physically present (no error)."
+    current_user: Annotated[User, Depends(require_roles(UserRole.scheduler, UserRole.root))],
+    window_seconds: Annotated[
+        int,
+        Query(
+            ge=1,
+            description=(
+                "Trailing window in seconds. The underlying ZSET is trimmed to "
+                "the last 5 minutes, so windows wider than 300s return only the "
+                "samples that are physically present (no error)."
+            ),
         ),
-    ),
-    current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),
+    ] = 60,
 ) -> RedMetricsResponse:
     """Return aggregated RED metrics for the trailing window.
 
@@ -116,24 +116,25 @@ def get_red_metrics(
 
 @router.get(
     "/slo",
-    response_model=SloComplianceResponse,
     summary="SLO compliance + error-budget snapshot over a trailing window.",
 )
 def get_slo_compliance(
-    window_hours: int = Query(
-        default=24,
-        ge=1,
-        le=168,
-        description=(
-            "Trailing window in hours. The underlying ZSET is trimmed to "
-            "the last 1 hour by the RED middleware, so longer windows "
-            "report against the available sample slice rather than a true "
-            "24h history. The response carries ``data_window_seconds_actual`` "
-            "so the caller can see exactly how much of the requested window "
-            "is actually backed by data."
+    current_user: Annotated[User, Depends(require_roles(UserRole.scheduler, UserRole.root))],
+    window_hours: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=168,
+            description=(
+                "Trailing window in hours. The underlying ZSET is trimmed to "
+                "the last 1 hour by the RED middleware, so longer windows "
+                "report against the available sample slice rather than a true "
+                "24h history. The response carries ``data_window_seconds_actual`` "
+                "so the caller can see exactly how much of the requested window "
+                "is actually backed by data."
+            ),
         ),
-    ),
-    current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),
+    ] = 24,
 ) -> SloComplianceResponse:
     """Return SLO compliance + error-budget remaining for the trailing window.
 
@@ -151,21 +152,22 @@ def get_slo_compliance(
 
 @router.get(
     "/schedule-lag",
-    response_model=ScheduleLagStats,
     summary="P50 / P95 / max compound enqueue → commit latency over a window.",
 )
 def get_schedule_lag(
-    window_seconds: int = Query(
-        default=60,
-        ge=1,
-        le=3600,
-        description=(
-            "Trailing window in seconds. The underlying sorted set is "
-            "trimmed to 1 hour of retention — same upper bound as the "
-            "widest pill (15m / 1h) on the observability page."
+    current_user: Annotated[User, Depends(require_roles(UserRole.scheduler, UserRole.root))],
+    window_seconds: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=3600,
+            description=(
+                "Trailing window in seconds. The underlying sorted set is "
+                "trimmed to 1 hour of retention — same upper bound as the "
+                "widest pill (15m / 1h) on the observability page."
+            ),
         ),
-    ),
-    current_user: User = Depends(require_roles(UserRole.scheduler, UserRole.root)),
+    ] = 60,
 ) -> ScheduleLagStats:
     """Return aggregated schedule-pipeline lag (enqueue → worker commit).
 
@@ -179,20 +181,21 @@ def get_schedule_lag(
 
 @router.get(
     "/usernames",
-    response_model=UsernamesLookupResponse,
     summary="Bulk UUID → username lookup for dashboard rendering.",
 )
 def get_usernames(
-    ids: str = Query(
-        ...,
-        min_length=1,
-        description=(
-            "Comma-separated list of user UUIDs to resolve. Up to "
-            f"{_MAX_USERNAME_LOOKUPS_PER_REQUEST} per request."
+    ids: Annotated[
+        str,
+        Query(
+            min_length=1,
+            description=(
+                "Comma-separated list of user UUIDs to resolve. Up to "
+                f"{_MAX_USERNAME_LOOKUPS_PER_REQUEST} per request."
+            ),
         ),
-    ),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    ],
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
 ) -> UsernamesLookupResponse:
     """Return ``{uuid: username | null}`` for each requested ID.
 

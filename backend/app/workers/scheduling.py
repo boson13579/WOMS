@@ -32,7 +32,7 @@ import time
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 
 import structlog
 from celery import Task
@@ -74,6 +74,11 @@ from app.services.scheduling import (
     unpin_order,
 )
 from app.workers.celery_app import celery_app
+
+# TypeAliases for repeated ``typing.cast`` targets (S1192). A TypeAlias is a
+# valid cast() target under ``mypy --strict`` (see system.py for precedent).
+_StrOrNone: TypeAlias = "str | None"
+_DictStrAny: TypeAlias = "dict[str, Any]"
 
 logger = structlog.get_logger(__name__)
 
@@ -198,7 +203,7 @@ def _get_reject_rate() -> float:
     the key (manual surgery, future schema change, etc.) — a wild p would
     poison the take-count computation otherwise.
     """
-    raw = cast("str | None", _get_redis().get(COMPOUND_REJECT_RATE_KEY))
+    raw = cast(_StrOrNone, _get_redis().get(COMPOUND_REJECT_RATE_KEY))
     if raw is None:
         return _REJECT_RATE_INITIAL
     try:
@@ -273,7 +278,7 @@ def _get_redis() -> Redis:
 
 def _load_state() -> SchedulerState:
     """Read ``schedule:state`` or initialize a fresh one anchored at today."""
-    raw = cast("str | None", _get_redis().get(STATE_KEY))
+    raw = cast(_StrOrNone, _get_redis().get(STATE_KEY))
     if raw is None:
         return SchedulerState.initial(datetime.now(tz=UTC).date())
     return SchedulerState.from_json(raw)
@@ -304,10 +309,10 @@ def _set_status(
 
 
 def _get_status() -> dict[str, Any] | None:
-    raw = cast("str | None", _get_redis().get(STATUS_KEY))
+    raw = cast(_StrOrNone, _get_redis().get(STATUS_KEY))
     if raw is None:
         return None
-    return cast("dict[str, Any]", json.loads(raw))
+    return cast(_DictStrAny, json.loads(raw))
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +458,7 @@ def _read_pending_compounds(*, limit: int | None = None) -> list[tuple[str, dict
     parsed: list[tuple[str, dict[str, Any]]] = []
     for member, _score in members:
         try:
-            payload = cast("dict[str, Any]", json.loads(member))
+            payload = cast(_DictStrAny, json.loads(member))
         except json.JSONDecodeError:
             # Drain to DLQ + ZREM the malformed entry so it doesn't
             # block batch admission on the next read.
@@ -1012,8 +1017,51 @@ def _finalize_run(state: SchedulerState) -> int:
     return len(scheduled)
 
 
+def _drain_pending_compounds() -> tuple[bool, bool]:
+    """Drain the pending queue via halving-search batch admission.
+
+    Returns ``(any_batch_committed, any_compound_rejected)``. Behaviour is
+    a straight extraction of the former inline drain loop in
+    ``run_scheduling_task`` — see that task's docstring for the full
+    drain-loop contract.
+    """
+    any_batch_committed = False
+    any_compound_rejected = False
+
+    while True:
+        rate = _get_reject_rate()
+        read_cap = _take_count_from_rate(pending_count=10**9, rate=rate)
+        pending = _read_pending_compounds(limit=read_cap)
+        if not pending:
+            break
+
+        state = _load_state()
+        take = _take_count_from_rate(len(pending), rate)
+        candidates = pending[:take]
+
+        k, attempts_tried = _largest_halving_feasible_prefix(state, [c for _, c in candidates])
+        # Halving rounds that failed before the successful one (or all
+        # rounds, if k == 0) feed the EWMA as "this many prefix sizes
+        # were rejected" — so the cap moves up when halving had to
+        # retreat repeatedly, even if some compounds ended up accepted.
+        halving_misses = max(0, attempts_tried - (1 if k > 0 else 0))
+
+        if k == 0:
+            first_member, first_compound = pending[0]
+            _reject_first_compound(first_member, first_compound)
+            _update_reject_rate(accepted=0, rejected=1 + halving_misses)
+            any_compound_rejected = True
+            continue
+
+        _commit_accepted_batch(state, candidates[:k])
+        _update_reject_rate(accepted=k, rejected=halving_misses)
+        any_batch_committed = True
+
+    return any_batch_committed, any_compound_rejected
+
+
 @celery_app.task(bind=True, name="scheduling.run")  # type: ignore[untyped-decorator]
-def run_scheduling_task(self: Task) -> None:  # noqa: PLR0915 — orchestration function: long but linear, extracting helpers hurts readability
+def run_scheduling_task(self: Task) -> None:
     """Drain the pending queue via batch admission, then flip back to idle.
 
     **Phase 4 fast/slow split** still applies: this task is the fast path,
@@ -1080,48 +1128,7 @@ def run_scheduling_task(self: Task) -> None:  # noqa: PLR0915 — orchestration 
     logger.info("schedule.run.start", task_id=task_id)
 
     try:
-        any_batch_committed = False
-        any_compound_rejected = False
-
-        while True:
-            # Reject-rate adaptive cap: only consider the first ``ceil(1/p)``
-            # candidates for halving. With p tracking the per-compound
-            # reject rate, this is the expected position of the next reject,
-            # so prefixes beyond it are unlikely to be feasible anyway —
-            # skipping them avoids paying ``compute_batch_capacity_delta``
-            # on doomed candidates. ``_update_reject_rate`` keeps p current
-            # below, so the cap auto-adapts to the workload. Reading p
-            # BEFORE the pending fetch lets us bound the ZRANGE itself to
-            # ``ceil(1/p)`` entries — saves O(N) bandwidth on long queues.
-            rate = _get_reject_rate()
-            read_cap = _take_count_from_rate(pending_count=10**9, rate=rate)
-            pending = _read_pending_compounds(limit=read_cap)
-            if not pending:
-                break
-
-            state = _load_state()
-            take = _take_count_from_rate(len(pending), rate)
-            candidates = pending[:take]
-
-            k, attempts_tried = _largest_halving_feasible_prefix(state, [c for _, c in candidates])
-            # Halving rounds that failed before the successful one (or all
-            # rounds, if k == 0) feed the EWMA as "this many prefix sizes
-            # were rejected" — so the cap moves up when halving had to
-            # retreat repeatedly, even if some compounds ended up accepted.
-            halving_misses = max(0, attempts_tried - (1 if k > 0 else 0))
-
-            if k == 0:
-                first_member, first_compound = pending[0]
-                _reject_first_compound(first_member, first_compound)
-                # Count the dropped head as one real rejection; halving_misses
-                # are extra hint pressure from the failed probes.
-                _update_reject_rate(accepted=0, rejected=1 + halving_misses)
-                any_compound_rejected = True
-                continue
-
-            _commit_accepted_batch(state, candidates[:k])
-            _update_reject_rate(accepted=k, rejected=halving_misses)
-            any_batch_committed = True
+        any_batch_committed, any_compound_rejected = _drain_pending_compounds()
 
         if any_batch_committed:
             # Dispatch one materializer for the whole drain so DB rows
@@ -1734,7 +1741,7 @@ def rebuild_schedule_task() -> None:
         started_at = datetime.now(tz=UTC).isoformat()
         _set_status(state=_STATUS_RUNNING, started_at=started_at)
         try:
-            raw = cast("str | None", _get_redis().get(STATE_KEY))
+            raw = cast(_StrOrNone, _get_redis().get(STATE_KEY))
             if raw is not None:
                 base_date = SchedulerState.from_json(raw).base_date
             else:
