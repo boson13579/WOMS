@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WOMS 報告簡報</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
+<script>
+  tailwind.config = {
+    theme: { extend: {
+      colors: { brand: { blue:'#0033A0', light:'#0056D6', accent:'#F59E0B', dark:'#1e293b', gray:'#f8fafc' } },
+      fontFamily: { sans:['"Noto Sans TC"','sans-serif'], mono:['"JetBrains Mono"','monospace'] }
+    }}
+  }
+</script>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin:0; overflow:hidden; background:#222;
+  font-family:"Noto Sans TC",sans-serif;
+  display:flex; align-items:center; justify-content:center;
+  width:100vw; height:100vh;
+}
+#stage {
+  width: 1280px;
+  height: 720px;
+  position: relative;
+  background: white;
+  transform-origin: center center;
+  flex-shrink: 0;
+}
+.slide-container {
+  display:none; width:1280px; height:720px; background:white;
+  position:absolute; top:0; left:0; flex-direction:column;
+}
+.slide-container.active { display:flex; animation:fadeIn 0.4s ease-out forwards; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+
+/* ── Shared header ── */
+.slide-header {
+  flex-shrink:0; padding:0.85rem 2.4rem 0.5rem;
+  border-bottom:1px solid #e2e8f0;
+  display:flex; align-items:center; gap:0.75rem;
+}
+.hbar { width:10px; height:2rem; background:#0033A0; border-radius:2px; flex-shrink:0; }
+.htitle { font-size:2rem; font-weight:900; color:#0033A0; line-height:1; }
+.slide-content { flex:1; overflow:hidden; padding:0.7rem 2.4rem 0.5rem; }
+
+.page-number {
+  position:fixed; bottom:1.2rem; right:2.5rem;
+  font-family:"JetBrains Mono",monospace; font-size:0.9rem; color:#94a3b8; z-index:100;
+}
+.nav-dots { position:fixed; bottom:1.4rem; left:50%; transform:translateX(-50%); display:flex; gap:9px; z-index:100; }
+.dot { width:9px; height:9px; border-radius:50%; background:#cbd5e1; cursor:pointer; transition:all .2s; }
+.dot.active { background:#0033A0; transform:scale(1.3); }
+
+/* ══════════ SLIDE 1 ══════════ */
+.s1-wrap { display:flex; flex-direction:column; height:100%; gap:0.4rem; }
+.s1-group { flex:1; display:flex; flex-direction:column; }
+
+.s1-role-bar {
+  background:#0033A0; color:white;
+  padding:0.3rem 1rem;
+  font-size:1rem; line-height:1.35;
+  flex-shrink:0;
+}
+.s1-role-bar .desc { font-size:0.84rem; color:rgba(255,255,255,.85); }
+.s1-role-bar .name { font-weight:700; }
+
+.s1-stories { flex:1; display:flex; flex-direction:column; border:1px solid #e2e8f0; }
+.s1-story {
+  flex:1; display:grid;
+  grid-template-columns:2rem 1fr 1fr;
+  align-items:center;
+  padding:0.3rem 0.8rem;
+  gap:0 0.7rem;
+  border-bottom:1px solid #f1f5f9;
+}
+.s1-story:last-child { border-bottom:none; }
+.s1-story:nth-child(even) { background:#f8fafc; }
+
+.s1-num {
+  background:#0033A0; color:white;
+  border-radius:50%; width:1.55rem; height:1.55rem;
+  display:flex; align-items:center; justify-content:center;
+  font-size:0.78rem; font-weight:700; flex-shrink:0;
+}
+.s1-col { display:flex; flex-direction:column; gap:0.08rem; }
+.s1-lbl { font-size:0.68rem; font-weight:700; color:#0033A0; letter-spacing:.04em; }
+.s1-txt { font-size:0.88rem; color:#1e293b; line-height:1.4; }
+.s1-val { font-size:0.86rem; color:#475569; line-height:1.4; }
+
+/* lighter for 訂單管理專員 */
+.grp-b .s1-role-bar { background:#0056D6; }
+.grp-b .s1-num      { background:#0056D6; }
+.grp-b .s1-lbl      { color:#0056D6; }
+
+.hi { color:#DC2626; font-weight:600; }
+
+/* ══════════ SLIDE 2 ══════════ */
+.s2-grid {
+  display:grid; grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr;
+  gap:0.6rem; height:100%;
+}
+.s2-card { border:1.5px solid #dbeafe; border-radius:6px; overflow:hidden; display:flex; flex-direction:column; background:#EFF6FF; }
+.s2-head {
+  background:#0033A0; color:white;
+  padding:0.35rem 0.9rem; font-size:1rem; font-weight:700;
+  flex-shrink:0;
+}
+.s2-body { padding:0.45rem 0.9rem; flex:1; display:flex; flex-direction:column; gap:0.35rem; }
+.s2-row {}
+.s2-story { font-size:0.88rem; font-weight:700; color:#0056D6; }
+.s2-desc  { font-size:0.84rem; color:#475569; margin-top:0.08rem; }
+.hi2 { color:#DC2626; font-weight:600; }
+
+/* ══════════ SLIDE 3 ══════════ */
+.s3-wrap { display:flex; gap:1.0rem; height:100%; }
+.s3-left { width:59%; flex-shrink:0; display:flex; flex-direction:column; overflow:hidden; }
+.s3-right { flex:1; display:flex; align-items:stretch; justify-content:center; }
+
+/* bullet 區：上方約 33% */
+.s3-bullets { flex:1; display:flex; flex-direction:column; justify-content:space-evenly; }
+.s3-item { display:flex; align-items:flex-start; gap:0.5rem; }
+.s3-num {
+  background:#0033A0; color:white; border-radius:50%;
+  width:1.45rem; height:1.45rem; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center;
+  font-size:0.74rem; font-weight:700; margin-top:0.05rem;
+}
+.s3-txt { font-size:0.85rem; color:#1e293b; line-height:1.5; }
+.s3-title { font-weight:700; color:#0033A0; }
+
+/* 表格區：下方約 67% */
+.s3-tbl-wrap { flex:2; display:flex; flex-direction:column; padding-top:0.3rem; padding-bottom:0.55rem; }
+.s3-tbl-title { flex-shrink:0; font-size:0.84rem; font-weight:700; color:#0033A0; margin-bottom:0.28rem; }
+.s3-tbl { width:100%; border-collapse:collapse; font-size:0.80rem; }
+.s3-tbl th { background:#0033A0; color:white; padding:0.42rem 0.5rem; border:1px solid #2d5298; text-align:center; }
+.s3-tbl td { padding:0.4rem 0.45rem; border:1px solid #94a3b8; text-align:center; background:white; }
+.s3-tbl td:first-child { text-align:left; font-weight:600; background:white; }
+.tok { color:#059669; font-weight:700; }
+.tno { color:#DC2626; font-weight:700; }
+.teye { color:#0056D6; }
+
+.s3-img {
+  width:100%; height:100%; max-height:100%;
+  border:1.5px solid #dbeafe; border-radius:10px; overflow:hidden;
+  box-shadow:0 3px 12px rgba(0,51,160,.08);
+  display:flex; align-items:center; justify-content:center;
+}
+.s3-img img { width:100%; height:100%; object-fit:contain; display:block; }
+
+/* ══════════ SLIDE 4 ══════════ */
+.s4-wrap { display:flex; flex-direction:column; height:100%; gap:0.4rem; }
+.s4-frame {
+  flex:1; border:1px solid #dbeafe; border-radius:8px;
+  overflow:hidden; box-shadow:0 2px 12px rgba(0,51,160,.07);
+  background:#f8fafc;
+  display:flex; align-items:center; justify-content:center;
+  padding:0.6rem 1rem;
+}
+.s4-frame img { max-width:100%; max-height:100%; object-fit:contain; border-radius:4px; }
+</style>
+</head>
+<body>
+
+<!-- ═══════ SLIDE 1 ═══════ -->
+<div id="stage">
+<div class="slide-container active" id="slide-1">
+  <div class="slide-header">
+    <div class="hbar"></div>
+    <div class="htitle">User Story</div>
+  </div>
+  <div class="slide-content">
+    <div class="s1-wrap">
+
+      <!-- 資深廠長 -->
+      <div class="s1-group grp-a">
+        <div class="s1-role-bar">
+          <span class="desc">統籌全局排程、熟悉現場限制、每天面對大量訂單的</span>
+          <span class="name">資深廠長(Scheduler)</span>
+        </div>
+        <div class="s1-stories">
+          <div class="s1-story">
+            <div class="s1-num">1</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">排程大部分交給系統<span class="hi">自動處理</span>，遇到例外時能透過<span class="hi">直觀介面</span>快速<span class="hi">微調</span></div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">把精力留在真正需要人工判斷的地方</div>
+            </div>
+          </div>
+          <div class="s1-story">
+            <div class="s1-num">2</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">針對特定客戶或<span class="hi">特殊情況</span>所做的排程安排，能確保<span class="hi">被系統保留</span></div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">不管系統怎麼重新排程，指定的訂單都會待在原來的位置</div>
+            </div>
+          </div>
+          <div class="s1-story">
+            <div class="s1-num">3</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">能即時查看整體<span class="hi">排程狀態</span>與<span class="hi">剩餘產能</span></div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">訂單有異動時掌握全局，做出正確的調度決策</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 訂單管理專員 -->
+      <div class="s1-group grp-b">
+        <div class="s1-role-bar">
+          <span class="desc">同時追蹤多筆訂單、及時掌握動態、隨時因應客戶臨時變更的</span>
+          <span class="name">訂單管理專員(Order Manager)</span>
+        </div>
+        <div class="s1-stories">
+          <div class="s1-story">
+            <div class="s1-num">4</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt"><span class="hi">即時</span>查看<span class="hi">自己</span>經手訂單目前的狀態（待排程／已排程／生產中／已完成／已取消）</div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">被詢問時能立即回覆，不需要花時間四處確認</div>
+            </div>
+          </div>
+          <div class="s1-story">
+            <div class="s1-num">5</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">清楚知道訂單現在<span class="hi">能不能改</span>，<span class="hi">操作後</span>立即知道有沒有成功</div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">避免在不該動的訂單上誤操作，每次都有明確的回饋</div>
+            </div>
+          </div>
+          <div class="s1-story">
+            <div class="s1-num">6</div>
+            <div class="s1-col">
+              <div class="s1-lbl">需求描述</div>
+              <div class="s1-txt">自己經手的訂單發生狀態<span class="hi">異動</span>時收到<span class="hi">即時通知</span></div>
+            </div>
+            <div class="s1-col">
+              <div class="s1-lbl">使用者價值</div>
+              <div class="s1-val">第一時間掌握情況，不會在不知情下對客戶做出錯誤承諾</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  <div class="page-number">01 / 04</div>
+</div>
+
+
+<!-- ═══════ SLIDE 2 ═══════ -->
+<div class="slide-container" id="slide-2">
+  <div class="slide-header">
+    <div class="hbar"></div>
+    <div class="htitle">主要功能導覽</div>
+  </div>
+  <div class="slide-content">
+    <div class="s2-grid">
+
+      <div class="s2-card">
+        <div class="s2-head">User &amp; 權限控管</div>
+        <div class="s2-body">
+          <div class="s2-row">
+            <div class="s2-story">Story 4（訂單狀態查看）</div>
+            <div class="s2-desc">→ RBAC 控管可見範圍，專員即時看到<span class="hi2">自己</span>經手的訂單的狀態</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="s2-card">
+        <div class="s2-head">Order &amp; Scheduling &amp; 日曆視圖</div>
+        <div class="s2-body">
+          <div class="s2-row">
+            <div class="s2-story">Story 1（自動排程 + 微調）</div>
+            <div class="s2-desc">→ 訂單異動自動觸發排程，視覺化介面支援手動微調</div>
+          </div>
+          <div class="s2-row">
+            <div class="s2-story">Story 2（鎖定機制）</div>
+            <div class="s2-desc">→ 手動調整後的訂單鎖定，不被排程器更動</div>
+          </div>
+          <div class="s2-row">
+            <div class="s2-story">Story 5（可修改判斷）</div>
+            <div class="s2-desc">→ 依訂單狀態決定是否可編輯，操作後 toast 即時回饋</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="s2-card">
+        <div class="s2-head">Notification System</div>
+        <div class="s2-body">
+          <div class="s2-row">
+            <div class="s2-story">Story 6（異動即時通知）</div>
+            <div class="s2-desc">→ 訂單鎖定／狀態變更／取消時推送 in-app 通知</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="s2-card">
+        <div class="s2-head">Dashboard</div>
+        <div class="s2-body">
+          <div class="s2-row">
+            <div class="s2-story">Story 3（排程和產能概覽）</div>
+            <div class="s2-desc">→ 即時顯示產能使用狀況、排程器狀態、訂單數量分布</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  <div class="page-number">02 / 04</div>
+</div>
+
+
+<!-- ═══════ SLIDE 3 ═══════ -->
+<div class="slide-container" id="slide-3">
+  <div class="slide-header">
+    <div class="hbar"></div>
+    <div class="htitle">使用者認證與權限管理</div>
+  </div>
+  <div class="slide-content">
+    <div class="s3-wrap">
+      <div class="s3-left">
+
+        <div class="s3-bullets">
+          <div class="s3-item">
+            <div class="s3-num">1</div>
+            <div class="s3-txt"><span class="s3-title">註冊 / 修改權限介面 — </span>提供使用者註冊與帳號管理功能</div>
+          </div>
+          <div class="s3-item">
+            <div class="s3-num">2</div>
+            <div class="s3-txt"><span class="s3-title">JWT — </span>無狀態驗證，token 存放於 httpOnly cookie，防止前端 script 存取</div>
+          </div>
+          <div class="s3-item">
+            <div class="s3-num">3</div>
+            <div class="s3-txt"><span class="s3-title">RBAC — </span>不同角色對應不同操作權限（見下方表格）</div>
+          </div>
+        </div>
+
+        <div class="s3-tbl-wrap">
+          <div class="s3-tbl-title">RBAC 權限對應表</div>
+          <table class="s3-tbl">
+            <thead>
+              <tr><th>操作</th><th>root</th><th>scheduler</th><th>order_manager</th><th>viewer</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>查看訂單</td>
+                <td class="tok">v</td><td class="tok">v</td><td class="tok">v</td><td class="tok">v</td>
+              </tr>
+              <tr>
+                <td>訂單操作</td>
+                <td class="tok">所有</td><td class="tok">所有</td>
+                <td class="tok" style="font-size:.7rem">自己（可取消，不可刪除）</td>
+                <td class="tno">x</td>
+              </tr>
+              <tr>
+                <td>Dashboard</td>
+                <td class="tok">v</td><td class="tok">v</td><td class="tok">v</td><td class="tno">x</td>
+              </tr>
+              <tr>
+                <td>主動觸發排程</td>
+                <td class="tok">v</td><td class="tok">v</td><td class="tno">x</td><td class="tno">x</td>
+              </tr>
+              <tr>
+                <td>日曆視圖</td>
+                <td class="tok">可編輯</td><td class="tok">可編輯</td>
+                <td class="teye">閱覽</td><td class="teye">閱覽</td>
+              </tr>
+              <tr>
+                <td>User CRUD</td>
+                <td class="tok">v</td><td class="tno">x</td><td class="tno">x</td><td class="tno">x</td>
+              </tr>
+              <tr>
+                <td>Observability</td>
+                <td class="tok">v</td><td class="tno">x</td><td class="tno">x</td><td class="tno">x</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+      <div class="s3-right">
+        <div class="s3-img">
+          <img src="min1.png" alt="Login Page">
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="page-number">03 / 04</div>
+</div>
+
+
+<!-- ═══════ SLIDE 4 ═══════ -->
+<div class="slide-container" id="slide-4">
+  <div class="slide-header">
+    <div class="hbar"></div>
+    <div class="htitle">User Management 介面</div>
+  </div>
+  <div class="slide-content">
+    <div class="s4-wrap">
+      <div class="s4-frame">
+        <img src="min2.png" alt="User Management">
+      </div>
+    </div>
+  </div>
+  <div class="page-number">04 / 04</div>
+</div>
+
+
+<!-- Nav dots -->
+</div>
+
+<div class="nav-dots">
+  <div class="dot active" onclick="goToSlide(1)"></div>
+  <div class="dot" onclick="goToSlide(2)"></div>
+  <div class="dot" onclick="goToSlide(3)"></div>
+  <div class="dot" onclick="goToSlide(4)"></div>
+</div>
+
+<script>
+let cur = 1;
+function goToSlide(n) {
+  if (n === cur) return;
+  document.getElementById("slide-"+cur).classList.remove("active");
+  document.getElementById("slide-"+n).classList.add("active");
+  document.querySelectorAll(".dot").forEach((d,i) => d.classList.toggle("active", i===n-1));
+  cur = n;
+}
+document.addEventListener("keydown", e => {
+  if (["ArrowRight","Space","PageDown"].includes(e.key)) { e.preventDefault(); goToSlide(Math.min(cur+1,4)); }
+  else if (["ArrowLeft","PageUp"].includes(e.key))       { e.preventDefault(); goToSlide(Math.max(cur-1,1)); }
+});
+function scaleStage() {
+  const stage = document.getElementById("stage");
+  const scale = Math.min(window.innerWidth / 1280, window.innerHeight / 720);
+  stage.style.transform = "scale(" + scale + ")";
+}
+scaleStage();
+window.addEventListener("resize", scaleStage);
+</script>
+</body>
+</html>
