@@ -24,6 +24,7 @@ env/
 .coverage*
 coverage.xml
 htmlcov/
+backend/test-results/
 .tox/
 .nox/
 dist/

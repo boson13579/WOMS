@@ -21,6 +21,9 @@ jobs:
     name: playwright e2e
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      checks: write
+      contents: read
 
     env:
       E2E_ADMIN_USERNAME: admin
@@ -132,6 +135,15 @@ jobs:
       - name: Run Playwright E2E
         working-directory: frontend
         run: pnpm test:e2e
+
+      - name: E2E Test Report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: E2E Test Results
+          path: frontend/test-results/junit.xml
+          reporter: java-junit
+          fail-on-error: false
 
       - name: Upload Playwright report
         uses: actions/upload-artifact@v4

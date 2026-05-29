@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>測試策略報告 - Smart Order</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            blue: '#0033A0',
+                            light: '#0056D6',
+                            accent: '#F59E0B',
+                            dark: '#1e293b',
+                            gray: '#f8fafc'
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['"Noto Sans TC"', 'sans-serif'],
+                        mono: ['"JetBrains Mono"', 'monospace']
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #333; color: #1e293b; }
+        .slide-container {
+            display: none;
+            width: 100vw;
+            height: 100vh;
+            background-color: white;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        .slide-container.active {
+            display: flex;
+            flex-direction: column;
+            animation: fadeIn 0.4s ease-out forwards;
+        }
+        .slide-content {
+            flex-grow: 1;
+            padding: 4rem 6rem;
+            display: flex;
+            flex-direction: column;
+            max-width: 1600px;
+            margin: 0 auto;
+            width: 100%;
+        }
+        .slide-title {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #0033A0;
+            border-left: 8px solid #0033A0;
+            padding-left: 1rem;
+            margin-bottom: 2rem;
+            line-height: 1.2;
+        }
+        .page-number {
+            position: absolute;
+            bottom: 2rem;
+            right: 3rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.25rem;
+            color: #94a3b8;
+            font-weight: 700;
+        }
+        .nav-dots {
+            position: absolute;
+            bottom: 2.5rem;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 0.75rem;
+            z-index: 10;
+        }
+        .dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background-color: #cbd5e1;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .dot.active { background-color: #0033A0; transform: scale(1.2); }
+        .tech-font { font-family: 'JetBrains Mono', monospace; }
+        .highlight-box {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 0.5rem;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+        }
+        .layer-card {
+            border-left: 8px solid #0033A0;
+            background: #fff;
+            border-radius: 0.5rem;
+            box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body>
+    <div class="slide-container active" id="slide-1">
+        <div class="slide-content">
+            <h2 class="slide-title">測試策略：三層防線</h2>
+            <div class="grid grid-cols-[1.15fr_0.85fr] gap-10 flex-grow items-center">
+                <div class="space-y-5">
+                    <div class="layer-card p-6">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <h3 class="text-2xl font-black text-brand-blue tech-font">Frontend Tests</h3>
+                                <p class="text-lg text-gray-500 font-bold mt-1">Component / Form / UI State</p>
+                            </div>
+                            <i class="fas fa-window-restore text-4xl text-brand-accent"></i>
+                        </div>
+                        <p class="text-xl text-gray-700 mt-4">表單驗證、modal、欄位狀態、錯誤訊息</p>
+                        <p class="text-lg text-gray-500 mt-2">快速回饋畫面邏輯錯誤，不啟動完整系統。</p>
+                    </div>
+                    <div class="layer-card p-6">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <h3 class="text-2xl font-black text-brand-blue tech-font">Backend Tests</h3>
+                                <p class="text-lg text-gray-500 font-bold mt-1">API / Service / Worker</p>
+                            </div>
+                            <i class="fas fa-server text-4xl text-brand-accent"></i>
+                        </div>
+                        <p class="text-xl text-gray-700 mt-4">權限、商業規則、排程任務、concurrency</p>
+                        <p class="text-lg text-gray-500 mt-2">使用真實 Postgres + Redis 覆蓋鎖與佇列行為。</p>
+                    </div>
+                    <div class="layer-card p-6">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <h3 class="text-2xl font-black text-brand-blue tech-font">E2E Tests</h3>
+                                <p class="text-lg text-gray-500 font-bold mt-1">Playwright</p>
+                            </div>
+                            <i class="fas fa-route text-4xl text-brand-accent"></i>
+                        </div>
+                        <p class="text-xl text-gray-700 mt-4">登入 / 訂單 / RBAC / 日曆 / 通知 / Audit Log</p>
+                        <p class="text-lg text-gray-500 mt-2">前後端都穩定後，再驗證完整使用者流程。</p>
+                    </div>
+                </div>
+                <div class="flex flex-col gap-6 min-h-0 justify-center">
+                    <div class="highlight-box bg-blue-50/60 border-brand-blue">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <p class="tech-font text-brand-blue text-xl font-black tracking-wide">LINE COVERAGE</p>
+                                <p class="text-gray-500 text-lg font-bold mt-2">Backend tests</p>
+                            </div>
+                            <i class="fas fa-chart-line text-4xl text-brand-blue"></i>
+                        </div>
+                        <div class="tech-font text-7xl font-black text-brand-blue mt-8">93.63%</div>
+                        <div class="text-2xl font-bold text-gray-600 mt-5">3585 / 3829 lines</div>
+                    </div>
+                    <div class="highlight-box bg-amber-50 border-amber-200">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <p class="tech-font text-brand-accent text-xl font-black tracking-wide">BRANCH COVERAGE</p>
+                                <p class="text-gray-500 text-lg font-bold mt-2">Decision paths</p>
+                            </div>
+                            <i class="fas fa-code-branch text-4xl text-brand-accent"></i>
+                        </div>
+                        <div class="tech-font text-7xl font-black text-brand-accent mt-8">87.27%</div>
+                        <div class="text-2xl font-bold text-gray-600 mt-5">665 / 762 branches</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">1 / 2</div>
+    </div>
+
+    <div class="slide-container" id="slide-2">
+        <div class="slide-content">
+            <h2 class="slide-title">排程正確性：比 Coverage 更有說服力</h2>
+            <div class="grid grid-cols-[0.95fr_1.05fr] gap-10 flex-grow items-center">
+                <div class="highlight-box bg-amber-50 border-amber-200">
+                    <div class="text-center border-b border-amber-200 pb-6 mb-6">
+                        <p class="tech-font text-brand-accent font-black text-xl">Scheduling Correctness Highlight</p>
+                        <h3 class="text-5xl font-black text-brand-dark mt-4">Batch apply</h3>
+                        <p class="text-4xl font-black text-brand-blue my-3">==</p>
+                        <h3 class="text-5xl font-black text-brand-dark">Per-op apply</h3>
+                    </div>
+                    <p class="text-xl text-gray-700 text-center font-bold">證明批次優化沒有破壞演算法正確性。</p>
+                </div>
+                <div class="space-y-5">
+                    <div class="bg-white border-l-8 border-brand-blue rounded-lg p-6 shadow-sm flex items-start gap-5">
+                        <span class="tech-font text-brand-blue bg-blue-100 font-black px-3 py-2 rounded">01</span>
+                        <div>
+                            <h3 class="text-2xl font-black text-brand-dark">同一批 operation</h3>
+                            <p class="text-lg text-gray-600 mt-2">準備相同輸入，避免測試只驗證單一路徑。</p>
+                        </div>
+                    </div>
+                    <div class="bg-white border-l-8 border-brand-blue rounded-lg p-6 shadow-sm flex items-start gap-5">
+                        <span class="tech-font text-brand-blue bg-blue-100 font-black px-3 py-2 rounded">02</span>
+                        <div>
+                            <h3 class="text-2xl font-black text-brand-dark">分別跑 batch 與 per-op 路徑</h3>
+                            <p class="text-lg text-gray-600 mt-2">一邊是效能優化，一邊是逐筆處理基準。</p>
+                        </div>
+                    </div>
+                    <div class="bg-white border-l-8 border-brand-blue rounded-lg p-6 shadow-sm flex items-start gap-5">
+                        <span class="tech-font text-brand-blue bg-blue-100 font-black px-3 py-2 rounded">03</span>
+                        <div>
+                            <h3 class="text-2xl font-black text-brand-dark">比對最後排程狀態完全一致</h3>
+                            <p class="text-lg text-gray-600 mt-2">不是只看有沒有跑完，而是確認結果沒有被優化改壞。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="page-number">2 / 2</div>
+    </div>
+
+    <div class="nav-dots" id="nav-dots"></div>
+
+    <script>
+        const slides = document.querySelectorAll('.slide-container');
+        const dotsContainer = document.getElementById('nav-dots');
+        let currentSlide = 0;
+
+        slides.forEach((_, index) => {
+            const dot = document.createElement('div');
+            dot.classList.add('dot');
+            if (index === 0) dot.classList.add('active');
+            dot.addEventListener('click', () => goToSlide(index));
+            dotsContainer.appendChild(dot);
+        });
+
+        const dots = document.querySelectorAll('.dot');
+
+        function goToSlide(n) {
+            slides[currentSlide].classList.remove('active');
+            dots[currentSlide].classList.remove('active');
+            currentSlide = (n + slides.length) % slides.length;
+            slides[currentSlide].classList.add('active');
+            dots[currentSlide].classList.add('active');
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'Space' || e.key === 'PageDown') {
+                goToSlide(currentSlide + 1);
+            } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+                goToSlide(currentSlide - 1);
+            }
+        });
+    </script>
+</body>
+</html>
