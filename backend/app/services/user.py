@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import NoReturn
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +24,8 @@ from app.schemas.user import (
 )
 
 _LAST_ROOT_MSG = "Cannot demote/deactivate the last active root user."
+_USER_NOT_FOUND_MSG = "User not found."
+_USER_STALE_VERSION_MSG = "User was modified by another request. Refresh and try again."
 
 
 def _guard_last_root(
@@ -67,8 +70,51 @@ def get_user(db: Session, user_id: uuid.UUID) -> UserResponse:
     """Return a single user by id; raise 404 if not found."""
     user = user_repo.get_by_id(db, user_id)
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_USER_NOT_FOUND_MSG)
     return UserResponse.model_validate(user)
+
+
+def _check_self_username_conflict(db: Session, current_user: User, username: str | None) -> None:
+    if username is None:
+        return
+    existing = user_repo.get_by_username(db, username)
+    if existing is not None and existing.id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{username}' is already taken.",
+        )
+
+
+def _check_self_email_conflict(db: Session, current_user: User, email: str | None) -> None:
+    if email is None:
+        return
+    existing_email = user_repo.get_by_email(db, email)
+    if existing_email is not None and existing_email.id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Email '{email}' is already in use.",
+        )
+
+
+def _raise_unique_conflict(
+    exc: IntegrityError, *, email: str | None, username: str | None
+) -> NoReturn:
+    """Translate an IntegrityError into a 409 with the right message."""
+    orig = str(exc.orig).lower()
+    if "ix_users_email" in orig or "users_email" in orig:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Email '{email or '<unknown>'}' is already in use.",
+        ) from exc
+    if "ix_users_username" in orig or "users_username" in orig:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{username or '<unknown>'}' is already taken.",
+        ) from exc
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Conflict: username or email already taken.",
+    ) from exc
 
 
 def update_self(
@@ -80,16 +126,10 @@ def update_self(
     if current_user.version_id != request.version_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="User was modified by another request. Refresh and try again.",
+            detail=_USER_STALE_VERSION_MSG,
         )
 
-    if request.username is not None:
-        existing = user_repo.get_by_username(db, request.username)
-        if existing is not None and existing.id != current_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Username '{request.username}' is already taken.",
-            )
+    _check_self_username_conflict(db, current_user, request.username)
 
     if "email" in request.model_fields_set and request.email is None:
         raise HTTPException(
@@ -97,13 +137,7 @@ def update_self(
             detail="email cannot be set to null; omit the field to leave it unchanged.",
         )
 
-    if request.email is not None:
-        existing_email = user_repo.get_by_email(db, request.email)
-        if existing_email is not None and existing_email.id != current_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Email '{request.email}' is already in use.",
-            )
+    _check_self_email_conflict(db, current_user, request.email)
 
     old_val = {"username": current_user.username, "email": current_user.email}
     new_val: dict[str, object] = {}
@@ -131,27 +165,54 @@ def update_self(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="User was modified by another request. Refresh and try again.",
+            detail=_USER_STALE_VERSION_MSG,
         ) from exc
     except IntegrityError as exc:
         db.rollback()
-        orig = str(exc.orig).lower()
-        if "ix_users_email" in orig or "users_email" in orig:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Email '{request.email or '<unknown>'}' is already in use.",
-            ) from exc
-        if "ix_users_username" in orig or "users_username" in orig:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Username '{request.username or '<unknown>'}' is already taken.",
-            ) from exc
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Conflict: username or email already taken.",
-        ) from exc
+        _raise_unique_conflict(exc, email=request.email, username=request.username)
 
     return UserResponse.model_validate(current_user)
+
+
+def _check_user_username_conflict(db: Session, user: User, username: str | None) -> None:
+    if username is None:
+        return
+    existing = user_repo.get_by_username(db, username)
+    if existing is not None and existing.id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{username}' is already taken.",
+        )
+
+
+def _check_user_email_conflict(db: Session, user: User, email: str | None) -> None:
+    if email is None:
+        return
+    existing_email = user_repo.get_by_email(db, email)
+    if existing_email is not None and existing_email.id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Email '{email}' is already in use.",
+        )
+
+
+def _validate_update_user_request(db: Session, user: User, request: UserUpdateRequest) -> None:
+    """Pre-write validation for ``update_user``: version, email-null, conflicts, last-root."""
+    if user.version_id != request.version_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_USER_STALE_VERSION_MSG,
+        )
+
+    if "email" in request.model_fields_set and request.email is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="email cannot be set to null; omit the field to leave it unchanged.",
+        )
+
+    _check_user_username_conflict(db, user, request.username)
+    _check_user_email_conflict(db, user, request.email)
+    _guard_last_root(db, user, request.role, request.is_active)
 
 
 def update_user(
@@ -163,37 +224,9 @@ def update_user(
     """Apply partial updates to a user; enforce optimistic lock and last-root protection."""
     user = user_repo.get_by_id(db, user_id)
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_USER_NOT_FOUND_MSG)
 
-    if user.version_id != request.version_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User was modified by another request. Refresh and try again.",
-        )
-
-    if "email" in request.model_fields_set and request.email is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="email cannot be set to null; omit the field to leave it unchanged.",
-        )
-
-    if request.username is not None:
-        existing = user_repo.get_by_username(db, request.username)
-        if existing is not None and existing.id != user.id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Username '{request.username}' is already taken.",
-            )
-
-    if request.email is not None:
-        existing_email = user_repo.get_by_email(db, request.email)
-        if existing_email is not None and existing_email.id != user.id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Email '{request.email}' is already in use.",
-            )
-
-    _guard_last_root(db, user, request.role, request.is_active)
+    _validate_update_user_request(db, user, request)
 
     old_val = {
         "username": user.username,
@@ -233,25 +266,11 @@ def update_user(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="User was modified by another request. Refresh and try again.",
+            detail=_USER_STALE_VERSION_MSG,
         ) from exc
     except IntegrityError as exc:
         db.rollback()
-        orig = str(exc.orig).lower()
-        if "ix_users_email" in orig or "users_email" in orig:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Email '{request.email or '<unknown>'}' is already in use.",
-            ) from exc
-        if "ix_users_username" in orig or "users_username" in orig:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Username '{request.username or '<unknown>'}' is already taken.",
-            ) from exc
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Conflict: username or email already taken.",
-        ) from exc
+        _raise_unique_conflict(exc, email=request.email, username=request.username)
 
     return UserResponse.model_validate(user)
 
@@ -260,7 +279,7 @@ def deactivate_user(db: Session, user_id: uuid.UUID, actor: User) -> UserRespons
     """Set is_active=False (soft-deactivate); idempotent if already inactive."""
     user = user_repo.get_by_id(db, user_id)
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_USER_NOT_FOUND_MSG)
 
     if not user.is_active:
         return UserResponse.model_validate(user)
@@ -312,7 +331,7 @@ def get_user_audit_log(
     """
     user = user_repo.get_by_id(db, user_id)
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_USER_NOT_FOUND_MSG)
 
     logs = audit_log_repo.get_by_resource_id(
         db,

@@ -1012,8 +1012,51 @@ def _finalize_run(state: SchedulerState) -> int:
     return len(scheduled)
 
 
+def _drain_pending_compounds() -> tuple[bool, bool]:
+    """Drain the pending queue via halving-search batch admission.
+
+    Returns ``(any_batch_committed, any_compound_rejected)``. Behaviour is
+    a straight extraction of the former inline drain loop in
+    ``run_scheduling_task`` — see that task's docstring for the full
+    drain-loop contract.
+    """
+    any_batch_committed = False
+    any_compound_rejected = False
+
+    while True:
+        rate = _get_reject_rate()
+        read_cap = _take_count_from_rate(pending_count=10**9, rate=rate)
+        pending = _read_pending_compounds(limit=read_cap)
+        if not pending:
+            break
+
+        state = _load_state()
+        take = _take_count_from_rate(len(pending), rate)
+        candidates = pending[:take]
+
+        k, attempts_tried = _largest_halving_feasible_prefix(state, [c for _, c in candidates])
+        # Halving rounds that failed before the successful one (or all
+        # rounds, if k == 0) feed the EWMA as "this many prefix sizes
+        # were rejected" — so the cap moves up when halving had to
+        # retreat repeatedly, even if some compounds ended up accepted.
+        halving_misses = max(0, attempts_tried - (1 if k > 0 else 0))
+
+        if k == 0:
+            first_member, first_compound = pending[0]
+            _reject_first_compound(first_member, first_compound)
+            _update_reject_rate(accepted=0, rejected=1 + halving_misses)
+            any_compound_rejected = True
+            continue
+
+        _commit_accepted_batch(state, candidates[:k])
+        _update_reject_rate(accepted=k, rejected=halving_misses)
+        any_batch_committed = True
+
+    return any_batch_committed, any_compound_rejected
+
+
 @celery_app.task(bind=True, name="scheduling.run")  # type: ignore[untyped-decorator]
-def run_scheduling_task(self: Task) -> None:  # noqa: PLR0915 — orchestration function: long but linear, extracting helpers hurts readability
+def run_scheduling_task(self: Task) -> None:
     """Drain the pending queue via batch admission, then flip back to idle.
 
     **Phase 4 fast/slow split** still applies: this task is the fast path,
@@ -1080,48 +1123,7 @@ def run_scheduling_task(self: Task) -> None:  # noqa: PLR0915 — orchestration 
     logger.info("schedule.run.start", task_id=task_id)
 
     try:
-        any_batch_committed = False
-        any_compound_rejected = False
-
-        while True:
-            # Reject-rate adaptive cap: only consider the first ``ceil(1/p)``
-            # candidates for halving. With p tracking the per-compound
-            # reject rate, this is the expected position of the next reject,
-            # so prefixes beyond it are unlikely to be feasible anyway —
-            # skipping them avoids paying ``compute_batch_capacity_delta``
-            # on doomed candidates. ``_update_reject_rate`` keeps p current
-            # below, so the cap auto-adapts to the workload. Reading p
-            # BEFORE the pending fetch lets us bound the ZRANGE itself to
-            # ``ceil(1/p)`` entries — saves O(N) bandwidth on long queues.
-            rate = _get_reject_rate()
-            read_cap = _take_count_from_rate(pending_count=10**9, rate=rate)
-            pending = _read_pending_compounds(limit=read_cap)
-            if not pending:
-                break
-
-            state = _load_state()
-            take = _take_count_from_rate(len(pending), rate)
-            candidates = pending[:take]
-
-            k, attempts_tried = _largest_halving_feasible_prefix(state, [c for _, c in candidates])
-            # Halving rounds that failed before the successful one (or all
-            # rounds, if k == 0) feed the EWMA as "this many prefix sizes
-            # were rejected" — so the cap moves up when halving had to
-            # retreat repeatedly, even if some compounds ended up accepted.
-            halving_misses = max(0, attempts_tried - (1 if k > 0 else 0))
-
-            if k == 0:
-                first_member, first_compound = pending[0]
-                _reject_first_compound(first_member, first_compound)
-                # Count the dropped head as one real rejection; halving_misses
-                # are extra hint pressure from the failed probes.
-                _update_reject_rate(accepted=0, rejected=1 + halving_misses)
-                any_compound_rejected = True
-                continue
-
-            _commit_accepted_batch(state, candidates[:k])
-            _update_reject_rate(accepted=k, rejected=halving_misses)
-            any_batch_committed = True
+        any_batch_committed, any_compound_rejected = _drain_pending_compounds()
 
         if any_batch_committed:
             # Dispatch one materializer for the whole drain so DB rows
