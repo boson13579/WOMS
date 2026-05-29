@@ -213,9 +213,6 @@ function ActorCombobox({
           aria-expanded={isOpen}
           aria-controls={listboxId}
           aria-autocomplete="list"
-          aria-activedescendant={
-            isOpen && matches.length > 0 ? `${listboxId}-opt-${matches[highlight].id}` : undefined
-          }
           aria-label="Actor filter"
           className={value ? 'pr-9' : undefined}
         />
@@ -247,7 +244,6 @@ function ActorCombobox({
               return (
                 <li
                   key={user.id}
-                  id={`${listboxId}-opt-${user.id}`}
                   role="option"
                   aria-selected={isSelected}
                   data-testid={`actor-option-${user.username}`}
