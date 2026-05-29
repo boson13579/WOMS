@@ -191,31 +191,59 @@ def perform_compound_db_action(
                     user_id=str(_created_by),
                     exc_info=True,
                 )
-        _is_rejected_pin_update = (
-            kind == "update"
-            and not accepted
-            and bool(db_action_raw.get("new_pinned_production_date_set"))
+        _notify_rejected_pin_update(
+            db,
+            accepted=accepted,
+            kind=kind,
+            order_id=_oid,
+            order_number=_order_number,
+            created_by=_created_by,
+            db_action_raw=db_action_raw,
         )
-        if _is_rejected_pin_update:
-            try:
-                target_date = db_action_raw.get("new_pinned_production_date")
-                detail = f"目標日期 {target_date}" if target_date else "解除固定"
-                notification_service.create_notification(
-                    db,
-                    user_id=_created_by,
-                    order_id=_oid,
-                    type="order_schedule_rejected",
-                    message=f"訂單 {_order_number} 排程調整失敗, {detail} 未套用.",
-                )
-            except Exception:
-                logger.warning(
-                    "notification.create_failed",
-                    order_id=str(_oid),
-                    user_id=str(_created_by),
-                    exc_info=True,
-                )
     finally:
         db.close()
+
+
+def _notify_rejected_pin_update(
+    db: Session,
+    *,
+    accepted: bool,
+    kind: str,
+    order_id: uuid.UUID,
+    order_number: str,
+    created_by: uuid.UUID,
+    db_action_raw: dict[str, Any],
+) -> None:
+    """Notify the order creator that a rejected compound left a pin change unapplied.
+
+    No-op unless this is a rejected *update* that targeted the pinned production
+    date. Best-effort: notification failures are logged, never raised, so they
+    cannot break the already-committed decision.
+    """
+    is_rejected_pin_update = (
+        kind == "update"
+        and not accepted
+        and bool(db_action_raw.get("new_pinned_production_date_set"))
+    )
+    if not is_rejected_pin_update:
+        return
+    try:
+        target_date = db_action_raw.get("new_pinned_production_date")
+        detail = f"目標日期 {target_date}" if target_date else "解除固定"
+        notification_service.create_notification(
+            db,
+            user_id=created_by,
+            order_id=order_id,
+            type="order_schedule_rejected",
+            message=f"訂單 {order_number} 排程調整失敗, {detail} 未套用.",
+        )
+    except Exception:
+        logger.warning(
+            "notification.create_failed",
+            order_id=str(order_id),
+            user_id=str(created_by),
+            exc_info=True,
+        )
 
 
 def _accept_create(order: Order) -> None:
@@ -351,6 +379,36 @@ def _apply_db_action_accept(
         _accept_cancel(db, order, db_action, actor_id)
 
 
+def _restore_order_fields_on_reject(order: Order, db_action: dict[str, Any]) -> None:
+    """Roll an order's mutable fields back to their pre-update snapshot.
+
+    Used when a compound *update* is rejected: each ``old_*`` value captured in
+    ``db_action`` is restored only if the corresponding field was actually part
+    of the rejected change. Field-presence keys (``new_*_set``) gate the restore
+    so untouched fields are left alone.
+    """
+    if "old_wafer_quantity" in db_action and db_action.get("old_wafer_quantity") is not None:
+        order.wafer_quantity = int(db_action["old_wafer_quantity"])
+    if (
+        "old_requested_delivery_date" in db_action
+        and db_action.get("old_requested_delivery_date") is not None
+    ):
+        order.requested_delivery_date = date.fromisoformat(
+            str(db_action["old_requested_delivery_date"])
+        )
+    if db_action.get("new_notes_set"):
+        order.notes = db_action.get("old_notes")
+    if db_action.get("new_assigned_to_set"):
+        raw_assignee = db_action.get("old_assigned_to")
+        order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
+    if db_action.get("new_pinned_production_date_set"):
+        raw_old_pin_day = db_action.get("old_pinned_production_date")
+        order.is_pinned = bool(db_action.get("old_is_pinned"))
+        order.pinned_production_date = (
+            date.fromisoformat(str(raw_old_pin_day)) if raw_old_pin_day else None
+        )
+
+
 def _apply_db_action_reject(
     db: Session,
     order: Order,
@@ -441,26 +499,7 @@ def _apply_db_action_reject(
     if order.status == OrderStatus.cancelled or order.is_deleted:
         return
     if kind == "update":
-        if "old_wafer_quantity" in db_action and db_action.get("old_wafer_quantity") is not None:
-            order.wafer_quantity = int(db_action["old_wafer_quantity"])
-        if (
-            "old_requested_delivery_date" in db_action
-            and db_action.get("old_requested_delivery_date") is not None
-        ):
-            order.requested_delivery_date = date.fromisoformat(
-                str(db_action["old_requested_delivery_date"])
-            )
-        if db_action.get("new_notes_set"):
-            order.notes = db_action.get("old_notes")
-        if db_action.get("new_assigned_to_set"):
-            raw_assignee = db_action.get("old_assigned_to")
-            order.assigned_to = uuid.UUID(raw_assignee) if raw_assignee else None
-        if db_action.get("new_pinned_production_date_set"):
-            raw_old_pin_day = db_action.get("old_pinned_production_date")
-            order.is_pinned = bool(db_action.get("old_is_pinned"))
-            order.pinned_production_date = (
-                date.fromisoformat(str(raw_old_pin_day)) if raw_old_pin_day else None
-            )
+        _restore_order_fields_on_reject(order, db_action)
     if order.scheduled_production_date is not None:
         order.status = OrderStatus.scheduled
     else:
