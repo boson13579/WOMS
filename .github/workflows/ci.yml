@@ -89,6 +89,11 @@ jobs:
         # invisible — pytest never prints them by default.
         run: uv run pytest --durations=20
 
+      - name: Coverage Summary
+        run: |
+          echo "## Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+          uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+
       - name: Backend Test Report
         uses: dorny/test-reporter@v1
         if: always()
