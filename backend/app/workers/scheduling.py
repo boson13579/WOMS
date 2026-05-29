@@ -32,7 +32,7 @@ import time
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 
 import structlog
 from celery import Task
@@ -74,6 +74,11 @@ from app.services.scheduling import (
     unpin_order,
 )
 from app.workers.celery_app import celery_app
+
+# TypeAliases for repeated ``typing.cast`` targets (S1192). A TypeAlias is a
+# valid cast() target under ``mypy --strict`` (see system.py for precedent).
+_StrOrNone: TypeAlias = "str | None"
+_DictStrAny: TypeAlias = "dict[str, Any]"
 
 logger = structlog.get_logger(__name__)
 
@@ -198,7 +203,7 @@ def _get_reject_rate() -> float:
     the key (manual surgery, future schema change, etc.) — a wild p would
     poison the take-count computation otherwise.
     """
-    raw = cast("str | None", _get_redis().get(COMPOUND_REJECT_RATE_KEY))
+    raw = cast(_StrOrNone, _get_redis().get(COMPOUND_REJECT_RATE_KEY))
     if raw is None:
         return _REJECT_RATE_INITIAL
     try:
@@ -273,7 +278,7 @@ def _get_redis() -> Redis:
 
 def _load_state() -> SchedulerState:
     """Read ``schedule:state`` or initialize a fresh one anchored at today."""
-    raw = cast("str | None", _get_redis().get(STATE_KEY))
+    raw = cast(_StrOrNone, _get_redis().get(STATE_KEY))
     if raw is None:
         return SchedulerState.initial(datetime.now(tz=UTC).date())
     return SchedulerState.from_json(raw)
@@ -304,10 +309,10 @@ def _set_status(
 
 
 def _get_status() -> dict[str, Any] | None:
-    raw = cast("str | None", _get_redis().get(STATUS_KEY))
+    raw = cast(_StrOrNone, _get_redis().get(STATUS_KEY))
     if raw is None:
         return None
-    return cast("dict[str, Any]", json.loads(raw))
+    return cast(_DictStrAny, json.loads(raw))
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +458,7 @@ def _read_pending_compounds(*, limit: int | None = None) -> list[tuple[str, dict
     parsed: list[tuple[str, dict[str, Any]]] = []
     for member, _score in members:
         try:
-            payload = cast("dict[str, Any]", json.loads(member))
+            payload = cast(_DictStrAny, json.loads(member))
         except json.JSONDecodeError:
             # Drain to DLQ + ZREM the malformed entry so it doesn't
             # block batch admission on the next read.
@@ -1736,7 +1741,7 @@ def rebuild_schedule_task() -> None:
         started_at = datetime.now(tz=UTC).isoformat()
         _set_status(state=_STATUS_RUNNING, started_at=started_at)
         try:
-            raw = cast("str | None", _get_redis().get(STATE_KEY))
+            raw = cast(_StrOrNone, _get_redis().get(STATE_KEY))
             if raw is not None:
                 base_date = SchedulerState.from_json(raw).base_date
             else:
