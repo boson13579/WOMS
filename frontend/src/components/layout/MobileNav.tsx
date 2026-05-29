@@ -89,6 +89,7 @@ export function MobileNav(): JSX.Element | null {
     drawer.addEventListener('keydown', onKey);
     return () => {
       drawer.removeEventListener('keydown', onKey);
+      restoreFocus();
     };
   }, [open]);
 
