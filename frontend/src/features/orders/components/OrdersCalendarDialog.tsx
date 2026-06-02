@@ -344,11 +344,6 @@ function dragOrdersFromEvent(event: DragEvent): DraggableOrder[] {
   }
 }
 
-function capacityShortfallMessage(orders: DraggableOrder[], targetDate: string): string {
-  const quantity = orders.reduce((total, order) => total + order.wafer_quantity, 0);
-  return `目標日期 ${targetDate} 產能不足，需要 ${quantity.toLocaleString()} 片晶圓。`;
-}
-
 function renderUnscheduledBody({
   isPending,
   isError,
@@ -720,15 +715,6 @@ export function OrdersCalendarDialog({
         return;
       }
 
-      const capacity = dailyCapacityByDate.get(targetDate);
-      const requestedQuantity = orders.reduce((total, order) => total + order.wafer_quantity, 0);
-      if (capacity && requestedQuantity > capacity.remaining) {
-        const message = capacityShortfallMessage(orders, targetDate);
-        setOperationError(message);
-        toast.error('目標日期產能不足', { description: message });
-        return;
-      }
-
       setSelectedDate(targetDate);
       setOperationError(null);
       setPendingMoves((current) => {
@@ -739,7 +725,7 @@ export function OrdersCalendarDialog({
         ];
       });
     },
-    [canManageSchedule, dailyCapacityByDate],
+    [canManageSchedule],
   );
 
   const handlePinAction = useCallback(
@@ -751,13 +737,6 @@ export function OrdersCalendarDialog({
       }
       if (targetDate && isTargetAfterDeadline(order, targetDate)) {
         toast.error('目標日期不能晚於客戶要求交期。');
-        return;
-      }
-      const capacity = targetDate ? dailyCapacityByDate.get(targetDate) : undefined;
-      if (targetDate !== null && capacity && order.wafer_quantity > capacity.remaining) {
-        const message = capacityShortfallMessage([order], targetDate);
-        setOperationError(message);
-        toast.error('目標日期產能不足', { description: message });
         return;
       }
       const compoundId = crypto.randomUUID();
@@ -779,7 +758,7 @@ export function OrdersCalendarDialog({
         },
       );
     },
-    [canManageSchedule, dailyCapacityByDate, pinSchedule],
+    [canManageSchedule, pinSchedule],
   );
 
   const removePendingMove = useCallback((orderId: string) => {
