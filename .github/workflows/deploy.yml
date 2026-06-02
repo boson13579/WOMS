@@ -120,6 +120,19 @@ jobs:
             -n woms
           kubectl rollout status deployment/worker -n woms --timeout=180s
 
+      - name: Apply + roll beat Deployment
+        env:
+          ECR_URI: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Beat is a singleton (replicas: 1, strategy: Recreate). First
+          # deploy creates the Deployment; subsequent deploys re-apply
+          # with the new image tag and trigger a Recreate rollout.
+          # kubectl set image (the pattern used for backend/worker/frontend)
+          # would fail on the very first deploy because the Deployment
+          # doesn't exist yet — `apply` handles both cases.
+          envsubst '${ECR_URI} ${IMAGE_TAG}' < k8s/41-beat-deployment.yaml | kubectl apply -f -
+          kubectl rollout status deployment/beat -n woms --timeout=180s
+
       - name: Roll frontend Deployment
         run: |
           kubectl set image deployment/frontend \
