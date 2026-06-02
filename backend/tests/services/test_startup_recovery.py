@@ -17,8 +17,9 @@ was queued the right number of times".
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from app.services.scheduling import (
@@ -72,7 +73,10 @@ def _patch_tasks(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
 
 
 def _today() -> datetime.date:
-    return datetime.now(tz=UTC).date()
+    # Must match the timezone used by ``startup_recovery._DAY_BOUNDARY_TZ``
+    # — comparing against UTC here would make the catchup-counts tests
+    # off-by-one inside the 00:00-08:00 Asia/Taipei window.
+    return datetime.now(tz=ZoneInfo("Asia/Taipei")).date()
 
 
 # ---------------------------------------------------------------------------

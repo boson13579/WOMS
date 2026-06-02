@@ -2,12 +2,17 @@
 
 Three known gaps after a server restart that the runtime can't self-heal:
 
-1. **Stale ``base_date``** — Celery Beat fires ``advance_day_task`` at 00:00
-   UTC. If the worker (or whole stack) was down across one or more
-   midnights, those Beat ticks are missed and ``schedule:state.base_date``
-   stays at the OLD day. Segment-tree day 1 is no longer "today" — every
-   subsequent ``add_order`` / ``compute_schedule`` reasons against the wrong
-   calendar.
+1. **Stale ``base_date``** — Celery Beat fires ``advance_day_task`` at the
+   configured day boundary (currently 00:00 ``Asia/Taipei``; see
+   ``app/workers/celery_app.py::beat_schedule['advance-day']``). If the
+   worker (or whole stack) was down across one or more midnights, those
+   Beat ticks are missed and ``schedule:state.base_date`` stays at the
+   OLD day. Segment-tree day 1 is no longer "today" — every subsequent
+   ``add_order`` / ``compute_schedule`` reasons against the wrong calendar.
+   "Today" here is computed in the Beat timezone (``Asia/Taipei``) so
+   that startup recovery agrees with Beat on where the day boundary
+   sits — comparing against UTC would silently skip catch-up in the
+   00:00 ~ 08:00 ``Asia/Taipei`` window every day.
 2. **Missing ``schedule:state``** — Redis flushed / first deploy / state
    schema upgrade. Worker would fall back to an empty state and silently
    forget existing scheduled orders' load.
@@ -35,8 +40,9 @@ the cost of raising is "API container in CrashLoopBackoff".
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import structlog
 from redis import Redis
@@ -60,6 +66,13 @@ __all__ = ["run_startup_recovery"]
 # of advance_day_task and the state would over-advance.
 _RECOVERY_FLAG_KEY = "schedule:startup_recovery_running"
 _RECOVERY_FLAG_TTL_SECONDS = 60
+
+# "Today" is computed in the same timezone that Beat fires in, so this
+# module's notion of the day boundary matches advance_day's. Pre-fix this
+# used UTC and silently skipped catch-up in the 00:00-08:00 Asia/Taipei
+# window (= 16:00-24:00 UTC previous day) — a restart inside that window
+# with a stale base_date would see ``missed_days = 0`` and do nothing.
+_DAY_BOUNDARY_TZ = ZoneInfo("Asia/Taipei")
 
 
 def run_startup_recovery() -> None:
@@ -147,7 +160,7 @@ def _dispatch_recovery(rds: Redis) -> None:
         run_scheduling_task,
     )
 
-    today = datetime.now(tz=UTC).date()
+    today = datetime.now(tz=_DAY_BOUNDARY_TZ).date()
     raw_state = cast("str | None", rds.get(STATE_KEY))
 
     # --- Step 1: state missing → rebuild ------------------------------------
