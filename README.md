@@ -2,9 +2,6 @@
 
 晶圓代工訂單管理 + 智慧排程平台。前後端、worker、即時通知、可觀測性、AWS 部署全套打通。
 
-> **Live demo**：[https://d2eo1ky9o3esf3.cloudfront.net](https://d2eo1ky9o3esf3.cloudfront.net)（隨 EKS deploy 啟停）
-> **Demo 帳號**：見 `terraform output -raw admin_password`（或 ops 那邊問）。
-
 ---
 
 ## What's built
@@ -115,56 +112,69 @@ cd frontend && pnpm install && cd ..
 ```bash
 docker compose up -d
 
-# 等待全部 healthy（約 30-60 秒第一次 build）
+# 等待全部 healthy（第一次 build 約 3-5 分鐘）
 docker compose ps
 ```
 
-跑起來會有：
-- `db` (postgres:15) — :5432
-- `redis` (redis:7) — :6379
-- `backend` × 2 (FastAPI + uvicorn) — 透過 nginx LB 對外
-- `nginx` (load balancer 給兩個 backend) — :8000
-- `worker` (Celery) — 處理排程
-- `beat` (Celery Beat) — 每日 00:00 Asia/Taipei 觸發 `advance_day_task`
-- `frontend` (Vite dev server) — :5173
+跑完應該看到 7 個 service：
 
-### 步驟 6：跑 alembic migration
+| Service | 內容 | Port |
+|---|---|---|
+| `db` | Postgres 15 | 5432 |
+| `redis` | Redis 7（queue + pub/sub + metrics） | 6379 |
+| `backend` × 2 | FastAPI + uvicorn (replicas: 2) | (內部) |
+| `nginx` | load balancer 給兩個 backend | 8000 |
+| `worker` | Celery worker（處理排程 compounds） | — |
+| `beat` | Celery Beat（每日 00:00 Asia/Taipei 觸發 `advance_day_task`） | — |
+| `frontend` | Vite dev server | 5173 |
+
+> ⚠️ 如果 `docker compose ps` 只看到一個 `backend`，你的 Docker Compose 版本可能不認 `deploy.replicas`。改用：`docker compose up -d --scale backend=2`。
+
+### 步驟 6：跑 migration
 
 ```bash
 docker compose exec backend alembic upgrade head
 ```
 
-### 步驟 7：建管理員（demo 用）
+驗證：
+```bash
+docker compose exec db psql -U postgres -d smart_order -c "\dt"
+```
+應該看到 `orders` / `users` / `audit_logs` / `order_daily_seq` / `schedule_daily_capacity` 等 table。
+
+### 步驟 7：建管理員帳號
+
+跟 prod 的 seed-admin job 走相同 path（`user_repo.create` + bcrypt）：
 
 ```bash
-docker compose exec backend python -c "
+docker compose exec -e ADMIN_PASSWORD=Password123 backend python -c "
 from app.core.db import SessionLocal
 from app.core.security import hash_password
-from app.models.user import User, UserRole
-db = SessionLocal()
-db.add(User(
-    username='admin', email='admin@example.com',
-    password_hash=hash_password('Password123'),
-    role=UserRole.root, is_active=True,
-))
-db.commit()
+from app.models.user import UserRole
+from app.repositories import user as user_repo
+import os
+with SessionLocal() as db:
+    if user_repo.get_by_username(db, 'admin'):
+        print('admin already exists, skipping')
+    else:
+        user_repo.create(
+            db,
+            username='admin',
+            password_hash=hash_password(os.environ['ADMIN_PASSWORD']),
+            role=UserRole.root,
+            email='admin@example.com',
+        )
+        db.commit()
+        print('admin created')
 "
 ```
 
-### 步驟 8：玩
+### 步驟 8：登入 + 驗證
 
-| URL | 內容 |
-|---|---|
-| [http://localhost:5173](http://localhost:5173) | 前端 SPA — 用 `admin / Password123` 登入 |
-| [http://localhost:8000/docs](http://localhost:8000/docs) | Swagger UI（API 對照） |
-| [http://localhost:8000/api/v1/health](http://localhost:8000/api/v1/health) | health check |
+開 [http://localhost:5173](http://localhost:5173)，用 `admin / Password123` 登入。看得到 Dashboard 就代表全鏈通了：前端 → nginx → backend → DB / Redis。
 
-登入後可以：
-- 建 / 改 / 刪 / 取消 訂單
-- 看 Dashboard（30 天 capacity、Pending Ops、Orders by status）
-- 看 Observability（RED / USE / Schedule Lag P95 / Live Connections）
-- 看 Audit Log（root 角色）
-- 看 Calendar 視圖（含 pin/unpin、today 高亮、訂單顏色標）
+API 對照看 Swagger：[http://localhost:8000/docs](http://localhost:8000/docs)
+Health check：[http://localhost:8000/api/v1/health](http://localhost:8000/api/v1/health) 應該回 `{"status":"ok"}`。
 
 ---
 
@@ -222,12 +232,12 @@ cd frontend && pnpm test
 ├── k8s/                        Kubernetes manifests — configmap / deployment / service / ingress / migration-job
 ├── docker/                     local-only docker assets (nginx config 給 backend LB)
 ├── docs/                       架構與貢獻指南
-│   ├── ARCHITECTURE.md         ⭐ 從這裡開始 — 整個專案的 mental model
-│   ├── RULES.md                ⚠️ 強制編碼規範（12-Factor / Bulletproof React / FastAPI Best Practices）
+│   ├── ARCHITECTURE.md            整個專案的 mental model（建議先讀這個）
+│   ├── RULES.md                   強制編碼規範（12-Factor / Bulletproof React / FastAPI Best Practices）
 │   ├── DEVELOPMENT_GUIDELINES.md  開發 SOP、命名、TDD、API 錯誤格式
 │   ├── scheduling-integration.md  排程 API 怎麼用（隊友看的）
-│   ├── scheduling.md            排程內部實作（要改 worker code 才需要看）
-│   ├── DEPLOY.md                AWS 部署 SOP
+│   ├── scheduling.md              排程內部實作（要改 worker code 才需要看）
+│   ├── DEPLOY.md                  AWS 部署 SOP
 │   ├── FRONTEND_SPEC.md
 │   ├── GITHUB_SETUP.md
 │   └── HOW_TO_TEST.md
@@ -258,16 +268,16 @@ cd frontend && pnpm test
 
 ## 文件導引
 
-從 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 開始 — 拿到整個專案的 mental map。再依需要：
+建議先讀 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 拿到整個專案的 mental map，再依需要：
 
-- **[Project rules](docs/RULES.md)** ⚠️ — 12-Factor / Bulletproof React / FastAPI 嚴格分層 — **所有 PR 必須符合**。
-- **[Development guidelines](docs/DEVELOPMENT_GUIDELINES.md)** — 命名、TDD、API 錯誤格式、新增 endpoint 的 SOP。
-- **[Scheduling integration guide](docs/scheduling-integration.md)** ⭐ — 跟排程模組整合的隊友（Order CRUD / 前端 / Ops）看這份就夠。
-- **[Scheduling internals](docs/scheduling.md)** — 排程模組內部實作（segment tree、EDF、batch admission、race fix）。要動 worker code 才需要看。
-- **[Deploy](docs/DEPLOY.md)** — Terraform → AWS EKS 的部署 SOP。
-- **[How to test](docs/HOW_TO_TEST.md)** — 怎麼手動測完整 user flow。
-- **[Frontend spec](docs/FRONTEND_SPEC.md)** — 前端各頁面的設計規格。
-- **[GitHub setup](docs/GITHUB_SETUP.md)** — repo 上 GitHub、CI / CD、PR 流程。
+- [Project rules](docs/RULES.md) — 12-Factor / Bulletproof React / FastAPI 嚴格分層；所有 PR 必須符合。
+- [Development guidelines](docs/DEVELOPMENT_GUIDELINES.md) — 命名、TDD、API 錯誤格式、新增 endpoint 的 SOP。
+- [Scheduling integration guide](docs/scheduling-integration.md) — 跟排程模組整合的隊友（Order CRUD / 前端 / Ops）看這份就夠。
+- [Scheduling internals](docs/scheduling.md) — 排程模組內部實作（segment tree、EDF、batch admission、race fix）。要動 worker code 才需要看。
+- [Deploy](docs/DEPLOY.md) — Terraform → AWS EKS 的部署 SOP。
+- [How to test](docs/HOW_TO_TEST.md) — 怎麼手動測完整 user flow。
+- [Frontend spec](docs/FRONTEND_SPEC.md) — 前端各頁面的設計規格。
+- [GitHub setup](docs/GITHUB_SETUP.md) — repo 上 GitHub、CI / CD、PR 流程。
 
 ---
 
