@@ -441,7 +441,8 @@ describe('OrdersCalendarDialog', () => {
     expect(payload.targets.map((target) => target.targetDate)).toEqual(['2026-05-10']);
   });
 
-  it('does not queue a drag when the target date has insufficient capacity', () => {
+  it('queues a drag to a full target date so the backend can reject it', async () => {
+    const user = userEvent.setup();
     renderDialog();
 
     const dragData = new Map<string, string>();
@@ -455,8 +456,15 @@ describe('OrdersCalendarDialog', () => {
     fireEvent.dragStart(screen.getByText('ORD-20260504-0002'), { dataTransfer });
     fireEvent.drop(screen.getByRole('button', { name: /2026-05-11/ }), { dataTransfer });
 
-    expect(screen.getByText(/產能不足/)).toBeInTheDocument();
-    expect(mockPinMutate).not.toHaveBeenCalled();
+    expect(screen.getByText('待送出的排程變更')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '送出嘗試' }));
+
+    const [payload] = mockPinMutate.mock.calls[0] as [
+      { targets: { order: { id: string }; targetDate: string }[] },
+      unknown,
+    ];
+    expect(payload.targets.map((target) => target.order.id)).toEqual([pendingOrder.id]);
+    expect(payload.targets.map((target) => target.targetDate)).toEqual(['2026-05-11']);
   });
 
   it('keeps selected order order when queueing a multi-order pin attempt', async () => {
