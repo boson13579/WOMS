@@ -446,10 +446,6 @@ def _build_patch_compound(
     old_deadline = order.requested_delivery_date
     is_pinned_before = order.is_pinned
     old_pin_day = order.pinned_production_date
-    old_status = order.status
-    old_scheduled_production_date = order.scheduled_production_date
-    old_expected_delivery_date = order.expected_delivery_date
-    old_daily_breakdown = order.daily_breakdown
 
     qty_changed = new_qty != old_qty
     deadline_changed = new_deadline != old_deadline
@@ -517,10 +513,6 @@ def _build_patch_compound(
             old_assigned_to=order.assigned_to,
             old_pinned_production_date=old_pin_day,
             old_is_pinned=is_pinned_before,
-            old_status=old_status,
-            old_scheduled_production_date=old_scheduled_production_date,
-            old_expected_delivery_date=old_expected_delivery_date,
-            old_daily_breakdown=old_daily_breakdown,
         ),
     )
 
