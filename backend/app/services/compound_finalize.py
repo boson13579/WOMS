@@ -407,20 +407,6 @@ def _restore_order_fields_on_reject(order: Order, db_action: dict[str, Any]) -> 
         order.pinned_production_date = (
             date.fromisoformat(str(raw_old_pin_day)) if raw_old_pin_day else None
         )
-    if db_action.get("old_status") and "old_scheduled_production_date" in db_action:
-        raw_scheduled_date = db_action.get("old_scheduled_production_date")
-        order.scheduled_production_date = (
-            date.fromisoformat(str(raw_scheduled_date)) if raw_scheduled_date else None
-        )
-    if db_action.get("old_status") and "old_expected_delivery_date" in db_action:
-        raw_expected_date = db_action.get("old_expected_delivery_date")
-        order.expected_delivery_date = (
-            date.fromisoformat(str(raw_expected_date)) if raw_expected_date else None
-        )
-    if db_action.get("old_status") and "old_daily_breakdown" in db_action:
-        order.daily_breakdown = db_action.get("old_daily_breakdown")
-    if db_action.get("old_status"):
-        order.status = OrderStatus(str(db_action["old_status"]))
 
 
 def _apply_db_action_reject(
@@ -514,8 +500,6 @@ def _apply_db_action_reject(
         return
     if kind == "update":
         _restore_order_fields_on_reject(order, db_action)
-    if db_action.get("old_status"):
-        return
     if order.scheduled_production_date is not None:
         order.status = OrderStatus.scheduled
     else:

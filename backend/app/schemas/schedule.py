@@ -127,10 +127,6 @@ class CompoundDbAction(BaseModel):
     old_assigned_to: uuid.UUID | None = None
     old_pinned_production_date: date | None = None
     old_is_pinned: bool = False
-    old_status: OrderStatus | None = None
-    old_scheduled_production_date: date | None = None
-    old_expected_delivery_date: date | None = None
-    old_daily_breakdown: list[dict[str, str | int]] | None = None
 
 
 class ScheduleCompoundRequest(BaseModel):

@@ -2219,10 +2219,6 @@ def _stub_compound_with_db_action(
     new_pinned_production_date: str | None = None,
     old_pinned_production_date: str | None = None,
     old_is_pinned: bool = False,
-    old_status: str | None = None,
-    old_scheduled_production_date: str | None = None,
-    old_expected_delivery_date: str | None = None,
-    old_daily_breakdown: list[dict[str, str | int]] | None = None,
 ) -> dict[str, Any]:
     """Build a compound dict that mimics what ``schedule_queue.enqueue_compound``
     stores in Redis — only the fields ``_perform_compound_db_action`` reads."""
@@ -2257,10 +2253,6 @@ def _stub_compound_with_db_action(
             "old_assigned_to": None,
             "old_pinned_production_date": old_pinned_production_date,
             "old_is_pinned": old_is_pinned,
-            "old_status": old_status,
-            "old_scheduled_production_date": old_scheduled_production_date,
-            "old_expected_delivery_date": old_expected_delivery_date,
-            "old_daily_breakdown": old_daily_breakdown,
         },
     }
 
@@ -2435,72 +2427,6 @@ def test_perform_db_action_reject_update_clears_lock_only(
     # Lock cleared; status restored to scheduled (had a scheduled date).
     assert order.is_processing_locked is False
     assert order.status == OrderStatus.scheduled
-
-
-def test_perform_db_action_reject_update_restores_materialized_schedule_fields(
-    db_session: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Rejected calendar move restores the exact pre-move schedule snapshot."""
-    from app.models.order import Order, OrderStatus
-    from app.models.user import User, UserRole
-    from app.workers.scheduling import _perform_compound_db_action
-
-    _patch_worker_sessionlocal_to_test_db(monkeypatch, db_session)
-
-    import bcrypt
-
-    actor = User(
-        username="worker-dbaction-reject-schedule-fields",
-        email="worker-dbaction-reject-schedule-fields@test.internal",
-        password_hash=bcrypt.hashpw(b"x", bcrypt.gensalt()).decode(),
-        role=UserRole.scheduler,
-        is_active=True,
-    )
-    db_session.add(actor)
-    db_session.commit()
-
-    old_breakdown = [{"date": "2026-07-15", "quantity": 100}]
-    order = Order(
-        order_number="ORD-DBACTION-REJ-SCHEDULE-FIELDS",
-        customer_name="ACME",
-        wafer_quantity=100,
-        requested_delivery_date=date(2026, 8, 1),
-        created_by=actor.id,
-        status=OrderStatus.pending,
-        scheduled_production_date=None,
-        expected_delivery_date=None,
-        daily_breakdown=None,
-        is_processing_locked=True,
-    )
-    db_session.add(order)
-    db_session.commit()
-
-    compound = _stub_compound_with_db_action(
-        kind="update",
-        order_id=order.id,
-        actor_id=actor.id,
-        new_pinned_production_date_set=True,
-        new_pinned_production_date="2026-07-16",
-        old_status="scheduled",
-        old_scheduled_production_date="2026-07-15",
-        old_expected_delivery_date="2026-07-15",
-        old_daily_breakdown=old_breakdown,
-        old_pinned_production_date="2026-07-15",
-        old_is_pinned=True,
-    )
-
-    _perform_compound_db_action(compound, accepted=False)
-
-    db_session.expire_all()
-    db_session.refresh(order)
-    assert order.is_processing_locked is False
-    assert order.status == OrderStatus.scheduled
-    assert order.scheduled_production_date == date(2026, 7, 15)
-    assert order.expected_delivery_date == date(2026, 7, 15)
-    assert order.daily_breakdown == old_breakdown
-    assert order.is_pinned is True
-    assert order.pinned_production_date == date(2026, 7, 15)
 
 
 def test_perform_db_action_reject_update_restores_old_pin_columns(
