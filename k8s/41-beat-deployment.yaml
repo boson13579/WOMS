@@ -48,6 +48,18 @@ spec:
             - app.workers.celery_app
             - beat
             - --loglevel=INFO
+            # PersistentScheduler writes ``celerybeat-schedule.db`` to its
+            # CWD by default. The Dockerfile's WORKDIR is ``/app`` and the
+            # ``app`` user can't write there (files were chowned to root
+            # when copied in), so without an explicit path Beat crashes at
+            # boot → CrashLoopBackOff. Pointing the schedule file at
+            # ``/tmp`` (always writable in a container) sidesteps the
+            # permission problem. Losing the file on a pod restart is
+            # harmless — the schedule itself lives in code
+            # (``celery_app.py::beat_schedule``); the .db only tracks
+            # "last fired at" timestamps which Beat re-derives from the
+            # cron expression on first tick.
+            - --schedule=/tmp/celerybeat-schedule
           envFrom:
             - configMapRef:
                 name: woms-config
